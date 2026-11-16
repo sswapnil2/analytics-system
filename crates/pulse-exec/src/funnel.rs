@@ -563,9 +563,10 @@ impl FunnelEngine {
             let session_id = chunk.session_id_for_row(r_idx);
             let replay_offset_kb = chunk.tier_a.replay_offset_kb[r_idx];
             let has_replay = rstore.has_session(ps.project_id(), &session_id).await;
-            let distinct_id = id_graph
+            let raw_did = id_graph
                 .external_id(ev.canon_uid)
                 .unwrap_or_else(|| format!("uid_{}", ev.canon_uid));
+            let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
 
             dropped_sample_sessions.push(DroppedSessionSample {
                 dropped_before_step,

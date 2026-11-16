@@ -12,8 +12,8 @@ pub use bucketing::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
 pub use error::{Result, WireError};
 pub use event::{PropValue, WireEvent};
 pub use replay::{
-    mask_input_value, InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp,
-    FIXED_MASK_PLACEHOLDER, MASK_CHAR, REPLAY_MAGIC,
+    mask_input_value, mask_user_identifier, InteractionKind, NodeKind, ReplayChunk, WireNode,
+    WireframeOp, FIXED_MASK_PLACEHOLDER, MASK_CHAR, REPLAY_MAGIC,
 };
 
 #[cfg(test)]
@@ -264,5 +264,18 @@ mod tests {
             ReplayChunk::decode_stream(&stream[offset2..]).expect("decode range slice");
         assert_eq!(tail_chunks.len(), 1);
         assert_eq!(tail_chunks[0], chunk2);
+    }
+
+    #[test]
+    fn pr3_mask_user_identifier_redacts_phones_and_emails_only() {
+        assert_eq!(mask_user_identifier("+919845106153"), "+91 •••• 153");
+        assert_eq!(mask_user_identifier("9845106153"), "•••• 153");
+        assert_eq!(mask_user_identifier("+91 98451-06153"), "+91 •••• 153");
+        assert_eq!(
+            mask_user_identifier("priya.sharma@fintech.in"),
+            "p•••@fintech.in"
+        );
+        assert_eq!(mask_user_identifier("anon_in_00123"), "anon_in_00123");
+        assert_eq!(mask_user_identifier("u_1234567890"), "u_1234567890");
     }
 }

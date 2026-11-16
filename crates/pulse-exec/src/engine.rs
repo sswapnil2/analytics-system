@@ -430,9 +430,10 @@ impl QueryEngine {
                     }
                 }
 
-                let distinct_id = id_graph
+                let raw_did = id_graph
                     .external_id(canon_uid)
                     .unwrap_or_else(|| format!("uid_{canon_uid}"));
+                let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
                 let event_count = evs.len() as u32;
                 let mapped_evs = evs
                     .into_iter()
@@ -537,9 +538,10 @@ impl QueryEngine {
                     }
 
                     let canon_uid = id_snap.resolve(hdr.raw_uid);
-                    let distinct_id = id_graph
+                    let raw_did = id_graph
                         .external_id(canon_uid)
                         .unwrap_or_else(|| format!("uid_{canon_uid}"));
+                    let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
                     let ev_list: Vec<(i64, String, u32)> = (r_start..r_end)
                         .map(|r| {
                             let ename = id_to_name
