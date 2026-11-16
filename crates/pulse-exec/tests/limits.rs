@@ -2,13 +2,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use object_store::ObjectStore;
 use pulse_exec::{
-    eval_math_expr, validate_cohort_acyclic, BehavioralCohortDef, CatalogRegistry, QueryEngine,
-    TimeRange,
+    eval_math_expr, validate_cohort_acyclic, BehavioralCohortDef, CatalogRegistry,
+    CustomPropertyDef, ExecError, FlowDirection, FlowsQuery, FunnelExclusion, FunnelOrderMode,
+    FunnelQuery, FunnelStepSpec, GlobalFilter, InsightsMetric, InsightsQuery, InsightsSeriesSpec,
+    LookupTableDef, PropFilterOp, PropPredicate, QueryEngine, RetentionMode, RetentionQuery,
+    SessionSearchQuery, TimeInterval, TimeRange,
 };
 use pulse_identity::IdentityRouter;
+use pulse_ingest::{InMemoryGovernance, IngestService};
 use pulse_storage::{StorageConfig, StorageEngine};
+use pulse_wire::{PropValue, WireBatch, WireEvent};
+
+fn ev(
+    seq: u64,
+    uid: &str,
+    sess: &str,
+    name: &str,
+    ts_ms: i64,
+    props: Vec<(&str, PropValue)>,
+) -> WireEvent {
+    WireEvent {
+        event_uuid: WireEvent::deterministic_uuid(uid, sess, name, ts_ms, seq),
+        routing_seed: uid.to_string(),
+        distinct_id: uid.to_string(),
+        session_id: sess.to_string(),
+        event_name: name.to_string(),
+        client_event_ts_ms: ts_ms,
+        client_sent_ts_ms: 0,
+        props: props.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        replay_offset_kb: 0,
+    }
+}
 
 #[test]
 fn p0_08_formula_unknown_var_and_trailing_junk_are_rejected() {
@@ -121,4 +149,755 @@ async fn p0_09_cyclic_cohort_references_return_error_instead_of_infinite_recursi
         &cat_ref
     )
     .is_err());
+}
+
+#[test]
+fn p2_09c_previous_period_is_exact_inclusive_duration() {
+    // [1_000, 1_999] is an inclusive 1,000 ms window; previous period must be [0, 999], not [1, 999]!
+    let tr = TimeRange {
+        start_ts_ms: 1_000,
+        end_ts_ms: 1_999,
+    };
+    assert_eq!(tr.duration_ms(), 1_000);
+    assert_eq!(
+        tr.previous_period(),
+        TimeRange {
+            start_ts_ms: 0,
+            end_ts_ms: 999,
+        }
+    );
+}
+
+#[tokio::test]
+async fn p2_09i_custom_property_preserves_camel_case_identifiers() {
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 10_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let cat = catalogs.for_project("proj_camel");
+    cat.custom_properties.insert(
+        "effectiveFee".to_string(),
+        CustomPropertyDef {
+            name: "effectiveFee".to_string(),
+            sql_expr: "case when userPlan = 'Pro' then coalesce(baseFee, 0) * 2 else 10 end"
+                .to_string(),
+            referenced_props: Vec::new(),
+        },
+    );
+
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    ingest
+        .ingest_for_project(
+            "proj_camel",
+            WireBatch::new(vec![
+                ev(
+                    1,
+                    "u1",
+                    "s1",
+                    "Pay",
+                    ts,
+                    vec![
+                        ("userPlan", PropValue::Str("Pro".into())),
+                        ("baseFee", PropValue::Int(25)),
+                    ],
+                ),
+                ev(
+                    2,
+                    "u2",
+                    "s2",
+                    "Pay",
+                    ts + 100,
+                    vec![
+                        ("userPlan", PropValue::Str("Free".into())),
+                        ("baseFee", PropValue::Int(25)),
+                    ],
+                ),
+            ]),
+            ts + 1_000,
+        )
+        .await
+        .unwrap();
+
+    let res = qengine
+        .query_insights(
+            "proj_camel",
+            &InsightsQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ts - 1_000,
+                    end_ts_ms: ts + 5_000,
+                },
+                interval: TimeInterval::Day,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "Pay".into(),
+                    metric: InsightsMetric::PropSum {
+                        prop: "effectiveFee".into(),
+                    },
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await
+        .expect("mixed-case custom property SQL must evaluate without lowercasing identifiers");
+    assert_eq!(res.series[0].overall_value, Some(60.0));
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn p2_01_inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_cardinality() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    let mut batch = vec![
+        // (a) Int(2) + Str("2") in the same segment
+        ev(
+            1,
+            "u_int",
+            "s1",
+            "Evt",
+            ts + 10,
+            vec![("mixed_num", PropValue::Int(2))],
+        ),
+        ev(
+            2,
+            "u_str",
+            "s2",
+            "Evt",
+            ts + 20,
+            vec![("mixed_num", PropValue::Str("2".into()))],
+        ),
+        // (b) Bool(true) + Str("true") in the same segment
+        ev(
+            3,
+            "u_b",
+            "s3",
+            "Evt",
+            ts + 30,
+            vec![("mixed_bool", PropValue::Bool(true))],
+        ),
+        ev(
+            4,
+            "u_bs",
+            "s4",
+            "Evt",
+            ts + 40,
+            vec![("mixed_bool", PropValue::Str("true".into()))],
+        ),
+    ];
+    // (c) Bool(false) + > 1,024 distinct Str values in `hi_card` so Str exceeds MAX_INVERTED_INDEX_CARDINALITY while Bool remains!
+    batch.push(ev(
+        5,
+        "u_hc_bool",
+        "s5",
+        "Evt",
+        ts + 50,
+        vec![("hi_card", PropValue::Bool(false))],
+    ));
+    for i in 0..1_100u64 {
+        batch.push(ev(
+            100 + i,
+            &format!("u_hc_{i}"),
+            &format!("s_hc_{i}"),
+            "Evt",
+            ts + 100 + i as i64,
+            vec![("hi_card", PropValue::Str(format!("val_{i}")))],
+        ));
+    }
+
+    ingest
+        .ingest_for_project("proj_p201", WireBatch::new(batch), ts + 10_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    let range = TimeRange {
+        start_ts_ms: ts,
+        end_ts_ms: ts + 5_000,
+    };
+
+    for (prop, target, expected_users) in [
+        ("mixed_num", PropValue::Int(2), 2u64),
+        ("mixed_num", PropValue::Str("2".into()), 2u64),
+        ("mixed_bool", PropValue::Bool(true), 2u64),
+        ("hi_card", PropValue::Str("val_777".into()), 1u64),
+    ] {
+        let pred = PropPredicate {
+            prop_name: prop.to_string(),
+            filter: PropFilterOp::Eq(target),
+        };
+        let ins = qengine
+            .query_insights(
+                "proj_p201",
+                &InsightsQuery {
+                    time_range: range,
+                    interval: TimeInterval::Day,
+                    series: vec![InsightsSeriesSpec {
+                        label: "A".into(),
+                        event_name: "Evt".into(),
+                        metric: InsightsMetric::Uniques,
+                        filters: vec![pred.clone()],
+                    }],
+                    breakdown_by: Vec::new(),
+                    global_filter: GlobalFilter::default(),
+                    compare_previous_period: false,
+                    formula: None,
+                },
+            )
+            .await
+            .unwrap();
+        let fun = qengine
+            .query_funnel(
+                "proj_p201",
+                &FunnelQuery {
+                    time_range: range,
+                    steps: vec![FunnelStepSpec {
+                        event_name: "Evt".into(),
+                        filters: vec![pred],
+                        first_time_ever: false,
+                    }],
+                    order_mode: FunnelOrderMode::LooseOrder,
+                    conversion_window_ms: 86_400_000,
+                    exclusions: Vec::new(),
+                    hold_constant_props: Vec::new(),
+                    breakdown_by: None,
+                    global_filter: GlobalFilter::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ins.series[0].overall_value,
+            Some(expected_users as f64),
+            "Insights masked query wrong for {prop}"
+        );
+        assert_eq!(
+            fun.overall_steps[0].entered_users, expected_users,
+            "Insights masked vs Funnel unmasked mismatch for {prop}"
+        );
+    }
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn p2_09_semantics_and_p3_02_governance_regression_suite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let cat = catalogs.for_project("proj_sem");
+    cat.set_timezone("Asia/Kolkata");
+    cat.insert_lookup_table(
+        LookupTableDef::from_csv_bytes(
+            "merchants",
+            "merchant_id",
+            b"merchant_id,category\nm1,LookupCat\n",
+        )
+        .unwrap(),
+    );
+
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    // 2026-02-01 00:30:00 IST == 2026-01-31 19:00:00 UTC!
+    // In UTC this is Jan 2026; in Asia/Kolkata this is Feb 1, 2026!
+    let ist_feb1_0030 = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:30:00+05:30")
+        .unwrap()
+        .timestamp_millis();
+    let ist_mar1_0030 = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:30:00+05:30")
+        .unwrap()
+        .timestamp_millis();
+
+    ingest
+        .ingest_for_project(
+            "proj_sem",
+            WireBatch::new(vec![
+                ev(
+                    1,
+                    "u_neg1",
+                    "s1",
+                    "PnL",
+                    ist_feb1_0030,
+                    vec![
+                        ("delta", PropValue::Float(-100.0)),
+                        ("category", PropValue::Str("PhysicalWins".into())),
+                        ("merchant_id", PropValue::Str("m1".into())),
+                        ("nullable_col", PropValue::Null),
+                    ],
+                ),
+                ev(
+                    2,
+                    "u_neg2",
+                    "s2",
+                    "PnL",
+                    ist_feb1_0030 + 1_000,
+                    vec![
+                        ("delta", PropValue::Float(-50.0)),
+                        ("merchant_id", PropValue::Str("m1".into())),
+                    ],
+                ),
+                ev(
+                    3,
+                    "u_neg3",
+                    "s3",
+                    "PnL",
+                    ist_mar1_0030,
+                    vec![("delta", PropValue::Float(-10.0))],
+                ),
+            ]),
+            ist_mar1_0030 + 5_000,
+        )
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    // P2-09l: Explicit PropValue::Null must survive flush to Vortex segment (distinct from missing)
+    let ps = storage.get_or_open_project("proj_sem").await.unwrap();
+    let nullable_pk = ps
+        .dictionary()
+        .lookup_prop_key("nullable_col")
+        .expect("nullable_col interned");
+    let snap = ps.snapshot();
+    let mut saw_explicit_null = false;
+    for seg in snap.manifest.active_segments.values().flatten() {
+        for r in storage.segment_reader().read_all_rows(seg).await.unwrap() {
+            if r.event_ts_ms == ist_feb1_0030 {
+                assert!(
+                    r.props
+                        .iter()
+                        .any(|(k, v)| *k == nullable_pk && *v == PropValue::Null),
+                    "explicit PropValue::Null was lost on segment flush: {:?}",
+                    r.props
+                );
+                saw_explicit_null = true;
+            }
+        }
+    }
+    assert!(saw_explicit_null);
+
+    let range = TimeRange {
+        start_ts_ms: ist_feb1_0030 - 60_000,
+        end_ts_ms: ist_mar1_0030 + 60_000,
+    };
+
+    // P2-09a & P2-09d: Negative percentiles must be negative (~ -50.0, NOT clamped to 0.0!)
+    // and Month buckets in Asia/Kolkata must align to Feb 1 IST and Mar 1 IST!
+    let ins_neg = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: range,
+                interval: TimeInterval::Month,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::PropPercentile {
+                        prop: "delta".into(),
+                        quantile: 0.50,
+                    },
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await
+        .unwrap();
+    let p50 = ins_neg.series[0].overall_value.expect("p50 value");
+    assert!(
+        p50 < -40.0 && p50 > -60.0,
+        "expected negative p50 around -50.0, got {p50}"
+    );
+    let ist_feb1_midnight = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00+05:30")
+        .unwrap()
+        .timestamp_millis();
+    let ist_mar1_midnight = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00+05:30")
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(
+        ins_neg.buckets_ts_ms,
+        vec![ist_feb1_midnight, ist_mar1_midnight],
+        "Month buckets must align to 1st of month in Asia/Kolkata"
+    );
+
+    // P2-09b: Dau at Week interval must return InvalidQuery; Wau at Week interval anchors at end of bucket!
+    let bad_dau = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: range,
+                interval: TimeInterval::Week,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::Dau,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await;
+    assert!(matches!(bad_dau, Err(ExecError::InvalidQuery(_))));
+
+    let wau_week = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ist_feb1_0030,
+                    end_ts_ms: ist_feb1_0030 + 3_600_000,
+                },
+                interval: TimeInterval::Week,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::Wau,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await
+        .unwrap();
+    // Both u_neg1 and u_neg2 acted inside that week bucket -> end-anchored WAU must see both (2.0), not lag!
+    assert_eq!(wau_week.series[0].points[0].value, Some(2.0));
+
+    // P2-09j: Physical `category` property wins over lookup, while qualified `merchants.category` resolves lookup!
+    let phys_vs_lookup = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: range,
+                interval: TimeInterval::Month,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: vec!["category".into(), "merchants.category".into()],
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        phys_vs_lookup
+            .series
+            .iter()
+            .any(|s| s.breakdown_key == "PhysicalWins | LookupCat" && s.overall_value == Some(1.0)),
+        "expected physical `category` to win and `merchants.category` to join: {:?}",
+        phys_vs_lookup.series
+    );
+
+    // P2-09k: > 2 breakdown dimensions must error instead of silently dropping the 3rd
+    let three_bdowns = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: range,
+                interval: TimeInterval::Day,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: vec!["a".into(), "b".into(), "c".into()],
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await;
+    assert!(matches!(three_bdowns, Err(ExecError::InvalidQuery(_))));
+
+    // P2-09g: Out-of-range FunnelExclusion `between_steps` must return InvalidQuery (no shift panic!)
+    let bad_excl = qengine
+        .query_funnel(
+            "proj_sem",
+            &FunnelQuery {
+                time_range: range,
+                steps: vec![
+                    FunnelStepSpec {
+                        event_name: "PnL".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                    FunnelStepSpec {
+                        event_name: "PnL".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                ],
+                order_mode: FunnelOrderMode::LooseOrder,
+                conversion_window_ms: 60_000,
+                exclusions: vec![FunnelExclusion {
+                    event_name: "Err".into(),
+                    between_steps: (0, 99),
+                }],
+                hold_constant_props: Vec::new(),
+                breakdown_by: None,
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await;
+    assert!(matches!(bad_excl, Err(ExecError::InvalidQuery(_))));
+
+    // P2-09d: Month Retention from Feb 1 IST must match Mar 1 IST return (28-day Feb calendar month, NOT 30 fixed days!)
+    ingest
+        .ingest_for_project(
+            "proj_sem",
+            WireBatch::new(vec![ev(
+                99,
+                "u_neg1",
+                "s99",
+                "PnL",
+                ist_mar1_0030 + 500,
+                Vec::new(),
+            )]),
+            ist_mar1_0030 + 5_000,
+        )
+        .await
+        .unwrap();
+    let ret_month = qengine
+        .query_retention(
+            "proj_sem",
+            &RetentionQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ist_feb1_midnight,
+                    end_ts_ms: ist_feb1_midnight + 86_400_000,
+                },
+                start_event: "PnL".into(),
+                return_event: "PnL".into(),
+                mode: RetentionMode::NDay,
+                unit: TimeInterval::Month,
+                num_periods: 1,
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ret_month.cohorts.len(), 1);
+    assert_eq!(ret_month.cohorts[0].retained_counts, vec![2, 1]);
+
+    // P3-02: Bucket cap (> 10,000 hourly buckets) must fail fast with InvalidQuery
+    let huge_buckets = qengine
+        .query_insights(
+            "proj_sem",
+            &InsightsQuery {
+                time_range: TimeRange {
+                    start_ts_ms: 0,
+                    end_ts_ms: 20_000 * 3_600_000,
+                },
+                interval: TimeInterval::Hour,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "PnL".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await;
+    assert!(matches!(huge_buckets, Err(ExecError::InvalidQuery(_))));
+
+    // Section 6 & P3-02: Flows `top_n_per_step` folds lower-ranked step events into `$Other`
+    ingest
+        .ingest_for_project(
+            "proj_sem",
+            WireBatch::new(vec![
+                ev(201, "uf1", "sf1", "Anchor", ist_feb1_0030, Vec::new()),
+                ev(202, "uf1", "sf1", "TopA", ist_feb1_0030 + 100, Vec::new()),
+                ev(203, "uf2", "sf2", "Anchor", ist_feb1_0030, Vec::new()),
+                ev(204, "uf2", "sf2", "TopA", ist_feb1_0030 + 100, Vec::new()),
+                ev(205, "uf3", "sf3", "Anchor", ist_feb1_0030, Vec::new()),
+                ev(206, "uf3", "sf3", "RareB", ist_feb1_0030 + 100, Vec::new()),
+            ]),
+            ist_feb1_0030 + 5_000,
+        )
+        .await
+        .unwrap();
+    let flows_top1 = qengine
+        .query_flows(
+            "proj_sem",
+            &FlowsQuery {
+                time_range: range,
+                anchor_event: "Anchor".into(),
+                direction: FlowDirection::Forward,
+                steps: 1,
+                top_n_per_step: Some(1),
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(flows_top1
+        .nodes
+        .iter()
+        .any(|n| n.step_offset == 1 && n.event_name == "TopA" && n.user_count == 2));
+    assert!(flows_top1
+        .nodes
+        .iter()
+        .any(|n| n.step_offset == 1 && n.event_name == "$Other" && n.user_count == 1));
+
+    // P3-02: Session search `limit` pushdown returns exact top-`limit` newest sessions
+    let sess_res = qengine
+        .search_sessions(
+            "proj_sem",
+            &SessionSearchQuery {
+                time_range: Some(range),
+                event_name: None,
+                only_rage_tap: false,
+                only_dead_tap: false,
+                only_errors: false,
+                limit: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sess_res.sessions.len(), 2);
+    assert!(sess_res.sessions[0].end_ts_ms >= sess_res.sessions[1].end_ts_ms);
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn p3_02_per_query_deadline_enforces_timeout() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+
+    let inner = InMemory::new();
+    let throttled = Arc::new(ThrottledStore::new(
+        inner,
+        ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(80),
+            ..Default::default()
+        },
+    ));
+    let store: Arc<dyn ObjectStore> = throttled.clone();
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    ingest
+        .ingest_for_project(
+            "proj_timeout",
+            WireBatch::new(vec![ev(1, "u1", "s1", "SlowEvt", ts, Vec::new())]),
+            ts + 1_000,
+        )
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    qengine.set_query_timeout(Duration::from_millis(10));
+    let res = qengine
+        .query_insights(
+            "proj_timeout",
+            &InsightsQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ts - 1_000,
+                    end_ts_ms: ts + 1_000,
+                },
+                interval: TimeInterval::Day,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "SlowEvt".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: Vec::new(),
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(res, Err(ExecError::QueryTimeout(10))),
+        "expected ExecError::QueryTimeout(10), got {res:?}"
+    );
+
+    id_router.close_all().await.unwrap();
 }

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use parking_lot::Mutex;
 use pulse_identity::{IdentitySnapshot, ProjectIdentityGraph};
 use pulse_storage::{ProjectStorage, StorageSnapshot};
 use pulse_wire::PropValue;
 use rayon::prelude::*;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::ast::{
     DroppedSessionSample, FunnelBreakdownGroup, FunnelOrderMode, FunnelQuery, FunnelResult,
@@ -19,8 +19,9 @@ use crate::scanner::{
     row_matches_predicates, DataChunk, ExecError, Result,
 };
 
-const HOLD_MISSING: u32 = u32::MAX;
+const HOLD_MISSING: u64 = 0;
 const MAX_DROPPED_SAMPLES_PER_STEP: usize = 15;
+const MAX_FUNNEL_BREAKDOWN_GROUPS: usize = 250;
 
 #[derive(Debug, Clone, Copy)]
 struct UserEvent {
@@ -28,9 +29,9 @@ struct UserEvent {
     ts_ms: i64,
     step_mask: u16,
     excl_mask: u16,
-    hold_id: u32,
+    hold_id: u64,
     breakdown_id: u32,
-    chunk_idx: u16,
+    chunk_idx: u32,
     row_idx: u32,
 }
 
@@ -89,14 +90,17 @@ impl ShardSummary {
         }
     }
 
-    fn merge(&mut self, mut other: ShardSummary, k: usize) {
+    fn merge_remapped(&mut self, mut other: ShardSummary, k: usize, remap: Option<&[u32]>) {
         for s in 0..k {
             self.step_counts[s] += other.step_counts[s];
         }
         for (bid, counts) in other.breakdown_counts {
+            let mapped_bid = remap
+                .and_then(|r| r.get(bid as usize).copied())
+                .unwrap_or(bid);
             let dst = self
                 .breakdown_counts
-                .entry(bid)
+                .entry(mapped_bid)
                 .or_insert_with(|| vec![0u64; k]);
             for s in 0..k {
                 dst[s] += counts[s];
@@ -129,11 +133,34 @@ impl FunnelEngine {
         catalog: &VirtualCatalog,
     ) -> Result<FunnelResult> {
         let t0 = Instant::now();
+        if query.time_range.start_ts_ms > query.time_range.end_ts_ms {
+            return Err(ExecError::InvalidQuery(format!(
+                "invalid time_range: start_ts_ms ({}) > end_ts_ms ({})",
+                query.time_range.start_ts_ms, query.time_range.end_ts_ms
+            )));
+        }
+
         let k = query.steps.len();
         if k == 0 || k > 16 {
             return Err(ExecError::InvalidQuery(
                 "funnel must contain between 1 and 16 steps".into(),
             ));
+        }
+
+        // Validate exclusions count and `between_steps` bounds before any `1u16 << idx` shift (`P2-09g`).
+        if query.exclusions.len() > 16 {
+            return Err(ExecError::InvalidQuery(format!(
+                "funnel supports at most 16 exclusions (got {})",
+                query.exclusions.len()
+            )));
+        }
+        for ex in &query.exclusions {
+            let (lo, hi) = ex.between_steps;
+            if lo >= hi || hi >= k {
+                return Err(ExecError::InvalidQuery(format!(
+                    "invalid exclusion between_steps ({lo}, {hi}) for {k}-step funnel: require 0 <= from_step < to_step < {k}"
+                )));
+            }
         }
 
         let window_ms = if query.conversion_window_ms <= 0 {
@@ -227,7 +254,7 @@ impl FunnelEngine {
                 }
             }
         }
-        for (e_idx, (tgt, _)) in excl_targets.iter().enumerate().take(16) {
+        for (e_idx, (tgt, _)) in excl_targets.iter().enumerate() {
             for &eid in &tgt.event_ids {
                 if (eid as usize) < ev_excl_bits.len() {
                     ev_excl_bits[eid as usize] |= 1u16 << e_idx;
@@ -242,21 +269,17 @@ impl FunnelEngine {
         let has_hold = !query.hold_constant_props.is_empty();
         let has_breakdown = query.breakdown_by.is_some();
 
-        // Thread-safe string-tuple interners for `hold_constant` and `breakdown_by`
-        let hold_dict: Mutex<(HashMap<String, u32>, Vec<String>)> =
-            Mutex::new((HashMap::new(), vec![String::new()]));
-        let bdown_dict: Mutex<(HashMap<String, u32>, Vec<String>)> =
-            Mutex::new((HashMap::new(), vec!["(none)".to_string()]));
-
-        // Group chunks by physical `bucket_id` so single-bucket users execute 100% shard-locally in parallel!
-        let mut chunks_by_bucket: BTreeMap<u8, Vec<(u16, &DataChunk)>> = BTreeMap::new();
+        // Group chunks by physical `bucket_id` with `u32` chunk indices (`P2-09h`)
+        let mut chunks_by_bucket: BTreeMap<u8, Vec<(u32, &DataChunk)>> = BTreeMap::new();
         for (c_idx, chunk) in chunks.iter().enumerate() {
+            let c_idx_u32 = u32::try_from(c_idx)
+                .map_err(|_| ExecError::InvalidQuery("chunk count exceeds u32::MAX".into()))?;
             chunks_by_bucket
                 .entry(chunk.bucket_id)
                 .or_default()
-                .push((c_idx as u16, chunk));
+                .push((c_idx_u32, chunk));
         }
-        let bucket_groups: Vec<(u8, Vec<(u16, &DataChunk)>)> =
+        let bucket_groups: Vec<(u8, Vec<(u32, &DataChunk)>)> =
             chunks_by_bucket.into_iter().collect();
 
         let first_time_mask: u16 = query.steps.iter().enumerate().fold(0u16, |acc, (i, s)| {
@@ -276,14 +299,18 @@ impl FunnelEngine {
             query.time_range.start_ts_ms
         };
 
-        // Parallel shard execution via Rayon!
-        // Single-bucket users (~98%) finish completely inside their shard;
-        // Cross-bucket users (~2%) emit compact `UserEvent`s to be stitched at the coordinator.
-        let shard_outputs: Vec<(ShardSummary, Vec<UserEvent>)> = bucket_groups
+        // Lock-free parallel shard execution via Rayon (`P3-05`):
+        // Every shard uses a local breakdown interner + deterministic 64-bit hold hash (`0 == HOLD_MISSING`),
+        // with zero cross-thread `Mutex` contention.
+        let shard_outputs: Vec<(ShardSummary, Vec<String>, Vec<UserEvent>)> = bucket_groups
             .par_iter()
             .map(|(_bucket_id, b_chunks)| {
                 let mut local_events: Vec<UserEvent> = Vec::new();
                 let mut cross_events: Vec<UserEvent> = Vec::new();
+                let mut shard_bdown_map: HashMap<String, u32> = HashMap::new();
+                let mut shard_bdown_names: Vec<String> = vec!["(none)".to_string()];
+                shard_bdown_map.insert("(none)".to_string(), 0);
+                let mut hold_scratch: Vec<u8> = Vec::new();
 
                 for &(chunk_idx, chunk) in b_chunks {
                     let ta = &chunk.tier_a;
@@ -361,14 +388,20 @@ impl FunnelEngine {
                         }
 
                         let hold_id = if has_hold {
-                            intern_hold_tuple(chunk, r, &query.hold_constant_props, &hold_dict)
+                            hash_hold_tuple(chunk, r, &query.hold_constant_props, &mut hold_scratch)
                         } else {
-                            0
+                            1
                         };
 
                         let breakdown_id = if let Some(bprop) = &query.breakdown_by {
                             if (s_mask & 1) != 0 || query.order_mode == FunnelOrderMode::AnyOrder {
-                                intern_single_prop(chunk, r, bprop, &bdown_dict)
+                                intern_local_prop(
+                                    chunk,
+                                    r,
+                                    bprop,
+                                    &mut shard_bdown_map,
+                                    &mut shard_bdown_names,
+                                )
                             } else {
                                 0
                             }
@@ -406,15 +439,38 @@ impl FunnelEngine {
                     has_hold,
                     has_breakdown,
                 );
-                (summary, cross_events)
+                (summary, shard_bdown_names, cross_events)
             })
             .collect();
 
         // Merge shard summaries + execute coordinator Cross-Bucket Exact Stitch on `cross_bucket_users`!
         let mut final_summary = ShardSummary::new(k);
         let mut all_cross_events: Vec<UserEvent> = Vec::new();
-        for (shard_sum, mut cross) in shard_outputs {
-            final_summary.merge(shard_sum, k);
+        let mut coord_bdown_map: HashMap<String, u32> = HashMap::new();
+        let mut coord_bdown_names: Vec<String> = vec!["(none)".to_string()];
+        coord_bdown_map.insert("(none)".to_string(), 0);
+
+        for (shard_sum, shard_names, mut cross) in shard_outputs {
+            if has_breakdown {
+                let mut remap = Vec::with_capacity(shard_names.len());
+                for name in shard_names {
+                    let cid = if let Some(&existing) = coord_bdown_map.get(&name) {
+                        existing
+                    } else {
+                        let next_id = coord_bdown_names.len() as u32;
+                        coord_bdown_names.push(name.clone());
+                        coord_bdown_map.insert(name, next_id);
+                        next_id
+                    };
+                    remap.push(cid);
+                }
+                for ev in &mut cross {
+                    ev.breakdown_id = remap.get(ev.breakdown_id as usize).copied().unwrap_or(0);
+                }
+                final_summary.merge_remapped(shard_sum, k, Some(&remap));
+            } else {
+                final_summary.merge_remapped(shard_sum, k, None);
+            }
             all_cross_events.append(&mut cross);
         }
 
@@ -430,35 +486,50 @@ impl FunnelEngine {
                 has_hold,
                 has_breakdown,
             );
-            final_summary.merge(cross_summary, k);
+            final_summary.merge_remapped(cross_summary, k, None);
         }
 
         let overall_steps = build_step_counts(&query.steps, &final_summary.step_counts);
 
         let mut breakdowns = Vec::new();
         if has_breakdown {
-            let bdown_names = bdown_dict.into_inner().1;
-            let mut entries: Vec<(String, Vec<FunnelStepCount>)> = final_summary
+            let mut raw_entries: Vec<(String, Vec<u64>)> = final_summary
                 .breakdown_counts
                 .into_iter()
                 .map(|(bid, counts)| {
-                    let name = bdown_names
+                    let name = coord_bdown_names
                         .get(bid as usize)
                         .cloned()
                         .unwrap_or_else(|| "(none)".to_string());
-                    (name, build_step_counts(&query.steps, &counts))
+                    (name, counts)
                 })
                 .collect();
-            entries.sort_by(|a, b| {
-                b.1[0]
-                    .entered_users
-                    .cmp(&a.1[0].entered_users)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            for (breakdown_value, steps) in entries {
+            raw_entries.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(&b.0)));
+
+            // Cap breakdown cardinality to top `MAX_FUNNEL_BREAKDOWN_GROUPS` + `"$other"` (`P3-02`)
+            if raw_entries.len() > MAX_FUNNEL_BREAKDOWN_GROUPS {
+                let overflow = raw_entries.split_off(MAX_FUNNEL_BREAKDOWN_GROUPS);
+                let mut other_counts = vec![0u64; k];
+                for (_, counts) in overflow {
+                    for s in 0..k {
+                        other_counts[s] += counts[s];
+                    }
+                }
+                if let Some((_, existing_other)) =
+                    raw_entries.iter_mut().find(|(n, _)| n == "$other")
+                {
+                    for s in 0..k {
+                        existing_other[s] += other_counts[s];
+                    }
+                } else {
+                    raw_entries.push(("$other".to_string(), other_counts));
+                }
+            }
+
+            for (breakdown_value, counts) in raw_entries {
                 breakdowns.push(FunnelBreakdownGroup {
                     breakdown_value,
-                    steps,
+                    steps: build_step_counts(&query.steps, &counts),
                 });
             }
         }
@@ -531,13 +602,7 @@ fn evaluate_sorted_user_stream(
     // Precompute exclusion bitmask active at `cur_step`: `lo <= cur_step && cur_step < hi`
     let mut active_excl_at_step = [0u16; 16];
     for (e_idx, &(lo, hi)) in exclusions.iter().enumerate().take(16) {
-        for (s, mask_slot) in active_excl_at_step
-            .iter_mut()
-            .enumerate()
-            .take(hi.min(16))
-            .skip(lo)
-        {
-            let _ = s;
+        for mask_slot in active_excl_at_step.iter_mut().take(hi.min(16)).skip(lo) {
             *mask_slot |= 1u16 << e_idx;
         }
     }
@@ -642,9 +707,6 @@ fn evaluate_single_user(
                     last_ev,
                 };
                 best = Some(pick_better(best, cand));
-                if cur_step == k - 1 && !has_hold {
-                    // Already converted all steps; keep scanning only if an even faster TTC exists
-                }
             }
         }
         FunnelOrderMode::AnyOrder => {
@@ -668,7 +730,7 @@ fn evaluate_single_user(
                     // Check if any exclusion `(lo, hi)` triggers when `lo` is matched and `hi` is not yet matched
                     let mut excluded = false;
                     if ej.excl_mask != 0 {
-                        for (e_idx, &(lo, hi)) in exclusions.iter().enumerate().take(16) {
+                        for (e_idx, &(lo, hi)) in exclusions.iter().enumerate() {
                             if (ej.excl_mask & (1u16 << e_idx)) != 0
                                 && (matched_mask & (1u16 << lo)) != 0
                                 && (matched_mask & (1u16 << hi)) == 0
@@ -731,40 +793,39 @@ fn pick_better(prev: Option<UserFunnelOutcome>, cand: UserFunnelOutcome) -> User
     cur
 }
 
-fn intern_hold_tuple(
+fn hash_hold_tuple(
     chunk: &DataChunk,
     row_idx: usize,
     hold_props: &[String],
-    dict: &Mutex<(HashMap<String, u32>, Vec<String>)>,
-) -> u32 {
-    let mut key = String::new();
-    for (idx, hp) in hold_props.iter().enumerate() {
+    scratch: &mut Vec<u8>,
+) -> u64 {
+    scratch.clear();
+    for hp in hold_props {
         let Some(pv) = chunk.prop_cols.get(hp).and_then(|c| c.get(row_idx)) else {
             return HOLD_MISSING;
         };
         if matches!(pv, PropValue::Null) {
             return HOLD_MISSING;
         }
-        if idx > 0 {
-            key.push('\x1f');
-        }
-        key.push_str(&pv.as_str_cow());
+        let cow = pv.as_str_cow();
+        let bytes = cow.as_bytes();
+        scratch.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        scratch.extend_from_slice(bytes);
     }
-    let mut guard = dict.lock();
-    if let Some(&id) = guard.0.get(&key) {
-        return id;
+    let h = xxh3_64(scratch);
+    if h == HOLD_MISSING {
+        1
+    } else {
+        h
     }
-    let id = guard.1.len() as u32;
-    guard.1.push(key.clone());
-    guard.0.insert(key, id);
-    id
 }
 
-fn intern_single_prop(
+fn intern_local_prop(
     chunk: &DataChunk,
     row_idx: usize,
     prop_name: &str,
-    dict: &Mutex<(HashMap<String, u32>, Vec<String>)>,
+    map: &mut HashMap<String, u32>,
+    names: &mut Vec<String>,
 ) -> u32 {
     let Some(pv) = chunk.prop_cols.get(prop_name).and_then(|c| c.get(row_idx)) else {
         return 0;
@@ -773,14 +834,13 @@ fn intern_single_prop(
         return 0;
     }
     let s = pv.as_str_cow();
-    let mut guard = dict.lock();
-    if let Some(&id) = guard.0.get(s.as_ref()) {
+    if let Some(&id) = map.get(s.as_ref()) {
         return id;
     }
-    let id = guard.1.len() as u32;
+    let id = names.len() as u32;
     let owned = s.into_owned();
-    guard.1.push(owned.clone());
-    guard.0.insert(owned, id);
+    names.push(owned.clone());
+    map.insert(owned, id);
     id
 }
 

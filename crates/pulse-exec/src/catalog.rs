@@ -10,9 +10,11 @@ use arrow_array::types::{
 use arrow_array::{Array as ArrowArray, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use chrono_tz::Tz;
 use dashmap::DashMap;
 use datafusion::common::DFSchema;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use parking_lot::RwLock;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pulse_storage::extract_arrow_str;
 use pulse_wire::PropValue;
@@ -20,9 +22,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::{BehavioralCohortDef, PropPredicate};
 
+/// Shared DataFusion `SessionContext` with `enable_ident_normalization = false` so mixed-case
+/// property names like `userPlan` resolve without being lowercased to `userplan` (`P2-09i`).
 fn shared_df_context() -> &'static SessionContext {
     static CTX: OnceLock<SessionContext> = OnceLock::new();
-    CTX.get_or_init(SessionContext::new)
+    CTX.get_or_init(|| {
+        let mut cfg = SessionConfig::new();
+        cfg.options_mut().sql_parser.enable_ident_normalization = false;
+        SessionContext::new_with_config(cfg)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +44,7 @@ pub struct CustomEventDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomPropertyDef {
     pub name: String,
-    /// SQL expression evaluated via DataFusion, e.g. `CASE WHEN amount > 1000 THEN 'High' ELSE 'Standard' END` or `amount * 0.018`.
+    /// SQL expression evaluated via DataFusion, e.g. `CASE WHEN userPlan = 'Pro' THEN amount * 1.5 ELSE amount END`.
     pub sql_expr: String,
     /// Explicit base property columns referenced by `sql_expr` (auto-extracted if empty).
     #[serde(default)]
@@ -52,7 +60,7 @@ impl CustomPropertyDef {
     }
 }
 
-/// Extracts candidate column identifiers from an inline SQL expression, excluding SQL keywords.
+/// Extracts candidate column identifiers (both unquoted and `"doubleQuoted"`) from an inline SQL expression, excluding SQL keywords (`P2-09i`).
 pub fn extract_sql_identifiers(sql: &str) -> Vec<String> {
     const KEYWORDS: &[&str] = &[
         "CASE",
@@ -105,9 +113,29 @@ pub fn extract_sql_identifiers(sql: &str) -> Vec<String> {
             while i < bytes.len() {
                 if bytes[i] == b'\'' {
                     i += 1;
+                    if i < bytes.len() && bytes[i] == b'\'' {
+                        i += 1;
+                        continue;
+                    }
                     break;
                 }
                 i += 1;
+            }
+            continue;
+        }
+        // Double-quoted column identifier: `"userPlan"`
+        if b == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let ident = &sql[start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+            if !ident.is_empty() && seen.insert(ident.to_string()) {
+                out.push(ident.to_string());
             }
             continue;
         }
@@ -120,7 +148,6 @@ pub fn extract_sql_identifiers(sql: &str) -> Vec<String> {
                 i += 1;
             }
             let ident = &sql[start..i];
-            // Skip function calls followed immediately by `(`
             let next_non_ws = sql[i..].chars().find(|c| !c.is_whitespace());
             if next_non_ws == Some('(') {
                 continue;
@@ -131,6 +158,49 @@ pub fn extract_sql_identifiers(sql: &str) -> Vec<String> {
             }
         } else {
             i += 1;
+        }
+    }
+    out
+}
+
+/// Lowercases unquoted SQL function names (e.g. `COALESCE(...)` -> `coalesce(...)`) while preserving
+/// exact casing of column identifiers when `enable_ident_normalization = false` (`P2-09i`).
+fn normalize_sql_function_calls(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let token = &sql[start..i];
+            let next_non_ws = sql[i..].chars().find(|c| !c.is_whitespace());
+            if next_non_ws == Some('(') {
+                out.push_str(&token.to_ascii_lowercase());
+            } else {
+                out.push_str(token);
+            }
+        } else {
+            out.push(sql[i..].chars().next().unwrap());
+            i += out.chars().last().unwrap().len_utf8();
         }
     }
     out
@@ -209,9 +279,10 @@ pub fn evaluate_custom_property(
     let batch = RecordBatch::try_new(arrow_schema.clone(), arrays).map_err(|e| e.to_string())?;
     let df_schema = DFSchema::try_from(arrow_schema).map_err(|e| e.to_string())?;
 
+    let prepared_sql = normalize_sql_function_calls(&def.sql_expr);
     let ctx = shared_df_context();
     let logical_expr = ctx
-        .parse_sql_expr(&def.sql_expr, &df_schema)
+        .parse_sql_expr(&prepared_sql, &df_schema)
         .map_err(|e| format!("DataFusion parse_sql_expr('{}') error: {e}", def.sql_expr))?;
     let physical_expr = ctx
         .create_physical_expr(logical_expr, &df_schema)
@@ -295,16 +366,49 @@ pub fn arrow_array_to_prop_values(arr: &dyn ArrowArray) -> Vec<PropValue> {
     out
 }
 
-/// Dictionary Lookup Table (`join_prop` -> attribute columns) importable from CSV, Parquet, or JSON.
+/// Dictionary Lookup Table (`join_prop` -> attribute columns) with pre-indexed column set (`P2-09j`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupTableDef {
     pub name: String,
     pub join_prop: String,
     /// `join_key_value -> { attribute_col_name -> PropValue }`
     pub entries: HashMap<String, HashMap<String, PropValue>>,
+    /// Pre-indexed attribute column names so lookup resolution is O(1) without scanning/cloning `entries` (`P2-09j`).
+    #[serde(default)]
+    pub indexed_columns: HashSet<String>,
 }
 
 impl LookupTableDef {
+    pub fn new(
+        name: impl Into<String>,
+        join_prop: impl Into<String>,
+        entries: HashMap<String, HashMap<String, PropValue>>,
+    ) -> Self {
+        let mut def = Self {
+            name: name.into(),
+            join_prop: join_prop.into(),
+            entries,
+            indexed_columns: HashSet::new(),
+        };
+        def.ensure_indexed();
+        def
+    }
+
+    pub fn ensure_indexed(&mut self) {
+        if self.indexed_columns.is_empty() && !self.entries.is_empty() {
+            for row in self.entries.values() {
+                for col in row.keys() {
+                    self.indexed_columns.insert(col.clone());
+                }
+            }
+        }
+    }
+
+    pub fn into_indexed_arc(mut self) -> Arc<Self> {
+        self.ensure_indexed();
+        Arc::new(self)
+    }
+
     pub fn from_csv_bytes(
         name: impl Into<String>,
         join_prop: impl Into<String>,
@@ -322,6 +426,13 @@ impl LookupTableDef {
             .map(|h| h.to_string())
             .collect();
         let key_idx = headers.iter().position(|h| h == &join_prop).unwrap_or(0);
+
+        let mut indexed_columns = HashSet::new();
+        for (idx, h) in headers.iter().enumerate() {
+            if idx != key_idx {
+                indexed_columns.insert(h.clone());
+            }
+        }
 
         let mut entries: HashMap<String, HashMap<String, PropValue>> = HashMap::new();
         for rec in rdr.records() {
@@ -355,6 +466,7 @@ impl LookupTableDef {
             name,
             join_prop,
             entries,
+            indexed_columns,
         })
     }
 
@@ -371,6 +483,7 @@ impl LookupTableDef {
             .map_err(|e| e.to_string())?;
 
         let mut entries: HashMap<String, HashMap<String, PropValue>> = HashMap::new();
+        let mut indexed_columns: HashSet<String> = HashSet::new();
         for batch_res in reader {
             let batch = batch_res.map_err(|e| e.to_string())?;
             let schema = batch.schema();
@@ -379,6 +492,12 @@ impl LookupTableDef {
                 .iter()
                 .position(|f| f.name() == &join_prop)
                 .unwrap_or(0);
+
+            for (i, f) in schema.fields().iter().enumerate() {
+                if i != key_idx {
+                    indexed_columns.insert(f.name().clone());
+                }
+            }
 
             let converted: Vec<(String, Vec<PropValue>)> = schema
                 .fields()
@@ -408,6 +527,7 @@ impl LookupTableDef {
             name,
             join_prop,
             entries,
+            indexed_columns,
         })
     }
 
@@ -416,13 +536,25 @@ impl LookupTableDef {
     }
 }
 
-/// Per-project virtual schema catalog (Custom Events, Custom Properties, Lookup Tables, Saved Cohorts).
-#[derive(Default)]
+/// Per-project virtual schema catalog (Custom Events, Custom Properties, pre-indexed Lookup Tables, Saved Cohorts, and IANA Timezone).
 pub struct VirtualCatalog {
     pub custom_events: DashMap<String, CustomEventDef>,
     pub custom_properties: DashMap<String, CustomPropertyDef>,
-    pub lookup_tables: DashMap<String, LookupTableDef>,
+    pub lookup_tables: DashMap<String, Arc<LookupTableDef>>,
     pub saved_cohorts: DashMap<String, BehavioralCohortDef>,
+    timezone: RwLock<Tz>,
+}
+
+impl Default for VirtualCatalog {
+    fn default() -> Self {
+        Self {
+            custom_events: DashMap::new(),
+            custom_properties: DashMap::new(),
+            lookup_tables: DashMap::new(),
+            saved_cohorts: DashMap::new(),
+            timezone: RwLock::new(chrono_tz::UTC),
+        }
+    }
 }
 
 impl VirtualCatalog {
@@ -430,24 +562,33 @@ impl VirtualCatalog {
         Arc::new(Self::default())
     }
 
-    /// Resolves `(lookup_table_name, attr_col)` for either `"table.col"` or an unambiguous `"col"`.
-    pub fn resolve_lookup_column(&self, prop_name: &str) -> Option<(LookupTableDef, String)> {
-        if let Some((tbl, col)) = prop_name.split_once('.') {
-            if let Some(def) = self.lookup_tables.get(tbl) {
-                return Some((def.clone(), col.to_string()));
-            }
+    pub fn timezone(&self) -> Tz {
+        *self.timezone.read()
+    }
+
+    pub fn set_timezone(&self, tz_name: &str) {
+        if let Ok(parsed) = tz_name.trim().parse::<Tz>() {
+            *self.timezone.write() = parsed;
         }
-        for entry in self.lookup_tables.iter() {
-            if entry
-                .value()
-                .entries
-                .values()
-                .any(|m| m.contains_key(prop_name))
-            {
-                return Some((entry.value().clone(), prop_name.to_string()));
-            }
+    }
+
+    pub fn insert_lookup_table(&self, def: LookupTableDef) {
+        let name = def.name.clone();
+        self.lookup_tables.insert(name, def.into_indexed_arc());
+    }
+
+    /// Resolves `(Arc<LookupTableDef>, attr_col)` strictly for qualified `"table.col"` names in O(1) (`P2-09j`).
+    /// Never matches unqualified column names so lookup tables can NEVER silently shadow real event properties!
+    pub fn resolve_lookup_column(&self, prop_name: &str) -> Option<(Arc<LookupTableDef>, String)> {
+        let (tbl, col) = prop_name.split_once('.')?;
+        let def = self.lookup_tables.get(tbl)?;
+        if def.indexed_columns.contains(col)
+            || (def.indexed_columns.is_empty() && def.entries.values().any(|m| m.contains_key(col)))
+        {
+            Some((def.clone(), col.to_string()))
+        } else {
+            None
         }
-        None
     }
 }
 

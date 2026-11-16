@@ -1,3 +1,5 @@
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use pulse_wire::PropValue;
 use serde::{Deserialize, Serialize};
 
@@ -13,16 +15,21 @@ impl TimeRange {
         ts_ms >= self.start_ts_ms && ts_ms <= self.end_ts_ms
     }
 
+    /// Inclusive duration in milliseconds (`end_ts_ms - start_ts_ms + 1`) (`P2-09c`).
     #[inline]
     pub fn duration_ms(&self) -> i64 {
-        (self.end_ts_ms - self.start_ts_ms).max(1)
+        self.end_ts_ms
+            .saturating_sub(self.start_ts_ms)
+            .saturating_add(1)
+            .max(1)
     }
 
+    /// Computes the immediately preceding period of identical inclusive length (`P2-09c`).
     pub fn previous_period(&self) -> Self {
         let dur = self.duration_ms();
         Self {
-            start_ts_ms: self.start_ts_ms - dur,
-            end_ts_ms: self.start_ts_ms - 1,
+            start_ts_ms: self.start_ts_ms.saturating_sub(dur),
+            end_ts_ms: self.start_ts_ms.saturating_sub(1),
         }
     }
 }
@@ -38,18 +45,113 @@ pub enum TimeInterval {
 }
 
 impl TimeInterval {
+    /// Nominal upper-bound step in milliseconds (used only for coarse scan-range padding).
     pub fn step_ms(self) -> i64 {
         match self {
             TimeInterval::Hour => 3_600_000,
             TimeInterval::Day => 86_400_000,
             TimeInterval::Week => 7 * 86_400_000,
-            TimeInterval::Month => 30 * 86_400_000,
+            TimeInterval::Month => 31 * 86_400_000,
         }
     }
 
+    /// Calendar-aware floor alignment in `UTC` (Monday-aligned weeks, 1st-of-month months) (`P2-09d`).
     pub fn align_floor(self, ts_ms: i64) -> i64 {
-        let step = self.step_ms();
-        ts_ms.div_euclid(step) * step
+        self.align_floor_tz(ts_ms, chrono_tz::UTC)
+    }
+
+    /// Calendar-aware floor alignment in the project's IANA timezone `tz` (`P2-09d`):
+    /// - `Hour`: top of the hour (`HH:00:00.000`)
+    /// - `Day`: local midnight (`00:00:00.000`)
+    /// - `Week`: Monday `00:00:00.000` in `tz`
+    /// - `Month`: 1st of the calendar month `00:00:00.000` in `tz`
+    pub fn align_floor_tz(self, ts_ms: i64, tz: Tz) -> i64 {
+        if matches!(self, TimeInterval::Hour) {
+            return ts_ms.div_euclid(3_600_000) * 3_600_000;
+        }
+        let Some(utc_dt) = DateTime::<Utc>::from_timestamp_millis(ts_ms) else {
+            let step = self.step_ms();
+            return ts_ms.div_euclid(step) * step;
+        };
+        let local = utc_dt.with_timezone(&tz);
+        let date = local.date_naive();
+        let target_date = match self {
+            TimeInterval::Hour => unreachable!(),
+            TimeInterval::Day => date,
+            TimeInterval::Week => {
+                let days_from_mon = i64::from(date.weekday().num_days_from_monday());
+                date.checked_sub_signed(ChronoDuration::days(days_from_mon))
+                    .unwrap_or(date)
+            }
+            TimeInterval::Month => {
+                NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
+            }
+        };
+        local_midnight_ts_ms(target_date, tz).unwrap_or_else(|| {
+            let _ = local.hour();
+            ts_ms
+        })
+    }
+
+    /// Advances an aligned bucket start timestamp to the exact start of the next calendar bucket in `tz` (`P2-09d`, `P3-02`).
+    pub fn next_bucket_tz(self, bucket_ts_ms: i64, tz: Tz) -> Option<i64> {
+        if matches!(self, TimeInterval::Hour) {
+            return bucket_ts_ms.checked_add(3_600_000);
+        }
+        let utc_dt = DateTime::<Utc>::from_timestamp_millis(bucket_ts_ms)?;
+        let local = utc_dt.with_timezone(&tz);
+        let date = local.date_naive();
+        let next_date = match self {
+            TimeInterval::Hour => unreachable!(),
+            TimeInterval::Day => date.succ_opt()?,
+            TimeInterval::Week => date.checked_add_signed(ChronoDuration::days(7))?,
+            TimeInterval::Month => {
+                if date.month() == 12 {
+                    NaiveDate::from_ymd_opt(date.year().checked_add(1)?, 1, 1)?
+                } else {
+                    NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)?
+                }
+            }
+        };
+        let next_ts = local_midnight_ts_ms(next_date, tz)?;
+        if next_ts <= bucket_ts_ms {
+            bucket_ts_ms.checked_add(self.step_ms())
+        } else {
+            Some(next_ts)
+        }
+    }
+
+    /// Inclusive end timestamp (`next_bucket - 1`) of `bucket_ts_ms` in `tz` (`P2-09b`).
+    pub fn bucket_end_inclusive_tz(self, bucket_ts_ms: i64, tz: Tz) -> i64 {
+        self.next_bucket_tz(bucket_ts_ms, tz)
+            .map(|nxt| nxt.saturating_sub(1))
+            .unwrap_or_else(|| bucket_ts_ms.saturating_add(self.step_ms() - 1))
+    }
+
+    /// Steps backward by `days` calendar days from a `Day`-aligned timestamp in `tz` (`P2-09b`).
+    pub fn prev_days_tz(day_bucket_ts_ms: i64, days: i64, tz: Tz) -> Option<i64> {
+        if days == 0 {
+            return Some(day_bucket_ts_ms);
+        }
+        let utc_dt = DateTime::<Utc>::from_timestamp_millis(day_bucket_ts_ms)?;
+        let date = utc_dt.with_timezone(&tz).date_naive();
+        let target = date.checked_sub_signed(ChronoDuration::days(days))?;
+        local_midnight_ts_ms(target, tz)
+    }
+}
+
+fn local_midnight_ts_ms(date: NaiveDate, tz: Tz) -> Option<i64> {
+    let naive_midnight = date.and_hms_opt(0, 0, 0)?;
+    match tz.from_local_datetime(&naive_midnight) {
+        chrono::LocalResult::Single(dt) => Some(dt.timestamp_millis()),
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
+        chrono::LocalResult::None => {
+            // Spring-forward gap right at midnight (e.g., America/Sao_Paulo): resolve +1h
+            let fallback = date.and_hms_opt(1, 0, 0)?;
+            tz.from_local_datetime(&fallback)
+                .earliest()
+                .map(|dt| dt.timestamp_millis())
+        }
     }
 }
 
@@ -81,11 +183,25 @@ impl PropPredicate {
         }
     }
 
+    /// Evaluates a property filter against `candidate` (`None` = omitted property, `Some(&PropValue::Null)` = explicit null) (`P2-09e`).
+    ///
+    /// Documented null/missing semantics:
+    /// - `IsSet`: `true` iff property is present and non-`Null`.
+    /// - `Eq(Null)`: `true` iff property is missing (`None`) or `Null`.
+    /// - `Eq(v)` (`v != Null`): `true` iff property is present, non-`Null`, and `values_equal_coalesced(actual, v)`.
+    /// - `Neq(Null)`: `true` iff property is present and non-`Null` (equivalent to `IsSet`).
+    /// - `Neq(v)` (`v != Null`, e.g., `country != "US"`): **`true` when property is missing (`None`) or `Null`**,
+    ///   or when `actual` is non-`Null` and `!values_equal_coalesced(actual, v)`.
+    /// - `Gt` / `Gte` / `Lt` / `Lte` / `Contains` / `In`: `false` when missing or `Null`.
     pub fn matches(&self, candidate: Option<&PropValue>) -> bool {
         match (&self.filter, candidate) {
             (PropFilterOp::IsSet, Some(v)) => !matches!(v, PropValue::Null),
             (PropFilterOp::IsSet, None) => false,
-            (PropFilterOp::Neq(target), None) => !matches!(target, PropValue::Null),
+            (PropFilterOp::Eq(PropValue::Null), None | Some(PropValue::Null)) => true,
+            (PropFilterOp::Eq(PropValue::Null), Some(_)) => false,
+            (PropFilterOp::Neq(target), None | Some(PropValue::Null)) => {
+                !matches!(target, PropValue::Null)
+            }
             (_, None | Some(PropValue::Null)) => false,
             (PropFilterOp::Eq(target), Some(actual)) => values_equal_coalesced(actual, target),
             (PropFilterOp::Neq(target), Some(actual)) => !values_equal_coalesced(actual, target),
@@ -359,8 +475,6 @@ pub struct RetentionCohortRow {
     pub cohort_start_ts_ms: i64,
     pub cohort_label: String,
     pub cohort_size: u64,
-    /// For `NDay` / `Unbounded`: active count in period `0..=num_periods`.
-    /// For `FrequencyStickiness`: count of users active on `>= (k+1)` distinct intervals in window.
     pub retained_counts: Vec<u64>,
     pub retained_pcts: Vec<f64>,
 }

@@ -396,6 +396,15 @@ impl ControlPlaneService {
     pub async fn refresh_project_virtual_catalog(&self, project_id: &str) -> Result<(), String> {
         let cat = self.qengine.catalogs().for_project(project_id);
 
+        if let Some(proj) = self
+            .meta
+            .get_project(project_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            cat.set_timezone(&proj.timezone);
+        }
+
         let ces = self
             .meta
             .list_custom_events(project_id)
@@ -423,7 +432,7 @@ impl ControlPlaneService {
             .map_err(|e| e.to_string())?;
         cat.lookup_tables.clear();
         for (_, def) in lts {
-            cat.lookup_tables.insert(def.name.clone(), def);
+            cat.insert_lookup_table(def);
         }
 
         let cohorts = self
@@ -648,6 +657,18 @@ impl CtrlError {
     fn meta(err: MetaError) -> Self {
         match err {
             MetaError::Conflict(msg) => Self::conflict(msg),
+            other => Self::internal(other),
+        }
+    }
+    fn exec(err: pulse_exec::ExecError) -> Self {
+        match err {
+            pulse_exec::ExecError::QueryTimeout(ms) => Self(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("query exceeded deadline ({ms} ms)"),
+            ),
+            pulse_exec::ExecError::InvalidQuery(msg) | pulse_exec::ExecError::Expression(msg) => {
+                Self::bad(msg)
+            }
             other => Self::internal(other),
         }
     }
@@ -951,7 +972,7 @@ async fn handle_unified_query(
                 .qengine
                 .query_insights(&pid, &q)
                 .await
-                .map_err(|e| CtrlError::bad(e.to_string()))?;
+                .map_err(CtrlError::exec)?;
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "funnel" | "funnels" => {
@@ -961,7 +982,7 @@ async fn handle_unified_query(
                 .qengine
                 .query_funnel(&pid, &q)
                 .await
-                .map_err(|e| CtrlError::bad(e.to_string()))?;
+                .map_err(CtrlError::exec)?;
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "retention" => {
@@ -971,7 +992,7 @@ async fn handle_unified_query(
                 .qengine
                 .query_retention(&pid, &q)
                 .await
-                .map_err(|e| CtrlError::bad(e.to_string()))?;
+                .map_err(CtrlError::exec)?;
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "flows" | "flow" => {
@@ -981,7 +1002,7 @@ async fn handle_unified_query(
                 .qengine
                 .query_flows(&pid, &q)
                 .await
-                .map_err(|e| CtrlError::bad(e.to_string()))?;
+                .map_err(CtrlError::exec)?;
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         other => Err(CtrlError::bad(format!("unknown query kind: {other}"))),
@@ -999,7 +1020,7 @@ async fn handle_query_insights(
         .qengine
         .query_insights(&id, &q)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1014,7 +1035,7 @@ async fn handle_query_funnel(
         .qengine
         .query_funnel(&id, &q)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1029,7 +1050,7 @@ async fn handle_query_retention(
         .qengine
         .query_retention(&id, &q)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1044,7 +1065,7 @@ async fn handle_query_flows(
         .qengine
         .query_flows(&id, &q)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1096,7 +1117,7 @@ async fn handle_get_sessions_default(
         .qengine
         .search_sessions(&pid, &sq)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1111,7 +1132,7 @@ async fn handle_post_sessions_default(
         .qengine
         .search_sessions(&pid, &sq)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1127,7 +1148,7 @@ async fn handle_get_sessions(
         .qengine
         .search_sessions(&id, &sq)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1142,7 +1163,7 @@ async fn handle_post_sessions(
         .qengine
         .search_sessions(&id, &sq)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(res))
 }
 
@@ -1488,7 +1509,7 @@ async fn handle_preview_cohort(
         .qengine
         .preview_cohort_count(&id, &req.definition, req.time_range)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(json!({
         "user_count": user_count,
         "exec_time_us": exec_time_us
@@ -1562,11 +1583,7 @@ async fn handle_upload_lookup_table(
         LookupTableDef::from_csv_bytes(&req.name, &req.join_prop, csv_str.as_bytes())
             .map_err(CtrlError::bad)?
     } else if let Some(entries) = req.entries {
-        LookupTableDef {
-            name: req.name.clone(),
-            join_prop: req.join_prop.clone(),
-            entries,
-        }
+        LookupTableDef::new(req.name.clone(), req.join_prop.clone(), entries)
     } else {
         return Err(CtrlError::bad(
             "provide either `csv_text` or `entries` JSON map",

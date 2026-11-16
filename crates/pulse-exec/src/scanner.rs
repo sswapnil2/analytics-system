@@ -28,6 +28,9 @@ pub enum ExecError {
 
     #[error("invalid query parameter: {0}")]
     InvalidQuery(String),
+
+    #[error("query execution exceeded deadline of {0}ms")]
+    QueryTimeout(u64),
 }
 
 pub type Result<T> = std::result::Result<T, ExecError>;
@@ -156,12 +159,15 @@ pub async fn load_project_chunks(
 
     for p in requested_props {
         final_props_set.insert(p.clone());
-        if let Some(cp) = catalog.custom_properties.get(p) {
+        // Physical properties ALWAYS take precedence over virtual/lookup columns (`P2-09j`)!
+        if dict.lookup_prop_key(p).is_some() {
+            base_props_needed.insert(p.clone());
+        } else if let Some(cp) = catalog.custom_properties.get(p) {
             for dep in cp.referenced_columns() {
                 base_props_needed.insert(dep);
             }
         } else if let Some((lt, _)) = catalog.resolve_lookup_column(p) {
-            base_props_needed.insert(lt.join_prop);
+            base_props_needed.insert(lt.join_prop.clone());
         } else if !p.starts_with("$cohort:") {
             base_props_needed.insert(p.clone());
         }
@@ -310,7 +316,10 @@ fn materialize_virtual_columns(
 ) -> Result<HashMap<String, Arc<Vec<PropValue>>>> {
     let mut out: HashMap<String, Arc<Vec<PropValue>>> = HashMap::with_capacity(final_props.len());
     for p in final_props {
-        if let Some(cp) = catalog.custom_properties.get(p) {
+        // Physical property in `base_map` ALWAYS wins over custom/lookup columns (`P2-09j`)!
+        if let Some(col) = base_map.get(p) {
+            out.insert(p.clone(), col.clone());
+        } else if let Some(cp) = catalog.custom_properties.get(p) {
             let computed =
                 evaluate_custom_property(&cp, num_rows, base_map).map_err(ExecError::Expression)?;
             out.insert(p.clone(), Arc::new(computed));
@@ -331,8 +340,6 @@ fn materialize_virtual_columns(
                 joined.push(val);
             }
             out.insert(p.clone(), Arc::new(joined));
-        } else if let Some(col) = base_map.get(p) {
-            out.insert(p.clone(), col.clone());
         } else {
             out.insert(p.clone(), Arc::new(vec![PropValue::Null; num_rows]));
         }
@@ -358,14 +365,11 @@ pub fn row_matches_predicates(chunk: &DataChunk, row_idx: usize, preds: &[PropPr
 
 /// Computes segment-level `RoaringBitmap` row mask ONLY when the Tier B inverted index is strictly
 /// complete AND unmixed for the predicate's exact value type (`P1-15`, `P2-01`).
-///
-/// Because `values_equal_coalesced` coerces `Int(2) == Str("2")` and `Bool(true) == Str("true")`,
-/// an inverted index on `Str` or `Bool` is ONLY sound for row-skipping when no other value types
-/// exist for `pk` in that segment and string cardinality did not overflow `MAX_INVERTED_INDEX_CARDINALITY`.
 pub async fn precompute_segment_row_mask(
     chunk: &DataChunk,
     preds: &[PropPredicate],
     dict: &ProjectDictionary,
+    catalog: &VirtualCatalog,
     cache: &SegmentBlockCache,
 ) -> Result<Option<RoaringBitmap>> {
     let Some(meta) = &chunk.segment_meta else {
@@ -377,11 +381,12 @@ pub async fn precompute_segment_row_mask(
 
     let mut combined: Option<RoaringBitmap> = None;
     for pred in preds {
-        // Never use physical Tier B index if a virtual custom property shadows/computes this name.
         let PropFilterOp::Eq(target) = &pred.filter else {
             continue;
         };
+        // Skip physical index if property is not physical
         let Some(pk) = dict.lookup_prop_key(&pred.prop_name) else {
+            let _ = catalog;
             continue;
         };
         let Some(entry) = meta
@@ -546,9 +551,14 @@ fn evaluate_cohort_bounded<'a>(
 
                 let mut counts: HashMap<u32, u32> = HashMap::new();
                 for chunk in &chunks {
-                    let row_mask =
-                        precompute_segment_row_mask(chunk, where_clauses, ps.dictionary(), cache)
-                            .await?;
+                    let row_mask = precompute_segment_row_mask(
+                        chunk,
+                        where_clauses,
+                        ps.dictionary(),
+                        catalog,
+                        cache,
+                    )
+                    .await?;
                     for i in 0..chunk.len() {
                         if let Some(rm) = &row_mask {
                             if !rm.contains(i as u32) {

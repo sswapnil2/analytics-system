@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
+use chrono_tz::Tz;
 use pulse_identity::IdentitySnapshot;
 use pulse_storage::{ProjectStorage, StorageSnapshot};
 use pulse_wire::PropValue;
@@ -18,6 +19,9 @@ use crate::scanner::{
     resolve_global_cohort_bitmap, row_matches_predicates, ExecError, Result,
 };
 
+pub const MAX_TIME_BUCKETS: usize = 10_000;
+pub const MAX_BREAKDOWN_GROUPS: usize = 250;
+
 pub struct InsightsEngine;
 
 impl InsightsEngine {
@@ -30,12 +34,16 @@ impl InsightsEngine {
         catalog: &VirtualCatalog,
     ) -> Result<InsightsResult> {
         let t0 = Instant::now();
-        let buckets = build_time_buckets(query.time_range, query.interval);
+        validate_insights_query(query)?;
+
+        let tz = catalog.timezone();
+        let buckets = build_time_buckets_tz(query.time_range, query.interval, tz)?;
 
         let series = evaluate_window(
             query,
             query.time_range,
             &buckets,
+            tz,
             ps,
             snap,
             id_snap,
@@ -46,11 +54,12 @@ impl InsightsEngine {
 
         let previous_series = if query.compare_previous_period {
             let prev_range = query.time_range.previous_period();
-            let prev_buckets = build_time_buckets(prev_range, query.interval);
+            let prev_buckets = build_time_buckets_tz(prev_range, query.interval, tz)?;
             evaluate_window(
                 query,
                 prev_range,
                 &prev_buckets,
+                tz,
                 ps,
                 snap,
                 id_snap,
@@ -83,19 +92,73 @@ impl InsightsEngine {
     }
 }
 
-fn build_time_buckets(range: TimeRange, interval: TimeInterval) -> Vec<i64> {
-    let step = interval.step_ms();
-    let mut cur = interval.align_floor(range.start_ts_ms);
-    let end = interval.align_floor(range.end_ts_ms);
+fn validate_insights_query(query: &InsightsQuery) -> Result<()> {
+    if query.time_range.start_ts_ms > query.time_range.end_ts_ms {
+        return Err(ExecError::InvalidQuery(
+            "time_range.start_ts_ms must be <= end_ts_ms".into(),
+        ));
+    }
+    if query.breakdown_by.len() > 2 {
+        return Err(ExecError::InvalidQuery(format!(
+            "insights supports at most 2 breakdown dimensions, got {}",
+            query.breakdown_by.len()
+        )));
+    }
+    for spec in &query.series {
+        match spec.metric {
+            InsightsMetric::Dau if !matches!(query.interval, TimeInterval::Day) => {
+                return Err(ExecError::InvalidQuery(format!(
+                    "series '{}': DAU metric is only valid with Day interval",
+                    spec.label
+                )));
+            }
+            InsightsMetric::Wau if matches!(query.interval, TimeInterval::Hour) => {
+                return Err(ExecError::InvalidQuery(format!(
+                    "series '{}': WAU metric is not valid with Hour interval",
+                    spec.label
+                )));
+            }
+            InsightsMetric::Mau if matches!(query.interval, TimeInterval::Hour) => {
+                return Err(ExecError::InvalidQuery(format!(
+                    "series '{}': MAU metric is not valid with Hour interval",
+                    spec.label
+                )));
+            }
+            InsightsMetric::PropPercentile { quantile, .. } if !(0.0..=1.0).contains(&quantile) => {
+                return Err(ExecError::InvalidQuery(format!(
+                    "series '{}': quantile {quantile} must be in [0.0, 1.0]",
+                    spec.label
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn build_time_buckets_tz(range: TimeRange, interval: TimeInterval, tz: Tz) -> Result<Vec<i64>> {
+    let mut cur = interval.align_floor_tz(range.start_ts_ms, tz);
+    let end = interval.align_floor_tz(range.end_ts_ms, tz);
     let mut out = Vec::new();
     while cur <= end {
+        if out.len() >= MAX_TIME_BUCKETS {
+            return Err(ExecError::InvalidQuery(format!(
+                "time range produces more than {MAX_TIME_BUCKETS} interval buckets"
+            )));
+        }
         out.push(cur);
-        cur += step;
+        let Some(next) = interval.next_bucket_tz(cur, tz) else {
+            break;
+        };
+        if next <= cur {
+            break;
+        }
+        cur = next;
     }
     if out.is_empty() {
         out.push(range.start_ts_ms);
     }
-    out
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -103,26 +166,26 @@ async fn evaluate_window(
     query: &InsightsQuery,
     range: TimeRange,
     buckets: &[i64],
+    tz: Tz,
     ps: &ProjectStorage,
     snap: &StorageSnapshot,
     id_snap: &IdentitySnapshot,
     cache: &SegmentBlockCache,
     catalog: &VirtualCatalog,
 ) -> Result<Vec<SeriesOutput>> {
-    // Expand query scan window backward if DAU/WAU/MAU rolling lookbacks are requested
     let max_lookback_ms = query
         .series
         .iter()
         .map(|s| match s.metric {
-            InsightsMetric::Mau => 29 * 86_400_000,
-            InsightsMetric::Wau => 6 * 86_400_000,
+            InsightsMetric::Mau => 31 * 86_400_000,
+            InsightsMetric::Wau => 8 * 86_400_000,
             _ => 0,
         })
         .max()
         .unwrap_or(0);
 
     let scan_range = TimeRange {
-        start_ts_ms: range.start_ts_ms - max_lookback_ms,
+        start_ts_ms: range.start_ts_ms.saturating_sub(max_lookback_ms),
         end_ts_ms: range.end_ts_ms,
     };
 
@@ -137,9 +200,8 @@ async fn evaluate_window(
     )
     .await?;
 
-    // Resolve any cohort-based breakdowns (`$cohort:<id>`)
     let mut breakdown_cohort_bitmaps: HashMap<String, RoaringBitmap> = HashMap::new();
-    let breakdown_dims: Vec<String> = query.breakdown_by.iter().take(2).cloned().collect();
+    let breakdown_dims: Vec<String> = query.breakdown_by.clone();
     for bdim in &breakdown_dims {
         if let Some(cid) = bdim.strip_prefix("$cohort:") {
             if let Some(cdef) = catalog.saved_cohorts.get(cid) {
@@ -153,7 +215,6 @@ async fn evaluate_window(
         }
     }
 
-    // Collect required property names across global filter, breakdown, and all series
     let mut props_needed: HashSet<String> = HashSet::new();
     for p in &query.global_filter.predicates {
         props_needed.insert(p.prop_name.clone());
@@ -208,6 +269,7 @@ async fn evaluate_window(
             range,
             query.interval,
             buckets,
+            tz,
             &breakdown_dims,
             &breakdown_cohort_bitmaps,
             &query.global_filter.predicates,
@@ -216,6 +278,7 @@ async fn evaluate_window(
             ps,
             id_snap,
             cache,
+            catalog,
         )
         .await?;
         all_outputs.append(&mut series_out);
@@ -259,47 +322,62 @@ impl BucketAccum {
                 self.count_num += 1;
                 self.min = self.min.min(v);
                 self.max = self.max.max(v);
-                // DDSketch supports non-negative values; clamp negative values to 0.0 or abs for quantile estimation
-                self.sketch.add(v.max(0.0));
+                // Native signed DDSketch (`negative_store` + `zero_count` + `store`) — never clamp negatives (`P2-09a`)!
+                self.sketch.add(v);
             }
         }
     }
 
-    fn finish(&self, metric: &InsightsMetric) -> f64 {
+    fn merge(&mut self, other: Self) {
+        self.users |= other.users;
+        self.sessions.extend(other.sessions);
+        self.totals += other.totals;
+        self.sum += other.sum;
+        self.count_num += other.count_num;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        let _ = self.sketch.merge(&other.sketch);
+    }
+
+    fn finish(&self, metric: &InsightsMetric) -> Option<f64> {
         match metric {
-            InsightsMetric::Uniques | InsightsMetric::Dau => self.users.len() as f64,
-            InsightsMetric::Totals => self.totals as f64,
-            InsightsMetric::Sessions => self.sessions.len() as f64,
-            InsightsMetric::PropSum { .. } => self.sum,
+            InsightsMetric::Uniques | InsightsMetric::Dau => Some(self.users.len() as f64),
+            InsightsMetric::Totals => Some(self.totals as f64),
+            InsightsMetric::Sessions => Some(self.sessions.len() as f64),
+            InsightsMetric::PropSum { .. } => Some(self.sum),
             InsightsMetric::PropAvg { .. } => {
+                (self.count_num > 0).then(|| self.sum / (self.count_num as f64))
+            }
+            InsightsMetric::PropMin { .. } => (self.count_num > 0).then_some(self.min),
+            InsightsMetric::PropMax { .. } => (self.count_num > 0).then_some(self.max),
+            InsightsMetric::PropPercentile { quantile, .. } => {
                 if self.count_num == 0 {
-                    0.0
+                    None
                 } else {
-                    self.sum / (self.count_num as f64)
+                    self.sketch
+                        .quantile(quantile.clamp(0.0, 1.0))
+                        .ok()
+                        .flatten()
                 }
             }
-            InsightsMetric::PropMin { .. } => {
-                if self.count_num == 0 {
-                    0.0
-                } else {
-                    self.min
-                }
-            }
-            InsightsMetric::PropMax { .. } => {
-                if self.count_num == 0 {
-                    0.0
-                } else {
-                    self.max
-                }
-            }
-            InsightsMetric::PropPercentile { quantile, .. } => self
-                .sketch
-                .quantile(quantile.clamp(0.0, 1.0))
-                .ok()
-                .flatten()
-                .unwrap_or(0.0),
-            InsightsMetric::Wau | InsightsMetric::Mau => self.users.len() as f64,
+            InsightsMetric::Wau | InsightsMetric::Mau => Some(self.users.len() as f64),
         }
+    }
+}
+
+fn empty_metric_value(metric: &InsightsMetric) -> Option<f64> {
+    match metric {
+        InsightsMetric::PropAvg { .. }
+        | InsightsMetric::PropMin { .. }
+        | InsightsMetric::PropMax { .. }
+        | InsightsMetric::PropPercentile { .. } => None,
+        InsightsMetric::Uniques
+        | InsightsMetric::Totals
+        | InsightsMetric::Sessions
+        | InsightsMetric::Dau
+        | InsightsMetric::Wau
+        | InsightsMetric::Mau
+        | InsightsMetric::PropSum { .. } => Some(0.0),
     }
 }
 
@@ -310,6 +388,7 @@ async fn evaluate_single_series(
     range: TimeRange,
     interval: TimeInterval,
     buckets: &[i64],
+    tz: Tz,
     breakdown_dims: &[String],
     breakdown_cohorts: &HashMap<String, RoaringBitmap>,
     global_preds: &[crate::ast::PropPredicate],
@@ -318,8 +397,8 @@ async fn evaluate_single_series(
     ps: &ProjectStorage,
     id_snap: &IdentitySnapshot,
     cache: &SegmentBlockCache,
+    catalog: &VirtualCatalog,
 ) -> Result<Vec<SeriesOutput>> {
-    // Breakdown key -> (overall accum, per-day-or-bucket accums)
     let is_rolling = matches!(spec.metric, InsightsMetric::Wau | InsightsMetric::Mau);
     let metric_prop = match &spec.metric {
         InsightsMetric::PropSum { prop }
@@ -347,7 +426,7 @@ async fn evaluate_single_series(
             break;
         }
         let row_mask =
-            precompute_segment_row_mask(chunk, &all_preds, ps.dictionary(), cache).await?;
+            precompute_segment_row_mask(chunk, &all_preds, ps.dictionary(), catalog, cache).await?;
 
         for r in 0..chunk.len() {
             if let Some(rm) = &row_mask {
@@ -360,6 +439,9 @@ async fn evaluate_single_series(
             }
             let ts = chunk.tier_a.event_ts_ms[r];
             if !is_rolling && !range.contains(ts) {
+                continue;
+            }
+            if is_rolling && ts > range.end_ts_ms {
                 continue;
             }
             let canon_uid = id_snap.resolve(chunk.tier_a.uid_internal[r]);
@@ -419,7 +501,7 @@ async fn evaluate_single_series(
             } else {
                 interval
             };
-            let b_ts = align_unit.align_floor(ts);
+            let b_ts = align_unit.align_floor_tz(ts, tz);
             entry
                 .1
                 .entry(b_ts)
@@ -428,41 +510,71 @@ async fn evaluate_single_series(
         }
     }
 
-    let mut out = Vec::with_capacity(groups.len());
-    for (bkey, (overall_acc, per_bucket)) in groups {
+    // Cap breakdown cardinality to `MAX_BREAKDOWN_GROUPS`, folding tail groups into `"$other"` (`P3-02`).
+    type BreakdownGroup = (BucketAccum, BTreeMap<i64, BucketAccum>);
+    let mut group_vec: Vec<(String, BreakdownGroup)> = groups.into_iter().collect();
+    if group_vec.len() > MAX_BREAKDOWN_GROUPS {
+        group_vec.sort_by(|a, b| {
+            b.1 .0
+                .totals
+                .cmp(&a.1 .0.totals)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let tail = group_vec.split_off(MAX_BREAKDOWN_GROUPS);
+        let mut other_overall = BucketAccum::new();
+        let mut other_per_bucket: BTreeMap<i64, BucketAccum> = BTreeMap::new();
+        for (_k, (ov, pb)) in tail {
+            other_overall.merge(ov);
+            for (bts, acc) in pb {
+                other_per_bucket
+                    .entry(bts)
+                    .or_insert_with(BucketAccum::new)
+                    .merge(acc);
+            }
+        }
+        group_vec.push(("$other".to_string(), (other_overall, other_per_bucket)));
+    }
+
+    let mut out = Vec::with_capacity(group_vec.len());
+    for (bkey, (overall_acc, per_bucket)) in group_vec {
         let mut points = Vec::with_capacity(buckets.len());
         for &bts in buckets {
             let val = match spec.metric {
                 InsightsMetric::Wau | InsightsMetric::Mau => {
+                    // Anchor rolling WAU (7d) and MAU (30d) at the END of the interval bucket (`P2-09b`)!
                     let window_days = if matches!(spec.metric, InsightsMetric::Wau) {
-                        7
+                        7i64
                     } else {
-                        30
+                        30i64
                     };
-                    let end_day = TimeInterval::Day.align_floor(bts);
+                    let bucket_end = interval
+                        .bucket_end_inclusive_tz(bts, tz)
+                        .min(range.end_ts_ms);
+                    let end_day = TimeInterval::Day.align_floor_tz(bucket_end, tz);
                     let mut union_bm = RoaringBitmap::new();
                     for d in 0..window_days {
-                        let day_ts = end_day - d * 86_400_000;
-                        if let Some(acc) = per_bucket.get(&day_ts) {
-                            union_bm |= &acc.users;
+                        if let Some(day_ts) = TimeInterval::prev_days_tz(end_day, d, tz) {
+                            if let Some(acc) = per_bucket.get(&day_ts) {
+                                union_bm |= &acc.users;
+                            }
                         }
                     }
-                    union_bm.len() as f64
+                    Some(union_bm.len() as f64)
                 }
                 _ => per_bucket
                     .get(&bts)
                     .map(|acc| acc.finish(&spec.metric))
-                    .unwrap_or(0.0),
+                    .unwrap_or_else(|| empty_metric_value(&spec.metric)),
             };
             points.push(TimePoint {
                 bucket_ts_ms: bts,
-                value: Some(val),
+                value: val,
             });
         }
         let overall_value = if is_rolling {
             points.last().and_then(|p| p.value).or(Some(0.0))
         } else {
-            Some(overall_acc.finish(&spec.metric))
+            overall_acc.finish(&spec.metric)
         };
 
         out.push(SeriesOutput {

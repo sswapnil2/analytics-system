@@ -11,8 +11,10 @@ use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
     load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
-    row_matches_predicates, Result,
+    row_matches_predicates, ExecError, Result,
 };
+
+const MAX_RETENTION_COHORTS: usize = 10_000;
 
 pub struct RetentionEngine;
 
@@ -26,15 +28,28 @@ impl RetentionEngine {
         catalog: &VirtualCatalog,
     ) -> Result<RetentionResult> {
         let t0 = Instant::now();
+        if query.time_range.start_ts_ms > query.time_range.end_ts_ms {
+            return Err(ExecError::InvalidQuery(format!(
+                "invalid time_range: start_ts_ms ({}) > end_ts_ms ({})",
+                query.time_range.start_ts_ms, query.time_range.end_ts_ms
+            )));
+        }
+
+        let tz = catalog.timezone();
         let num_periods = query.num_periods.clamp(1, 60);
-        let step_ms = query.unit.step_ms();
+
+        let mut scan_end_ts = query.unit.align_floor_tz(query.time_range.end_ts_ms, tz);
+        for _ in 0..=(num_periods + 1) {
+            scan_end_ts = query
+                .unit
+                .next_bucket_tz(scan_end_ts, tz)
+                .unwrap_or_else(|| scan_end_ts.saturating_add(query.unit.step_ms()));
+        }
+        scan_end_ts = scan_end_ts.max(query.time_range.end_ts_ms);
 
         let scan_range = TimeRange {
             start_ts_ms: query.time_range.start_ts_ms,
-            end_ts_ms: query
-                .time_range
-                .end_ts_ms
-                .saturating_add((num_periods as i64 + 1) * step_ms),
+            end_ts_ms: scan_end_ts,
         };
 
         let eligible_cohort = resolve_global_cohort_bitmap(
@@ -79,7 +94,7 @@ impl RetentionEngine {
         .await?;
 
         // 1. Track each canonical user's earliest qualifying `start_event` inside `query.time_range`
-        // 2. Track exact `RoaringBitmap` of users performing `return_event` in every aligned interval bucket
+        // 2. Track exact `RoaringBitmap` of users performing `return_event` in every timezone-aligned calendar bucket (`P2-09d`)
         let mut first_start_ts: HashMap<u32, i64> = HashMap::new();
         let mut return_by_bucket: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();
 
@@ -126,16 +141,21 @@ impl RetentionEngine {
                         .as_ref()
                         .is_none_or(|ef| row_matches_predicates(chunk, r, std::slice::from_ref(ef)))
                 {
-                    let b_ts = query.unit.align_floor(ts);
+                    let b_ts = query.unit.align_floor_tz(ts, tz);
                     return_by_bucket.entry(b_ts).or_default().insert(canon_uid);
                 }
             }
         }
 
-        // Group users into cohorts by `unit.align_floor(first_start_ts)`
+        // Group users into cohorts by `unit.align_floor_tz(first_start_ts, tz)` (`P2-09d`)
         let mut cohorts_map: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();
         for (uid, start_ts) in first_start_ts {
-            let c_ts = query.unit.align_floor(start_ts);
+            let c_ts = query.unit.align_floor_tz(start_ts, tz);
+            if cohorts_map.len() >= MAX_RETENTION_COHORTS && !cohorts_map.contains_key(&c_ts) {
+                return Err(ExecError::InvalidQuery(format!(
+                    "retention query exceeded maximum cohort limit ({MAX_RETENTION_COHORTS})"
+                )));
+            }
             cohorts_map.entry(c_ts).or_default().insert(uid);
         }
 
@@ -143,15 +163,26 @@ impl RetentionEngine {
         for (cohort_ts, cohort_bm) in cohorts_map {
             let cohort_size = cohort_bm.len();
             let label = DateTime::from_timestamp_millis(cohort_ts)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .map(|dt| dt.with_timezone(&tz).format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| cohort_ts.to_string());
+
+            // Precompute exact calendar-aligned period start timestamps `period_ts[0..=num_periods]` (`P2-09d`)
+            let mut period_ts = Vec::with_capacity(num_periods + 1);
+            period_ts.push(cohort_ts);
+            let mut cur_ts = cohort_ts;
+            for _ in 1..=num_periods {
+                cur_ts = query
+                    .unit
+                    .next_bucket_tz(cur_ts, tz)
+                    .unwrap_or_else(|| cur_ts.saturating_add(query.unit.step_ms()));
+                period_ts.push(cur_ts);
+            }
 
             let retained_counts: Vec<u64> = match query.mode {
                 RetentionMode::NDay => {
                     let mut counts = Vec::with_capacity(num_periods + 1);
                     counts.push(cohort_size);
-                    for k in 1..=num_periods {
-                        let target_ts = cohort_ts + (k as i64) * step_ms;
+                    for &target_ts in &period_ts[1..] {
                         let cnt = if let Some(ret_bm) = return_by_bucket.get(&target_ts) {
                             (&cohort_bm & ret_bm).len()
                         } else {
@@ -166,7 +197,7 @@ impl RetentionEngine {
                     counts[0] = cohort_size;
                     let mut suffix_union = RoaringBitmap::new();
                     for k in (1..=num_periods).rev() {
-                        let target_ts = cohort_ts + (k as i64) * step_ms;
+                        let target_ts = period_ts[k];
                         if let Some(ret_bm) = return_by_bucket.get(&target_ts) {
                             suffix_union |= ret_bm;
                         }
@@ -177,8 +208,7 @@ impl RetentionEngine {
                 RetentionMode::FrequencyStickiness => {
                     // Count distinct active periods in `[0..=num_periods]` per user in `cohort_bm`
                     let mut freq_per_user: HashMap<u32, usize> = HashMap::new();
-                    for k in 0..=num_periods {
-                        let target_ts = cohort_ts + (k as i64) * step_ms;
+                    for &target_ts in &period_ts {
                         if let Some(ret_bm) = return_by_bucket.get(&target_ts) {
                             let active = &cohort_bm & ret_bm;
                             for uid in active.iter() {

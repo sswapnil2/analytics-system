@@ -6,8 +6,9 @@ cd "$ROOT_DIR"
 
 PORT="${PULSE_VERIFY_PORT:-18080}"
 BASE_URL="${PULSE_BASE_URL:-http://127.0.0.1:${PORT}}"
-API_KEY="${PULSE_API_KEY:-pk_pulse_live_india_01}"
 PROJECT_ID="${PULSE_PROJECT_ID:-proj_fintech_in}"
+API_KEY="${PULSE_API_KEY:-}"
+ADMIN_TOKEN="${PULSE_ADMIN_TOKEN:-}"
 
 NODE_PID=""
 TMP_DATA_DIR=""
@@ -26,16 +27,17 @@ trap cleanup EXIT
 echo "=== Pulse Analytics End-to-End Verification ==="
 
 if ! curl -fsS "${BASE_URL}/healthz" >/dev/null 2>&1; then
-  echo "[boot] No live pulse-node at ${BASE_URL}; booting isolated release instance..."
+  echo "[boot] No live pulse-node at ${BASE_URL}; booting isolated release instance with --seed..."
   if [[ ! -f "${ROOT_DIR}/web/dist/index.html" ]]; then
     npm --prefix "${ROOT_DIR}/web" run build
   fi
   cargo build -p pulse-node --release
   TMP_DATA_DIR="$(mktemp -d "${TMP_DIR:-/tmp}/pulse_e2e.XXXXXX")"
   PORT="$PORT" \
+  PULSE_DEFAULT_PROJECT="$PROJECT_ID" \
   PULSE_DATA_DIR="$TMP_DATA_DIR" \
   PULSE_WEB_DIST_DIR="${ROOT_DIR}/web/dist" \
-  "${ROOT_DIR}/target/release/pulse-node" --no-quic >"${TMP_DATA_DIR}/node.log" 2>&1 &
+  "${ROOT_DIR}/target/release/pulse-node" --seed --no-quic >"${TMP_DATA_DIR}/node.log" 2>&1 &
   NODE_PID=$!
 
   for _ in $(seq 1 240); do
@@ -54,26 +56,59 @@ if ! curl -fsS "${BASE_URL}/healthz" >/dev/null 2>&1; then
     cat "${TMP_DATA_DIR}/node.log" >&2
     exit 1
   fi
+
+  if [[ -z "$ADMIN_TOKEN" ]]; then
+    ADMIN_TOKEN="$(python3 - "${TMP_DATA_DIR}/node.log" <<'PY'
+import re, sys
+text = open(sys.argv[1], "r", encoding="utf-8", errors="replace").read()
+m = re.search(r"(sk_root_[A-Za-z0-9_]+)", text)
+assert m, f"failed to find generated sk_root_ token in boot log:\n{text}"
+print(m.group(1))
+PY
+)"
+  fi
+  if [[ -z "$API_KEY" ]]; then
+    API_KEY="$(python3 - "${TMP_DATA_DIR}/node.log" <<'PY'
+import re, sys
+text = open(sys.argv[1], "r", encoding="utf-8", errors="replace").read()
+m = re.search(r"(pk_live_[A-Za-z0-9_]+)", text)
+assert m, f"failed to find generated pk_live_ key in boot log:\n{text}"
+print(m.group(1))
+PY
+)"
+  fi
   echo "[boot] pulse-node healthy at ${BASE_URL} (pid=${NODE_PID})"
 else
   echo "[boot] Using live pulse-node at ${BASE_URL}"
+  if [[ -z "$ADMIN_TOKEN" || -z "$API_KEY" ]]; then
+    echo "When targeting an already-running pulse-node, export PULSE_ADMIN_TOKEN and PULSE_API_KEY." >&2
+    exit 1
+  fi
 fi
+
+AUTH_HDR="Authorization: Bearer ${ADMIN_TOKEN}"
 
 NOW_MS="$(python3 -c 'import time; print(int(time.time() * 1000))')"
 START_MS="$((NOW_MS - 15 * 86400 * 1000))"
 END_MS="$((NOW_MS + 3600 * 1000))"
 
-# 1. Verify Node Status & Auto-Seeded 100k+ Dataset
-echo "[1/9] Checking GET /v1/status..."
-STATUS_JSON="$(curl -fsS "${BASE_URL}/v1/status?project_id=${PROJECT_ID}")"
+# 1. Verify Admin Authentication Enforcement (`P0-01`) & Seeded 100k+ Dataset
+echo "[1/9] Checking GET /v1/status (401 unauthenticated -> 200 with Bearer token)..."
+UNAUTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/v1/status?project_id=${PROJECT_ID}")"
+if [[ "$UNAUTH_CODE" != "401" ]]; then
+  echo "Expected HTTP 401 on unauthenticated /v1/status, got ${UNAUTH_CODE}" >&2
+  exit 1
+fi
+STATUS_JSON="$(curl -fsS -H "${AUTH_HDR}" "${BASE_URL}/v1/status?project_id=${PROJECT_ID}")"
 python3 - "$STATUS_JSON" <<'PY'
 import json, sys
 s = json.loads(sys.argv[1])
 total_rows = int(s["l0_rows"]) + int(s["l1_rows"])
 assert s["status"] == "ok", f"unexpected status: {s}"
+assert "default_api_key" not in s, f"/v1/status must never leak API keys: {s}"
 assert total_rows >= 100_000, f"expected >= 100,000 seeded rows, got {total_rows}"
 assert int(s["interned_users"]) >= 7_000, f"expected >= 7,000 interned u32 users, got {s['interned_users']}"
-print(f"      ✓ Stored rows={total_rows:,}, Vortex segments={s['segment_count']}, u32 users={s['interned_users']:,}")
+print(f"      ✓ Unauth=401, Auth=200 | Stored rows={total_rows:,}, Vortex segments={s['segment_count']}, u32 users={s['interned_users']:,}")
 PY
 
 # 2. Verify /v1/ingest + Deterministic Retry Deduplication + /v1/identify
@@ -134,6 +169,7 @@ PY
 echo "[3/9] Checking POST /v1/query (Insights, Funnel, Retention, Flows)..."
 
 INSIGHTS_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
+  -H "${AUTH_HDR}" \
   -H "Content-Type: application/json" \
   -d "{
     \"project_id\": \"${PROJECT_ID}\",
@@ -149,6 +185,7 @@ INSIGHTS_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
   }")"
 
 FUNNEL_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
+  -H "${AUTH_HDR}" \
   -H "Content-Type: application/json" \
   -d "{
     \"project_id\": \"${PROJECT_ID}\",
@@ -167,6 +204,7 @@ FUNNEL_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
   }")"
 
 RETENTION_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
+  -H "${AUTH_HDR}" \
   -H "Content-Type: application/json" \
   -d "{
     \"project_id\": \"${PROJECT_ID}\",
@@ -180,6 +218,7 @@ RETENTION_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
   }")"
 
 FLOWS_RES="$(curl -fsS -X POST "${BASE_URL}/v1/query" \
+  -H "${AUTH_HDR}" \
   -H "Content-Type: application/json" \
   -d "{
     \"project_id\": \"${PROJECT_ID}\",
@@ -209,7 +248,7 @@ PY
 
 # 4. Verify SessionIndex 64-bit Bitmask Pruning on GET /v1/sessions
 echo "[4/9] Checking GET /v1/sessions (SessionIndex 64-bit Bloom pruning)..."
-SESSIONS_JSON="$(curl -fsS "${BASE_URL}/v1/sessions?event=NSDL_Gateway_504_Timeout&rage_tap=true&limit=10")"
+SESSIONS_JSON="$(curl -fsS -H "${AUTH_HDR}" "${BASE_URL}/v1/sessions?project_id=${PROJECT_ID}&event=NSDL_Gateway_504_Timeout&rage_tap=true&limit=10")"
 TARGET_SESSION_ID="$(python3 - "$SESSIONS_JSON" <<'PY'
 import json, sys
 res = json.loads(sys.argv[1])
@@ -222,14 +261,16 @@ PY
 )"
 echo "      ✓ SessionIndex pruned non-matching sessions via 64-bit bitmask; matched session=${TARGET_SESSION_ID}"
 
-# 5. Verify Byte-Range Wireframe Replay (`206 Partial Content` + `PLSR` magic + Masked PII)
-echo "[5/9] Checking GET /v1/replay/${TARGET_SESSION_ID} (HTTP 206 Range + PII masking)..."
+# 5. Verify Byte-Range Wireframe Replay (`206 Partial Content` + `PLSR` magic + Masked PII, `P3-01`, `P3-05`)
+echo "[5/9] Checking GET /v1/projects/${PROJECT_ID}/replay/${TARGET_SESSION_ID} (HTTP 206 Range + PII masking)..."
 TMP_RANGE_HEADERS="$(mktemp)"
 TMP_RANGE_BODY="$(mktemp)"
-curl -fsS -D "$TMP_RANGE_HEADERS" -H "Range: bytes=0-511" \
-  "${BASE_URL}/v1/replay/${TARGET_SESSION_ID}" -o "$TMP_RANGE_BODY"
+curl -fsS -D "$TMP_RANGE_HEADERS" \
+  -H "${AUTH_HDR}" \
+  -H "Range: bytes=0-511" \
+  "${BASE_URL}/v1/projects/${PROJECT_ID}/replay/${TARGET_SESSION_ID}" -o "$TMP_RANGE_BODY"
 
-grep -q "206" "$TMP_RANGE_HEADERS"
+head -n 1 "$TMP_RANGE_HEADERS" | tr -d '\r' | grep -Eq '^HTTP/[0-9.]+ 206([[:space:]]|$)'
 MAGIC_HEX="$(head -c 4 "$TMP_RANGE_BODY" | xxd -p)"
 rm -f "$TMP_RANGE_HEADERS" "$TMP_RANGE_BODY"
 if [[ "$MAGIC_HEX" != "504c5352" ]]; then
@@ -237,32 +278,34 @@ if [[ "$MAGIC_HEX" != "504c5352" ]]; then
   exit 1
 fi
 
-REPLAY_JSON="$(curl -fsS "${BASE_URL}/v1/replay/${TARGET_SESSION_ID}")"
+REPLAY_JSON="$(curl -fsS -H "${AUTH_HDR}" "${BASE_URL}/v1/projects/${PROJECT_ID}/replay/${TARGET_SESSION_ID}")"
 python3 - "$REPLAY_JSON" <<'PY'
 import json, sys
 raw = sys.argv[1]
 data = json.loads(raw)
 assert len(data["chunks"]) >= 1, "expected >= 1 replay chunk"
-assert "██████████" in raw, "expected client-masked PAN placeholder in wireframe stream"
+assert "████" in raw, "expected fixed-length client-masked placeholder in wireframe stream"
 assert "rage_tap" in raw, "expected rage_tap interaction in wireframe stream"
-print(f"      ✓ HTTP 206 Partial Content (PLSR magic verified) & decoded {len(data['chunks'])} masked wireframe chunk(s)")
+print(f"      ✓ HTTP 206 Partial Content (status line & PLSR magic verified) & decoded {len(data['chunks'])} masked wireframe chunk(s)")
 PY
 
-# 6. Verify Experimentation Engine (Frequentist Z-test + Bayesian Monte Carlo)
-echo "[6/9] Checking GET /v1/experiments/exp_one_tap_upi_mandate/results..."
-EXP_JSON="$(curl -fsS "${BASE_URL}/v1/experiments/exp_one_tap_upi_mandate/results")"
+# 6. Verify Experimentation Engine (Frequentist Z-test + SRM + Holm + Bayesian Monte Carlo, `P0-04`, `P2-10`)
+echo "[6/9] Checking GET /v1/projects/${PROJECT_ID}/experiments/exp_one_tap_upi_mandate/results..."
+EXP_JSON="$(curl -fsS -H "${AUTH_HDR}" "${BASE_URL}/v1/projects/${PROJECT_ID}/experiments/exp_one_tap_upi_mandate/results")"
 python3 - "$EXP_JSON" <<'PY'
 import json, sys
 exp = json.loads(sys.argv[1])
+assert exp["sample_ratio_mismatch"] is False, f"unexpected SRM in balanced synthetic experiment: {exp}"
+assert "not peeking-corrected" in exp["statistical_methodology_note"]
 variants = {v["variant_key"]: v for v in exp["variants"]}
 treat = variants["one_tap_sheet"]
 assert treat["relative_lift_pct"] > 5.0, f"expected positive lift, got {treat}"
-assert treat["p_value"] < 0.05, f"expected p_value < 0.05, got {treat}"
+assert treat["p_value"] < 0.05, f"expected Holm-adjusted p_value < 0.05, got {treat}"
 assert treat["bayesian_prob_to_beat_control"] > 0.95, f"expected Bayesian prob > 0.95, got {treat}"
 assert treat["statistically_significant"] is True
 print(
     f"      ✓ Lift=+{treat['relative_lift_pct']:.2f}%, "
-    f"p_value={treat['p_value']:.4g}, "
+    f"adj_p={treat['p_value']:.4g}, SRM_p={exp['srm_p_value']:.3f}, "
     f"Bayesian P(beat control)={treat['bayesian_prob_to_beat_control']*100:.2f}%"
 )
 PY
@@ -280,21 +323,25 @@ if [[ "$HTTP_304" != "304" ]]; then
 fi
 echo "      ✓ Edge Flag bundle ETag=${ETAG_VAL} -> HTTP 304 Not Modified"
 
-# 8. Verify Built-in MCP JSON-RPC 2.0 Server (`POST /v1/mcp`)
+# 8. Verify Principal-Bound Built-in MCP JSON-RPC 2.0 Server (`POST /v1/mcp`, `P0-04`)
 echo "[8/9] Checking POST /v1/mcp JSON-RPC 2.0 server..."
 MCP_LIST="$(curl -fsS -X POST "${BASE_URL}/v1/mcp" \
+  -H "${AUTH_HDR}" \
+  -H "x-pulse-project: ${PROJECT_ID}" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')"
 MCP_CALL="$(curl -fsS -X POST "${BASE_URL}/v1/mcp" \
+  -H "${AUTH_HDR}" \
+  -H "x-pulse-project: ${PROJECT_ID}" \
   -H "Content-Type: application/json" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"query_funnel\",\"arguments\":{\"project_id\":\"${PROJECT_ID}\",\"steps\":[\"App_Open\",\"KYC_PAN_Submitted\",\"First_Disbursal_Success\"],\"days\":14}}}")"
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_funnel","arguments":{"steps":["App_Open","KYC_PAN_Submitted","First_Disbursal_Success"],"days":14}}}')"
 python3 - "$MCP_LIST" "$MCP_CALL" <<'PY'
 import json, sys
 tl, tc = json.loads(sys.argv[1]), json.loads(sys.argv[2])
 tools = tl["result"]["tools"]
 assert len(tools) >= 5, f"expected >= 5 MCP tools, got {len(tools)}"
 assert tc["result"].get("isError", False) is False and len(tc["result"]["content"]) >= 1
-print(f"      ✓ MCP registered {len(tools)} tools & executed tools/call(query_funnel)")
+print(f"      ✓ MCP registered {len(tools)} tools & executed principal-bound tools/call(query_funnel)")
 PY
 
 # 9. Verify Static Analytics Studio Delivery (`GET /`)

@@ -233,7 +233,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                             w: 342,
                             h: 52,
                             bg_rgba: 0x1E29_3BFF,
-                            masked_label: "PAN: ██████████".to_string(),
+                            masked_label: "████".to_string(),
                         },
                         WireNode {
                             node_id: 5,
@@ -244,7 +244,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                             w: 342,
                             h: 52,
                             bg_rgba: 0x1E29_3BFF,
-                            masked_label: "Mobile: ██████████".to_string(),
+                            masked_label: "████".to_string(),
                         },
                         WireNode {
                             node_id: 6,
@@ -508,7 +508,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 client_sent_ts_ms: now_ms,
                 props: base_props(
                     base_amount,
-                    Some(("pan_masked", PropValue::Str("PAN: ██████████".into()))),
+                    Some(("pan_masked", PropValue::Str("████".into()))),
                 ),
                 replay_offset_kb: replay_kb,
             });

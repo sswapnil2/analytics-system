@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use pulse_identity::IdentitySnapshot;
@@ -10,8 +10,11 @@ use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
     load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
-    row_matches_predicates, Result,
+    row_matches_predicates, ExecError, Result,
 };
+
+const MAX_FLOWS_SCANNED_EVENTS: usize = 2_000_000;
+const MAX_FLOWS_EVENTS_PER_USER: usize = 4_096;
 
 pub struct FlowsEngine;
 
@@ -25,7 +28,15 @@ impl FlowsEngine {
         catalog: &VirtualCatalog,
     ) -> Result<FlowsResult> {
         let t0 = Instant::now();
+        if query.time_range.start_ts_ms > query.time_range.end_ts_ms {
+            return Err(ExecError::InvalidQuery(format!(
+                "invalid time_range: start_ts_ms ({}) > end_ts_ms ({})",
+                query.time_range.start_ts_ms, query.time_range.end_ts_ms
+            )));
+        }
+
         let steps = query.steps.clamp(1, 10);
+        let top_n = query.top_n_per_step.unwrap_or(25).clamp(1, 50);
 
         let eligible_cohort = resolve_global_cohort_bitmap(
             &query.global_filter,
@@ -62,8 +73,9 @@ impl FlowsEngine {
         // Map `event_id -> event_name` once
         let id_to_name: HashMap<u16, String> = dict.all_events().into_iter().collect();
 
-        // Collect chronological `(ts_ms, event_id, is_anchor)` per canonical user
+        // Collect chronological `(ts_ms, event_id, is_anchor)` per canonical user with resource bounds (`P3-02`)
         let mut timelines: HashMap<u32, Vec<(i64, u16, bool)>> = HashMap::new();
+        let mut total_collected = 0usize;
 
         for chunk in &chunks {
             let ta = &chunk.tier_a;
@@ -81,21 +93,31 @@ impl FlowsEngine {
                 if !row_matches_predicates(chunk, r, &query.global_filter.predicates) {
                     continue;
                 }
+
+                total_collected += 1;
+                if total_collected > MAX_FLOWS_SCANNED_EVENTS {
+                    return Err(ExecError::InvalidQuery(format!(
+                        "flows query exceeded maximum scanned event budget ({MAX_FLOWS_SCANNED_EVENTS}); narrow time_range or add global_filter"
+                    )));
+                }
+
                 let eid = ta.event_id[r];
                 let is_anchor = anchor_tgt.matches_id(eid)
                     && anchor_tgt.extra_filter.as_ref().is_none_or(|ef| {
                         row_matches_predicates(chunk, r, std::slice::from_ref(ef))
                     });
 
-                timelines
-                    .entry(canon_uid)
-                    .or_default()
-                    .push((ts, eid, is_anchor));
+                let user_tl = timelines.entry(canon_uid).or_default();
+                if user_tl.len() < MAX_FLOWS_EVENTS_PER_USER || is_anchor {
+                    user_tl.push((ts, eid, is_anchor));
+                }
             }
         }
 
-        let mut node_users: BTreeMap<(i32, String), RoaringBitmap> = BTreeMap::new();
-        let mut link_users: BTreeMap<(String, String), RoaringBitmap> = BTreeMap::new();
+        // First pass: extract each anchored user's step sequence `(step_offset, event_name)`
+        // and count raw unique users per `(step_offset, event_name)` so `top_n_per_step` can rank them (`Section 6`, `P3-02`).
+        let mut user_paths: Vec<(u32, Vec<(i32, String)>)> = Vec::new();
+        let mut raw_step_counts: HashMap<i32, HashMap<String, u64>> = HashMap::new();
 
         for (uid, mut evs) in timelines {
             evs.sort_by_key(|(ts, eid, _)| (*ts, *eid));
@@ -124,73 +146,103 @@ impl FlowsEngine {
                 continue;
             };
 
-            let anchor_node_id = format_node_id(0, &query.anchor_event);
-            node_users
-                .entry((0, query.anchor_event.clone()))
-                .or_default()
-                .insert(uid);
+            let mut path: Vec<(i32, String)> = Vec::with_capacity(steps + 1);
+            path.push((0, query.anchor_event.clone()));
 
             match query.direction {
                 FlowDirection::Forward => {
-                    let mut prev_id = anchor_node_id;
                     for offset in 1..=steps {
                         let pos = anchor_idx + offset;
                         let step_off = offset as i32;
                         if let Some((ev_name, _)) = collapsed.get(pos) {
-                            let cur_id = format_node_id(step_off, ev_name);
-                            node_users
-                                .entry((step_off, ev_name.clone()))
+                            *raw_step_counts
+                                .entry(step_off)
                                 .or_default()
-                                .insert(uid);
-                            link_users
-                                .entry((prev_id, cur_id.clone()))
-                                .or_default()
-                                .insert(uid);
-                            prev_id = cur_id;
+                                .entry(ev_name.clone())
+                                .or_insert(0) += 1;
+                            path.push((step_off, ev_name.clone()));
                         } else {
-                            let drop_name = "$Drop_Off".to_string();
-                            let drop_id = format_node_id(step_off, &drop_name);
-                            node_users
-                                .entry((step_off, drop_name))
-                                .or_default()
-                                .insert(uid);
-                            link_users
-                                .entry((prev_id, drop_id))
-                                .or_default()
-                                .insert(uid);
+                            path.push((step_off, "$Drop_Off".to_string()));
                             break;
                         }
                     }
                 }
                 FlowDirection::Reverse => {
-                    let mut next_id = anchor_node_id;
                     for offset in 1..=steps {
                         let step_off = -(offset as i32);
                         if anchor_idx >= offset {
-                            let ev_name = &collapsed[anchor_idx - offset].0;
-                            let cur_id = format_node_id(step_off, ev_name);
-                            node_users
-                                .entry((step_off, ev_name.clone()))
+                            let ev_name = collapsed[anchor_idx - offset].0.clone();
+                            *raw_step_counts
+                                .entry(step_off)
                                 .or_default()
-                                .insert(uid);
-                            link_users
-                                .entry((cur_id.clone(), next_id))
-                                .or_default()
-                                .insert(uid);
-                            next_id = cur_id;
+                                .entry(ev_name.clone())
+                                .or_insert(0) += 1;
+                            path.push((step_off, ev_name));
                         } else {
-                            let entry_name = "$Session_Start".to_string();
-                            let entry_id = format_node_id(step_off, &entry_name);
-                            node_users
-                                .entry((step_off, entry_name))
-                                .or_default()
-                                .insert(uid);
-                            link_users
-                                .entry((entry_id, next_id))
-                                .or_default()
-                                .insert(uid);
+                            path.push((step_off, "$Session_Start".to_string()));
                             break;
                         }
+                    }
+                }
+            }
+
+            user_paths.push((uid, path));
+        }
+
+        // Determine top-`top_n` event names at each non-zero `step_offset`
+        let mut allowed_per_step: HashMap<i32, HashSet<String>> = HashMap::new();
+        for (step_off, counts) in raw_step_counts {
+            let mut ranked: Vec<(String, u64)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let keep: HashSet<String> = ranked
+                .into_iter()
+                .take(top_n)
+                .map(|(name, _)| name)
+                .collect();
+            allowed_per_step.insert(step_off, keep);
+        }
+
+        let mut node_users: BTreeMap<(i32, String), RoaringBitmap> = BTreeMap::new();
+        let mut link_users: BTreeMap<(String, String), RoaringBitmap> = BTreeMap::new();
+
+        for (uid, path) in user_paths {
+            let mut mapped_ids: Vec<String> = Vec::with_capacity(path.len());
+            for (step_off, raw_name) in path {
+                let final_name = if step_off == 0
+                    || raw_name == "$Drop_Off"
+                    || raw_name == "$Session_Start"
+                    || allowed_per_step
+                        .get(&step_off)
+                        .is_some_and(|set| set.contains(&raw_name))
+                {
+                    raw_name
+                } else {
+                    "$Other".to_string()
+                };
+                let nid = format_node_id(step_off, &final_name);
+                node_users
+                    .entry((step_off, final_name))
+                    .or_default()
+                    .insert(uid);
+                mapped_ids.push(nid);
+            }
+
+            match query.direction {
+                FlowDirection::Forward => {
+                    for pair in mapped_ids.windows(2) {
+                        link_users
+                            .entry((pair[0].clone(), pair[1].clone()))
+                            .or_default()
+                            .insert(uid);
+                    }
+                }
+                FlowDirection::Reverse => {
+                    for pair in mapped_ids.windows(2) {
+                        // `path` runs from `0` -> `-1` -> `-2`; links point chronologically (`-1 -> 0`, `-2 -> -1`)
+                        link_users
+                            .entry((pair[1].clone(), pair[0].clone()))
+                            .or_default()
+                            .insert(uid);
                     }
                 }
             }
