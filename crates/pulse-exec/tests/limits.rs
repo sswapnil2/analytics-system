@@ -1096,3 +1096,123 @@ fn pr8_en4_flexible_query_enums_and_readable_errors() {
     );
     assert!(!msg.contains("TimeInterval"), "leaked Rust enum: {msg}");
 }
+
+#[tokio::test]
+async fn pr10_flows_hides_system_events_unless_anchored() {
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    let mut batch = Vec::new();
+    for u in 0..5u64 {
+        let uid = format!("flow_u_{u}");
+        let sid = format!("flow_s_{u}");
+        batch.push(ev(
+            u * 3 + 1,
+            &uid,
+            &sid,
+            "App_Open",
+            ts + 1_000,
+            Vec::new(),
+        ));
+        batch.push(ev(
+            u * 3 + 2,
+            &uid,
+            &sid,
+            "$experiment_started",
+            ts + 2_000,
+            Vec::new(),
+        ));
+        batch.push(ev(
+            u * 3 + 3,
+            &uid,
+            &sid,
+            "Checkout",
+            ts + 3_000,
+            Vec::new(),
+        ));
+    }
+    ingest
+        .ingest_for_project("proj_pr10", WireBatch::new(batch), ts + 10_000)
+        .await
+        .unwrap();
+
+    let range = TimeRange {
+        start_ts_ms: ts,
+        end_ts_ms: ts + 10_000,
+    };
+
+    let product_flows = qengine
+        .query_flows(
+            "proj_pr10",
+            &FlowsQuery {
+                time_range: range,
+                anchor_event: "App_Open".to_string(),
+                direction: FlowDirection::Forward,
+                steps: 3,
+                top_n_per_step: Some(10),
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !product_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name.starts_with('$') && n.event_name != "$Drop_Off"),
+        "system $-prefixed events must not clutter user journeys anchored on App_Open: {:?}",
+        product_flows.nodes
+    );
+    assert!(
+        product_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name == "Checkout" && n.step_offset == 1),
+        "Checkout should advance directly to step +1 once system event is excluded: {:?}",
+        product_flows.nodes
+    );
+
+    let exp_flows = qengine
+        .query_flows(
+            "proj_pr10",
+            &FlowsQuery {
+                time_range: range,
+                anchor_event: "$experiment_started".to_string(),
+                direction: FlowDirection::Forward,
+                steps: 2,
+                top_n_per_step: Some(10),
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        exp_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name == "$experiment_started" && n.step_offset == 0),
+        "anchoring directly on a $ system event must still include it: {:?}",
+        exp_flows.nodes
+    );
+
+    id_router.close_all().await.unwrap();
+}

@@ -24,6 +24,50 @@ pub struct SeedSummary {
     pub elapsed_ms: u128,
 }
 
+#[inline]
+fn seed_hash(salt: &str, u: usize) -> u64 {
+    let mut buf = [0u8; 32];
+    let sb = salt.as_bytes();
+    let copy = sb.len().min(24);
+    buf[..copy].copy_from_slice(&sb[..copy]);
+    buf[24..32].copy_from_slice(&(u as u64).to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&buf)
+}
+
+fn pick_cohort_day(u: usize) -> i64 {
+    // Smooth two-week acquisition trend with realistic weekend softenings on days 5-6 (`PR-4`)
+    const WEIGHTS: [u64; 14] = [48, 52, 60, 63, 66, 54, 51, 70, 74, 82, 86, 89, 101, 104];
+    let slot = seed_hash("cohort_day", u) % 1000;
+    let mut acc = 0u64;
+    for (idx, w) in WEIGHTS.iter().enumerate() {
+        acc += *w;
+        if slot < acc {
+            return idx as i64;
+        }
+    }
+    13
+}
+
+fn pick_city(u: usize) -> &'static str {
+    const CITIES: [(&str, u64); 6] = [
+        ("Bengaluru", 290),
+        ("Mumbai", 220),
+        ("Delhi_NCR", 180),
+        ("Hyderabad", 130),
+        ("Pune", 100),
+        ("Chennai", 80),
+    ];
+    let slot = seed_hash("city_dist", u) % 1000;
+    let mut acc = 0u64;
+    for (name, w) in CITIES {
+        acc += w;
+        if slot < acc {
+            return name;
+        }
+    }
+    "Bengaluru"
+}
+
 /// Generates the deterministic 100,000+ event Indian Consumer Fintech & Quick-Commerce dataset
 /// across 8,000 users over 14 days on first boot.
 pub async fn seed_indian_fintech_dataset(
@@ -124,7 +168,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         description: "Bottom-sheet 1-Tap UPI Autopay Mandate vs legacy multi-step VPA redirect"
             .to_string(),
         enabled: true,
-        rollout_pct: 100.0,
+        rollout_pct: 50.0,
         targeting_cohort_id: None,
         variants: vec![
             VariantAllocation {
@@ -182,7 +226,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         let u = 200 + r_idx * 17;
         let sess_id = format!("sess_kyc_timeout_{u:05}");
         kyc_timeout_sessions.insert(sess_id.clone());
-        let base_t = start_day_ms + ((u % 14) as i64) * 86_400_000 + 38_000_000;
+        let base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
 
         let chunk1 = ReplayChunk {
             project_id: project_id.to_string(),
@@ -412,7 +456,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     ];
     for &(u, screen_title, err_msg, api_path) in extra_step_replays {
         let sess_id = format!("sess_onboard_{u:05}");
-        let base_t = start_day_ms + ((u % 14) as i64) * 86_400_000 + 38_000_000;
+        let base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
         let chunk = ReplayChunk {
             project_id: project_id.to_string(),
             session_id: sess_id.clone(),
@@ -494,14 +538,6 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     }
 
     // 3. Generate 100,000+ Analytical Events + Retroactive Aliases across 8,000 Users over 14 Days
-    let cities = [
-        "Bengaluru",
-        "Mumbai",
-        "Delhi_NCR",
-        "Hyderabad",
-        "Pune",
-        "Chennai",
-    ];
     let networks = ["Jio_5G", "Airtel_5G", "Jio_4G", "Airtel_4G", "WiFi_Fiber"];
     let merchants = [
         "m_zepto",
@@ -524,9 +560,9 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     let mut seq = 1u64;
 
     for u in 0..total_users {
-        let cohort_day = (u % 14) as i64;
-        let user_day0_ts =
-            start_day_ms + cohort_day * 86_400_000 + ((u * 97) % 50_000) as i64 * 600;
+        let cohort_day = pick_cohort_day(u);
+        let time_of_day_ms = ((seed_hash("tod", u) % 61_200) + 18_000) as i64 * 1_000; // active 05:00..22:00 UTC/IST spread
+        let user_day0_ts = start_day_ms + cohort_day * 86_400_000 + time_of_day_ms;
 
         let anon_id = format!("anon_in_{u:05}");
         let phone_id = format!("+919845{:06}", 100_000 + u);
@@ -539,18 +575,37 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             primary_seed.clone()
         };
 
-        let city = cities[u % cities.len()];
-        let net = networks[(u * 3) % networks.len()];
-        let platform_primary = if u % 4 == 0 { "iOS" } else { "Android" };
-        let payment_method = if u % 5 == 0 {
+        let city = pick_city(u);
+        let net_slot = seed_hash("network", u) % 100;
+        let net = if net_slot < 36 {
+            networks[0]
+        } else if net_slot < 64 {
+            networks[1]
+        } else if net_slot < 80 {
+            networks[2]
+        } else if net_slot < 91 {
+            networks[3]
+        } else {
+            networks[4]
+        };
+        let platform_primary = if seed_hash("platform", u) % 100 < 26 {
+            "iOS"
+        } else {
+            "Android"
+        };
+        let pay_slot = seed_hash("payment", u) % 100;
+        let payment_method = if pay_slot < 20 {
             "card"
-        } else if u % 9 == 0 {
+        } else if pay_slot < 31 {
             "netbanking"
         } else {
             "upi"
         };
-        let merchant = merchants[(u * 7) % merchants.len()];
-        let base_amount = 750 + ((u * 137) % 18_500) as i64;
+        let merchant = merchants[(seed_hash("merchant", u) % (merchants.len() as u64)) as usize];
+        let base_amount = 650 + (seed_hash("amount", u) % 18_500) as i64;
+
+        let is_step2_3_replay = [300usize, 304, 306, 308].contains(&u);
+        let is_step3_4_replay = [164usize, 166, 168, 170].contains(&u);
 
         let sess_onboard =
             if u >= 200 && (u - 200) % 17 == 0 && (u - 200) / 17 < replay_session_count {
@@ -596,10 +651,40 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         };
 
         // --- Anonymous Device Exploration (`anon_id`) ---
-        for (dt, ename) in [
-            (0i64, "App_Open"),
-            (8_000, "Browse_Credit_Card"),
-            (19_000, "View_Loan_Calculator"),
+        let t_browse = 5_000 + (seed_hash("t_browse", u) % 12_000) as i64;
+        let t_calc = t_browse + 7_000 + (seed_hash("t_calc", u) % 18_000) as i64;
+        let t_otp = t_calc + 10_000 + (seed_hash("t_otp", u) % 24_000) as i64;
+        let t_pan = t_otp + 15_000 + (seed_hash("t_pan", u) % 45_000) as i64;
+        let t_nsdl = t_pan + 4_500 + (seed_hash("t_nsdl", u) % 7_500) as i64;
+        let tail_vkyc = if seed_hash("vkyc_tail", u) % 100 < 15 {
+            240_000 + (seed_hash("vkyc_tail_ms", u) % 600_000) as i64
+        } else {
+            0
+        };
+        let t_vkyc = t_pan + 28_000 + (seed_hash("t_vkyc", u) % 150_000) as i64 + tail_vkyc;
+        let t_exp = t_vkyc + 8_000 + (seed_hash("t_exp", u) % 25_000) as i64;
+        let tail_mandate = if seed_hash("mandate_tail", u) % 100 < 18 {
+            180_000 + (seed_hash("mandate_tail_ms", u) % 540_000) as i64
+        } else {
+            0
+        };
+        let t_mandate = t_exp + 14_000 + (seed_hash("t_mandate", u) % 95_000) as i64 + tail_mandate;
+        let tail_disb = if seed_hash("disb_tail", u) % 100 < 12 {
+            220_000 + (seed_hash("disb_tail_ms", u) % 720_000) as i64
+        } else {
+            0
+        };
+        let t_disbursal =
+            t_mandate + 18_000 + (seed_hash("t_disb", u) % 140_000) as i64 + tail_disb;
+
+        for (dt, ename, r_kb) in [
+            (0i64, "App_Open", 0),
+            (t_browse, "Browse_Credit_Card", 0),
+            (
+                t_calc,
+                "View_Loan_Calculator",
+                if u >= 6_000 { replay_kb } else { 0 },
+            ),
         ] {
             seq += 1;
             all_events.push(WireEvent {
@@ -617,7 +702,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 client_event_ts_ms: user_day0_ts + dt,
                 client_sent_ts_ms: now_ms,
                 props: base_props(base_amount, None),
-                replay_offset_kb: 0,
+                replay_offset_kb: r_kb,
             });
         }
 
@@ -634,14 +719,14 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                     &phone_id,
                     &sess_onboard,
                     "OTP_Verified",
-                    user_day0_ts + 32_000,
+                    user_day0_ts + t_otp,
                     seq,
                 ),
                 routing_seed: primary_seed.clone(),
                 distinct_id: phone_id.clone(),
                 session_id: sess_onboard.clone(),
                 event_name: "OTP_Verified".to_string(),
-                client_event_ts_ms: user_day0_ts + 32_000,
+                client_event_ts_ms: user_day0_ts + t_otp,
                 client_sent_ts_ms: now_ms,
                 props: base_props(base_amount, None),
                 replay_offset_kb: 0,
@@ -658,14 +743,14 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                     active_did,
                     &sess_onboard,
                     "KYC_PAN_Submitted",
-                    user_day0_ts + 55_000,
+                    user_day0_ts + t_pan,
                     seq,
                 ),
                 routing_seed: primary_seed.clone(),
                 distinct_id: active_did.clone(),
                 session_id: sess_onboard.clone(),
                 event_name: "KYC_PAN_Submitted".to_string(),
-                client_event_ts_ms: user_day0_ts + 55_000,
+                client_event_ts_ms: user_day0_ts + t_pan,
                 client_sent_ts_ms: now_ms,
                 props: base_props(
                     base_amount,
@@ -675,7 +760,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             });
 
             // Frustration cohort (~380 users, including all 32 KYC-timeout replay sessions) hits `NSDL_Gateway_504_Timeout`!
-            let hit_nsdl_timeout = kyc_timeout_sessions.contains(&sess_onboard) || (u % 16 == 5);
+            let hit_nsdl_timeout = kyc_timeout_sessions.contains(&sess_onboard)
+                || (seed_hash("nsdl_504", u) % 16 == 5);
             if hit_nsdl_timeout {
                 seq += 1;
                 all_events.push(WireEvent {
@@ -683,21 +769,21 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                         active_did,
                         &sess_onboard,
                         "NSDL_Gateway_504_Timeout",
-                        user_day0_ts + 63_000,
+                        user_day0_ts + t_nsdl,
                         seq,
                     ),
                     routing_seed: primary_seed.clone(),
                     distinct_id: active_did.clone(),
                     session_id: sess_onboard.clone(),
                     event_name: "NSDL_Gateway_504_Timeout".to_string(),
-                    client_event_ts_ms: user_day0_ts + 63_000,
+                    client_event_ts_ms: user_day0_ts + t_nsdl,
                     client_sent_ts_ms: now_ms,
                     props: base_props(base_amount, Some(("status_code", PropValue::Int(504)))),
                     replay_offset_kb: replay_kb,
                 });
             }
 
-            // --- Funnel Step 2: `Video_KYC_Completed` & A/B Experiment Exposure (`5,000` users: 2,500 control vs 2,500 one_tap_sheet) ---
+            // --- Funnel Step 2: `Video_KYC_Completed` & A/B Experiment Exposure ---
             if u < 5_000 && !kyc_timeout_sessions.contains(&sess_onboard) {
                 seq += 1;
                 all_events.push(WireEvent {
@@ -705,23 +791,25 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                         active_did,
                         &sess_onboard,
                         "Video_KYC_Completed",
-                        user_day0_ts + 120_000,
+                        user_day0_ts + t_vkyc,
                         seq,
                     ),
                     routing_seed: secondary_seed.clone(),
                     distinct_id: active_did.clone(),
                     session_id: sess_onboard.clone(),
                     event_name: "Video_KYC_Completed".to_string(),
-                    client_event_ts_ms: user_day0_ts + 120_000,
+                    client_event_ts_ms: user_day0_ts + t_vkyc,
                     client_sent_ts_ms: now_ms,
                     props: base_props(base_amount, None),
-                    replay_offset_kb: 0,
+                    replay_offset_kb: if is_step2_3_replay { replay_kb } else { 0 },
                 });
 
-                // Deterministic 50/50 split on `exp_one_tap_upi_mandate`:
-                //   even `u` -> `control` (48.0% conversion)
-                //   odd  `u` -> `one_tap_sheet` (55.0% conversion -> +14.58% relative lift!)
-                let is_treatment = u % 2 == 1;
+                // Natural hash-based ~50/50 split on `exp_one_tap_upi_mandate` (`PR-4`):
+                //   control       ~48.0% conversion
+                //   one_tap_sheet ~55.0% conversion (~+14.5% relative lift)
+                let is_treatment =
+                    pulse_wire::flag_variant_slot("one_tap_upi_mandate", active_did, 10_000)
+                        >= 5_000;
                 let variant = if is_treatment {
                     "one_tap_sheet"
                 } else {
@@ -734,14 +822,14 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                         active_did,
                         &sess_onboard,
                         "$experiment_started",
-                        user_day0_ts + 145_000,
+                        user_day0_ts + t_exp,
                         seq,
                     ),
                     routing_seed: secondary_seed.clone(),
                     distinct_id: active_did.clone(),
                     session_id: sess_onboard.clone(),
                     event_name: "$experiment_started".to_string(),
-                    client_event_ts_ms: user_day0_ts + 145_000,
+                    client_event_ts_ms: user_day0_ts + t_exp,
                     client_sent_ts_ms: now_ms,
                     props: vec![
                         (
@@ -754,11 +842,15 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                     replay_offset_kb: 0,
                 });
 
-                let slot_pct = (u / 2) % 200; // 0..199
-                let converts_mandate = if is_treatment {
-                    slot_pct < 110 // 110 / 200 = 55.0%
+                let conv_slot = (seed_hash("upi_mandate_conv", u) % 10_000) as u32;
+                let converts_mandate = if is_step2_3_replay {
+                    false
+                } else if is_step3_4_replay {
+                    true
+                } else if is_treatment {
+                    conv_slot < 5_350
                 } else {
-                    slot_pct < 96 // 96 / 200 = 48.0% -> +14.58% lift!
+                    conv_slot < 4_800
                 };
 
                 if converts_mandate {
@@ -768,38 +860,38 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                             active_did,
                             &sess_onboard,
                             "UPI_Autopay_Mandate_Approved",
-                            user_day0_ts + 185_000,
+                            user_day0_ts + t_mandate,
                             seq,
                         ),
                         routing_seed: secondary_seed.clone(),
                         distinct_id: active_did.clone(),
                         session_id: sess_onboard.clone(),
                         event_name: "UPI_Autopay_Mandate_Approved".to_string(),
-                        client_event_ts_ms: user_day0_ts + 185_000,
+                        client_event_ts_ms: user_day0_ts + t_mandate,
                         client_sent_ts_ms: now_ms,
                         props: base_props(
                             base_amount,
                             Some(("$exp_one_tap_upi_mandate", PropValue::Str(variant.into()))),
                         ),
-                        replay_offset_kb: 0,
+                        replay_offset_kb: if is_step3_4_replay { replay_kb } else { 0 },
                     });
 
-                    // --- Funnel Step 4: `First_Disbursal_Success` (82% of Mandate-Approved users) ---
-                    if slot_pct % 100 < 82 {
+                    // --- Funnel Step 4: `First_Disbursal_Success` (~82% of Mandate-Approved users) ---
+                    if !is_step3_4_replay && (seed_hash("disbursal_conv", u) % 100) < 82 {
                         seq += 1;
                         all_events.push(WireEvent {
                             event_uuid: WireEvent::deterministic_uuid(
                                 active_did,
                                 &sess_onboard,
                                 "First_Disbursal_Success",
-                                user_day0_ts + 240_000,
+                                user_day0_ts + t_disbursal,
                                 seq,
                             ),
                             routing_seed: secondary_seed.clone(),
                             distinct_id: active_did.clone(),
                             session_id: sess_onboard.clone(),
                             event_name: "First_Disbursal_Success".to_string(),
-                            client_event_ts_ms: user_day0_ts + 240_000,
+                            client_event_ts_ms: user_day0_ts + t_disbursal,
                             client_sent_ts_ms: now_ms,
                             props: base_props(base_amount, None),
                             replay_offset_kb: 0,
@@ -812,17 +904,19 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         // --- Multi-Day Retention & Quick-Commerce Repeat Sessions across Days +1 .. (13 - cohort_day) ---
         let remaining_days = (13 - cohort_day).max(0);
         for d_off in 1..=remaining_days {
-            // Realistic decaying retention curve (~58% D1 -> ~44% D3 -> ~32% D7 -> ~25% D13) yielding 108,000+ unique events
+            // Smooth decaying retention curve (~62% D1 -> ~47% D3 -> ~35% D7 -> ~28% D13) yielding 105,000+ unique events
             let retention_threshold = match d_off {
-                1 => 58,
-                2 => 50,
-                3 => 44,
-                4..=6 => 37,
-                7..=10 => 32,
-                _ => 25,
+                1 => 62,
+                2 => 54,
+                3 => 47,
+                4..=6 => 40,
+                7..=10 => 35,
+                _ => 28,
             };
-            if ((u * 31 + (d_off as usize) * 17) % 100) < retention_threshold {
-                let ret_ts = user_day0_ts + d_off * 86_400_000 + ((u % 600) as i64) * 1_000;
+            if (seed_hash("ret_day", u * 32 + d_off as usize) % 100) < retention_threshold {
+                let ret_ts = user_day0_ts
+                    + d_off * 86_400_000
+                    + (seed_hash("ret_tod", u * 32 + d_off as usize) % 7_200) as i64 * 1_000;
                 let ret_sess = format!("sess_ret_{u:05}_d{d_off}");
 
                 for (dt, ename) in [
@@ -830,7 +924,9 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                     (12_000, "Quick_Grocery_Browse"),
                     (28_000, "Quick_Commerce_Order_Paid"),
                 ] {
-                    if ename == "Quick_Commerce_Order_Paid" && (u + d_off as usize) % 3 == 0 {
+                    if ename == "Quick_Commerce_Order_Paid"
+                        && (seed_hash("ret_order", u * 32 + d_off as usize) % 100) < 34
+                    {
                         continue;
                     }
                     seq += 1;
@@ -849,7 +945,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                         client_event_ts_ms: ret_ts + dt,
                         client_sent_ts_ms: now_ms,
                         props: base_props(
-                            320 + ((u * 19 + d_off as usize * 43) % 1800) as i64,
+                            320 + (seed_hash("ret_amt", u * 32 + d_off as usize) % 1800) as i64,
                             None,
                         ),
                         replay_offset_kb: 0,
@@ -901,7 +997,11 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             .await?;
     }
     ctrl.qengine().storage().flush_all_projects().await?;
-    ctrl.qengine().storage().compact_all_projects().await?;
+    ctrl.qengine()
+        .storage()
+        .compact_all_with_min_segments(2)
+        .await?;
+    let _ = ctrl.qengine().warm_project_cache(project_id).await;
 
     let summary = SeedSummary {
         unique_events,

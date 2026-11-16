@@ -151,6 +151,28 @@ impl QueryEngine {
         self.queries_executed.load(Ordering::Relaxed)
     }
 
+    /// Pre-loads segment headers and commonly queried property columns into the cache (`EN-3`).
+    pub async fn warm_project_cache(&self, project_id: &str) -> Result<usize> {
+        let ps = self.storage.get_or_open_project(project_id).await?;
+        let snap = ps.snapshot();
+        let cat = self.catalogs.for_project(project_id);
+        let warm_props: Vec<String> = ["city", "platform", "variant", "flag_key", "amount"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let chunks = crate::scanner::load_project_chunks(
+            &ps,
+            &snap,
+            &self.cache,
+            &cat,
+            None,
+            &warm_props,
+            None,
+        )
+        .await?;
+        Ok(chunks.len())
+    }
+
     fn record_latency(&self, us: u64) {
         self.last_query_latency_us.store(us, Ordering::Relaxed);
         self.queries_executed.fetch_add(1, Ordering::Relaxed);
