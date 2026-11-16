@@ -15,8 +15,8 @@ use crate::ast::{
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    evaluate_cohort, load_project_chunks, precompute_segment_row_mask, resolve_event_target,
-    resolve_global_cohort_bitmap, row_matches_predicates, ExecError, Result,
+    evaluate_cohort, load_project_chunks_with_id, precompute_segment_row_mask,
+    resolve_event_target, resolve_global_cohort_bitmap, row_matches_predicates, ExecError, Result,
 };
 
 pub const MAX_TIME_BUCKETS: usize = 10_000;
@@ -249,7 +249,7 @@ async fn evaluate_window(
     }
 
     let props_vec: Vec<String> = props_needed.into_iter().collect();
-    let chunks = load_project_chunks(
+    let chunks = load_project_chunks_with_id(
         ps,
         snap,
         cache,
@@ -257,6 +257,7 @@ async fn evaluate_window(
         Some(scan_range),
         &props_vec,
         (combined_bloom != 0).then_some(combined_bloom),
+        Some(id_snap),
     )
     .await?;
 

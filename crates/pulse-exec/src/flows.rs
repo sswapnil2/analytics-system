@@ -9,7 +9,7 @@ use crate::ast::{FlowDirection, FlowLink, FlowNode, FlowsQuery, FlowsResult};
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
+    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
     row_matches_predicates, ExecError, Result,
 };
 
@@ -59,7 +59,7 @@ impl FlowsEngine {
             .collect();
         props_needed.extend(anchor_tgt.required_props());
 
-        let chunks = load_project_chunks(
+        let chunks = load_project_chunks_with_id(
             ps,
             snap,
             cache,
@@ -67,6 +67,7 @@ impl FlowsEngine {
             Some(query.time_range),
             &props_needed,
             None,
+            Some(id_snap),
         )
         .await?;
 

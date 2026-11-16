@@ -294,4 +294,25 @@ impl ReplayStore {
         }
         Ok(out)
     }
+
+    /// Deletes all `.plsr` replay chunks belonging to `session_id` under `project_id` (`Gap 4`).
+    pub async fn delete_session(&self, project_id: &str, session_id: &str) -> Result<bool> {
+        let chunks = self.list_session_chunks(project_id, session_id).await?;
+        let had_any = !chunks.is_empty();
+        for c in chunks {
+            let _ = self.object_store.delete(&c.location).await;
+        }
+        self.recorded_sessions
+            .remove(&(project_id.to_string(), session_id.to_string()));
+        let target_hash = xxh3_64(session_id.as_bytes());
+        let still_colliding = self
+            .recorded_sessions
+            .iter()
+            .any(|e| e.0 == project_id && xxh3_64(e.1.as_bytes()) == target_hash);
+        if !still_colliding {
+            self.recorded_hashes
+                .remove(&(project_id.to_string(), target_hash));
+        }
+        Ok(had_any)
+    }
 }

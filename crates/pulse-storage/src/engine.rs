@@ -11,6 +11,7 @@ use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use pulse_identity::IdentityRouter;
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
+use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -709,6 +710,20 @@ impl ProjectStorage {
             }
         }
         Ok(deleted)
+    }
+
+    /// Removes in-memory L0 events belonging to erased UIDs, returning `(purged_rows, session_ids)` (`Gap 4`).
+    pub fn purge_user_l0(&self, uids: &RoaringBitmap) -> (u64, Vec<String>) {
+        let mut total_purged = 0u64;
+        let mut sessions = Vec::new();
+        for bucket in &self.mem_buckets {
+            let (purged, mut sids) = bucket.purge_uids(uids);
+            total_purged += purged;
+            sessions.append(&mut sids);
+        }
+        sessions.sort_unstable();
+        sessions.dedup();
+        (total_purged, sessions)
     }
 }
 

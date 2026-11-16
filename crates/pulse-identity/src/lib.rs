@@ -725,6 +725,21 @@ impl ProjectIdentityGraph {
         out
     }
 
+    /// Returns a `RoaringBitmap` of every raw `u32` UID (including all merged `anon_id` aliases)
+    /// whose canonical root matches `canonical_uid`, plus `canonical_uid` itself (`Gap 4`).
+    pub fn all_raw_uids_for_canonical_root(&self, canonical_uid: u32) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        out.insert(canonical_uid);
+        let st = self.state.read();
+        for raw_uid in 0..st.u32_to_external.len() {
+            let raw = raw_uid as u32;
+            if st.find_root_ref(raw) == canonical_uid {
+                out.insert(raw);
+            }
+        }
+        out
+    }
+
     /// Returns an immutable `IdentitySnapshot` in < 5ms for lock-free vectorized query scans.
     pub fn snapshot(&self) -> IdentitySnapshot {
         if !self.snapshot_dirty.load(Ordering::Acquire) {

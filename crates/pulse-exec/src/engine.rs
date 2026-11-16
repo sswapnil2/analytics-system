@@ -9,6 +9,8 @@ use chrono::NaiveDate;
 use pulse_storage::{
     SessionHeader, StorageEngine, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
+use pulse_wire::{mask_user_identifier, PropValue};
+use serde::Serialize;
 
 use crate::ast::{
     BehavioralCohortDef, FlowsQuery, FlowsResult, FunnelQuery, FunnelResult, InsightsQuery,
@@ -22,6 +24,16 @@ use crate::funnel::FunnelEngine;
 use crate::insights::InsightsEngine;
 use crate::retention::RetentionEngine;
 use crate::scanner::{evaluate_cohort, resolve_event_target, ts_to_date_floor, ExecError, Result};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportedEventRow {
+    pub event_ts_ms: i64,
+    pub event_name: String,
+    pub distinct_id: String,
+    pub canonical_uid: u32,
+    pub session_id: String,
+    pub props: std::collections::BTreeMap<String, PropValue>,
+}
 
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 30_000;
 
@@ -335,6 +347,151 @@ impl QueryEngine {
         .await
     }
 
+    /// Evaluates a saved cohort (`cohort_id`) and returns `(canonical_uid, masked_distinct_id)` pairs (`Gap 15`).
+    pub async fn evaluate_saved_cohort_uids(
+        &self,
+        project_id: &str,
+        cohort_id: &str,
+    ) -> Result<Vec<(u32, String)>> {
+        self.with_deadline(async {
+            let cat = self.catalogs.for_project(project_id);
+            let Some(def_ref) = cat.saved_cohorts.get(cohort_id) else {
+                return Ok(Vec::new());
+            };
+            let def = def_ref.clone();
+            drop(def_ref);
+
+            let ps = self.storage.get_or_open_project(project_id).await?;
+            let snap = ps.snapshot();
+            let id_graph = self
+                .storage
+                .identity_router()
+                .get_or_open(project_id)
+                .await?;
+            let id_snap = id_graph.snapshot();
+
+            let bm = evaluate_cohort(&def, None, &ps, &snap, &id_snap, &self.cache, &cat).await?;
+            let deleted = cat.deleted_uids_snapshot();
+            let mut out = Vec::new();
+            for uid in bm.iter() {
+                if deleted.contains(uid) {
+                    continue;
+                }
+                let ext = id_graph
+                    .external_id(uid)
+                    .map(|raw| mask_user_identifier(&raw))
+                    .unwrap_or_else(|| format!("uid_{uid}"));
+                out.push((uid, ext));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Exports raw event rows (honoring DPDP erasure tombstones and PII masking) filtered optionally
+    /// by `time_range` and/or `filter_canonical_uid` (`Gaps 1, 16`).
+    pub async fn export_events(
+        &self,
+        project_id: &str,
+        time_range: Option<TimeRange>,
+        filter_canonical_uid: Option<u32>,
+        limit: usize,
+        mask_ids: bool,
+    ) -> Result<Vec<ExportedEventRow>> {
+        self.with_deadline(async {
+            let ps = self.storage.get_or_open_project(project_id).await?;
+            let snap = ps.snapshot();
+            let id_graph = self
+                .storage
+                .identity_router()
+                .get_or_open(project_id)
+                .await?;
+            let id_snap = id_graph.snapshot();
+            let cat = self.catalogs.for_project(project_id);
+            let dict = ps.dictionary();
+            let id_to_name: HashMap<u16, String> = dict.all_events().into_iter().collect();
+
+            let prop_names: Vec<String> = dict
+                .all_prop_keys()
+                .into_iter()
+                .map(|(_, k)| k)
+                .take(64)
+                .collect();
+
+            let chunks = crate::scanner::load_project_chunks_with_id(
+                &ps,
+                &snap,
+                &self.cache,
+                &cat,
+                time_range,
+                &prop_names,
+                None,
+                Some(&id_snap),
+            )
+            .await?;
+
+            let cap = limit.clamp(1, 50_000);
+            let mut rows = Vec::new();
+            for chunk in &chunks {
+                let ta = &chunk.tier_a;
+                for r in 0..chunk.len() {
+                    let ts = ta.event_ts_ms[r];
+                    if let Some(tr) = time_range {
+                        if !tr.contains(ts) {
+                            continue;
+                        }
+                    }
+                    let canon = id_snap.resolve(ta.uid_internal[r]);
+                    if let Some(target_uid) = filter_canonical_uid {
+                        if canon != target_uid {
+                            continue;
+                        }
+                    }
+                    let raw_did = id_graph
+                        .external_id(canon)
+                        .unwrap_or_else(|| format!("uid_{canon}"));
+                    let distinct_id = if mask_ids {
+                        mask_user_identifier(&raw_did)
+                    } else {
+                        raw_did
+                    };
+                    let event_name = id_to_name
+                        .get(&ta.event_id[r])
+                        .cloned()
+                        .unwrap_or_else(|| format!("event_{}", ta.event_id[r]));
+                    let session_id = chunk.session_id_for_row(r);
+
+                    let mut props = std::collections::BTreeMap::new();
+                    for (pk, col) in &chunk.prop_cols {
+                        if let Some(pv) = col.get(r) {
+                            if !matches!(pv, PropValue::Null) {
+                                props.insert(pk.clone(), pv.clone());
+                            }
+                        }
+                    }
+                    rows.push(ExportedEventRow {
+                        event_ts_ms: ts,
+                        event_name,
+                        distinct_id,
+                        canonical_uid: canon,
+                        session_id,
+                        props,
+                    });
+                    if rows.len() >= cap && filter_canonical_uid.is_none() {
+                        break;
+                    }
+                }
+                if rows.len() >= cap && filter_canonical_uid.is_none() {
+                    break;
+                }
+            }
+            rows.sort_by(|a, b| b.event_ts_ms.cmp(&a.event_ts_ms));
+            rows.truncate(cap);
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Searches sessions leveraging `SessionIndex` 64-bit event Bloom bitmasks, frustration flags,
     /// and `limit` pushdown (`P3-02`) BEFORE reading any Tier A/B arrays on pruned segments!
     pub async fn search_sessions(
@@ -398,6 +555,7 @@ impl QueryEngine {
             let mut total_sessions_inspected = 0usize;
             let mut sessions_pruned_by_bloom = 0usize;
             let mut top_heap: BinaryHeap<Reverse<RankedSession>> = BinaryHeap::with_capacity(limit);
+            let deleted_uids = cat.deleted_uids_snapshot();
 
             // 1. Scan hot L0 `MemBucket` sessions first to establish an immediate recency floor for `limit` pushdown (`P3-02`)
             type L0SessionAcc = (u16, Vec<(i64, u16, u32)>);
@@ -406,6 +564,12 @@ impl QueryEngine {
                 let rows = ps.snapshot_l0_bucket(&snap, b as u8);
                 for r in rows.iter() {
                     let canon_uid = id_snap.resolve(r.uid_internal);
+                    if !deleted_uids.is_empty()
+                        && (deleted_uids.contains(r.uid_internal)
+                            || deleted_uids.contains(canon_uid))
+                    {
+                        continue;
+                    }
                     let entry = l0_grouped
                         .entry((canon_uid, r.session_id.clone()))
                         .or_insert_with(|| (0, Vec::new()));
@@ -512,6 +676,12 @@ impl QueryEngine {
                 };
 
                 let mut matched_ranges = sidx.matching_session_ranges(|hdr: &SessionHeader| {
+                    if !deleted_uids.is_empty()
+                        && (deleted_uids.contains(hdr.raw_uid)
+                            || deleted_uids.contains(id_snap.resolve(hdr.raw_uid)))
+                    {
+                        return false;
+                    }
                     if (hdr.flags & required_flags) != required_flags {
                         return false;
                     }

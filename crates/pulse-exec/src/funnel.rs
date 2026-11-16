@@ -15,7 +15,7 @@ use crate::ast::{
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
+    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
     row_matches_predicates, DataChunk, ExecError, Result,
 };
 
@@ -252,9 +252,17 @@ impl FunnelEngine {
         };
 
         let props_vec: Vec<String> = props_needed.into_iter().collect();
-        let chunks =
-            load_project_chunks(ps, snap, cache, catalog, scan_range, &props_vec, bloom_hint)
-                .await?;
+        let chunks = load_project_chunks_with_id(
+            ps,
+            snap,
+            cache,
+            catalog,
+            scan_range,
+            &props_vec,
+            bloom_hint,
+            Some(id_snap),
+        )
+        .await?;
         let recorded_hashes = rstore.recorded_hashes_for_project(ps.project_id()).await;
 
         // Fast event_id -> (base_step_mask, base_excl_mask) lookup table for pure event-ID checks

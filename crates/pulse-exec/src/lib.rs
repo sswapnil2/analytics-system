@@ -14,7 +14,7 @@ pub use catalog::{
     arrow_array_to_prop_values, evaluate_custom_property, extract_sql_identifiers, CatalogRegistry,
     CustomEventDef, CustomPropertyDef, LookupTableDef, VirtualCatalog,
 };
-pub use engine::QueryEngine;
+pub use engine::{ExportedEventRow, QueryEngine};
 pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;
 pub use insights::{eval_math_expr, InsightsEngine};
@@ -128,6 +128,8 @@ mod tests {
                         user_id: user.clone(),
                         routing_seed: Some(seed.clone()),
                         anon_routing_seed: Some(seed.clone()),
+                        user_properties: None,
+                        operations: None,
                     },
                 )
                 .await
@@ -180,6 +182,8 @@ mod tests {
                         user_id: user.clone(),
                         routing_seed: Some(seed_b.clone()),
                         anon_routing_seed: Some(seed_a.clone()),
+                        user_properties: None,
+                        operations: None,
                     },
                 )
                 .await

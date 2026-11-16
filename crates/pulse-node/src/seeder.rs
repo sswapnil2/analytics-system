@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use chrono::Utc;
 use pulse_control::{
-    CohortRecord, ControlPlaneService, Experiment, ExperimentMetricSpec, FeatureFlag,
-    LexiconProperty, VariantAllocation,
+    AlertRule, CohortRecord, ControlPlaneService, Experiment, ExperimentMetricSpec, FeatureFlag,
+    LexiconProperty, UserProfileRecord, VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -1002,6 +1002,105 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         .compact_all_with_min_segments(2)
         .await?;
     let _ = ctrl.qengine().warm_project_cache(project_id).await;
+
+    // Seed representative User Profiles + default Alert Rule for User Profile queries (`Gaps 1, 5, 14`)
+    let mut profile_indices: Vec<usize> = (0..260usize).collect();
+    profile_indices.extend([300, 304, 306, 308, 6005, 6022, 6039, 6056]);
+    profile_indices.sort_unstable();
+    profile_indices.dedup();
+    let utm_sources = [
+        "google_ads",
+        "meta_ig",
+        "organic",
+        "referral_upi",
+        "paytm_partner",
+    ];
+    let utm_campaigns = [
+        "diwali_zero_fee",
+        "upi_autopay_launch",
+        "instant_credit_q4",
+        "organic",
+    ];
+    for u in profile_indices {
+        let active_did = if u < 6_800 {
+            format!("+919845{:06}", 100_000 + u)
+        } else {
+            format!("anon_in_{u:05}")
+        };
+        let canon_uid = id_graph
+            .lookup_canonical(&active_did)
+            .or_else(|| id_graph.lookup_raw(&active_did))
+            .unwrap_or(0);
+        let city = pick_city(u);
+        let platform = if seed_hash("platform", u) % 100 < 26 {
+            "iOS"
+        } else {
+            "Android"
+        };
+        let plan_slot = seed_hash("plan", u) % 100;
+        let plan = if plan_slot < 24 {
+            "credit_pro"
+        } else if plan_slot < 62 {
+            "upi_plus"
+        } else {
+            "basic"
+        };
+        let kyc_status = if u >= 6_000 {
+            "pending"
+        } else if u >= 200 && (u - 200) % 17 == 0 && (u - 200) / 17 < replay_session_count {
+            "nsdl_timeout"
+        } else {
+            "verified"
+        };
+        let utm_src = utm_sources[(seed_hash("utm_s", u) % utm_sources.len() as u64) as usize];
+        let utm_cmp = if utm_src == "organic" {
+            "organic"
+        } else {
+            utm_campaigns[(seed_hash("utm_c", u) % (utm_campaigns.len() as u64 - 1)) as usize]
+        };
+        let total_rev = if kyc_status == "verified" && (seed_hash("prof_rev", u) % 100) < 44 {
+            ((seed_hash("prof_rev_amt", u) % 18) as f64 + 1.0) * 500.0
+        } else {
+            0.0
+        };
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("city".to_string(), serde_json::json!(city));
+        props.insert("platform".to_string(), serde_json::json!(platform));
+        props.insert("plan".to_string(), serde_json::json!(plan));
+        props.insert("kyc_status".to_string(), serde_json::json!(kyc_status));
+        props.insert("utm_source".to_string(), serde_json::json!(utm_src));
+        props.insert("utm_campaign".to_string(), serde_json::json!(utm_cmp));
+        props.insert("total_revenue".to_string(), serde_json::json!(total_rev));
+
+        ctrl.meta()
+            .upsert_user_profile(&UserProfileRecord {
+                project_id: project_id.to_string(),
+                distinct_id: active_did,
+                canonical_uid: canon_uid,
+                props,
+                total_revenue: total_rev,
+                updated_at_ms: now_ms - (pick_cohort_day(u) * 86_400_000),
+            })
+            .await?;
+    }
+
+    ctrl.meta()
+        .upsert_alert_rule(&AlertRule {
+            id: "alr_nsdl_timeout_spike".to_string(),
+            project_id: project_id.to_string(),
+            name: "NSDL KYC 504 Timeout Spike".to_string(),
+            event_name: "NSDL_Gateway_504_Timeout".to_string(),
+            operator: "gt".to_string(),
+            threshold: 25.0,
+            webhook_url: None,
+            last_triggered_ms: None,
+            created_at_ms: now_ms,
+        })
+        .await?;
+
+    ctrl.refresh_project_virtual_catalog(project_id)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let summary = SeedSummary {
         unique_events,

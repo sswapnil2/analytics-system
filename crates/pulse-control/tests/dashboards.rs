@@ -154,6 +154,7 @@ async fn dashboard_crud_with_report_and_text_cards() {
     assert_eq!(got["created_by"], "admin token");
 
     // Newest updated first.
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let (_, d2) = send(&app, "POST", base, ROOT, Some(json!({"name": "Second"}))).await;
     let (_, list) = send(&app, "GET", base, ROOT, None).await;
     assert_eq!(list[0]["id"], d2["id"]);
