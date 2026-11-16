@@ -239,11 +239,11 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
                     isScreen
                       ? "z-0 bg-panel"
                       : isErr
-                        ? "z-20 flex items-center rounded-md border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
+                        ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
                         : isBtn
-                          ? "z-10 flex items-center justify-center rounded-md text-xs font-semibold text-white"
+                          ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold text-white"
                           : isMasked
-                            ? "z-10 flex items-center rounded-md border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
+                            ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
                             : "z-10 flex items-center px-1 text-[11px] text-ink-2"
                   }
                 >
@@ -347,7 +347,7 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
               >
                 <RotateCcw className="h-4 w-4" />
               </button>
-              <div className="ml-1 flex rounded-md border border-line-strong p-0.5" role="group" aria-label="Playback speed">
+              <div className="ml-1 flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Playback speed">
                 {([1, 2, 4] as const).map((sp) => (
                   <button
                     key={sp}

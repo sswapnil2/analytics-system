@@ -343,7 +343,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
             ) : mcpOutput ? (
               <pre
                 aria-label="Tool result"
-                className={`max-h-96 overflow-auto rounded-md border border-line bg-sunken p-3 font-mono text-xs text-ink-2 ${
+                className={`max-h-96 overflow-auto rounded-lg border border-line bg-sunken p-3 font-mono text-xs text-ink-2 ${
                   mcpLoading ? "opacity-60" : ""
                 }`}
               >

@@ -1,4 +1,4 @@
-@import "@fontsource-variable/hanken-grotesk";
+@import "@fontsource-variable/instrument-sans";
 
 @tailwind base;
 @tailwind components;
@@ -11,89 +11,92 @@
  */
 :root {
   color-scheme: light;
-  --canvas: 247 248 246; /* ledger paper */
+  --canvas: 243 244 240; /* stone */
   --panel: 255 255 255;
-  --sunken: 240 243 240;
+  --sunken: 233 236 228;
   --field: 255 255 255;
-  --hover: 232 237 233;
-  --line: 222 228 224;
-  --line-strong: 196 205 199;
-  --ink: 23 32 28; /* deep green-black */
-  --ink-2: 52 64 58;
-  --muted: 91 104 98;
-  --faint: 132 145 139;
-  --brand: 11 110 79; /* ledger green: actions, conversion */
-  --brand-hover: 9 92 66;
-  --brand-soft: 224 241 233;
+  --hover: 238 240 234;
+  --line: 225 228 220;
+  --line-strong: 201 206 195;
+  --ink: 20 26 23;
+  --ink-2: 58 67 62;
+  --muted: 94 104 98;
+  --faint: 107 116 110;
+  --brand: 11 110 95; /* teal: actions, conversion */
+  --brand-hover: 8 86 74;
+  --brand-soft: 220 237 232;
   --on-brand: 255 255 255;
-  --danger: 180 35 24; /* stamp red: drop-off, errors */
-  --danger-soft: 252 233 230;
-  --warn: 166 112 8; /* turmeric: rage taps, warnings */
-  --warn-soft: 251 241 219;
-  --ok: 11 110 79;
-  --info: 61 79 159; /* indigo ink: secondary series */
-  --info-soft: 232 235 248;
+  --danger: 194 65 12; /* orange: lost users, failures. Nothing else is orange. */
+  --danger-soft: 251 231 218;
+  --warn: 138 84 6;
+  --warn-soft: 246 236 212;
+  --ok: 11 110 95;
+  --ok-soft: 220 237 232;
+  --info: 69 83 201; /* indigo: second series */
+  --info-soft: 230 232 248;
 }
 
 /* Dark values are repeated in the media query below; CSS cannot share them. */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: 14 19 17;
-  --panel: 21 28 25;
-  --sunken: 17 23 20;
-  --field: 25 33 29;
-  --hover: 31 41 36;
-  --line: 38 49 44;
-  --line-strong: 56 70 63;
-  --ink: 230 236 232;
-  --ink-2: 199 209 203;
-  --muted: 147 163 155;
-  --faint: 108 122 115;
-  --brand: 63 191 143;
-  --brand-hover: 92 207 163;
-  --brand-soft: 22 52 41;
-  --on-brand: 8 26 19;
-  --danger: 240 113 96;
-  --danger-soft: 58 26 22;
-  --warn: 233 180 76;
+  --canvas: 15 21 19;
+  --panel: 22 29 26;
+  --sunken: 18 24 22;
+  --field: 26 34 31;
+  --hover: 32 42 38;
+  --line: 40 51 46;
+  --line-strong: 58 72 66;
+  --ink: 232 237 234;
+  --ink-2: 200 209 204;
+  --muted: 150 163 157;
+  --faint: 124 137 131;
+  --brand: 52 184 160;
+  --brand-hover: 84 200 178;
+  --brand-soft: 20 50 44;
+  --on-brand: 6 26 22;
+  --danger: 240 128 74;
+  --danger-soft: 60 30 18;
+  --warn: 230 178 80;
   --warn-soft: 52 40 16;
-  --ok: 63 191 143;
-  --info: 147 162 235;
-  --info-soft: 30 35 64;
+  --ok: 52 184 160;
+  --ok-soft: 20 50 44;
+  --info: 150 160 240;
+  --info-soft: 32 36 70;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --canvas: 14 19 17;
-    --panel: 21 28 25;
-    --sunken: 17 23 20;
-    --field: 25 33 29;
-    --hover: 31 41 36;
-    --line: 38 49 44;
-    --line-strong: 56 70 63;
-    --ink: 230 236 232;
-    --ink-2: 199 209 203;
-    --muted: 147 163 155;
-    --faint: 108 122 115;
-    --brand: 63 191 143;
-    --brand-hover: 92 207 163;
-    --brand-soft: 22 52 41;
-    --on-brand: 8 26 19;
-    --danger: 240 113 96;
-    --danger-soft: 58 26 22;
-    --warn: 233 180 76;
+    --canvas: 15 21 19;
+    --panel: 22 29 26;
+    --sunken: 18 24 22;
+    --field: 26 34 31;
+    --hover: 32 42 38;
+    --line: 40 51 46;
+    --line-strong: 58 72 66;
+    --ink: 232 237 234;
+    --ink-2: 200 209 204;
+    --muted: 150 163 157;
+    --faint: 124 137 131;
+    --brand: 52 184 160;
+    --brand-hover: 84 200 178;
+    --brand-soft: 20 50 44;
+    --on-brand: 6 26 22;
+    --danger: 240 128 74;
+    --danger-soft: 60 30 18;
+    --warn: 230 178 80;
     --warn-soft: 52 40 16;
-    --ok: 63 191 143;
-    --info: 147 162 235;
-    --info-soft: 30 35 64;
+    --ok: 52 184 160;
+    --ok-soft: 20 50 44;
+    --info: 150 160 240;
+    --info-soft: 32 36 70;
   }
 }
 
 body {
   background-color: rgb(var(--canvas));
   color: rgb(var(--ink));
-  font-family: "Hanken Grotesk Variable", system-ui, -apple-system, sans-serif;
+  font-family: "Instrument Sans Variable", system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -132,4 +135,12 @@ table {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Drop-off hatch: lost users read as a gap, not a bar. */
+.hatch-drop {
+  background: repeating-linear-gradient(135deg, rgb(var(--danger) / 0.3) 0 4px, rgb(var(--danger) / 0.12) 4px 8px);
+}
+.hatch-drop-strong {
+  background: repeating-linear-gradient(135deg, rgb(var(--danger)) 0 4px, rgb(var(--danger) / 0.75) 4px 8px);
 }

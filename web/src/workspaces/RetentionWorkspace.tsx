@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck } from "lucide-react";
-import { api, default14DayRange, RetentionResult } from "../api/client";
+import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -37,25 +39,27 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  const buildQuery = useCallback(
+    () => ({ start_event: startEvent, return_event: returnEvent, mode, unit: "day", num_periods: numPeriods }),
+    [startEvent, returnEvent, mode, numPeriods],
+  );
+
+  const [days, setDays] = useState(14);
+  const reqId = useRef(0);
+
   const runRetention = useCallback(async () => {
+    const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryRetention(projectId, {
-        time_range: default14DayRange(),
-        start_event: startEvent,
-        return_event: returnEvent,
-        mode,
-        unit: "day",
-        num_periods: numPeriods,
-      });
-      setResult(res);
+      const res = await api.queryRetention(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      if (id === reqId.current) setResult(res);
     } catch (err) {
-      setError(errorMessage(err));
+      if (id === reqId.current) setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, startEvent, returnEvent, mode, numPeriods]);
+  }, [projectId, buildQuery, days]);
 
   useEffect(() => {
     void runRetention();
@@ -79,9 +83,18 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
         title="Retention"
         description="How many users come back after their first action."
         actions={
-          <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.primary}>
-            {loading ? "Running…" : "Run"}
-          </button>
+          <>
+            <RangePresets days={days} onChange={setDays} />
+            <SaveToDashboard
+              projectId={projectId}
+              kind="retention"
+              defaultName={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`}
+              query={buildQuery}
+            />
+            <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.primary}>
+              {loading ? "Running…" : "Run retention"}
+            </button>
+          </>
         }
       />
 
@@ -112,7 +125,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
               Count users who
             </span>
             <div
-              className="flex flex-wrap rounded-md border border-line-strong p-0.5"
+              className="flex flex-wrap rounded-lg border border-line-strong p-0.5"
               role="group"
               aria-labelledby="retention-mode"
             >

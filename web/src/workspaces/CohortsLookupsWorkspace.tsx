@@ -241,7 +241,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               </div>
             </div>
 
-            <div className="flex min-h-[44px] items-center rounded-md border border-line bg-sunken px-3.5 py-2.5">
+            <div className="flex min-h-[44px] items-center rounded-lg border border-line bg-sunken px-3.5 py-2.5">
               {previewError ? (
                 <div className="w-full">
                   <ErrorNotice message={previewError} onRetry={() => void runPreview()} />
@@ -279,7 +279,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
             ) : (
               <ul className="space-y-2">
                 {cohorts.map((c) => (
-                  <li key={c.id} className="rounded-md border border-line bg-sunken px-3 py-2">
+                  <li key={c.id} className="rounded-lg border border-line bg-sunken px-3 py-2">
                     <div className="text-sm font-medium text-ink">{c.name}</div>
                     <div className="text-xs text-muted">{c.description}</div>
                   </li>
@@ -341,7 +341,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               {extensions && extensions.lookup_tables.length > 0 && (
                 <ul className="space-y-1.5 pt-2">
                   {extensions.lookup_tables.map((lt) => (
-                    <li key={lt.id} className="rounded-md border border-line bg-sunken px-3 py-2 text-sm">
+                    <li key={lt.id} className="rounded-lg border border-line bg-sunken px-3 py-2 text-sm">
                       <div className="font-mono text-ink">{lt.name}</div>
                       <div className="text-xs text-muted">
                         Matched on <code className="font-mono text-ink-2">{lt.join_prop}</code>. Adds{" "}
@@ -391,7 +391,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               {extensions && extensions.custom_properties.length > 0 && (
                 <ul className="space-y-1 pt-1">
                   {extensions.custom_properties.map((cp) => (
-                    <li key={cp.name} className="rounded-md border border-line bg-sunken px-3 py-1.5 text-xs">
+                    <li key={cp.name} className="rounded-lg border border-line bg-sunken px-3 py-1.5 text-xs">
                       <span className="font-mono text-ink">{cp.name}</span>
                       <span className="text-muted"> = </span>
                       <span className="font-mono text-ink-2">{cp.sql_expr}</span>

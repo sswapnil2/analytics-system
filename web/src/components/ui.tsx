@@ -8,12 +8,12 @@ export const PageHeader: React.FC<{
   description: string;
   actions?: React.ReactNode;
 }> = ({ title, description, actions }) => (
-  <header className="flex flex-wrap items-end justify-between gap-3 pb-5">
+  <header className="flex flex-wrap items-end justify-between gap-3 pb-1">
     <div className="min-w-0 max-w-2xl">
-      <h1 className="text-[1.375rem] font-semibold leading-tight tracking-[-0.01em] text-ink">
+      <h1 className="text-[1.875rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
         {title}
       </h1>
-      <p className="mt-1 text-sm text-muted">{description}</p>
+      <p className="mt-1 text-[0.9375rem] text-muted">{description}</p>
     </div>
     {actions && <div className="flex items-center gap-2">{actions}</div>}
   </header>
@@ -26,17 +26,17 @@ export const Panel: React.FC<{
   className?: string;
   children: React.ReactNode;
 }> = ({ title, meta, actions, className = "", children }) => (
-  <section className={`rounded-[10px] border border-line bg-panel ${className}`}>
+  <section className={`rounded-xl border border-line bg-panel ${className}`}>
     {(title || actions || meta) && (
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-5 py-3.5">
         <div className="flex items-baseline gap-3 min-w-0">
-          {title && <h2 className="text-sm font-semibold text-ink">{title}</h2>}
+          {title && <h2 className="text-[0.9375rem] font-semibold text-ink">{title}</h2>}
           {meta && <span className="text-xs text-faint tabular">{meta}</span>}
         </div>
         {actions && <div className="flex items-center gap-2">{actions}</div>}
       </div>
     )}
-    <div className="p-4">{children}</div>
+    <div className="p-5">{children}</div>
   </section>
 );
 
@@ -88,14 +88,14 @@ export const Spinner: React.FC<{ label?: string }> = ({ label = "Loading" }) => 
 /** Shared control styles so every workspace reads as one product. */
 export const btn = {
   primary:
-    "inline-flex items-center justify-center gap-1.5 rounded-md bg-brand px-3 py-1.5 text-sm font-medium text-on-brand hover:bg-brand-hover disabled:opacity-50 disabled:cursor-not-allowed",
+    "inline-flex items-center justify-center gap-1.5 rounded-lg bg-brand px-3.5 py-2 text-sm font-semibold text-on-brand hover:bg-brand-hover disabled:opacity-50 disabled:cursor-not-allowed",
   secondary:
-    "inline-flex items-center justify-center gap-1.5 rounded-md border border-line-strong bg-panel px-3 py-1.5 text-sm font-medium text-ink hover:bg-hover disabled:opacity-50 disabled:cursor-not-allowed",
+    "inline-flex items-center justify-center gap-1.5 rounded-lg border border-line-strong bg-panel px-3.5 py-2 text-sm font-medium text-ink hover:bg-hover disabled:opacity-50 disabled:cursor-not-allowed",
   ghost:
-    "inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm text-muted hover:bg-hover hover:text-ink",
+    "inline-flex items-center justify-center gap-1.5 rounded-lg px-2 py-1 text-sm text-muted hover:bg-hover hover:text-ink",
 };
 
 export const field =
-  "rounded-md border border-line-strong bg-field px-2.5 py-1.5 text-sm text-ink placeholder:text-faint focus:border-brand focus:outline-none";
+  "rounded-lg border border-line-strong bg-field px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-brand focus:outline-none";
 
-export const fieldLabel = "text-xs font-medium text-muted";
+export const fieldLabel = "text-[0.8125rem] font-semibold text-ink-2";

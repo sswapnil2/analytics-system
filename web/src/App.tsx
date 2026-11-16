@@ -1,27 +1,30 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
-  Bot,
   FlaskConical,
   GitBranch,
-  Grid3X3,
+  CalendarCheck,
   LineChart,
-  ListFilter,
+  Filter,
+  LayoutDashboard,
   LogOut,
   Monitor,
   Moon,
-  Smartphone,
+  PlayCircle,
+  ShieldCheck,
   Sun,
   Users,
 } from "lucide-react";
 import {
   api,
   ApiAuthError,
+  AuthUser,
   getStoredAdminToken,
   NodeStatus,
   setStoredAdminToken,
 } from "./api/client";
-import { btn, field } from "./components/ui";
-import { errorMessage, formatCount } from "./lib/format";
+import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
+import { btn } from "./components/ui";
+import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
 import { FlowsWorkspace } from "./workspaces/FlowsWorkspace";
@@ -30,8 +33,10 @@ import { InsightsWorkspace } from "./workspaces/InsightsWorkspace";
 import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
 import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
+import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
 
 type WorkspaceId =
+  | "dashboards"
   | "trends"
   | "funnels"
   | "journeys"
@@ -49,29 +54,29 @@ interface NavItem {
 
 const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
+    label: "",
+    items: [{ id: "dashboards", label: "Dashboards", icon: LayoutDashboard }],
+  },
+  {
     label: "Analyze",
     items: [
-      { id: "funnels", label: "Funnels", icon: ListFilter },
+      { id: "funnels", label: "Funnels", icon: Filter },
       { id: "trends", label: "Trends", icon: LineChart },
       { id: "journeys", label: "Journeys", icon: GitBranch },
-      { id: "retention", label: "Retention", icon: Grid3X3 },
+      { id: "retention", label: "Retention", icon: CalendarCheck },
     ],
   },
   {
     label: "Investigate",
-    items: [{ id: "replays", label: "Session replays", icon: Smartphone }],
+    items: [{ id: "replays", label: "Session replays", icon: PlayCircle }],
   },
   {
-    label: "Audience",
-    items: [{ id: "cohorts", label: "Cohorts", icon: Users }],
-  },
-  {
-    label: "Ship",
-    items: [{ id: "experiments", label: "Experiments", icon: FlaskConical }],
-  },
-  {
-    label: "Data",
-    items: [{ id: "events", label: "Events & privacy", icon: Bot }],
+    label: "Audience and shipping",
+    items: [
+      { id: "cohorts", label: "Cohorts", icon: Users },
+      { id: "experiments", label: "Experiments", icon: FlaskConical },
+      { id: "events", label: "Events and privacy", icon: ShieldCheck },
+    ],
   },
 ];
 
@@ -79,7 +84,7 @@ const ALL_IDS = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id));
 const DEFAULT_TAB: WorkspaceId = "funnels";
 
 function tabFromHash(): WorkspaceId {
-  const h = window.location.hash.replace(/^#\/?/, "") as WorkspaceId;
+  const h = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
   return ALL_IDS.includes(h) ? h : DEFAULT_TAB;
 }
 
@@ -106,104 +111,6 @@ function applyTheme(t: ThemePref) {
   }
 }
 
-const Logo: React.FC = () => (
-  <svg viewBox="0 0 24 24" className="h-6 w-6" aria-hidden="true">
-    <rect width="24" height="24" rx="6" className="fill-brand" />
-    <path
-      d="M4 13h4l2-5 3 9 2-6 1.5 2H20"
-      fill="none"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="stroke-on-brand"
-    />
-  </svg>
-);
-
-// ---------------------------------------------------------------------------
-// Sign-in
-// ---------------------------------------------------------------------------
-
-const SignIn: React.FC<{ onSignedIn: () => void; reason?: string }> = ({ onSignedIn, reason }) => {
-  const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(reason ?? null);
-  const [checking, setChecking] = useState(false);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const value = token.trim();
-    if (!value) {
-      setError("Paste your admin token to continue.");
-      return;
-    }
-    setChecking(true);
-    setError(null);
-    setStoredAdminToken(value);
-    try {
-      await api.getStatus();
-      onSignedIn();
-    } catch (err) {
-      setStoredAdminToken("");
-      setError(
-        err instanceof ApiAuthError
-          ? "That token wasn't accepted. Check that you copied the whole sk_ token."
-          : `Couldn't reach the Pulse server: ${errorMessage(err)}`,
-      );
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-canvas p-4">
-      <form
-        onSubmit={(e) => void submit(e)}
-        className="w-full max-w-sm space-y-5 rounded-xl border border-line bg-panel p-6"
-        noValidate
-      >
-        <div className="flex items-center gap-2.5">
-          <Logo />
-          <span className="text-base font-semibold text-ink">Pulse</span>
-        </div>
-        <div className="space-y-1.5">
-          <h1 className="text-lg font-semibold text-ink">Sign in to your workspace</h1>
-          <p className="text-sm text-muted">
-            Use the admin token printed in the server log the first time Pulse started. It starts
-            with <code className="font-mono text-ink-2">sk_</code>.
-          </p>
-        </div>
-        <div className="space-y-1.5">
-          <label htmlFor="token" className="text-sm font-medium text-ink">
-            Admin token
-          </label>
-          <input
-            id="token"
-            type="password"
-            autoComplete="current-password"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="sk_…"
-            className={`${field} w-full font-mono`}
-            aria-invalid={!!error}
-            aria-describedby={error ? "token-error" : undefined}
-            autoFocus
-          />
-          {error && (
-            <p id="token-error" role="alert" className="text-sm text-danger">
-              {error}
-            </p>
-          )}
-        </div>
-        <button type="submit" disabled={checking} className={`${btn.primary} w-full py-2`}>
-          {checking ? "Signing in…" : "Sign in"}
-        </button>
-        <p className="text-xs text-faint">
-          The token is kept for this browser tab only and cleared when you close it.
-        </p>
-      </form>
-    </div>
-  );
-};
 
 // ---------------------------------------------------------------------------
 // Shell
@@ -211,10 +118,12 @@ const SignIn: React.FC<{ onSignedIn: () => void; reason?: string }> = ({ onSigne
 
 export const App: React.FC = () => {
   const [signedIn, setSignedIn] = useState<boolean>(() => !!getStoredAdminToken());
+  const [authRoute, setAuthRoute] = useState(parseAuthHash);
   const [signInReason, setSignInReason] = useState<string | undefined>();
   const [activeTab, setActiveTab] = useState<WorkspaceId>(tabFromHash);
   const [projectId, setProjectId] = useState<string>("");
   const [status, setStatus] = useState<NodeStatus | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
   const [refreshToken, setRefreshToken] = useState<number>(0);
@@ -225,7 +134,10 @@ export const App: React.FC = () => {
   useEffect(() => applyTheme(theme), [theme]);
 
   useEffect(() => {
-    const onHash = () => setActiveTab(tabFromHash());
+    const onHash = () => {
+      setActiveTab(tabFromHash());
+      setAuthRoute(parseAuthHash());
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -233,9 +145,23 @@ export const App: React.FC = () => {
   const signOut = useCallback((reason?: string) => {
     setStoredAdminToken("");
     setStatus(null);
+    setUser(null);
     setProjectId("");
     setSignInReason(reason);
     setSignedIn(false);
+    window.history.replaceState(null, "", "#/signin");
+    setAuthRoute(parseAuthHash());
+  }, []);
+
+  const handleSignedIn = useCallback(() => {
+    setSignInReason(undefined);
+    setSignedIn(true);
+    setRefreshToken((n) => n + 1);
+    const seg = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
+    if (!ALL_IDS.includes(seg)) {
+      window.history.replaceState(null, "", `#/${DEFAULT_TAB}`);
+      setActiveTab(DEFAULT_TAB);
+    }
   }, []);
 
   const loadStatus = useCallback(async () => {
@@ -284,9 +210,29 @@ export const App: React.FC = () => {
     if (signedIn) void loadCatalog();
   }, [signedIn, loadCatalog]);
 
+  // Who is signed in. Admin tokens aren't a person, so /me answers 404 for them.
+  useEffect(() => {
+    if (!signedIn) return;
+    api
+      .getMe()
+      .then(setUser)
+      .catch((err) => {
+        if (!isNotFound(err)) setUser(null);
+      });
+  }, [signedIn]);
+
   const go = (id: WorkspaceId) => {
     window.location.hash = `/${id}`;
     setActiveTab(id);
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await api.logOut();
+    } catch {
+      // Session may already be gone; clearing locally is what matters.
+    }
+    signOut();
   };
 
   const handleFlush = async () => {
@@ -306,15 +252,18 @@ export const App: React.FC = () => {
     }
   };
 
+  if (authRoute.view === "callback") {
+    return <AuthCallback code={authRoute.params.get("code")} onSignedIn={handleSignedIn} />;
+  }
+
   if (!signedIn) {
-    return (
-      <SignIn
+    return authRoute.view === "signup" ? (
+      <SignUpScreen onSignedIn={handleSignedIn} />
+    ) : (
+      <SignInScreen
+        onSignedIn={handleSignedIn}
         reason={signInReason}
-        onSignedIn={() => {
-          setSignInReason(undefined);
-          setSignedIn(true);
-          setRefreshToken((n) => n + 1);
-        }}
+        googleError={authRoute.params.get("error")}
       />
     );
   }
@@ -324,32 +273,84 @@ export const App: React.FC = () => {
   const projects = status?.projects ?? [];
   const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
+  const displayName = user?.name || user?.email || "Admin token";
+  const initials =
+    (user?.name || user?.email || "A")
+      .split(/[\s@.]+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase())
+      .join("") || "A";
+
+  const accountControls = (
+    <div className="flex items-center gap-0.5">
+      <button
+        type="button"
+        onClick={() => setTheme(nextTheme[theme])}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label={`Theme: ${theme}. Switch to ${nextTheme[theme]}`}
+        title={`Theme: ${theme}`}
+      >
+        <ThemeIcon className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        onClick={() => void handleSignOut()}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label="Sign out"
+        title="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
+    </div>
+  );
 
   return (
     <div className="flex min-h-screen flex-col bg-canvas text-ink md:flex-row">
       <a
         href="#main"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-md focus:bg-panel focus:px-3 focus:py-2"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-panel focus:px-3 focus:py-2"
       >
         Skip to content
       </a>
 
       {/* Sidebar: full height on desktop, a scrolling tab strip on small screens. */}
-      <aside className="shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:w-56 md:flex-col md:border-b-0 md:border-r">
-        <div className="flex items-center gap-2.5 px-4 py-3 md:py-4">
-          <Logo />
-          <span className="text-base font-semibold tracking-[-0.01em]">Pulse</span>
+      <aside className="shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:w-60 md:flex-col md:gap-5 md:border-b-0 md:border-r md:px-3.5 md:py-5">
+        <div className="flex items-center justify-between gap-2.5 px-4 py-3 md:px-1.5 md:py-0">
+          <span className="flex items-center gap-2.5">
+            <Logo size="sm" />
+            <span className="text-[1.0625rem] font-bold tracking-[-0.01em]">Pulse</span>
+          </span>
+          <span className="md:hidden">{accountControls}</span>
         </div>
+
+        <label className="mx-4 mb-3 flex flex-col gap-0.5 rounded-lg border border-line bg-canvas px-2.5 py-1.5 md:mx-0 md:mb-0">
+          <span className="text-xs text-muted">Project</span>
+          <select
+            value={activePid}
+            onChange={(e) => {
+              setProjectId(e.target.value);
+              setRefreshToken((n) => n + 1);
+            }}
+            className="w-full truncate bg-transparent text-sm font-semibold text-ink focus:outline-none"
+            disabled={projects.length === 0}
+          >
+            {projects.length === 0 && <option value={activePid}>{activePid || "Loading…"}</option>}
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
 
         <nav
           aria-label="Workspaces"
-          className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-4 md:overflow-y-auto md:pb-0"
+          className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-[18px] md:overflow-y-auto md:px-0 md:pb-0"
         >
           {NAV_GROUPS.map((group) => (
             <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">
-              <div className="hidden px-2 pb-1 text-xs font-medium text-faint md:block">
-                {group.label}
-              </div>
+              {group.label && <div className="hidden px-2.5 pb-1 text-xs text-muted md:block">{group.label}</div>}
               {group.items.map((item) => {
                 const Icon = item.icon;
                 const active = activeTab === item.id;
@@ -362,13 +363,13 @@ export const App: React.FC = () => {
                       go(item.id);
                     }}
                     aria-current={active ? "page" : undefined}
-                    className={`flex shrink-0 items-center gap-2.5 whitespace-nowrap rounded-md px-2 py-1.5 text-sm ${
+                    className={`flex h-9 shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 text-sm ${
                       active
-                        ? "bg-brand-soft font-medium text-brand"
+                        ? "bg-brand-soft font-semibold text-brand"
                         : "text-ink-2 hover:bg-hover hover:text-ink"
                     }`}
                   >
-                    <Icon className="h-4 w-4 shrink-0" />
+                    <Icon className="h-[17px] w-[17px] shrink-0" />
                     {item.label}
                   </a>
                 );
@@ -377,9 +378,9 @@ export const App: React.FC = () => {
           ))}
         </nav>
 
-        <div className="hidden space-y-2 border-t border-line px-4 py-3 text-xs text-muted md:block">
+        <div className="hidden space-y-1.5 px-1.5 text-xs text-muted md:block">
           <div className="tabular">
-            <span className="text-ink">{formatCount(totalEvents)}</span> events stored
+            <span className="text-ink-2">{formatCount(totalEvents)}</span> events stored
           </div>
           <div className="tabular">
             {(status?.live_eps ?? 0) > 0 ? (
@@ -402,63 +403,39 @@ export const App: React.FC = () => {
               {flushing ? "Saving…" : `Save ${formatCount(status?.l0_rows)} buffered events now`}
             </button>
           )}
+          {notice && (
+            <p role="status" className="text-ink-2">
+              {notice}
+            </p>
+          )}
+        </div>
+
+        <div className="hidden items-center gap-2.5 border-t border-line px-1.5 pt-3 md:flex">
+          <span
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-[0.8125rem] font-semibold text-ink-2"
+            aria-hidden="true"
+          >
+            {initials}
+          </span>
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="truncate text-sm font-semibold">{displayName}</span>
+            {user?.name && <span className="truncate text-xs text-muted">{user.email}</span>}
+          </span>
+          {accountControls}
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-line bg-canvas/90 px-4 backdrop-blur md:px-6">
-          <label className="flex min-w-0 items-center gap-2 text-sm">
-            <span className="hidden text-muted sm:inline">Project</span>
-            <select
-              value={activePid}
-              onChange={(e) => {
-                setProjectId(e.target.value);
-                setRefreshToken((n) => n + 1);
-              }}
-              className={`${field} max-w-[16rem] truncate font-medium`}
-              disabled={projects.length === 0}
-            >
-              {projects.length === 0 && (
-                <option value={activePid}>{activePid || "Loading…"}</option>
-              )}
-              {projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="flex items-center gap-1">
-            {notice && (
-              <span role="status" className="mr-2 hidden text-sm text-muted lg:inline">
-                {notice}
-              </span>
-            )}
-            <button
-              type="button"
-              onClick={() => setTheme(nextTheme[theme])}
-              className={btn.ghost}
-              aria-label={`Theme: ${theme}. Switch to ${nextTheme[theme]}`}
-              title={`Theme: ${theme}`}
-            >
-              <ThemeIcon className="h-4 w-4" />
-            </button>
-            <button type="button" onClick={() => signOut()} className={btn.ghost}>
-              <LogOut className="h-4 w-4" />
-              <span className="hidden sm:inline">Sign out</span>
-            </button>
-          </div>
-        </header>
-
-        <main id="main" className="min-w-0 flex-1 px-4 py-6 md:px-6 lg:px-8">
-          <div className="mx-auto max-w-[1400px]">
+      <main id="main" className="min-w-0 flex-1 px-4 py-7 md:px-8">
+        <div className="mx-auto max-w-[1200px]">
             {!activePid ? (
               <p className="text-sm text-muted" role="status">
                 Loading your workspace…
               </p>
             ) : (
               <>
+                {activeTab === "dashboards" && (
+                  <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                )}
                 {activeTab === "trends" && (
                   <InsightsWorkspace
                     projectId={activePid}
@@ -519,9 +496,8 @@ export const App: React.FC = () => {
                 )}
               </>
             )}
-          </div>
-        </main>
-      </div>
+        </div>
+      </main>
     </div>
   );
 };

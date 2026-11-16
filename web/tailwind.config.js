@@ -26,11 +26,12 @@ export default {
         warn: token("warn"),
         "warn-soft": token("warn-soft"),
         ok: token("ok"),
+        "ok-soft": token("ok-soft"),
         info: token("info"),
         "info-soft": token("info-soft"),
       },
       fontFamily: {
-        sans: ['"Hanken Grotesk Variable"', "system-ui", "-apple-system", "sans-serif"],
+        sans: ['"Instrument Sans Variable"', "system-ui", "-apple-system", "sans-serif"],
         mono: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
       },
     },

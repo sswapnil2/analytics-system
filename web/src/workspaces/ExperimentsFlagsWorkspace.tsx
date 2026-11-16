@@ -159,7 +159,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
             {rolloutBreaksTest && selectedFlag && (
               <div
                 role="alert"
-                className="flex items-start gap-3 rounded-md border border-warn/40 bg-warn-soft px-3.5 py-3 text-sm text-ink"
+                className="flex items-start gap-3 rounded-lg border border-warn/40 bg-warn-soft px-3.5 py-3 text-sm text-ink"
               >
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warn" />
                 <p>
@@ -277,7 +277,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
                         {g.variants.map((gv) => (
                           <div
                             key={gv.variant_key}
-                            className="rounded-md border border-line bg-sunken px-3 py-2 text-sm"
+                            className="rounded-lg border border-line bg-sunken px-3 py-2 text-sm"
                           >
                             <span className="text-ink-2">{gv.variant_key}: </span>
                             <span className="tabular text-ink">
@@ -318,7 +318,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
                 return (
                   <li
                     key={f.id}
-                    className="flex flex-wrap items-center justify-between gap-4 rounded-md border border-line bg-sunken p-4"
+                    className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-line bg-sunken p-4"
                   >
                     <div className="min-w-0 space-y-1">
                       <div className="flex items-center gap-2">

@@ -224,7 +224,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
               Show
             </span>
             <div
-              className="flex rounded-md border border-line-strong p-0.5"
+              className="flex rounded-lg border border-line-strong p-0.5"
               role="group"
               aria-labelledby="journey-direction"
             >

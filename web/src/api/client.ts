@@ -336,6 +336,43 @@ export function setStoredAdminToken(token: string): void {
   }
 }
 
+export type ReportKind = "funnel" | "insights" | "retention" | "flows";
+
+export interface SavedReport {
+  id: string;
+  project_id: string;
+  name: string;
+  report_kind: ReportKind;
+  query_json: Record<string, unknown>;
+  created_at_ms: number;
+  updated_at_ms?: number | null;
+}
+
+export interface DashboardCard {
+  id?: string;
+  kind: "report" | "text";
+  report_id?: string;
+  text?: string;
+  width: 1 | 2;
+}
+
+export interface Dashboard {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string | null;
+  cards: DashboardCard[];
+  created_by: string | null;
+  created_at_ms: number;
+  updated_at_ms: number | null;
+}
+
+export interface DashboardInput {
+  name: string;
+  description?: string | null;
+  cards: DashboardCard[];
+}
+
 export interface AuthUser {
   id: string;
   email: string;
@@ -383,7 +420,8 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(text || `HTTP ${res.status}`);
   }
-  return (await res.json()) as T;
+  const body = await res.text();
+  return (body ? JSON.parse(body) : null) as T;
 }
 
 export function default14DayRange(): TimeRange {
@@ -404,6 +442,40 @@ export const api = {
     fetchJson<AuthSession>("/v1/auth/exchange", { method: "POST", body: JSON.stringify({ code }) }),
   getMe: () => fetchJson<AuthUser>("/v1/auth/me"),
   logOut: () => fetchJson<unknown>("/v1/auth/logout", { method: "POST" }),
+  listReports: (projectId: string) =>
+    fetchJson<SavedReport[]>(`/v1/projects/${encodeURIComponent(projectId)}/saved-reports`),
+  createReport: (projectId: string, body: { name: string; report_kind: ReportKind; query_json: unknown }) =>
+    fetchJson<SavedReport>(`/v1/projects/${encodeURIComponent(projectId)}/saved-reports`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteReport: (projectId: string, reportId: string) =>
+    fetchJson<unknown>(
+      `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
+      { method: "DELETE" },
+    ),
+  listDashboards: (projectId: string) =>
+    fetchJson<Dashboard[]>(`/v1/projects/${encodeURIComponent(projectId)}/dashboards`),
+  getDashboard: (projectId: string, id: string) =>
+    fetchJson<Dashboard>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+    ),
+  createDashboard: (projectId: string, body: DashboardInput) =>
+    fetchJson<Dashboard>(`/v1/projects/${encodeURIComponent(projectId)}/dashboards`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateDashboard: (projectId: string, id: string, body: DashboardInput) =>
+    fetchJson<Dashboard>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  deleteDashboard: (projectId: string, id: string) =>
+    fetchJson<unknown>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+
 
   getStatus: (projectId?: string) =>
     fetchJson<NodeStatus>(

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -24,26 +25,36 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod auth;
+pub use auth::AuthConfig;
+
 use crate::db::{MetaError, MetaStore};
 use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     generate_random_api_key, generate_root_admin_token, mask_key_prefix, sha256_bytes, sha256_hex,
-    ApiKeyRecord, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconEvent, LexiconProperty, Organization, Project,
-    SavedReport, VariantAllocation, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS,
+    ApiKeyRecord, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard,
+    DashboardCard, Experiment, ExperimentMetricSpec, FeatureFlag, LexiconEvent, LexiconProperty,
+    Organization, Project, SavedReport, VariantAllocation, KEY_ROLE_ADMIN,
+    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
 pub enum AuthPrincipal {
     RootAdmin,
-    ProjectAdmin { project_id: String },
+    ProjectAdmin {
+        project_id: String,
+    },
+    /// Dashboard user signed in with a `ps_` session token; single-org deployment, so authorized like `RootAdmin`.
+    User {
+        user_id: String,
+    },
 }
 
 impl AuthPrincipal {
     fn authorize_project(&self, target_project_id: &str) -> Result<(), CtrlError> {
         match self {
-            AuthPrincipal::RootAdmin => Ok(()),
+            AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(()),
             AuthPrincipal::ProjectAdmin { project_id } => {
                 if project_id == target_project_id {
                     Ok(())
@@ -62,7 +73,7 @@ impl AuthPrincipal {
         default_pid: &str,
     ) -> Result<String, CtrlError> {
         match self {
-            AuthPrincipal::RootAdmin => Ok(requested
+            AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(requested
                 .filter(|s| !s.is_empty())
                 .unwrap_or(default_pid)
                 .to_string()),
@@ -104,6 +115,8 @@ pub struct ControlPlaneService {
     known_projects: DashSet<String>,
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
+    auth_cfg: parking_lot::RwLock<AuthConfig>,
+    auth_state: auth::AuthState,
 }
 
 impl ControlPlaneService {
@@ -156,6 +169,8 @@ impl ControlPlaneService {
             known_projects: DashSet::new(),
             lexicon_cache: DashMap::new(),
             discovery_tx: tx,
+            auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
+            auth_state: auth::AuthState::default(),
         });
 
         let generated_ingest = svc
@@ -509,7 +524,18 @@ async fn require_admin_auth(
             "missing Authorization: Bearer <sk_...> header",
         ));
     };
-    let principal = ctrl.verify_admin_token(token)?;
+    let session_user = if token.starts_with("ps_") {
+        ctrl.meta
+            .get_session_user_id(&sha256_hex(token), Utc::now().timestamp_millis())
+            .await
+            .map_err(CtrlError::meta)?
+    } else {
+        None
+    };
+    let principal = match session_user {
+        Some(user_id) => AuthPrincipal::User { user_id },
+        None => ctrl.verify_admin_token(token)?,
+    };
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
@@ -601,8 +627,20 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             get(handle_list_reports).post(handle_save_report),
         )
         .route(
+            "/v1/projects/:id/saved-reports/:rep_id",
+            get(handle_get_report)
+                .put(handle_update_report)
+                .delete(handle_delete_report),
+        )
+        .route(
             "/v1/projects/:id/dashboards",
             get(handle_list_dashboards).post(handle_save_dashboard),
+        )
+        .route(
+            "/v1/projects/:id/dashboards/:dash_id",
+            get(handle_get_dashboard)
+                .put(handle_replace_dashboard)
+                .delete(handle_delete_dashboard),
         )
         // Feature Flags & Experimentation
         .route(
@@ -620,10 +658,15 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
+        .route("/v1/auth/me", get(auth::handle_me))
+        .route("/v1/auth/logout", post(auth::handle_logout))
         .route_layer(middleware::from_fn_with_state(
             ctrl.clone(),
             require_admin_auth,
         ))
+        // Sign-in routes are merged after `route_layer`, so they stay outside the bearer middleware
+        // but share the admin CORS policy.
+        .merge(auth::public_auth_router())
         .with_state(ctrl)
 }
 
@@ -728,7 +771,7 @@ async fn handle_status(
 
     let all_projects = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
     let projects: Vec<Project> = match &principal {
-        AuthPrincipal::RootAdmin => all_projects,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => all_projects,
         AuthPrincipal::ProjectAdmin { project_id } => all_projects
             .into_iter()
             .filter(|p| &p.id == project_id)
@@ -758,7 +801,10 @@ async fn handle_admin_flush(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiRes<Value> {
-    if !matches!(principal, AuthPrincipal::RootAdmin) {
+    if !matches!(
+        principal,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. }
+    ) {
         return Err(CtrlError::forbidden(
             "cluster flush requires root admin token",
         ));
@@ -788,7 +834,7 @@ async fn handle_list_projects(
 ) -> ApiRes<Vec<Project>> {
     let list = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
     let scoped = match principal {
-        AuthPrincipal::RootAdmin => list,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => list,
         AuthPrincipal::ProjectAdmin { project_id } => {
             list.into_iter().filter(|p| p.id == project_id).collect()
         }
@@ -808,7 +854,10 @@ async fn handle_create_project(
     Extension(principal): Extension<AuthPrincipal>,
     Json(req): Json<CreateProjectReq>,
 ) -> ApiRes<Value> {
-    if !matches!(principal, AuthPrincipal::RootAdmin) {
+    if !matches!(
+        principal,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. }
+    ) {
         return Err(CtrlError::forbidden(
             "creating projects requires root admin token",
         ));
@@ -948,11 +997,36 @@ async fn handle_create_key(
 
 // ------------------- Queries -------------------
 
+fn parse_json_body<T: serde::de::DeserializeOwned>(
+    label: &str,
+    bytes: &[u8],
+) -> Result<T, CtrlError> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        CtrlError::bad(format!(
+            "invalid {label} request: {}",
+            pulse_wire::sanitize_json_error_message(&e.to_string())
+        ))
+    })
+}
+
+fn parse_query_value<T: serde::de::DeserializeOwned>(
+    label: &str,
+    value: Value,
+) -> Result<T, CtrlError> {
+    serde_json::from_value(value).map_err(|e| {
+        CtrlError::bad(format!(
+            "invalid {label} query: {}",
+            pulse_wire::sanitize_json_error_message(&e.to_string())
+        ))
+    })
+}
+
 async fn handle_unified_query(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
-    Json(payload): Json<Value>,
+    body: Bytes,
 ) -> ApiRes<Value> {
+    let payload: Value = parse_json_body("query", &body)?;
     let req_pid = payload.get("project_id").and_then(|v| v.as_str());
     let pid = principal.resolve_project(req_pid, &ctrl.default_project_id)?;
     ctrl.ensure_known_project(&pid).await?;
@@ -966,8 +1040,7 @@ async fn handle_unified_query(
     let inner = payload.get("query").cloned().unwrap_or(payload.clone());
     match kind {
         "insights" => {
-            let q: InsightsQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: InsightsQuery = parse_query_value("insights", inner)?;
             let res = ctrl
                 .qengine
                 .query_insights(&pid, &q)
@@ -976,8 +1049,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "funnel" | "funnels" => {
-            let q: FunnelQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: FunnelQuery = parse_query_value("funnel", inner)?;
             let res = ctrl
                 .qengine
                 .query_funnel(&pid, &q)
@@ -986,8 +1058,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "retention" => {
-            let q: RetentionQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: RetentionQuery = parse_query_value("retention", inner)?;
             let res = ctrl
                 .qengine
                 .query_retention(&pid, &q)
@@ -996,8 +1067,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "flows" | "flow" => {
-            let q: FlowsQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: FlowsQuery = parse_query_value("flows", inner)?;
             let res = ctrl
                 .qengine
                 .query_flows(&pid, &q)
@@ -1013,9 +1083,10 @@ async fn handle_query_insights(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<InsightsQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::InsightsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: InsightsQuery = parse_json_body("insights query", &body)?;
     let res = ctrl
         .qengine
         .query_insights(&id, &q)
@@ -1028,9 +1099,10 @@ async fn handle_query_funnel(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<FunnelQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::FunnelResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FunnelQuery = parse_json_body("funnel query", &body)?;
     let res = ctrl
         .qengine
         .query_funnel(&id, &q)
@@ -1043,9 +1115,10 @@ async fn handle_query_retention(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<RetentionQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::RetentionResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: RetentionQuery = parse_json_body("retention query", &body)?;
     let res = ctrl
         .qengine
         .query_retention(&id, &q)
@@ -1058,9 +1131,10 @@ async fn handle_query_flows(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<FlowsQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::FlowsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FlowsQuery = parse_json_body("flows query", &body)?;
     let res = ctrl
         .qengine
         .query_flows(&id, &q)
@@ -1648,6 +1722,136 @@ async fn handle_create_custom_property(
 
 // ------------------- Saved Reports & Dashboards -------------------
 
+const MAX_DASHBOARD_CARDS: usize = 60;
+const MAX_TEXT_CARD_CHARS: usize = 5000;
+const MAX_DESCRIPTION_CHARS: usize = 1000;
+
+fn validate_name(raw: &str) -> Result<String, CtrlError> {
+    let name = raw.trim();
+    if !(1..=120).contains(&name.chars().count()) {
+        return Err(CtrlError::bad("name must be between 1 and 120 characters"));
+    }
+    Ok(name.to_string())
+}
+
+fn new_card_id() -> String {
+    format!("card_{}", &Uuid::new_v4().simple().to_string()[..12])
+}
+
+impl ControlPlaneService {
+    /// Who to record as `created_by`: the user's email for sessions, otherwise `"admin token"`.
+    async fn principal_label(&self, principal: &AuthPrincipal) -> Result<String, CtrlError> {
+        if let AuthPrincipal::User { user_id } = principal {
+            if let Some(u) = self
+                .meta
+                .get_user_by_id(user_id)
+                .await
+                .map_err(CtrlError::meta)?
+            {
+                return Ok(u.email);
+            }
+        }
+        Ok("admin token".to_string())
+    }
+
+    async fn validate_cards(
+        &self,
+        project_id: &str,
+        cards: Vec<DashboardCard>,
+    ) -> Result<Vec<DashboardCard>, CtrlError> {
+        if cards.len() > MAX_DASHBOARD_CARDS {
+            return Err(CtrlError::bad(format!(
+                "a dashboard can hold at most {MAX_DASHBOARD_CARDS} cards"
+            )));
+        }
+        let report_ids: std::collections::HashSet<String> = self
+            .meta
+            .list_saved_reports(project_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(cards.len());
+        for mut card in cards {
+            if card.id.trim().is_empty() {
+                card.id = new_card_id();
+            }
+            if !seen.insert(card.id.clone()) {
+                return Err(CtrlError::bad(format!("duplicate card id '{}'", card.id)));
+            }
+            if card.width != 1 && card.width != 2 {
+                return Err(CtrlError::bad(
+                    "card width must be 1 (half row) or 2 (full row)",
+                ));
+            }
+            match card.kind.as_str() {
+                "report" => {
+                    let rid = card.report_id.as_deref().unwrap_or_default();
+                    if !report_ids.contains(rid) {
+                        return Err(CtrlError::bad(format!(
+                            "report card '{}' references unknown report '{rid}'",
+                            card.id
+                        )));
+                    }
+                    card.text = None;
+                }
+                "text" => {
+                    let text = card.text.as_deref().unwrap_or_default();
+                    if text.chars().count() > MAX_TEXT_CARD_CHARS {
+                        return Err(CtrlError::bad(format!(
+                            "text cards are limited to {MAX_TEXT_CARD_CHARS} characters"
+                        )));
+                    }
+                    card.text = Some(text.to_string());
+                    card.report_id = None;
+                }
+                _ => return Err(CtrlError::bad("card kind must be 'report' or 'text'")),
+            }
+            out.push(card);
+        }
+        Ok(out)
+    }
+
+    async fn dashboard_or_404(
+        &self,
+        project_id: &str,
+        dash_id: &str,
+    ) -> Result<Dashboard, CtrlError> {
+        self.meta
+            .get_dashboard(project_id, dash_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::not_found(format!("dashboard '{dash_id}' not found")))
+    }
+
+    async fn report_or_404(
+        &self,
+        project_id: &str,
+        rep_id: &str,
+    ) -> Result<SavedReport, CtrlError> {
+        self.meta
+            .get_saved_report(project_id, rep_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::not_found(format!("report '{rep_id}' not found")))
+    }
+}
+
+fn validate_description(raw: Option<String>) -> Result<Option<String>, CtrlError> {
+    let desc = raw.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+    if desc
+        .as_ref()
+        .is_some_and(|d| d.chars().count() > MAX_DESCRIPTION_CHARS)
+    {
+        return Err(CtrlError::bad(format!(
+            "description must be at most {MAX_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    Ok(desc)
+}
+
 async fn handle_list_reports(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1682,19 +1886,100 @@ async fn handle_save_report(
             "report id is generated by the server and must not be client-supplied",
         ));
     }
+    if !REPORT_KINDS.contains(&req.report_kind.as_str()) {
+        return Err(CtrlError::bad(
+            "report_kind must be one of funnel, insights, retention, flows",
+        ));
+    }
+    let now = Utc::now().timestamp_millis();
     let rep = SavedReport {
         id: format!("rep_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id,
-        name: req.name,
+        name: validate_name(&req.name)?,
         report_kind: req.report_kind,
         query_json: req.query_json,
-        created_at_ms: Utc::now().timestamp_millis(),
+        created_at_ms: now,
+        updated_at_ms: now,
     };
     ctrl.meta
         .upsert_saved_report(&rep)
         .await
         .map_err(CtrlError::meta)?;
     Ok(Json(rep))
+}
+
+async fn handle_get_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+) -> ApiRes<SavedReport> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(ctrl.report_or_404(&id, &rep_id).await?))
+}
+
+#[derive(Deserialize)]
+struct UpdateReportReq {
+    name: String,
+    query_json: Value,
+}
+
+async fn handle_update_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+    Json(req): Json<UpdateReportReq>,
+) -> ApiRes<SavedReport> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let mut rep = ctrl.report_or_404(&id, &rep_id).await?;
+    rep.name = validate_name(&req.name)?;
+    rep.query_json = req.query_json;
+    rep.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_saved_report(&rep)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(rep))
+}
+
+async fn handle_delete_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_saved_report(&id, &rep_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("report '{rep_id}' not found")));
+    }
+    // ponytail: not transactional with the delete; a crash in between leaves dangling report
+    // cards, which the UI must already tolerate. Wrap in a transaction if that ever matters.
+    let now = Utc::now().timestamp_millis();
+    let mut dashboards_updated = 0;
+    for mut dash in ctrl
+        .meta
+        .list_dashboards(&id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        let before = dash.cards.len();
+        dash.cards
+            .retain(|c| c.report_id.as_deref() != Some(rep_id.as_str()));
+        if dash.cards.len() != before {
+            dash.updated_at_ms = now;
+            ctrl.meta
+                .upsert_dashboard(&dash)
+                .await
+                .map_err(CtrlError::meta)?;
+            dashboards_updated += 1;
+        }
+    }
+    Ok(Json(
+        json!({ "status": "ok", "dashboards_updated": dashboards_updated }),
+    ))
 }
 
 async fn handle_list_dashboards(
@@ -1715,7 +2000,8 @@ async fn handle_list_dashboards(
 struct SaveDashboardReq {
     id: Option<String>,
     name: String,
-    report_ids: Vec<String>,
+    description: Option<String>,
+    cards: Option<Vec<DashboardCard>>,
 }
 
 async fn handle_save_dashboard(
@@ -1730,18 +2016,81 @@ async fn handle_save_dashboard(
             "dashboard id is generated by the server and must not be client-supplied",
         ));
     }
+    let name = validate_name(&req.name)?;
+    let description = validate_description(req.description)?;
+    let cards = ctrl
+        .validate_cards(&id, req.cards.unwrap_or_default())
+        .await?;
+    let now = Utc::now().timestamp_millis();
     let dash = Dashboard {
         id: format!("dash_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id,
-        name: req.name,
-        report_ids: req.report_ids,
-        created_at_ms: Utc::now().timestamp_millis(),
+        name,
+        description,
+        cards,
+        created_by: Some(ctrl.principal_label(&principal).await?),
+        created_at_ms: now,
+        updated_at_ms: now,
     };
     ctrl.meta
         .upsert_dashboard(&dash)
         .await
         .map_err(CtrlError::meta)?;
     Ok(Json(dash))
+}
+
+async fn handle_get_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+) -> ApiRes<Dashboard> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(ctrl.dashboard_or_404(&id, &dash_id).await?))
+}
+
+#[derive(Deserialize)]
+struct ReplaceDashboardReq {
+    name: String,
+    description: Option<String>,
+    cards: Vec<DashboardCard>,
+}
+
+async fn handle_replace_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+    Json(req): Json<ReplaceDashboardReq>,
+) -> ApiRes<Dashboard> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let mut dash = ctrl.dashboard_or_404(&id, &dash_id).await?;
+    dash.name = validate_name(&req.name)?;
+    dash.description = validate_description(req.description)?;
+    dash.cards = ctrl.validate_cards(&id, req.cards).await?;
+    dash.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_dashboard(&dash)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(dash))
+}
+
+async fn handle_delete_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_dashboard(&id, &dash_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!(
+            "dashboard '{dash_id}' not found"
+        )));
+    }
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 // ------------------- Feature Flags & Experiments (`P0-03`, `P0-04`, `P2-10`) -------------------

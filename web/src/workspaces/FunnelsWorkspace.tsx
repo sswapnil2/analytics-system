@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, RefreshCw, Trash2, X } from "lucide-react";
-import { api, default14DayRange, DroppedSessionSample, FunnelResult } from "../api/client";
+import { ArrowDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { api, DroppedSessionSample, FunnelResult } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
+import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -65,28 +67,36 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     [availableEvents],
   );
 
+  const buildQuery = useCallback(
+    () => ({
+      steps: steps.map((event_name) => ({ event_name, filters: [], first_time_ever: false })),
+      order_mode: orderMode,
+      conversion_window_ms: windowHours * 3_600_000,
+      exclusions: excludeEvent
+        ? [{ event_name: excludeEvent, between_steps: [1, Math.min(2, steps.length - 1)] }]
+        : [],
+      hold_constant_props: holdConstant ? [holdConstant] : [],
+      breakdown_by: breakdownBy || null,
+    }),
+    [steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy],
+  );
+
+  const [days, setDays] = useState(14);
+  const reqId = useRef(0);
+
   const runFunnel = useCallback(async () => {
+    const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFunnel(projectId, {
-        time_range: default14DayRange(),
-        steps: steps.map((event_name) => ({ event_name, filters: [], first_time_ever: false })),
-        order_mode: orderMode,
-        conversion_window_ms: windowHours * 3_600_000,
-        exclusions: excludeEvent
-          ? [{ event_name: excludeEvent, between_steps: [1, Math.min(2, steps.length - 1)] }]
-          : [],
-        hold_constant_props: holdConstant ? [holdConstant] : [],
-        breakdown_by: breakdownBy || null,
-      });
-      setResult(res);
+      const res = await api.queryFunnel(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      if (id === reqId.current) setResult(res);
     } catch (err) {
-      setError(errorMessage(err));
+      if (id === reqId.current) setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy]);
+  }, [projectId, buildQuery, days]);
 
   useEffect(() => {
     void runFunnel();
@@ -116,10 +126,19 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
         title="Funnels"
         description="Where users drop out of a multi-step flow, with recordings of the ones who left."
         actions={
-          <button type="button" onClick={() => void runFunnel()} disabled={loading} className={btn.primary}>
-            <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
-            {loading ? "Running…" : "Run funnel"}
-          </button>
+          <>
+            <RangePresets days={days} onChange={setDays} />
+            <SaveToDashboard
+              projectId={projectId}
+              kind="funnel"
+              defaultName={`${humanizeEvent(steps[0] ?? "")} to ${humanizeEvent(steps[steps.length - 1] ?? "")}`}
+              query={buildQuery}
+            />
+            <button type="button" onClick={() => void runFunnel()} disabled={loading} className={btn.primary}>
+              <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
+              {loading ? "Running…" : "Run funnel"}
+            </button>
+          </>
         }
       />
 
@@ -248,68 +267,104 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             />
           ) : (
             <>
-              <p className="mb-5 max-w-3xl text-base text-ink">
-                <span className="text-2xl font-semibold tabular">{pct(last.conversion_from_start_pct)}</span>{" "}
-                of users who did <strong className="font-semibold">{humanizeEvent(first.event_name)}</strong> went
-                on to <strong className="font-semibold">{humanizeEvent(last.event_name)}</strong> within{" "}
-                {WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}.
-              </p>
+              <div className="mb-6 max-w-3xl space-y-1.5">
+                <p className="text-xl font-semibold leading-snug tracking-[-0.01em] text-ink">
+                  <span className="tabular">{pct(last.conversion_from_start_pct)}</span> of users who did{" "}
+                  {humanizeEvent(first.event_name)} went on to {humanizeEvent(last.event_name)} within{" "}
+                  {WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}.
+                </p>
+                {biggestDrop > 0 && (
+                  <p className="text-[0.9375rem] text-ink-2">
+                    The biggest drop is between {humanizeEvent(overall[biggestDrop - 1].event_name)} and{" "}
+                    {humanizeEvent(overall[biggestDrop].event_name)}:{" "}
+                    <span className="tabular">
+                      {formatCount(overall[biggestDrop - 1].entered_users - overall[biggestDrop].entered_users)}
+                    </span>{" "}
+                    users, {pct(100 - overall[biggestDrop].conversion_from_prev_pct)} of that step.
+                  </p>
+                )}
+              </div>
 
-              <ol
-                className="grid gap-3"
-                style={{ gridTemplateColumns: `repeat(auto-fit, minmax(${overall.length > 5 ? 120 : 150}px, 1fr))` }}
-              >
+              <ol className="space-y-0">
                 {overall.map((st, idx) => {
                   const lost = idx > 0 ? overall[idx - 1].entered_users - st.entered_users : 0;
                   const isBiggest = idx === biggestDrop;
+                  const keptPct = (st.entered_users / first.entered_users) * 100;
+                  const lostPct = idx > 0 ? (lost / first.entered_users) * 100 : 0;
                   return (
-                    <li key={st.step_index} className="flex min-w-0 flex-col">
-                      <div className="mb-2 min-h-[2.75rem]">
-                        <div className="text-xs text-muted tabular">Step {idx + 1}</div>
-                        <div className="truncate text-sm font-medium text-ink" title={humanizeEvent(st.event_name)}>
-                          {humanizeEvent(st.event_name)}
-                        </div>
-                      </div>
-
-                      <div
-                        className="relative flex h-40 items-end overflow-hidden rounded-lg bg-sunken"
-                        role="img"
-                        aria-label={`${formatCount(st.entered_users)} users, ${pct(st.conversion_from_start_pct)} of start`}
-                      >
-                        <div
-                          className="w-full rounded-t-md bg-brand"
-                          style={{ height: `${Math.max(2, st.conversion_from_start_pct)}%` }}
-                        />
-                      </div>
-
-                      <div className="mt-2 flex items-baseline justify-between gap-2">
-                        <span className="text-lg font-semibold text-ink tabular">{formatCount(st.entered_users)}</span>
-                        <span className="text-sm text-muted tabular">
-                          {idx === 0 ? "start" : `${pct(st.conversion_from_prev_pct)} of prev.`}
-                        </span>
-                      </div>
-
+                    <li key={st.step_index}>
                       {idx > 0 && lost > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => setDrawerStep(idx)}
-                          className={`mt-2 rounded-lg border px-2.5 py-2 text-left text-sm ${
-                            isBiggest
-                              ? "border-danger bg-danger-soft text-danger hover:bg-danger/15"
-                              : "border-line text-ink-2 hover:border-danger/60 hover:bg-danger-soft"
+                        isBiggest ? (
+                          <div className="my-1.5 flex flex-wrap items-center gap-3 rounded-lg bg-danger-soft px-3.5 py-2.5 text-sm text-danger sm:ml-[13.5rem]">
+                            <ArrowDown className="h-4 w-4" aria-hidden="true" />
+                            <span className="font-semibold tabular">
+                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)}). Biggest drop
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setDrawerStep(idx)}
+                              className="ml-auto inline-flex h-8 items-center rounded-lg bg-danger px-3 font-semibold text-on-brand hover:bg-danger/90"
+                            >
+                              See who dropped and why
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2.5 py-0.5 text-[0.8125rem] text-muted sm:ml-[13.5rem]">
+                            <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span className="tabular">
+                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)})
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setDrawerStep(idx)}
+                              className="font-medium text-brand hover:underline"
+                            >
+                              See who
+                            </button>
+                          </div>
+                        )
+                      )}
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1.5 py-2.5 sm:grid-cols-[12.5rem_minmax(0,1fr)_7.5rem]">
+                        <span className="truncate text-sm font-semibold text-ink" title={humanizeEvent(st.event_name)}>
+                          {idx + 1}. {humanizeEvent(st.event_name)}
+                        </span>
+                        <span
+                          className="col-span-2 row-start-2 flex h-8 overflow-hidden rounded-md bg-sunken sm:col-span-1 sm:row-start-auto"
+                          role="img"
+                          aria-label={`${formatCount(st.entered_users)} users reached this step${
+                            lost > 0 ? `, ${formatCount(lost)} dropped before it` : ""
                           }`}
                         >
-                          <span className="block font-semibold tabular">
-                            {formatCount(lost)} dropped
-                            {isBiggest && <span className="font-normal"> (biggest drop)</span>}
+                          <span className="bg-brand" style={{ width: `${Math.max(0.5, keptPct)}%` }} />
+                          {lostPct > 0 && (
+                            <span className={isBiggest ? "hatch-drop-strong" : "hatch-drop"} style={{ width: `${lostPct}%` }} />
+                          )}
+                        </span>
+                        <span className="flex flex-col text-right">
+                          <span className="font-semibold tabular text-ink">{formatCount(st.entered_users)}</span>
+                          <span className="text-xs text-muted tabular">
+                            {idx === 0 ? "100%" : `${pct(st.conversion_from_prev_pct)} of previous`}
                           </span>
-                          <span className="block text-xs underline-offset-2 hover:underline">See who and why</span>
-                        </button>
-                      )}
+                        </span>
+                      </div>
                     </li>
                   );
                 })}
               </ol>
+              <div className="mt-4 flex flex-wrap gap-4 text-[0.8125rem] text-ink-2">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="h-2.5 w-3.5 rounded-sm bg-brand" aria-hidden="true" />
+                  Reached this step
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="hatch-drop h-2.5 w-3.5 rounded-sm" aria-hidden="true" />
+                  Dropped before this step
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="hatch-drop-strong h-2.5 w-3.5 rounded-sm" aria-hidden="true" />
+                  Biggest drop
+                </span>
+              </div>
             </>
           )}
         </Panel>

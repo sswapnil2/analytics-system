@@ -20,6 +20,19 @@ pub struct Project {
     pub created_at_ms: i64,
 }
 
+/// Dashboard user account. Deliberately not `Serialize` so `password_hash` can never leak into a response.
+#[derive(Debug, Clone)]
+pub struct User {
+    pub id: String,
+    /// Always stored lowercased.
+    pub email: String,
+    pub name: Option<String>,
+    /// Argon2id PHC string; `None` for Google-only accounts.
+    pub password_hash: Option<String>,
+    pub google_sub: Option<String>,
+    pub created_at_ms: i64,
+}
+
 pub const KEY_ROLE_INGEST_AND_FLAGS: &str = "ingest_and_flags";
 pub const KEY_ROLE_ADMIN: &str = "admin";
 
@@ -126,6 +139,30 @@ pub struct SavedReport {
     pub report_kind: String,
     pub query_json: serde_json::Value,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+pub const REPORT_KINDS: [&str; 4] = ["funnel", "insights", "retention", "flows"];
+
+/// One tile on a dashboard: a saved report or a markdown/text note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardCard {
+    /// Server-generated when empty on write.
+    #[serde(default)]
+    pub id: String,
+    /// `"report"` or `"text"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `1` = half row, `2` = full row.
+    #[serde(default = "default_card_width")]
+    pub width: i64,
+}
+
+fn default_card_width() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +170,12 @@ pub struct Dashboard {
     pub id: String,
     pub project_id: String,
     pub name: String,
-    pub report_ids: Vec<String>,
+    pub description: Option<String>,
+    pub cards: Vec<DashboardCard>,
+    /// User email, `"admin token"`, or `None` for rows created before ownership was recorded.
+    pub created_by: Option<String>,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

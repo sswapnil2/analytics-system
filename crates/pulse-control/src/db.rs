@@ -7,9 +7,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use sqlx::Row;
 use thiserror::Error;
 
+use crate::models::DashboardCard;
 use crate::models::{
     ApiKeyRecord, CohortRecord, Dashboard, Experiment, FeatureFlag, LexiconEvent, LexiconProperty,
-    LookupTableSummary, Organization, Project, SavedReport,
+    LookupTableSummary, Organization, Project, SavedReport, User,
 };
 
 #[derive(Debug, Error)]
@@ -94,6 +95,64 @@ macro_rules! db_map_opt {
             }
         }
     }};
+}
+
+fn saved_report_from_row<R>(r: &R) -> SavedReport
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    let qstr: String = r.get("query_json");
+    SavedReport {
+        id: r.get("id"),
+        project_id: r.get("project_id"),
+        name: r.get("name"),
+        report_kind: r.get("report_kind"),
+        query_json: serde_json::from_str(&qstr).unwrap_or(serde_json::Value::Null),
+        created_at_ms: r.get("created_at_ms"),
+        updated_at_ms: r.get("updated_at_ms"),
+    }
+}
+
+/// Rows written before `0003` have no `cards_json`; each legacy report id becomes a half-width card.
+fn dashboard_from_row<R>(r: &R) -> Dashboard
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    Option<String>: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    let cards = match r.get::<Option<String>, _>("cards_json") {
+        Some(cjson) => serde_json::from_str(&cjson).unwrap_or_default(),
+        None => {
+            let rstr: String = r.get("report_ids_json");
+            serde_json::from_str::<Vec<String>>(&rstr)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, report_id)| DashboardCard {
+                    id: format!("card_legacy_{i}"),
+                    kind: "report".to_string(),
+                    report_id: Some(report_id),
+                    text: None,
+                    width: 1,
+                })
+                .collect()
+        }
+    };
+    Dashboard {
+        id: r.get("id"),
+        project_id: r.get("project_id"),
+        name: r.get("name"),
+        description: r.get("description"),
+        cards,
+        created_by: r.get("created_by"),
+        created_at_ms: r.get("created_at_ms"),
+        updated_at_ms: r.get("updated_at_ms"),
+    }
 }
 
 impl MetaStore {
@@ -827,12 +886,13 @@ impl MetaStore {
         let qjson = serde_json::to_string(&rep.query_json).unwrap_or_else(|_| "{}".into());
         let affected = db_exec!(
             self,
-            "INSERT INTO saved_reports (id, project_id, name, report_kind, query_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO saved_reports (id, project_id, name, report_kind, query_json, created_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 report_kind = excluded.report_kind,
-                query_json = excluded.query_json
+                query_json = excluded.query_json,
+                updated_at_ms = excluded.updated_at_ms
              WHERE saved_reports.project_id = excluded.project_id",
             &rep.id,
             &rep.project_id,
@@ -840,6 +900,7 @@ impl MetaStore {
             &rep.report_kind,
             &qjson,
             rep.created_at_ms,
+            rep.updated_at_ms,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -856,39 +917,74 @@ impl MetaStore {
     ) -> Result<Vec<SavedReport>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, report_kind, query_json, created_at_ms
+            "SELECT id, project_id, name, report_kind, query_json, created_at_ms,
+                    COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
              FROM saved_reports WHERE project_id = ? ORDER BY created_at_ms DESC",
-            |r| {
-                let qstr: String = r.get("query_json");
-                SavedReport {
-                    id: r.get("id"),
-                    project_id: r.get("project_id"),
-                    name: r.get("name"),
-                    report_kind: r.get("report_kind"),
-                    query_json: serde_json::from_str(&qstr).unwrap_or(serde_json::Value::Null),
-                    created_at_ms: r.get("created_at_ms"),
-                }
-            },
+            |r| { saved_report_from_row(&r) },
             project_id,
         );
         Ok(rows)
     }
 
-    pub async fn upsert_dashboard(&self, d: &Dashboard) -> Result<(), MetaError> {
-        let rjson = serde_json::to_string(&d.report_ids).unwrap_or_else(|_| "[]".into());
+    pub async fn get_saved_report(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<SavedReport>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT id, project_id, name, report_kind, query_json, created_at_ms,
+                    COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM saved_reports WHERE project_id = ? AND id = ?",
+            |r| { saved_report_from_row(&r) },
+            project_id,
+            id,
+        );
+        Ok(row)
+    }
+
+    /// Returns `false` when no report with this id exists in the project.
+    pub async fn delete_saved_report(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
         let affected = db_exec!(
             self,
-            "INSERT INTO dashboards (id, project_id, name, report_ids_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?)
+            "DELETE FROM saved_reports WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
+    /// Writes `cards_json` plus the derived legacy `report_ids_json`. `created_by` and
+    /// `created_at_ms` are kept from the original row on update.
+    pub async fn upsert_dashboard(&self, d: &Dashboard) -> Result<(), MetaError> {
+        let report_ids: Vec<&str> = d
+            .cards
+            .iter()
+            .filter_map(|c| c.report_id.as_deref())
+            .collect();
+        let rjson = serde_json::to_string(&report_ids).unwrap_or_else(|_| "[]".into());
+        let cjson = serde_json::to_string(&d.cards).unwrap_or_else(|_| "[]".into());
+        let affected = db_exec!(
+            self,
+            "INSERT INTO dashboards (id, project_id, name, report_ids_json, created_at_ms,
+                                     description, cards_json, created_by, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
-                report_ids_json = excluded.report_ids_json
+                report_ids_json = excluded.report_ids_json,
+                description = excluded.description,
+                cards_json = excluded.cards_json,
+                updated_at_ms = excluded.updated_at_ms
              WHERE dashboards.project_id = excluded.project_id",
             &d.id,
             &d.project_id,
             &d.name,
             &rjson,
             d.created_at_ms,
+            &d.description,
+            &cjson,
+            &d.created_by,
+            d.updated_at_ms,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -902,20 +998,166 @@ impl MetaStore {
     pub async fn list_dashboards(&self, project_id: &str) -> Result<Vec<Dashboard>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, report_ids_json, created_at_ms
-             FROM dashboards WHERE project_id = ? ORDER BY created_at_ms DESC",
-            |r| {
-                let rstr: String = r.get("report_ids_json");
-                Dashboard {
-                    id: r.get("id"),
-                    project_id: r.get("project_id"),
-                    name: r.get("name"),
-                    report_ids: serde_json::from_str(&rstr).unwrap_or_default(),
-                    created_at_ms: r.get("created_at_ms"),
-                }
-            },
+            "SELECT id, project_id, name, report_ids_json, created_at_ms, description, cards_json,
+                    created_by, COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM dashboards WHERE project_id = ?
+             ORDER BY COALESCE(updated_at_ms, created_at_ms) DESC, id ASC",
+            |r| { dashboard_from_row(&r) },
             project_id,
         );
         Ok(rows)
+    }
+
+    pub async fn get_dashboard(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<Dashboard>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT id, project_id, name, report_ids_json, created_at_ms, description, cards_json,
+                    created_by, COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM dashboards WHERE project_id = ? AND id = ?",
+            |r| { dashboard_from_row(&r) },
+            project_id,
+            id,
+        );
+        Ok(row)
+    }
+
+    /// Returns `false` when no dashboard with this id exists in the project.
+    pub async fn delete_dashboard(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM dashboards WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
+    // ------------------- Users & Sessions -------------------
+
+    pub async fn count_users(&self) -> Result<i64, MetaError> {
+        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM users", |r| {
+            r.get::<i64, _>("n")
+        });
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Inserts a new user; `Conflict` when the email (or Google subject) is already taken.
+    pub async fn insert_user(&self, u: &User) -> Result<(), MetaError> {
+        let affected = db_exec!(
+            self,
+            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
+            &u.id,
+            &u.email,
+            &u.name,
+            &u.password_hash,
+            &u.google_sub,
+            u.created_at_ms,
+        );
+        if affected == 0 {
+            return Err(MetaError::Conflict(
+                "an account with this email already exists".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `column` is always a hard-coded identifier from this module, never user input.
+    async fn get_user_by(
+        &self,
+        column: &'static str,
+        value: &str,
+    ) -> Result<Option<User>, MetaError> {
+        let sql = format!(
+            "SELECT id, email, name, password_hash, google_sub, created_at_ms FROM users WHERE {column} = ?"
+        );
+        let user = db_map_opt!(
+            self,
+            &sql,
+            |r| {
+                User {
+                    id: r.get("id"),
+                    email: r.get("email"),
+                    name: r.get("name"),
+                    password_hash: r.get("password_hash"),
+                    google_sub: r.get("google_sub"),
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            value,
+        );
+        Ok(user)
+    }
+
+    pub async fn get_user_by_id(&self, id: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("id", id).await
+    }
+
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("email", email).await
+    }
+
+    pub async fn get_user_by_google_sub(&self, sub: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("google_sub", sub).await
+    }
+
+    pub async fn set_user_google_sub(&self, user_id: &str, sub: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET google_sub = ? WHERE id = ?",
+            sub,
+            user_id,
+        );
+        Ok(())
+    }
+
+    pub async fn insert_session(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO user_sessions (token_hash, user_id, created_at_ms, expires_at_ms)
+             VALUES (?, ?, ?, ?)",
+            token_hash,
+            user_id,
+            created_at_ms,
+            expires_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Returns the user id of a live (unexpired) session whose user still exists.
+    pub async fn get_session_user_id(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, MetaError> {
+        let uid = db_map_opt!(
+            self,
+            "SELECT s.user_id AS user_id FROM user_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ? AND s.expires_at_ms > ?",
+            |r| { r.get::<String, _>("user_id") },
+            token_hash,
+            now_ms,
+        );
+        Ok(uid)
+    }
+
+    pub async fn delete_session(&self, token_hash: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "DELETE FROM user_sessions WHERE token_hash = ?",
+            token_hash
+        );
+        Ok(())
     }
 }

@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, Trash2 } from "lucide-react";
-import { api, default14DayRange, InsightsResult, SeriesOutput } from "../api/client";
+import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
+import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -141,30 +143,38 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  const buildQuery = useCallback(
+    () => ({
+      interval: "day",
+      series: series.map((s) => ({
+        label: s.label,
+        event_name: s.eventName,
+        metric: buildMetricSpec(s.metricKind, s.propName),
+        filters: [],
+      })),
+      breakdown_by: breakdown ? [breakdown] : [],
+      compare_previous_period: comparePrev,
+      formula: formula.trim() ? formula.trim() : null,
+    }),
+    [series, formula, breakdown, comparePrev],
+  );
+
+  const [days, setDays] = useState(14);
+  const reqId = useRef(0);
+
   const runQuery = useCallback(async () => {
+    const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
-      const payload = {
-        time_range: default14DayRange(),
-        interval: "day",
-        series: series.map((s) => ({
-          label: s.label,
-          event_name: s.eventName,
-          metric: buildMetricSpec(s.metricKind, s.propName),
-          filters: [],
-        })),
-        breakdown_by: breakdown ? [breakdown] : [],
-        compare_previous_period: comparePrev,
-        formula: formula.trim() ? formula.trim() : null,
-      };
-      setResult(await api.queryInsights(projectId, payload));
+      const res = await api.queryInsights(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      if (id === reqId.current) setResult(res);
     } catch (err) {
-      setError(errorMessage(err));
+      if (id === reqId.current) setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, series, formula, breakdown, comparePrev]);
+  }, [projectId, buildQuery, days]);
 
   useEffect(() => {
     void runQuery();
@@ -230,9 +240,18 @@ export const InsightsWorkspace: React.FC<Props> = ({
         title="Trends"
         description="How an event or metric changes over time, by segment."
         actions={
-          <button type="button" onClick={() => void runQuery()} disabled={loading} className={btn.primary}>
-            {loading ? "Running…" : "Run"}
-          </button>
+          <>
+            <RangePresets days={days} onChange={setDays} />
+            <SaveToDashboard
+              projectId={projectId}
+              kind="insights"
+              defaultName={series.map((s) => humanizeEvent(s.eventName)).join(" and ")}
+              query={buildQuery}
+            />
+            <button type="button" onClick={() => void runQuery()} disabled={loading} className={btn.primary}>
+              {loading ? "Running…" : "Update chart"}
+            </button>
+          </>
         }
       />
 
@@ -262,7 +281,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
           {series.map((s, idx) => (
             <div
               key={s.label}
-              className="flex flex-wrap items-end gap-2 rounded-md border border-line bg-sunken px-3 py-2"
+              className="flex flex-wrap items-end gap-2 rounded-lg border border-line bg-sunken px-3 py-2"
             >
               <span
                 className="mb-1 flex h-6 w-6 items-center justify-center rounded text-xs font-semibold text-on-brand"
@@ -360,7 +379,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
               />
               Compare with previous period
             </label>
-            <div className="flex rounded-md border border-line-strong p-0.5" role="group" aria-label="Chart type">
+            <div className="flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Chart type">
               {(
                 [
                   ["line", "Line"],
