@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use crate::batch::{ByteCursor, FLAG_RAW_ZSTD, WIRE_VERSION};
+use crate::batch::{
+    decode_zstd_bounded, ByteCursor, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
+};
 use crate::error::{Result, WireError};
 
 pub const REPLAY_MAGIC: [u8; 4] = *b"PLSR";
 pub const MASK_CHAR: char = '█';
+pub const MAX_REPLAY_OPS_PER_CHUNK: usize = 100_000;
+pub const MAX_SNAPSHOT_NODES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -244,7 +248,13 @@ impl WireframeOp {
                 let width = cursor.read_u16("snapshot.width")?;
                 let height = cursor.read_u16("snapshot.height")?;
                 let count = cursor.read_u32("snapshot.nodes.len")? as usize;
-                let mut nodes = Vec::with_capacity(count);
+                if count > MAX_SNAPSHOT_NODES {
+                    return Err(WireError::ResourceLimitExceeded(
+                        "replay snapshot node count exceeds MAX_SNAPSHOT_NODES",
+                    ));
+                }
+                // Minimum wire size of a WireNode is 4+4+1+2+2+2+2+4+4 = 25 bytes
+                let mut nodes = Vec::with_capacity(cursor.bounded_capacity(count, 25));
                 for _ in 0..count {
                     nodes.push(WireNode::read_from(cursor)?);
                 }
@@ -359,13 +369,20 @@ impl ReplayChunk {
             return Err(WireError::TruncatedFrame("PLSR payload truncated"));
         }
 
-        let decompressed = zstd::stream::decode_all(&bytes[10..frame_end])?;
+        let decompressed =
+            decode_zstd_bounded(&bytes[10..frame_end], None, MAX_DECOMPRESSED_BYTES)?;
         let mut cursor = ByteCursor::new(&decompressed);
         let project_id = cursor.read_string("chunk.project_id")?;
         let session_id = cursor.read_string("chunk.session_id")?;
         let chunk_start_ts_ms = cursor.read_i64("chunk.start_ts")?;
         let op_count = cursor.read_u32("chunk.ops.len")? as usize;
-        let mut ops = Vec::with_capacity(op_count);
+        if op_count > MAX_REPLAY_OPS_PER_CHUNK {
+            return Err(WireError::ResourceLimitExceeded(
+                "replay chunk op count exceeds MAX_REPLAY_OPS_PER_CHUNK",
+            ));
+        }
+        // Minimum wire size of any WireframeOp is 1 (tag) + 4 (node_id) = 5 bytes
+        let mut ops = Vec::with_capacity(cursor.bounded_capacity(op_count, 5));
         for _ in 0..op_count {
             ops.push(WireframeOp::read_from(&mut cursor)?);
         }

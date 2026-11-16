@@ -14,6 +14,53 @@ pub const FLAG_DICT_ZSTD: u8 = 0x02;
 
 pub const DEFAULT_DICT_ID: u16 = 1;
 
+/// Maximum decompressed frame size (64 MiB) across all Zstd wire frames (`PLSB` & `PLSR`).
+pub const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum cumulative string bytes materialized when expanding string-table references in a batch (64 MiB).
+pub const MAX_MATERIALIZED_STRING_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum byte length of a single string field on the wire (64 KiB).
+pub const MAX_FIELD_STRING_BYTES: usize = 64 * 1024;
+/// Maximum events permitted in a single `WireBatch`.
+pub const MAX_BATCH_EVENTS: usize = 250_000;
+/// Maximum pre-allocated `Vec` elements before verifying individual entries from the stream.
+pub(crate) const MAX_INITIAL_VEC_CAP: usize = 65_536;
+
+/// Shared bounded Zstd decoder preventing decompression-bomb memory exhaustion (`P0-05`).
+pub(crate) fn decode_zstd_bounded(
+    compressed: &[u8],
+    dict: Option<&[u8]>,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    fn drain_bounded<R: Read>(mut reader: R, max_bytes: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut scratch = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut scratch)?;
+            if n == 0 {
+                break;
+            }
+            if out.len().saturating_add(n) > max_bytes {
+                return Err(WireError::ResourceLimitExceeded(
+                    "decompressed zstd payload exceeds 64 MiB limit",
+                ));
+            }
+            if out.capacity() < out.len() + n {
+                let target_cap = (out.capacity().max(64 * 1024) * 2)
+                    .max(out.len() + n)
+                    .min(max_bytes);
+                out.reserve_exact(target_cap - out.capacity());
+            }
+            out.extend_from_slice(&scratch[..n]);
+        }
+        Ok(out)
+    }
+
+    match dict {
+        Some(d) => drain_bounded(zstd::Decoder::with_dictionary(compressed, d)?, max_bytes),
+        None => drain_bounded(zstd::Decoder::new(compressed)?, max_bytes),
+    }
+}
+
 /// Registry of pre-shared Zstd dictionaries used by SDKs and edge gateways.
 #[derive(Debug, Clone)]
 pub struct DictionaryRegistry {
@@ -96,12 +143,22 @@ impl WireBatch {
 
     /// Deserializes a JSON payload accepting `{"events":[...]}`, `[...]`, or a single event `{...}`.
     pub fn decode_json(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_DECOMPRESSED_BYTES {
+            return Err(WireError::ResourceLimitExceeded(
+                "json batch exceeds 64 MiB limit",
+            ));
+        }
         let env: JsonBatchEnvelope = serde_json::from_slice(bytes)?;
         let events = match env {
             JsonBatchEnvelope::Wrapped { events } => events,
             JsonBatchEnvelope::Bare(events) => events,
             JsonBatchEnvelope::Single(ev) => vec![ev],
         };
+        if events.len() > MAX_BATCH_EVENTS {
+            return Err(WireError::ResourceLimitExceeded(
+                "json batch event count exceeds limit",
+            ));
+        }
         Ok(Self { events })
     }
 
@@ -175,7 +232,7 @@ impl WireBatch {
 
         let flags = bytes[5];
         let decompressed = match flags {
-            FLAG_RAW_ZSTD => zstd::stream::decode_all(&bytes[6..])?,
+            FLAG_RAW_ZSTD => decode_zstd_bounded(&bytes[6..], None, MAX_DECOMPRESSED_BYTES)?,
             FLAG_DICT_ZSTD => {
                 if bytes.len() < 8 {
                     return Err(WireError::TruncatedFrame("missing dictionary id"));
@@ -184,10 +241,7 @@ impl WireBatch {
                 let dict = registry
                     .get(dict_id)
                     .ok_or(WireError::UnknownDictionary(dict_id))?;
-                let mut decoder = zstd::Decoder::with_dictionary(&bytes[8..], dict)?;
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf)?;
-                buf
+                decode_zstd_bounded(&bytes[8..], Some(dict), MAX_DECOMPRESSED_BYTES)?
             }
             other => return Err(WireError::UnsupportedFlags(other)),
         };
@@ -329,27 +383,50 @@ impl WireBatch {
     fn decode_columnar_payload(bytes: &[u8]) -> Result<Self> {
         let mut cursor = ByteCursor::new(bytes);
         let n = cursor.read_u32("event count")? as usize;
+        if n > MAX_BATCH_EVENTS {
+            return Err(WireError::ResourceLimitExceeded(
+                "batch event count exceeds MAX_BATCH_EVENTS",
+            ));
+        }
         let unique_strings = cursor.read_u32("unique string count")? as usize;
+        let offset_count = unique_strings
+            .checked_add(1)
+            .ok_or(WireError::TruncatedFrame("string offset count overflow"))?;
 
-        let offsets = cursor.read_u32_vec(unique_strings + 1, "string offsets")?;
+        let offsets = cursor.read_u32_vec(offset_count, "string offsets")?;
         let blob_len = *offsets
             .last()
             .ok_or(WireError::TruncatedFrame("empty string offset table"))?
             as usize;
         let str_blob = cursor.read_slice(blob_len, "string blob")?;
 
-        let mut strings: Vec<String> = Vec::with_capacity(unique_strings);
+        let mut strings: Vec<&str> = Vec::with_capacity(unique_strings.min(MAX_INITIAL_VEC_CAP));
         for i in 0..unique_strings {
             let start = offsets[i] as usize;
             let end = offsets[i + 1] as usize;
             if end < start || end > str_blob.len() {
                 return Err(WireError::TruncatedFrame("invalid string offset bounds"));
             }
-            let s = String::from_utf8(str_blob[start..end].to_vec())?;
+            if end - start > MAX_FIELD_STRING_BYTES {
+                return Err(WireError::ResourceLimitExceeded(
+                    "string table entry exceeds 64 KiB field limit",
+                ));
+            }
+            let s = std::str::from_utf8(&str_blob[start..end]).map_err(|e| {
+                WireError::TruncatedFrame(if e.error_len().is_some() {
+                    "invalid utf8 in string table"
+                } else {
+                    "truncated utf8 in string table"
+                })
+            })?;
             strings.push(s);
         }
 
-        let uuid_bytes = cursor.read_slice(n * 16, "uuids")?;
+        let uuid_bytes = cursor.read_slice(
+            n.checked_mul(16)
+                .ok_or(WireError::TruncatedFrame("uuid length overflow"))?,
+            "uuids",
+        )?;
         let routing_ids = cursor.read_u32_vec(n, "routing_ids")?;
         let distinct_ids = cursor.read_u32_vec(n, "distinct_ids")?;
         let session_ids = cursor.read_u32_vec(n, "session_ids")?;
@@ -375,16 +452,21 @@ impl WireBatch {
         let str_val_len = cursor.read_u32("str_val_len")? as usize;
         let str_val_ids = cursor.read_u32_vec(str_val_len, "str_val_ids")?;
 
-        let get_str = |idx: u32| -> Result<String> {
-            strings
-                .get(idx as usize)
-                .cloned()
-                .ok_or(WireError::TruncatedFrame(
-                    "string table index out of bounds",
-                ))
+        let mut materialized_str_bytes = 0usize;
+        let mut take_str = |idx: u32| -> Result<String> {
+            let s = *strings.get(idx as usize).ok_or(WireError::TruncatedFrame(
+                "string table index out of bounds",
+            ))?;
+            materialized_str_bytes = materialized_str_bytes.saturating_add(s.len());
+            if materialized_str_bytes > MAX_MATERIALIZED_STRING_BYTES {
+                return Err(WireError::ResourceLimitExceeded(
+                    "materialized batch string bytes exceed 64 MiB limit",
+                ));
+            }
+            Ok(s.to_owned())
         };
 
-        let mut events = Vec::with_capacity(n);
+        let mut events = Vec::with_capacity(n.min(MAX_INITIAL_VEC_CAP));
         let mut prev_event_ts: i64 = 0;
         let mut prev_sent_ts: i64 = 0;
 
@@ -408,9 +490,9 @@ impl WireBatch {
             if p_idx + p_count > total_props {
                 return Err(WireError::TruncatedFrame("prop count exceeds total_props"));
             }
-            let mut props = Vec::with_capacity(p_count);
+            let mut props = Vec::with_capacity(p_count.min(256));
             for _ in 0..p_count {
-                let key = get_str(prop_key_ids[p_idx])?;
+                let key = take_str(prop_key_ids[p_idx])?;
                 let tag = prop_tags[p_idx];
                 p_idx += 1;
 
@@ -442,19 +524,24 @@ impl WireBatch {
                             .get(s_idx)
                             .ok_or(WireError::TruncatedFrame("str_val_ids underflow"))?;
                         s_idx += 1;
-                        PropValue::Str(get_str(sid)?)
+                        PropValue::Str(take_str(sid)?)
                     }
                     other => return Err(WireError::InvalidPropTag(other)),
                 };
                 props.push((key, val));
             }
 
+            let routing_seed = take_str(routing_ids[row])?;
+            let distinct_id = take_str(distinct_ids[row])?;
+            let session_id = take_str(session_ids[row])?;
+            let event_name = take_str(event_name_ids[row])?;
+
             events.push(WireEvent {
                 event_uuid,
-                routing_seed: get_str(routing_ids[row])?,
-                distinct_id: get_str(distinct_ids[row])?,
-                session_id: get_str(session_ids[row])?,
-                event_name: get_str(event_name_ids[row])?,
+                routing_seed,
+                distinct_id,
+                session_id,
+                event_name,
                 client_event_ts_ms,
                 client_sent_ts_ms,
                 props,
@@ -530,8 +617,22 @@ impl<'a> ByteCursor<'a> {
         Ok(i64::from_le_bytes(arr))
     }
 
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    pub fn bounded_capacity(&self, count: usize, min_elem_wire_bytes: usize) -> usize {
+        let max_by_bytes = self.remaining() / min_elem_wire_bytes.max(1);
+        count.min(max_by_bytes).min(MAX_INITIAL_VEC_CAP)
+    }
+
     pub fn read_string(&mut self, ctx: &'static str) -> Result<String> {
         let len = self.read_u32(ctx)? as usize;
+        if len > MAX_FIELD_STRING_BYTES {
+            return Err(WireError::ResourceLimitExceeded(
+                "wire string field exceeds 64 KiB limit",
+            ));
+        }
         let bytes = self.read_slice(len, ctx)?;
         Ok(String::from_utf8(bytes.to_vec())?)
     }

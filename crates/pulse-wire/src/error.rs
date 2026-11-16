@@ -34,6 +34,9 @@ pub enum WireError {
 
     #[error("invalid event_uuid string: {0}")]
     InvalidUuid(String),
+
+    #[error("wire frame resource limit exceeded: {0}")]
+    ResourceLimitExceeded(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
