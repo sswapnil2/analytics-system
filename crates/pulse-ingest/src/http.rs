@@ -84,6 +84,9 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             IngestError::Unauthorized => StatusCode::UNAUTHORIZED,
             IngestError::Wire(_) | IngestError::Json(_) => StatusCode::BAD_REQUEST,
+            IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict) => {
+                StatusCode::CONFLICT
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = serde_json::json!({

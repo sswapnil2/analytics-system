@@ -7,6 +7,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use slatedb::config::{DbOptions, WriteOptions};
 use slatedb::{Db, SlateDBError, WriteBatch};
 use thiserror::Error;
@@ -19,6 +20,9 @@ pub enum IdentityError {
     #[error("corrupted identity record in slatedb: {0}")]
     CorruptedRecord(&'static str),
 
+    #[error("cannot alias an already-identified user root into a different user")]
+    IdentifiedMergeConflict,
+
     #[error("identity database already closed")]
     Closed,
 }
@@ -26,7 +30,7 @@ pub enum IdentityError {
 pub type Result<T> = std::result::Result<T, IdentityError>;
 
 /// 256-bit physical bucket presence mask (`buckets 0..=255`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BucketMask([u64; 4]);
 
 impl BucketMask {
@@ -72,6 +76,16 @@ impl BucketMask {
     #[inline]
     pub fn is_cross_bucket(&self) -> bool {
         self.count_buckets() > 1
+    }
+
+    #[inline]
+    pub fn first_bucket(&self) -> u8 {
+        for (w, &bits) in self.0.iter().enumerate() {
+            if bits != 0 {
+                return (w as u8) * 64 + bits.trailing_zeros() as u8;
+            }
+        }
+        0
     }
 }
 
@@ -174,7 +188,8 @@ fn decode_mutation_chunk(bytes: &[u8]) -> Result<Vec<MutationEntry>> {
     }
     let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let mut pos = 4usize;
-    let mut out = Vec::with_capacity(count);
+    let max_prealloc = count.min((bytes.len() - 4) / 6).min(65_536);
+    let mut out = Vec::with_capacity(max_prealloc);
     for _ in 0..count {
         if pos >= bytes.len() {
             return Err(IdentityError::CorruptedRecord("chunk op EOF"));
@@ -258,20 +273,35 @@ fn decode_mutation_chunk(bytes: &[u8]) -> Result<Vec<MutationEntry>> {
     Ok(out)
 }
 
+/// Compacted SlateDB checkpoint record bounding startup recovery cost (`P3-04`).
+#[derive(Serialize, Deserialize)]
+struct IdentityCheckpoint {
+    next_chunk_seq: u64,
+    u32_to_external: Vec<String>,
+    origin_buckets: Vec<u8>,
+    parent: Vec<u32>,
+    bucket_masks: Vec<BucketMask>,
+    identified_roots: Vec<u32>,
+}
+
 struct GraphState {
     u32_to_external: Vec<String>,
+    origin_buckets: Vec<u8>,
     parent: Vec<u32>,
     bucket_masks: Vec<BucketMask>,
     cross_bucket_users: RoaringBitmap,
+    identified_roots: RoaringBitmap,
 }
 
 impl GraphState {
     fn new() -> Self {
         Self {
             u32_to_external: Vec::new(),
+            origin_buckets: Vec::new(),
             parent: Vec::new(),
             bucket_masks: Vec::new(),
             cross_bucket_users: RoaringBitmap::new(),
+            identified_roots: RoaringBitmap::new(),
         }
     }
 
@@ -307,12 +337,17 @@ impl GraphState {
         user_u32: u32,
         anon_bucket: u8,
         user_bucket: u8,
-    ) -> u32 {
-        self.bucket_masks[anon_u32 as usize].insert(anon_bucket);
-        self.bucket_masks[user_u32 as usize].insert(user_bucket);
-
+    ) -> Result<u32> {
         let r_anon = self.find_root_mut(anon_u32);
         let r_user = self.find_root_mut(user_u32);
+
+        // `P1-08`: Never merge an already-identified user root into a different user!
+        if r_anon != r_user && self.identified_roots.contains(r_anon) {
+            return Err(IdentityError::IdentifiedMergeConflict);
+        }
+
+        self.bucket_masks[anon_u32 as usize].insert(anon_bucket);
+        self.bucket_masks[user_u32 as usize].insert(user_bucket);
 
         let mut combined_mask = self.bucket_masks[r_user as usize];
         combined_mask.union_assign(self.bucket_masks[anon_u32 as usize]);
@@ -327,11 +362,12 @@ impl GraphState {
             }
         }
 
+        self.identified_roots.insert(r_user);
         self.bucket_masks[r_user as usize] = combined_mask;
         if combined_mask.is_cross_bucket() {
             self.cross_bucket_users.insert(r_user);
         }
-        r_user
+        Ok(r_user)
     }
 
     fn compress_all_and_build_snapshot(&mut self) -> IdentitySnapshot {
@@ -348,20 +384,55 @@ impl GraphState {
             cross_bucket_users: Arc::new(self.cross_bucket_users.clone()),
         }
     }
+
+    fn to_checkpoint(&mut self, next_chunk_seq: u64) -> IdentityCheckpoint {
+        let _ = self.compress_all_and_build_snapshot();
+        IdentityCheckpoint {
+            next_chunk_seq,
+            u32_to_external: self.u32_to_external.clone(),
+            origin_buckets: self.origin_buckets.clone(),
+            parent: self.parent.clone(),
+            bucket_masks: self.bucket_masks.clone(),
+            identified_roots: self.identified_roots.iter().collect(),
+        }
+    }
 }
 
 const META_CHUNK_COUNT_KEY: &[u8] = b"meta/chunk_count";
+const META_CHECKPOINT_KEY: &[u8] = b"meta/checkpoint";
+const CHECKPOINT_INTERVAL_CHUNKS: u64 = 32;
 
 /// Durable per-project `distinct_id <-> u32` dictionary and zero-rewrite Union-Find alias graph.
 pub struct ProjectIdentityGraph {
     project_id: String,
+    object_store: Arc<dyn ObjectStore>,
     fast_lookup: DashMap<String, (u32, u8)>,
     state: RwLock<GraphState>,
     snapshot_cache: RwLock<Option<IdentitySnapshot>>,
     snapshot_dirty: AtomicBool,
     next_chunk_seq: AtomicU64,
+    last_checkpoint_seq: AtomicU64,
     pending_mutations: Mutex<Vec<MutationEntry>>,
     db: tokio::sync::Mutex<Option<Db>>,
+}
+
+async fn open_slatedb_handle(project_id: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
+    let db_path = ObjectPath::from(format!("identity/{project_id}"));
+    for attempt in 0..8 {
+        let opts = DbOptions {
+            flush_interval: Some(Duration::from_millis(25)),
+            compactor_options: None,
+            ..DbOptions::default()
+        };
+        match Db::open_with_opts(db_path.clone(), opts, object_store.clone()).await {
+            Ok(opened) => return Ok(opened),
+            Err(SlateDBError::ManifestVersionExists) | Err(SlateDBError::Fenced) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            Err(e) => return Err(IdentityError::SlateDb(e)),
+        }
+    }
+    Err(IdentityError::SlateDb(SlateDBError::Fenced))
 }
 
 impl ProjectIdentityGraph {
@@ -371,28 +442,7 @@ impl ProjectIdentityGraph {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Self>> {
         let project_id = project_id.into();
-        let db_path = ObjectPath::from(format!("identity/{project_id}"));
-        let mut db = None;
-        for attempt in 0..8 {
-            let opts = DbOptions {
-                flush_interval: Some(Duration::from_millis(25)),
-                compactor_options: None,
-                ..DbOptions::default()
-            };
-            match Db::open_with_opts(db_path.clone(), opts, object_store.clone()).await {
-                Ok(opened) => {
-                    db = Some(opened);
-                    break;
-                }
-                Err(SlateDBError::ManifestVersionExists) | Err(SlateDBError::Fenced)
-                    if attempt < 7 =>
-                {
-                    tokio::time::sleep(Duration::from_millis(25 * (attempt + 1))).await;
-                }
-                Err(e) => return Err(IdentityError::SlateDb(e)),
-            }
-        }
-        let db = db.ok_or(IdentityError::SlateDb(SlateDBError::Fenced))?;
+        let db = open_slatedb_handle(&project_id, &object_store).await?;
 
         let chunk_count = match db.get(META_CHUNK_COUNT_KEY).await? {
             Some(b) if b.len() >= 8 => {
@@ -400,16 +450,55 @@ impl ProjectIdentityGraph {
                 arr.copy_from_slice(&b[0..8]);
                 u64::from_le_bytes(arr)
             }
-            _ => 0,
+            Some(_) => {
+                return Err(IdentityError::CorruptedRecord(
+                    "truncated meta/chunk_count value",
+                ))
+            }
+            None => 0,
         };
 
         let fast_lookup: DashMap<String, (u32, u8)> = DashMap::new();
         let mut state = GraphState::new();
+        let mut start_seq = 0u64;
 
-        for seq in 0..chunk_count {
+        // Restore compacted checkpoint if available (`P3-04`)
+        if let Some(cp_bytes) = db.get(META_CHECKPOINT_KEY).await? {
+            let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
+                .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
+            if cp.u32_to_external.len() != cp.parent.len()
+                || cp.u32_to_external.len() != cp.bucket_masks.len()
+                || cp.u32_to_external.len() != cp.origin_buckets.len()
+            {
+                return Err(IdentityError::CorruptedRecord(
+                    "inconsistent vector lengths in meta/checkpoint",
+                ));
+            }
+            start_seq = cp.next_chunk_seq;
+            for (idx, ext) in cp.u32_to_external.iter().enumerate() {
+                fast_lookup.insert(ext.clone(), (idx as u32, cp.origin_buckets[idx]));
+            }
+            for (idx, mask) in cp.bucket_masks.iter().enumerate() {
+                if cp.parent[idx] == idx as u32 && mask.is_cross_bucket() {
+                    state.cross_bucket_users.insert(idx as u32);
+                }
+            }
+            for r in cp.identified_roots {
+                state.identified_roots.insert(r);
+            }
+            state.u32_to_external = cp.u32_to_external;
+            state.origin_buckets = cp.origin_buckets;
+            state.parent = cp.parent;
+            state.bucket_masks = cp.bucket_masks;
+        }
+
+        // Replay remaining log chunks strictly (`P1-11`: fail loudly on missing chunk or dangling ref!)
+        for seq in start_seq..chunk_count {
             let chunk_key = format!("log/chunk_{seq:012}");
             let Some(bytes) = db.get(chunk_key.as_bytes()).await? else {
-                continue;
+                return Err(IdentityError::CorruptedRecord(
+                    "missing identity mutation log chunk",
+                ));
             };
             let entries = decode_mutation_chunk(&bytes)?;
             for entry in entries {
@@ -419,34 +508,38 @@ impl ProjectIdentityGraph {
                         origin_bucket,
                         distinct_id,
                     } => {
-                        if state.u32_to_external.len() <= uid as usize {
-                            state
-                                .u32_to_external
-                                .resize(uid as usize + 1, String::new());
-                            let old_len = state.parent.len();
-                            state.parent.resize(uid as usize + 1, 0);
-                            for idx in old_len..=uid as usize {
-                                state.parent[idx] = idx as u32;
-                            }
-                            state
-                                .bucket_masks
-                                .resize(uid as usize + 1, BucketMask::default());
+                        let cur_len = state.u32_to_external.len();
+                        if (uid as usize) > cur_len {
+                            return Err(IdentityError::CorruptedRecord(
+                                "non-contiguous intern uid gap in mutation log",
+                            ));
                         }
-                        state.u32_to_external[uid as usize] = distinct_id.clone();
-                        state.bucket_masks[uid as usize].insert(origin_bucket);
+                        if (uid as usize) == cur_len {
+                            state.u32_to_external.push(distinct_id.clone());
+                            state.origin_buckets.push(origin_bucket);
+                            state.parent.push(uid);
+                            state.bucket_masks.push(BucketMask::single(origin_bucket));
+                        } else {
+                            state.u32_to_external[uid as usize] = distinct_id.clone();
+                            state.origin_buckets[uid as usize] = origin_bucket;
+                            state.bucket_masks[uid as usize].insert(origin_bucket);
+                        }
                         if state.bucket_masks[uid as usize].is_cross_bucket() {
                             state.cross_bucket_users.insert(uid);
                         }
                         fast_lookup.insert(distinct_id, (uid, origin_bucket));
                     }
                     MutationEntry::ExtraBucket { uid, bucket_id } => {
-                        if (uid as usize) < state.bucket_masks.len() {
-                            state.bucket_masks[uid as usize].insert(bucket_id);
-                            let root = state.find_root_mut(uid);
-                            state.bucket_masks[root as usize].insert(bucket_id);
-                            if state.bucket_masks[root as usize].is_cross_bucket() {
-                                state.cross_bucket_users.insert(root);
-                            }
+                        if (uid as usize) >= state.bucket_masks.len() {
+                            return Err(IdentityError::CorruptedRecord(
+                                "dangling uid reference in ExtraBucket log entry",
+                            ));
+                        }
+                        state.bucket_masks[uid as usize].insert(bucket_id);
+                        let root = state.find_root_mut(uid);
+                        state.bucket_masks[root as usize].insert(bucket_id);
+                        if state.bucket_masks[root as usize].is_cross_bucket() {
+                            state.cross_bucket_users.insert(root);
                         }
                     }
                     MutationEntry::Alias {
@@ -455,11 +548,15 @@ impl ProjectIdentityGraph {
                         anon_bucket,
                         user_bucket,
                     } => {
-                        if (anon_u32 as usize) < state.parent.len()
-                            && (user_u32 as usize) < state.parent.len()
+                        if (anon_u32 as usize) >= state.parent.len()
+                            || (user_u32 as usize) >= state.parent.len()
                         {
-                            state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket);
+                            return Err(IdentityError::CorruptedRecord(
+                                "dangling uid reference in Alias log entry",
+                            ));
                         }
+                        // Apply deterministically; ignore conflict only if historical duplicate alias was logged
+                        let _ = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket);
                     }
                 }
             }
@@ -469,11 +566,13 @@ impl ProjectIdentityGraph {
 
         Ok(Arc::new(Self {
             project_id,
+            object_store,
             fast_lookup,
             state: RwLock::new(state),
             snapshot_cache: RwLock::new(Some(initial_snap)),
             snapshot_dirty: AtomicBool::new(false),
             next_chunk_seq: AtomicU64::new(chunk_count),
+            last_checkpoint_seq: AtomicU64::new(start_seq),
             pending_mutations: Mutex::new(Vec::new()),
             db: tokio::sync::Mutex::new(Some(db)),
         }))
@@ -487,7 +586,7 @@ impl ProjectIdentityGraph {
         self.state.read().u32_to_external.len()
     }
 
-    /// Lock-free hot path lookup + monotonic `u32` allocation on miss.
+    /// Lock-free hot path lookup + monotonic `u32` allocation on miss (`P1-11` ordered mutation push).
     pub fn get_or_intern(&self, distinct_id: &str, bucket_id: u8) -> u32 {
         if let Some(entry) = self.fast_lookup.get(distinct_id) {
             let (uid, origin_bucket) = *entry;
@@ -512,19 +611,21 @@ impl ProjectIdentityGraph {
         let uid = state.u32_to_external.len() as u32;
         let mask = BucketMask::single(bucket_id);
         state.u32_to_external.push(distinct_id.to_string());
+        state.origin_buckets.push(bucket_id);
         state.parent.push(uid);
         state.bucket_masks.push(mask);
-        self.fast_lookup
-            .insert(distinct_id.to_string(), (uid, bucket_id));
 
-        self.snapshot_dirty.store(true, Ordering::Release);
-        drop(state);
-
+        // Push to `pending_mutations` BEFORE publishing in `fast_lookup` or releasing `state` (`P1-11`)!
         self.pending_mutations.lock().push(MutationEntry::Intern {
             uid,
             origin_bucket: bucket_id,
             distinct_id: distinct_id.to_string(),
         });
+        self.fast_lookup
+            .insert(distinct_id.to_string(), (uid, bucket_id));
+        self.snapshot_dirty.store(true, Ordering::Release);
+        drop(state);
+
         uid
     }
 
@@ -546,37 +647,35 @@ impl ProjectIdentityGraph {
             state.cross_bucket_users.insert(root);
         }
         if added_raw || added_root {
-            self.snapshot_dirty.store(true, Ordering::Release);
-            drop(state);
             self.pending_mutations
                 .lock()
                 .push(MutationEntry::ExtraBucket { uid, bucket_id });
+            self.snapshot_dirty.store(true, Ordering::Release);
         }
     }
 
-    /// Retroactively merges `anon_id -> user_id` without rewriting historical segments.
-    /// Returns the canonical `u32` root (`root(user_u32)`).
-    pub fn alias(&self, anon_id: &str, user_id: &str, anon_bucket: u8, user_bucket: u8) -> u32 {
+    /// Retroactively merges `anon_id -> user_id` without rewriting historical segments (`P1-08`, `P1-11`).
+    /// Refuses with `Err(IdentityError::IdentifiedMergeConflict)` if `anon_id` already resolves to a different identified user.
+    pub fn alias(
+        &self,
+        anon_id: &str,
+        user_id: &str,
+        anon_bucket: u8,
+        user_bucket: u8,
+    ) -> Result<u32> {
         let anon_u32 = self.get_or_intern(anon_id, anon_bucket);
         let user_u32 = self.get_or_intern(user_id, user_bucket);
-        if anon_u32 == user_u32 {
-            return user_u32;
-        }
 
-        let canonical_root = {
-            let mut state = self.state.write();
-            let r = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket);
-            self.snapshot_dirty.store(true, Ordering::Release);
-            r
-        };
-
+        let mut state = self.state.write();
+        let canonical_root = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket)?;
         self.pending_mutations.lock().push(MutationEntry::Alias {
             anon_u32,
             user_u32,
             anon_bucket,
             user_bucket,
         });
-        canonical_root
+        self.snapshot_dirty.store(true, Ordering::Release);
+        Ok(canonical_root)
     }
 
     /// Performs `alias(...)` and immediately flushes the mutation batch to SlateDB.
@@ -587,7 +686,7 @@ impl ProjectIdentityGraph {
         anon_bucket: u8,
         user_bucket: u8,
     ) -> Result<u32> {
-        let root = self.alias(anon_id, user_id, anon_bucket, user_bucket);
+        let root = self.alias(anon_id, user_id, anon_bucket, user_bucket)?;
         self.flush().await?;
         Ok(root)
     }
@@ -614,55 +713,98 @@ impl ProjectIdentityGraph {
             }
         }
 
-        let mut state = self.state.write();
-        let snap = state.compress_all_and_build_snapshot();
-        *self.snapshot_cache.write() = Some(snap.clone());
+        let mut cache_guard = self.snapshot_cache.write();
+        if !self.snapshot_dirty.load(Ordering::Acquire) {
+            if let Some(snap) = cache_guard.as_ref() {
+                return snap.clone();
+            }
+        }
+        let snap = self.state.write().compress_all_and_build_snapshot();
+        *cache_guard = Some(snap.clone());
         self.snapshot_dirty.store(false, Ordering::Release);
         snap
     }
 
-    /// Flushes all staged intern & alias records durably to SlateDB on `object_store`.
+    /// Flushes all staged intern & alias records durably to SlateDB on `object_store` (`P1-09`).
+    ///
+    /// Retains `pending_mutations` and `next_chunk_seq` unchanged if the write or flush fails,
+    /// so retries never drop records or create chunk gaps.
     pub async fn flush(&self) -> Result<()> {
-        let entries = {
-            let mut guard = self.pending_mutations.lock();
+        let mut db_guard = self.db.lock().await;
+
+        let staged: Vec<MutationEntry> = {
+            let guard = self.pending_mutations.lock();
             if guard.is_empty() {
                 return Ok(());
             }
-            std::mem::take(&mut *guard)
+            guard.clone()
         };
+        let flushed_len = staged.len();
 
-        let db_guard = self.db.lock().await;
+        if db_guard.is_none() {
+            let reopened = open_slatedb_handle(&self.project_id, &self.object_store).await?;
+            *db_guard = Some(reopened);
+        }
         let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
 
         const CHUNK_SIZE: usize = 32_768;
+        let base_seq = self.next_chunk_seq.load(Ordering::Acquire);
+        let mut new_seq = base_seq;
+        let mut batch = WriteBatch::new();
+
+        for slice in staged.chunks(CHUNK_SIZE) {
+            let chunk_key = format!("log/chunk_{new_seq:012}");
+            let chunk_bytes = encode_mutation_chunk(slice);
+            batch.put(chunk_key.as_bytes(), &chunk_bytes);
+            new_seq += 1;
+        }
+        batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
+
+        // Periodically compact log history into `meta/checkpoint` (`P3-04`)
+        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
+        let wrote_checkpoint = if new_seq.saturating_sub(prev_cp) >= CHECKPOINT_INTERVAL_CHUNKS {
+            let cp_opt = {
+                let mut st = self.state.write();
+                let cur_pending = self.pending_mutations.lock().len();
+                if cur_pending == flushed_len {
+                    bincode::serialize(&st.to_checkpoint(new_seq)).ok()
+                } else {
+                    None
+                }
+            };
+            if let Some(cp_bytes) = cp_opt {
+                batch.put(META_CHECKPOINT_KEY, &cp_bytes);
+                for old_seq in prev_cp..new_seq {
+                    let old_key = format!("log/chunk_{old_seq:012}");
+                    batch.delete(old_key.as_bytes());
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let write_opts = WriteOptions {
             await_durable: false,
         };
-        let mut batch = WriteBatch::new();
-
-        for slice in entries.chunks(CHUNK_SIZE) {
-            let seq = self.next_chunk_seq.fetch_add(1, Ordering::AcqRel);
-            let chunk_key = format!("log/chunk_{seq:012}");
-            let chunk_bytes = encode_mutation_chunk(slice);
-            batch.put(chunk_key.as_bytes(), &chunk_bytes);
-
-            for item in slice {
-                if let MutationEntry::Intern {
-                    uid, distinct_id, ..
-                } = item
-                {
-                    let mut dkey = Vec::with_capacity(2 + distinct_id.len());
-                    dkey.extend_from_slice(b"d/");
-                    dkey.extend_from_slice(distinct_id.as_bytes());
-                    batch.put(&dkey, uid.to_le_bytes());
-                }
-            }
+        if let Err(e) = db.write_with_options(batch, &write_opts).await {
+            // SlateDB latches write errors on its handle; drop it so the next retry reopens cleanly
+            let _ = db_guard.take();
+            return Err(IdentityError::SlateDb(e));
+        }
+        if let Err(e) = db.flush().await {
+            let _ = db_guard.take();
+            return Err(IdentityError::SlateDb(e));
         }
 
-        let new_count = self.next_chunk_seq.load(Ordering::Acquire);
-        batch.put(META_CHUNK_COUNT_KEY, new_count.to_le_bytes());
-        db.write_with_options(batch, &write_opts).await?;
-        db.flush().await?;
+        // Commit state ONLY after SlateDB flush succeeded (`P1-09`)
+        self.next_chunk_seq.store(new_seq, Ordering::Release);
+        if wrote_checkpoint {
+            self.last_checkpoint_seq.store(new_seq, Ordering::Release);
+        }
+        self.pending_mutations.lock().drain(..flushed_len);
         Ok(())
     }
 
@@ -774,23 +916,27 @@ mod tests {
                 } else {
                     ((i + 1) % 256) as u8
                 };
-                let root = graph.alias(
-                    &format!("anon_a_{i:06}"),
-                    &format!("user_{i:06}"),
-                    anon_bucket,
-                    user_bucket,
-                );
+                let root = graph
+                    .alias(
+                        &format!("anon_a_{i:06}"),
+                        &format!("user_{i:06}"),
+                        anon_bucket,
+                        user_bucket,
+                    )
+                    .expect("alias anon_a");
                 assert_eq!(root, i);
             }
             for i in 0..10_000u32 {
                 let user_bucket = (i % 256) as u8;
                 let anon_b_bucket = ((i + 37) % 256) as u8;
-                let root = graph.alias(
-                    &format!("anon_b_{i:06}"),
-                    &format!("user_{i:06}"),
-                    anon_b_bucket,
-                    user_bucket,
-                );
+                let root = graph
+                    .alias(
+                        &format!("anon_b_{i:06}"),
+                        &format!("user_{i:06}"),
+                        anon_b_bucket,
+                        user_bucket,
+                    )
+                    .expect("alias anon_b");
                 assert_eq!(root, i);
             }
 

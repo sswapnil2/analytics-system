@@ -465,7 +465,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         if u < 6_800 {
             let b_anon = pulse_storage::route_bucket(&primary_seed, num_buckets);
             let b_user = pulse_storage::route_bucket(&secondary_seed, num_buckets);
-            id_graph.alias(&anon_id, &phone_id, b_anon, b_user);
+            id_graph.alias(&anon_id, &phone_id, b_anon, b_user)?;
 
             seq += 1;
             all_events.push(WireEvent {

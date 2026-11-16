@@ -6,15 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bincode.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
 roaring.workspace = true
+serde.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
 tempfile.workspace = true
