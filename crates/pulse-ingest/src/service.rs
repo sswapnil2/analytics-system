@@ -357,8 +357,18 @@ impl IngestService {
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
+        self.ingest_replay_for_project(&project_id, content_type, body)
+            .await
+    }
+
+    pub async fn ingest_replay_for_project(
+        &self,
+        project_id: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<ReplayIngestResponse> {
         let mut chunk = ReplayChunk::decode_auto(body, content_type)?;
-        chunk.project_id = project_id;
+        chunk.project_id = project_id.to_string();
         let res = self.storage.append_replay_chunk(&chunk).await?;
         Ok(ReplayIngestResponse {
             status: "ok".to_string(),

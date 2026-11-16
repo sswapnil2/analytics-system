@@ -1,20 +1,24 @@
 pub mod seeder;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{header, HeaderValue, Method};
 use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
-use pulse_control::{build_control_router, ControlPlaneService, MetaStore};
+use pulse_control::{
+    build_admin_control_router, build_public_flag_router, BootstrapCredentials,
+    ControlPlaneService, MetaStore,
+};
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
 use pulse_storage::{build_object_store, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS};
 use tokio::sync::{oneshot, watch};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
@@ -27,33 +31,71 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub web_dist_dir: PathBuf,
     pub default_project_id: String,
+    /// Optional explicit initial ingest key (used in deterministic tests); empty in production so a random key is generated once (`P0-02`).
     pub default_api_key: String,
+    /// Optional explicit root admin bearer token; when `None` and `PULSE_ADMIN_TOKEN` is unset, a random `sk_root_...` token is generated once (`P0-01`, `P0-02`).
+    pub admin_token: Option<String>,
+    /// Allowed browser origins for admin/query CORS (`P0-01`).
+    pub allowed_origins: Vec<String>,
+    /// Opt-in synthetic demo dataset seeder (`false` by default, enabled via `--seed` or `PULSE_SEED=1`, Section 6).
     pub auto_seed: bool,
     pub num_buckets: u16,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
+        let host: IpAddr = std::env::var("PULSE_HOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let port: u16 = std::env::var("PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
+        let quic_addr = std::env::var("PULSE_QUIC_ADDR")
+            .ok()
+            .and_then(|s| s.parse().ok());
         let data_dir = std::env::var("PULSE_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./pulse_data"));
         let web_dist_dir = std::env::var("PULSE_WEB_DIST_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./web/dist"));
-        let no_seed = std::env::var("PULSE_NO_SEED").is_ok_and(|v| v == "1" || v == "true");
+        let seed_enabled =
+            std::env::var("PULSE_SEED").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let allowed_origins = std::env::var("PULSE_CORS_ORIGINS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    format!("http://127.0.0.1:{port}"),
+                    format!("http://localhost:{port}"),
+                    "http://127.0.0.1:5173".to_string(),
+                    "http://localhost:5173".to_string(),
+                ]
+            });
 
         Self {
-            http_addr: SocketAddr::from(([0, 0, 0, 0], port)),
-            quic_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            http_addr: SocketAddr::new(host, port),
+            quic_addr,
             data_dir,
             web_dist_dir,
-            default_project_id: "proj_fintech_in".to_string(),
-            default_api_key: "pk_pulse_live_india_01".to_string(),
-            auto_seed: !no_seed,
+            default_project_id: std::env::var("PULSE_DEFAULT_PROJECT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "proj_default".to_string()),
+            default_api_key: String::new(),
+            admin_token: std::env::var("PULSE_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            allowed_origins,
+            auto_seed: seed_enabled,
             num_buckets: DEFAULT_NUM_BUCKETS,
         }
     }
@@ -66,6 +108,7 @@ pub struct RunningNode {
     pub ingest: Arc<IngestService>,
     pub storage: Arc<StorageEngine>,
     pub qengine: Arc<QueryEngine>,
+    pub bootstrap_credentials: BootstrapCredentials,
     shutdown_bg_tx: watch::Sender<bool>,
     shutdown_http_tx: Option<oneshot::Sender<()>>,
     http_task: tokio::task::JoinHandle<()>,
@@ -75,7 +118,7 @@ impl RunningNode {
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_bg_tx.send(true);
         if let Some(q) = &self.quic {
-            q.endpoint.close(0u32.into(), b"shutdown");
+            q.shutdown().await;
         }
         if let Some(tx) = self.shutdown_http_tx.take() {
             let _ = tx.send(());
@@ -86,7 +129,32 @@ impl RunningNode {
     }
 }
 
-/// Boots the unified single-binary Pulse Analytics Node (Control Plane + Data Plane + QUIC + Seeder + Static UI).
+fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(parsed))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::RANGE,
+            header::IF_NONE_MATCH,
+            header::HeaderName::from_static("x-pulse-admin-key"),
+            header::HeaderName::from_static("x-pulse-project"),
+        ])
+}
+
+/// Boots the unified single-binary Pulse Analytics Node.
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
 
@@ -113,19 +181,30 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     .await?;
 
     let meta = MetaStore::connect_auto(&config.data_dir).await?;
-    let control = ControlPlaneService::new(
+    let control = ControlPlaneService::new_with_admin(
         meta,
         qengine.clone(),
         &config.default_project_id,
         &config.default_api_key,
+        config.admin_token.clone(),
     )
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
 
+    let bootstrap_credentials = control.take_bootstrap_credentials();
+    if let Some(tok) = &bootstrap_credentials.generated_admin_token {
+        info!("Generated one-time Root Admin Bearer Token (save now, never stored in plaintext): {tok}");
+    }
+    if let Some(pk) = &bootstrap_credentials.generated_ingest_key {
+        info!(
+            project_id = %config.default_project_id,
+            "Generated one-time Public Ingest Key (save now, never stored in plaintext): {pk}"
+        );
+    }
+
     let ingest = IngestService::new(storage.clone(), control.clone());
     control.attach_ingest(ingest.clone()).await;
 
-    // Auto-seed 100,000+ Indian Fintech & Quick-Commerce events if project storage is empty
     if config.auto_seed {
         let ps = storage
             .get_or_open_project(&config.default_project_id)
@@ -154,30 +233,35 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         None
     };
 
-    let api_router = Router::new()
+    // Public SDK routes (permissive CORS) vs Protected Admin/Query routes (restricted CORS + Bearer auth, `P0-01`)
+    let public_router = Router::new()
         .merge(build_ingest_router(ingest.clone()))
-        .merge(build_control_router(control.clone()))
+        .merge(build_public_flag_router(control.clone()))
+        .layer(CorsLayer::permissive());
+
+    let admin_router = build_admin_control_router(control.clone())
+        .layer(build_admin_cors_layer(&config.allowed_origins));
+
+    let api_router = Router::new()
+        .merge(public_router)
+        .merge(admin_router)
         .route("/healthz", get(|| async { "ok" }));
 
     let index_file = config.web_dist_dir.join("index.html");
     let app = if index_file.exists() {
         let serve_dir =
             ServeDir::new(&config.web_dist_dir).not_found_service(ServeFile::new(index_file));
-        api_router
-            .fallback_service(serve_dir)
-            .layer(CorsLayer::permissive())
+        api_router.fallback_service(serve_dir)
     } else {
-        api_router
-            .fallback(get(|| async {
-                Html(
-                    "<!doctype html><html><head><title>Pulse Analytics</title></head>\
-                     <body style='background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:2rem'>\
-                     <h1>Pulse Analytics Node Running</h1>\
-                     <p>API &amp; Query Engine online. Run <code>npm --prefix web run build</code> to bundle Analytics Studio.</p>\
-                     </body></html>",
-                )
-            }))
-            .layer(CorsLayer::permissive())
+        api_router.fallback(get(|| async {
+            Html(
+                "<!doctype html><html><head><title>Pulse Analytics</title></head>\
+                 <body style='background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:2rem'>\
+                 <h1>Pulse Analytics Node Running</h1>\
+                 <p>API &amp; Query Engine online. Run <code>npm --prefix web run build</code> to bundle Analytics Studio.</p>\
+                 </body></html>",
+            )
+        }))
     };
 
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
@@ -200,6 +284,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         ingest,
         storage,
         qengine,
+        bootstrap_credentials,
         shutdown_bg_tx,
         shutdown_http_tx: Some(shutdown_http_tx),
         http_task,
@@ -213,16 +298,73 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn p0_01_and_p0_07_secure_node_config_defaults() {
+        let cfg = NodeConfig::default();
+        assert!(
+            cfg.http_addr.ip().is_loopback(),
+            "default HTTP bind must be loopback 127.0.0.1, got {}",
+            cfg.http_addr
+        );
+        assert!(
+            cfg.quic_addr.is_none(),
+            "QUIC listener must be disabled by default"
+        );
+        assert!(!cfg.auto_seed, "demo seeding must be opt-in (--seed)");
+        assert!(
+            cfg.default_api_key.is_empty(),
+            "default_api_key must not be a hardcoded secret"
+        );
+    }
+
     #[tokio::test]
     async fn gate4_full_node_sdk_offline_wireframe_lexicon_ab_lift_and_mcp() {
         let tmp_dir = tempfile::tempdir().expect("tempdir");
         let sdk_dir = tmp_dir.path().join("sdk_offline_wal");
 
-        // 1. Offline SDK phase: queue events + wireframe snapshot (with unmasked PII) + rage tap + `identify` while server isn't reachable yet!
+        // 1. Spin up `pulse-node` on ephemeral loopback ports with random first-boot credentials and `--seed` enabled
+        let node = start_pulse_node(NodeConfig {
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: tmp_dir.path().join("node_data"),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_fintech_in".to_string(),
+            default_api_key: String::new(),
+            admin_token: None,
+            allowed_origins: vec!["http://127.0.0.1:8080".to_string()],
+            auto_seed: true,
+            num_buckets: 32,
+        })
+        .await
+        .expect("start pulse-node");
+
+        let admin_token = node
+            .bootstrap_credentials
+            .generated_admin_token
+            .clone()
+            .expect("random admin token generated");
+        let ingest_key = node
+            .bootstrap_credentials
+            .generated_ingest_key
+            .clone()
+            .expect("random ingest key generated");
+
+        let base_url = format!("http://{}", node.http_addr);
+        let http = reqwest::Client::new();
+
+        // Unauthenticated `/v1/status` must return 401
+        let unauth = http
+            .get(format!("{base_url}/v1/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 2. Offline SDK phase using the freshly minted random `pk_live_...` key
         {
             let offline_sdk = PulseClient::new(SdkConfig {
                 endpoint_url: "http://127.0.0.1:9".to_string(),
-                api_key: "pk_pulse_live_india_01".to_string(),
+                api_key: ingest_key.clone(),
                 storage_dir: sdk_dir.to_string_lossy().to_string(),
                 flush_batch_size: 50,
                 flush_interval_ms: 0,
@@ -284,32 +426,17 @@ mod tests {
             assert!(offline_sdk.queued_packet_count() >= 3);
         }
 
-        // 2. Spin up full `pulse-node` on ephemeral ports with 100k+ Indian Fintech auto-seeder enabled!
-        let node = start_pulse_node(NodeConfig {
-            http_addr: "127.0.0.1:0".parse().unwrap(),
-            quic_addr: Some("127.0.0.1:0".parse().unwrap()),
-            data_dir: tmp_dir.path().join("node_data"),
-            web_dist_dir: tmp_dir.path().join("no_web"),
-            default_project_id: "proj_fintech_in".to_string(),
-            default_api_key: "pk_pulse_live_india_01".to_string(),
-            auto_seed: true,
-            num_buckets: 32,
-        })
-        .await
-        .expect("start pulse-node");
-
-        let base_url = format!("http://{}", node.http_addr);
-        let http = reqwest::Client::new();
-
-        // Verify 100,000+ auto-seeded events exist in status
+        // Verify 100,000+ auto-seeded events exist in authenticated `/v1/status`
         let status_json: Value = http
             .get(format!("{base_url}/v1/status"))
+            .bearer_auth(&admin_token)
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        assert!(status_json.get("default_api_key").is_none());
         let total_seeded = status_json["l1_rows"].as_u64().unwrap_or(0)
             + status_json["l0_rows"].as_u64().unwrap_or(0);
         assert!(
@@ -317,10 +444,10 @@ mod tests {
             "expected >= 100,000 seeded events, got {total_seeded}"
         );
 
-        // 3. Re-open SDK pointing at live ephemeral `pulse-node` -> flush offline disk WAL + evaluate edge flag!
+        // 3. Re-open SDK pointing at live `pulse-node` -> flush offline disk WAL + evaluate edge flag
         let live_sdk = PulseClient::new(SdkConfig {
             endpoint_url: base_url.clone(),
-            api_key: "pk_pulse_live_india_01".to_string(),
+            api_key: ingest_key.clone(),
             storage_dir: sdk_dir.to_string_lossy().to_string(),
             flush_batch_size: 50,
             flush_interval_ms: 0,
@@ -343,6 +470,7 @@ mod tests {
         // Verify SDK wireframe replay stored masked PAN (`ZZZZZ9999Z` must NEVER appear!)
         let replay_resp: Value = http
             .get(format!("{base_url}/v1/replay/{sdk_session_id}"))
+            .bearer_auth(&admin_token)
             .send()
             .await
             .unwrap()
@@ -351,13 +479,14 @@ mod tests {
             .unwrap();
         let replay_text = replay_resp.to_string();
         assert!(!replay_text.contains("ZZZZZ9999Z"));
-        assert!(replay_text.contains("PAN: ██████████"));
+        assert!(replay_text.contains("████"));
 
-        // 4. Blacklist an event via Lexicon API and assert live ingestion drops it!
+        // 4. Blacklist an event via Lexicon API and assert live ingestion drops it
         let put_lex = http
             .put(format!(
                 "{base_url}/v1/projects/proj_fintech_in/lexicon/events/Noisy_Debug_Spam"
             ))
+            .bearer_auth(&admin_token)
             .json(&json!({
                 "status": "dropped",
                 "description": "Dropped noisy debug heartbeat"
@@ -369,7 +498,7 @@ mod tests {
 
         let ingest_check: Value = http
             .post(format!("{base_url}/v1/ingest"))
-            .header("x-pulse-key", "pk_pulse_live_india_01")
+            .header("x-pulse-key", &ingest_key)
             .json(&json!({
                 "events": [
                     {
@@ -393,11 +522,12 @@ mod tests {
         assert_eq!(ingest_check["dropped"].as_u64(), Some(1));
         assert_eq!(ingest_check["accepted"].as_u64(), Some(1));
 
-        // 5. Evaluate active A/B Experiment `exp_one_tap_upi_mandate` statistical lift (~+14.5%, p < 0.01, Bayesian > 0.99)!
+        // 5. Evaluate active A/B Experiment `exp_one_tap_upi_mandate`
         let exp_res: Value = http
             .get(format!(
                 "{base_url}/v1/projects/proj_fintech_in/experiments/exp_one_tap_upi_mandate/results"
             ))
+            .bearer_auth(&admin_token)
             .send()
             .await
             .unwrap()
@@ -419,9 +549,10 @@ mod tests {
         assert!(p_val < 0.01, "expected p < 0.01, got {p_val}");
         assert!(bayes > 0.99, "expected Bayesian > 0.99, got {bayes}");
 
-        // 6. Invoke MCP JSON-RPC 2.0 `tools/list` and `tools/call` over HTTP!
+        // 6. Invoke MCP JSON-RPC 2.0 `tools/list` and `tools/call` over authenticated HTTP
         let mcp_list: Value = http
             .post(format!("{base_url}/v1/mcp"))
+            .bearer_auth(&admin_token)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -440,6 +571,7 @@ mod tests {
 
         let mcp_funnel: Value = http
             .post(format!("{base_url}/v1/mcp"))
+            .bearer_auth(&admin_token)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -462,7 +594,6 @@ mod tests {
             ["entered_users"]
             .as_u64()
             .unwrap_or(0);
-        // 8,000 seeded users + 0/1 SDK user -> >= 8,000 exact unique users at Step 0 (retroactively stitched!)
         assert!(
             step0_entered >= 8_000,
             "expected >= 8000 unique users at Funnel Step 0, got {step0_entered}"

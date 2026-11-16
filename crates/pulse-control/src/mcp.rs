@@ -64,9 +64,12 @@ impl JsonRpcResponse {
 }
 
 /// Built-in Model Context Protocol (MCP) JSON-RPC 2.0 handler (`initialize`, `tools/list`, `tools/call`).
+///
+/// Strictly bound to `bound_project_id` of the authenticated principal; any attempt to override
+/// `project_id` in tool arguments to a different project is rejected (`P0-04`).
 pub async fn handle_mcp_request(
     req: JsonRpcRequest,
-    default_project_id: &str,
+    bound_project_id: &str,
     meta: &MetaStore,
     qengine: &QueryEngine,
 ) -> JsonRpcResponse {
@@ -89,12 +92,10 @@ pub async fn handle_mcp_request(
                 "tools": [
                     {
                         "name": "get_lexicon_schema",
-                        "description": "Returns governed event and property schema definitions from the Pulse Lexicon.",
+                        "description": "Returns governed event and property schema definitions from the Pulse Lexicon for the authenticated project.",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "project_id": { "type": "string" }
-                            }
+                            "properties": {}
                         }
                     },
                     {
@@ -103,7 +104,6 @@ pub async fn handle_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "project_id": { "type": "string" },
                                 "event_name": { "type": "string" },
                                 "metric": { "type": "string", "enum": ["uniques", "totals", "sessions", "dau", "wau", "mau"] },
                                 "days": { "type": "integer", "default": 14 },
@@ -118,7 +118,6 @@ pub async fn handle_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "project_id": { "type": "string" },
                                 "steps": { "type": "array", "items": { "type": "string" } },
                                 "order_mode": { "type": "string", "enum": ["loose_order", "strict_order", "any_order"] },
                                 "days": { "type": "integer", "default": 14 },
@@ -133,7 +132,6 @@ pub async fn handle_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "project_id": { "type": "string" },
                                 "start_event": { "type": "string" },
                                 "return_event": { "type": "string" },
                                 "mode": { "type": "string", "enum": ["n_day", "unbounded", "frequency_stickiness"] },
@@ -145,11 +143,10 @@ pub async fn handle_mcp_request(
                     },
                     {
                         "name": "inspect_frustrated_sessions",
-                        "description": "Uses 64-bit SessionIndex Bloom pruning to surface sessions with Rage Taps, Dead Taps, or 5xx Gateway timeouts.",
+                        "description": "Uses 64-bit SessionIndex Bloom pruning to surface sessions with Rage Taps, Dead Taps, or errors.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "project_id": { "type": "string" },
                                 "event_name": { "type": "string" },
                                 "only_rage_tap": { "type": "boolean", "default": true },
                                 "only_errors": { "type": "boolean", "default": false },
@@ -169,13 +166,22 @@ pub async fn handle_mcp_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let pid = args
+
+            if let Some(arg_pid) = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .unwrap_or(default_project_id);
+            {
+                if arg_pid != bound_project_id {
+                    return JsonRpcResponse::err(
+                        req.id,
+                        -32602,
+                        "project_id argument cannot override authenticated principal scope",
+                    );
+                }
+            }
 
-            match invoke_tool(tool_name, pid, &args, meta, qengine).await {
+            match invoke_tool(tool_name, bound_project_id, &args, meta, qengine).await {
                 Ok(payload) => JsonRpcResponse::ok(
                     req.id,
                     json!({
@@ -247,7 +253,8 @@ async fn invoke_tool(
                 let ev = args
                     .get("event_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("App_Open")
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "missing required 'event_name'".to_string())?
                     .to_string();
                 let metric = match args
                     .get("metric")
@@ -302,17 +309,13 @@ async fn invoke_tool(
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(String::from))
                             .collect()
                     })
-                    .unwrap_or_else(|| {
-                        vec![
-                            "App_Open".to_string(),
-                            "KYC_PAN_Submitted".to_string(),
-                            "UPI_Autopay_Mandate_Approved".to_string(),
-                            "First_Disbursal_Success".to_string(),
-                        ]
-                    });
+                    .unwrap_or_default();
+                if step_names.len() < 2 {
+                    return Err("query_funnel requires at least 2 step event names".to_string());
+                }
                 let order_mode = match args
                     .get("order_mode")
                     .and_then(|v| v.as_str())
@@ -354,12 +357,14 @@ async fn invoke_tool(
             let start_event = args
                 .get("start_event")
                 .and_then(|v| v.as_str())
-                .unwrap_or("App_Open")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "missing required 'start_event'".to_string())?
                 .to_string();
             let return_event = args
                 .get("return_event")
                 .and_then(|v| v.as_str())
-                .unwrap_or("App_Open")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "missing required 'return_event'".to_string())?
                 .to_string();
             let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("n_day") {
                 "unbounded" => RetentionMode::Unbounded,

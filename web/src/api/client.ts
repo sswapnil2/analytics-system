@@ -9,7 +9,6 @@ export interface ProjectInfo {
 export interface NodeStatus {
   status: string;
   default_project_id: string;
-  default_api_key: string;
   active_project_id: string;
   live_eps: number;
   accepted_events_total: number;
@@ -291,16 +290,54 @@ export interface ExperimentResults {
   }[];
 }
 
+const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
+
+export function getStoredAdminToken(): string {
+  try {
+    return window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredAdminToken(token: string): void {
+  try {
+    if (token.trim()) {
+      window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token.trim());
+    } else {
+      window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage quota / sandbox restrictions
+  }
+}
+
+export class ApiAuthError extends Error {
+  public readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getStoredAdminToken();
+  const authHeaders: Record<string, string> = token
+    ? { Authorization: `Bearer ${token}` }
+    : {};
   const res = await fetch(url, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...authHeaders,
       ...(init?.headers ?? {}),
     },
   });
   if (!res.ok) {
     const text = await res.text();
+    if (res.status === 401 || res.status === 403) {
+      throw new ApiAuthError(res.status, text || `HTTP ${res.status}`);
+    }
     throw new Error(text || `HTTP ${res.status}`);
   }
   return (await res.json()) as T;
@@ -320,15 +357,13 @@ export const api = {
       projectId ? `/v1/status?project_id=${encodeURIComponent(projectId)}` : "/v1/status",
     ),
 
-  simulateBurst: (projectId: string, count = 1500) =>
+  flushStorage: () =>
     fetchJson<{
-      accepted: number;
-      deduped: number;
-      dropped: number;
-      frustrated_session_id: string;
-    }>("/v1/admin/simulate-burst", {
+      status: string;
+      segments_flushed: number;
+      partitions_compacted: number;
+    }>("/v1/admin/flush", {
       method: "POST",
-      body: JSON.stringify({ project_id: projectId, count }),
     }),
 
   queryInsights: (projectId: string, body: unknown) =>

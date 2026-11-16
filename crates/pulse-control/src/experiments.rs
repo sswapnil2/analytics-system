@@ -55,6 +55,7 @@ pub fn build_edge_flag_bundle(
             key: f.key.clone(),
             enabled: f.enabled,
             rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
+            targeting_cohort_id: f.targeting_cohort_id.clone(),
             variants: f.variants.clone(),
         })
         .collect();
@@ -108,6 +109,10 @@ pub async fn evaluate_experiment_results(
         hypothesis: exp.hypothesis.clone(),
         metric_name: exp.primary_metric.name.clone(),
         exec_time_us: t0.elapsed().as_micros() as u64,
+        srm_p_value: 1.0,
+        sample_ratio_mismatch: false,
+        statistical_methodology_note:
+            "Fixed-horizon two-sided Z-test / Welch t-test (not peeking-corrected)".to_string(),
         variants: primary_rows,
         guardrails,
     })

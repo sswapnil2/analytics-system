@@ -378,4 +378,66 @@ mod tests {
         quic.endpoint.close(0u32.into(), b"shutdown");
         id_router.close_all().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn p0_07_quic_authenticates_header_before_body_and_caps_streams() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 4,
+                l0_flush_row_threshold: 10_000,
+                l0_flush_max_age: Duration::from_secs(60),
+                compaction_min_segments: 4,
+            },
+            store,
+            id_router.clone(),
+        );
+        let gov = InMemoryGovernance::new();
+        gov.register_api_key("pk_valid", "proj_quic");
+        let ingest = IngestService::new(storage, gov);
+
+        let quic = spawn_quic_listener("127.0.0.1:0".parse().unwrap(), ingest).expect("bind quic");
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                quic.cert_der.as_slice(),
+            ))
+            .unwrap();
+        let client_cfg = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_cfg);
+
+        let conn = endpoint
+            .connect(quic.local_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        // Send ONLY the auth header claiming a 16 MiB body WITHOUT sending the body or closing `send`!
+        // A server that buffers `read_to_end` before checking auth will stall here instead of rejecting immediately.
+        let bad_key = b"pk_attacker_bad";
+        let mut header = Vec::new();
+        header.push(QUIC_OP_INGEST);
+        header.extend_from_slice(&(bad_key.len() as u16).to_le_bytes());
+        header.extend_from_slice(bad_key);
+        header.extend_from_slice(&(16_000_000u32).to_le_bytes());
+        send.write_all(&header).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(4096))
+            .await
+            .expect("QUIC server must reject unauthenticated stream before waiting for body")
+            .unwrap();
+        let reply_str = String::from_utf8_lossy(&reply);
+        assert!(
+            reply_str.contains("unauthorized"),
+            "expected unauthorized error, got: {reply_str}"
+        );
+
+        quic.endpoint.close(0u32.into(), b"shutdown");
+        id_router.close_all().await.unwrap();
+    }
 }

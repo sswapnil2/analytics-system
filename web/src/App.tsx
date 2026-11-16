@@ -8,12 +8,19 @@ import {
   FlaskConical,
   GitBranch,
   Grid3X3,
+  HardDrive,
+  KeyRound,
   LineChart,
   Smartphone,
   Sparkles,
-  Zap,
 } from "lucide-react";
-import { api, NodeStatus } from "./api/client";
+import {
+  api,
+  ApiAuthError,
+  getStoredAdminToken,
+  NodeStatus,
+  setStoredAdminToken,
+} from "./api/client";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
 import { FlowsWorkspace } from "./workspaces/FlowsWorkspace";
@@ -99,24 +106,34 @@ function formatLatency(us: number): string {
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<WorkspaceId>("funnels");
-  const [projectId, setProjectId] = useState<string>("proj_fintech_in");
+  const [projectId, setProjectId] = useState<string>("");
   const [status, setStatus] = useState<NodeStatus | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
   const [refreshToken, setRefreshToken] = useState<number>(0);
-  const [bursting, setBursting] = useState<boolean>(false);
-  const [burstToast, setBurstToast] = useState<string | null>(null);
+  const [flushing, setFlushing] = useState<boolean>(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const [authRequired, setAuthRequired] = useState<boolean>(() => !getStoredAdminToken());
+  const [tokenDraft, setTokenDraft] = useState<string>(() => getStoredAdminToken());
 
   const loadStatus = useCallback(async () => {
     try {
-      const s = await api.getStatus(projectId);
+      const s = await api.getStatus(projectId || undefined);
       setStatus(s);
-    } catch {
-      // Keep last status on transient poll hiccup
+      setAuthRequired(false);
+      if (!projectId && s.active_project_id) {
+        setProjectId(s.active_project_id);
+      }
+    } catch (err) {
+      if (err instanceof ApiAuthError) {
+        setAuthRequired(true);
+      }
     }
   }, [projectId]);
 
   const loadCatalog = useCallback(async () => {
+    if (!projectId) return;
     try {
       const [lex, ext] = await Promise.all([
         api.getLexicon(projectId),
@@ -146,7 +163,7 @@ export const App: React.FC = () => {
       setAvailableEvents(Array.from(evNames).sort());
       setAvailableProps(Array.from(propNames).sort());
     } catch {
-      // Fallback defaults inside workspaces will handle empty arrays
+      // Handled by auth state
     }
   }, [projectId]);
 
@@ -155,26 +172,71 @@ export const App: React.FC = () => {
     void loadCatalog();
     const timer = window.setInterval(() => {
       void loadStatus();
-    }, 2500);
+    }, 3000);
     return () => window.clearInterval(timer);
   }, [loadStatus, loadCatalog]);
 
-  const handleSimulateBurst = async () => {
-    setBursting(true);
+  const handleUnlock = (e: React.FormEvent) => {
+    e.preventDefault();
+    setStoredAdminToken(tokenDraft);
+    setAuthRequired(false);
+    void loadStatus();
+    setRefreshToken((n) => n + 1);
+  };
+
+  const handleFlushStorage = async () => {
+    setFlushing(true);
     try {
-      const res = await api.simulateBurst(projectId, 1800);
+      const res = await api.flushStorage();
       await loadStatus();
-      await loadCatalog();
       setRefreshToken((n) => n + 1);
-      setBurstToast(
-        `+${res.accepted.toLocaleString()} events ingested · ${res.deduped} flaky retries deduped`,
+      setToast(
+        `Flushed ${res.segments_flushed} Vortex segment(s) · ${res.partitions_compacted} compacted`,
       );
-      window.setTimeout(() => setBurstToast(null), 4500);
+      window.setTimeout(() => setToast(null), 4500);
     } finally {
-      setBursting(false);
+      setFlushing(false);
     }
   };
 
+  if (authRequired) {
+    return (
+      <div className="min-h-screen bg-[#090d16] text-slate-100 flex items-center justify-center p-6">
+        <form
+          onSubmit={handleUnlock}
+          className="w-full max-w-md bg-[#0e1422] border border-slate-800 rounded-xl p-6 space-y-4 shadow-2xl"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-lg bg-blue-600/20 border border-blue-500/40 flex items-center justify-center">
+              <KeyRound className="w-4 h-4 text-blue-400" />
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold text-white">Unlock Pulse Analytics Studio</h1>
+              <p className="text-xs text-slate-400">
+                Enter your Admin Bearer Token (<code className="font-mono">sk_…</code>)
+              </p>
+            </div>
+          </div>
+          <input
+            type="password"
+            value={tokenDraft}
+            onChange={(e) => setTokenDraft(e.target.value)}
+            placeholder="sk_root_… or project sk_live_…"
+            className="w-full bg-[#111827] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-blue-500"
+            autoFocus
+          />
+          <button
+            type="submit"
+            className="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white transition"
+          >
+            Authenticate Session
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  const activePid = projectId || status?.active_project_id || "proj_default";
   const totalStoredRows = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
 
   return (
@@ -203,7 +265,7 @@ export const App: React.FC = () => {
           <div className="ml-3 pl-3 border-l border-slate-800">
             <select
               aria-label="Active Project"
-              value={projectId}
+              value={activePid}
               onChange={(e) => {
                 setProjectId(e.target.value);
                 setRefreshToken((n) => n + 1);
@@ -212,13 +274,7 @@ export const App: React.FC = () => {
             >
               {(status?.projects && status.projects.length > 0
                 ? status.projects
-                : [
-                    {
-                      id: "proj_fintech_in",
-                      name: "Pulse SuperApp (IN)",
-                      timezone: "Asia/Kolkata",
-                    },
-                  ]
+                : [{ id: activePid, org_id: "org_default", name: activePid, timezone: "UTC", created_at_ms: 0 }]
               ).map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} ({p.id})
@@ -228,15 +284,14 @@ export const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Live Telemetry Pills + Traffic Burst Action */}
+        {/* Live Telemetry Pills */}
         <div className="flex items-center gap-2.5 flex-wrap justify-end">
-          {burstToast && (
+          {toast && (
             <div className="text-xs px-2.5 py-1 rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-mono">
-              {burstToast}
+              {toast}
             </div>
           )}
 
-          {/* Live Ingestion EPS & Stored Rows */}
           <div className="flex items-center gap-2 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs">
             <Activity className="w-3.5 h-3.5 text-emerald-400" />
             <span className="text-slate-400">Ingest:</span>
@@ -247,14 +302,8 @@ export const App: React.FC = () => {
             <span className="font-mono text-slate-200">
               {totalStoredRows.toLocaleString()} rows
             </span>
-            {(status?.deduped_events_total ?? 0) > 0 && (
-              <span className="text-[11px] font-mono text-amber-300/90">
-                ({status?.deduped_events_total.toLocaleString()} deduped)
-              </span>
-            )}
           </div>
 
-          {/* Engine Query Latency Pill */}
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs">
             <Cpu className="w-3.5 h-3.5 text-cyan-400" />
             <span className="text-slate-400">Engine:</span>
@@ -263,7 +312,6 @@ export const App: React.FC = () => {
             </span>
           </div>
 
-          {/* Snapshot Epoch & u32 Graph Badge */}
           <div className="hidden xl:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs font-mono">
             <span className="text-purple-300">Epoch #{status?.snapshot_epoch ?? 0}</span>
             <span className="text-slate-600">·</span>
@@ -274,22 +322,20 @@ export const App: React.FC = () => {
             </span>
           </div>
 
-          {/* Simulate Traffic Burst Button */}
           <button
             type="button"
-            onClick={() => void handleSimulateBurst()}
-            disabled={bursting}
+            onClick={() => void handleFlushStorage()}
+            disabled={flushing}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white shadow-sm shadow-blue-600/30 transition"
           >
-            <Zap className="w-3.5 h-3.5" />
-            {bursting ? "Streaming Burst…" : "Simulate Traffic Burst"}
+            <HardDrive className="w-3.5 h-3.5" />
+            {flushing ? "Flushing…" : "Flush & Compact"}
           </button>
         </div>
       </header>
 
       {/* Main Studio Body */}
       <div className="flex-1 flex min-h-0">
-        {/* Left Navigation Rail */}
         <aside className="w-60 shrink-0 border-r border-slate-800/90 bg-[#0b101c] p-3 flex flex-col justify-between">
           <nav className="space-y-1">
             {NAV_ITEMS.map((item) => {
@@ -322,25 +368,32 @@ export const App: React.FC = () => {
             })}
           </nav>
 
-          {/* Architecture Invariants Footer */}
           <div className="mt-6 p-3 rounded-lg bg-[#0f172a]/80 border border-slate-800/80 space-y-1.5 text-[11px] text-slate-400">
             <div className="font-semibold text-slate-200 flex items-center justify-between">
               <span>Physical Storage</span>
-              <span className="text-[10px] font-mono text-emerald-400">RPO = 0</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setStoredAdminToken("");
+                  setAuthRequired(true);
+                }}
+                className="text-[10px] font-mono text-slate-400 hover:text-white underline"
+              >
+                Lock
+              </button>
             </div>
             <div className="font-mono text-[10px] text-slate-400 leading-relaxed">
               <div>L0 Hot RAM: {(status?.l0_rows ?? 0).toLocaleString()}</div>
               <div>L1 Vortex: {(status?.l1_rows ?? 0).toLocaleString()}</div>
-              <div>Key: {status?.default_api_key ?? "pk_pulse_live_india_01"}</div>
+              <div>Project: {activePid}</div>
             </div>
           </div>
         </aside>
 
-        {/* Active Workspace Canvas */}
         <main className="flex-1 min-w-0 p-5 overflow-y-auto">
           {activeTab === "insights" && (
             <InsightsWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               availableProps={availableProps}
               refreshToken={refreshToken}
@@ -348,35 +401,35 @@ export const App: React.FC = () => {
           )}
           {activeTab === "funnels" && (
             <FunnelsWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               refreshToken={refreshToken}
             />
           )}
           {activeTab === "flows" && (
             <FlowsWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               refreshToken={refreshToken}
             />
           )}
           {activeTab === "retention" && (
             <RetentionWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               refreshToken={refreshToken}
             />
           )}
           {activeTab === "sessions" && (
             <SessionsReplayWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               refreshToken={refreshToken}
             />
           )}
           {activeTab === "cohorts" && (
             <CohortsLookupsWorkspace
-              projectId={projectId}
+              projectId={activePid}
               availableEvents={availableEvents}
               onCatalogChanged={() => {
                 void loadCatalog();
@@ -385,11 +438,11 @@ export const App: React.FC = () => {
             />
           )}
           {activeTab === "experiments" && (
-            <ExperimentsFlagsWorkspace projectId={projectId} refreshToken={refreshToken} />
+            <ExperimentsFlagsWorkspace projectId={activePid} refreshToken={refreshToken} />
           )}
           {activeTab === "lexicon" && (
             <LexiconMcpWorkspace
-              projectId={projectId}
+              projectId={activePid}
               onLexiconChanged={() => {
                 void loadCatalog();
                 setRefreshToken((n) => n + 1);

@@ -90,6 +90,11 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.8"
+sha2 = "0.10.9"
+hex = "0.4.3"
+constant_time_eq = "0.4.2"
+chrono-tz = "0.10.4"
+moka = { version = "0.12.16", features = ["sync"] }
 tempfile = "3.12"
 
 # FFI

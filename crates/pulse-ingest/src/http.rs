@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -20,32 +19,32 @@ pub fn build_ingest_router(service: Arc<IngestService>) -> Router {
         .with_state(service)
 }
 
-fn extract_api_key<'a>(
-    headers: &'a HeaderMap,
-    query: &'a HashMap<String, String>,
-) -> Option<&'a str> {
+/// Extracts the public `pk_` API key strictly from HTTP headers (never URL query strings, `P3-05`).
+fn extract_api_key(headers: &HeaderMap) -> Option<&str> {
     if let Some(val) = headers.get("x-pulse-key").and_then(|v| v.to_str().ok()) {
-        if !val.is_empty() {
-            return Some(val);
+        if !val.trim().is_empty() {
+            return Some(val.trim());
         }
     }
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            if !token.is_empty() {
+        if let Some(token) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        {
+            if !token.trim().is_empty() {
                 return Some(token.trim());
             }
         }
     }
-    query.get("api_key").map(|s| s.as_str())
+    None
 }
 
 async fn handle_ingest(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> std::result::Result<Json<crate::service::IngestResponse>, ApiError> {
-    let api_key = extract_api_key(&headers, &query).ok_or(IngestError::Unauthorized)?;
+    let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let resp = service.ingest_raw(api_key, content_type, &body).await?;
     Ok(Json(resp))
@@ -54,10 +53,9 @@ async fn handle_ingest(
 async fn handle_identify(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
     Json(req): Json<IdentifyRequest>,
 ) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
-    let api_key = extract_api_key(&headers, &query).ok_or(IngestError::Unauthorized)?;
+    let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let resp = service.identify(api_key, req).await?;
     Ok(Json(resp))
 }
@@ -65,10 +63,9 @@ async fn handle_identify(
 async fn handle_replay_chunk(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> std::result::Result<Json<crate::service::ReplayIngestResponse>, ApiError> {
-    let api_key = extract_api_key(&headers, &query).ok_or(IngestError::Unauthorized)?;
+    let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let resp = service.ingest_replay(api_key, content_type, &body).await?;
     Ok(Json(resp))
