@@ -2,84 +2,76 @@
 
 ## Milestone 1: Workspace Foundation, `pulse-wire`, and `pulse-identity`
 - [x] Initialize Cargo workspace (`Cargo.toml`) with shared dependencies & release profile (`lto = "thin"`, `codegen-units = 1`)
-- [x] Implement `crates/pulse-wire`:
+- [ ] Implement `crates/pulse-wire` *(open: P0-05, P0-06, P1-14, P3-01)*:
   - [x] `WireEvent` & `PropValue` (`Null`, `Bool`, `Int`, `Float`, `Str`)
-  - [x] `WireBatch` columnar binary framing (`PLSB` magic, Zstd + optional pre-shared dictionary framing, JSON fallback)
-  - [x] `ReplayChunk` & `WireframeOp` binary framing (`PLSR` magic, `FullSnapshot`, `NodeUpsert`, `NodeRemove`, `PointerInteraction`, `NetworkBreadcrumb`)
-- [x] Implement `crates/pulse-identity`:
-  - [x] `ProjectIdentityGraph` backed by `slatedb` + `object_store` + `DashMap`
-  - [x] Zero-rewrite retroactive `alias(anon_id, user_id, anon_bucket, user_bucket)` with Union-Find path compression
-  - [x] `cross_bucket_users` `RoaringBitmap` tracking & < 5ms lock-free `IdentitySnapshot`
-- [x] **Acceptance Gate 1**:
+  - [ ] `WireBatch` columnar binary framing (`PLSB` magic, bounded Zstd + optional pre-shared dictionary framing, JSON fallback)
+  - [ ] `ReplayChunk` & `WireframeOp` binary framing (`PLSR` magic, bounded allocations, default-deny PII masking)
+- [ ] Implement `crates/pulse-identity` *(open: P1-08, P1-09, P1-10, P1-11, P3-04)*:
+  - [ ] `ProjectIdentityGraph` backed by `slatedb` + `object_store` + `DashMap` with checkpointing & durable ordering
+  - [ ] Zero-rewrite retroactive `alias(anon_id, user_id, anon_bucket, user_bucket)` refusing identified-to-identified merges
+  - [x] `cross_bucket_users` `RoaringBitmap` tracking & lock-free `IdentitySnapshot`
+- [ ] **Acceptance Gate 1** *(open: P0-05, P0-06, P1-08..P1-11)*:
   - [x] `WireBatch` 10,000 polymorphic event round-trip & >= 65% compression vs JSON
-  - [x] `ProjectIdentityGraph` 250,000 IDs + 50,000 retroactive merges + SlateDB restart recovery + < 5ms snapshot
-  - [x] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p pulse-wire -p pulse-identity --release`
+  - [ ] Hostile wire input bounds (`crates/pulse-wire/tests/hostile_input.rs`)
+  - [ ] `ProjectIdentityGraph` 250,000 IDs + 50,000 retroactive merges + SlateDB failure/restart safety
 
 ## Milestone 2: `pulse-storage` & `pulse-ingest` (WAL, Dedup, Vortex Tier A/B/C, MVCC & Compactor)
-- [x] Implement `crates/pulse-storage`:
+- [ ] Implement `crates/pulse-storage` *(open: P1-02..P1-07, P1-12, P1-15, P1-16)*:
   - [x] Partitioning (`xxh3_64(routing_seed) % NUM_BUCKETS`)
-  - [x] `BucketWal` CRC32-checked WAL writer & startup recovery replayer (RPO = 0)
-  - [x] `MemBucket` L0 hot RAM buffer with row-count / age / manual flush
-  - [x] Immutable Vortex-backed Tier A/B/C segment writer & reader sorted by `(uid_internal, session_seq, event_ts_ms)`
-  - [x] Per-segment inverted `RoaringBitmap` indexes (Tier B) + 64-bit Bloom filter (Tier C) + `SessionIndex` 64-bit event Bloom footer
-  - [x] MVCC `Manifest` snapshot isolation & background late-data `Compactor` (>= 4 overlapping segments)
-  - [x] `ReplayStore` append & byte-range reader (`.plsr`)
-- [x] Implement `crates/pulse-ingest`:
-  - [x] `POST /v1/ingest` (binary `application/x-pulse-frame` + `application/json`), `POST /v1/identify`, `POST /v1/replay/chunk`
-  - [x] QUIC (`quinn`) UDP listener sharing ingestion service handler
-  - [x] Lexicon governance enforcement (drop events, mask PII, async discovery)
-  - [x] Rotating 15-minute deterministic deduplication ring & clock-skew normalizer
-- [x] **Acceptance Gate 2**:
-  - [x] 500,000 events with 20% duplicates, 15% out-of-order late timestamps, polymorphic `amount` (`Int`/`Float`/`Str`)
-  - [x] Abrupt restart WAL replay recovery test (100% restored, 0 duplicates)
-  - [x] L0 flush + compaction + `SessionIndex` skipping > 90% of non-matching sessions
-  - [x] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p pulse-storage -p pulse-ingest --release`
+  - [ ] `BucketWal` CRC32-checked WAL writer (covering header + fsync on local WAL + corrupt-frame quarantine + epoch fencing) (RPO = 0)
+  - [ ] `MemBucket` L0 hot RAM buffer with ordered per-bucket seq/append lock
+  - [ ] Immutable Vortex-backed Tier A/B/C segment writer & reader preserving `Null` props & typed inverted-index keys
+  - [ ] Per-segment inverted `RoaringBitmap` indexes (Tier B) + 64-bit Bloom filter (Tier C) + `SessionIndex` 64-bit event Bloom footer
+  - [ ] Strict read-after-write MVCC `Manifest` snapshot isolation (atomic L0 + pin lock) & locked `Compactor`
+  - [ ] `ReplayStore` immutable per-chunk objects (`replays/{project}/{session}/{seq:010}.plsr`) & byte-range reader
+- [ ] Implement `crates/pulse-ingest` *(open: P0-07, P1-01, P1-10, P1-13, P3-01, P3-05)*:
+  - [ ] `POST /v1/ingest`, `POST /v1/identify`, `POST /v1/replay/chunk` (header-only key, post-append dedup commit)
+  - [ ] QUIC (`quinn`) UDP listener disabled by default & resource-bounded when enabled
+  - [ ] Lexicon governance enforcement (drop events, mask PII on both events & replay labels, key-cardinality cap)
+  - [ ] Bounded rotating 15-minute deterministic deduplication ring & safe clock-skew normalizer
+- [ ] **Acceptance Gate 2** *(open: P1-01..P1-07, P1-12..P1-16)*:
+  - [ ] Concurrent failure-injected WAL + L0 + compaction + crash recovery (RPO = 0, 0 duplicates)
 
 ## Milestone 3: `pulse-exec` (Insights, Funnels, Retention, Flows, Cohorts, DataFusion Formulas & Lookups)
-- [x] Implement `crates/pulse-exec`:
-  - [x] `foyer` hybrid memory + disk cache integration for segment reads
-  - [x] Global pre-filter & recursive `BehavioralCohort` `RoaringBitmap` evaluator
-  - [x] `InsightsEngine` (Uniques, Totals, Sessions, DAU/WAU/MAU, Sum/Avg/Min/Max/p50/p90/p99 via `DDSketch`, breakdowns, previous period, formulas)
-  - [x] `FunnelEngine` (strict/loose/any, conversion window, exclusions, hold-constant, first-time-ever, cross-bucket stitch, TTC `DDSketch`, dropped sample sessions)
+- [ ] Implement `pulse-exec` *(open: P0-08, P0-09, P2-01, P2-09a..l, P3-02, P3-03)*:
+  - [ ] Bounded `foyer` / `moka` segment caches (evicting Tier A, inverted & prop caches)
+  - [ ] Global pre-filter & cycle-safe `BehavioralCohort` `RoaringBitmap` evaluator
+  - [ ] `InsightsEngine` (signed `DDSketch`, end-anchored WAU/MAU, calendar TZ bucketing, strict formula parser, resource caps)
+  - [ ] `FunnelEngine` (validated step bounds <= 16, `u32` chunk refs, sharded drop-off collector)
   - [x] `RetentionEngine` (`n_day`, `unbounded`, `frequency_stickiness`)
-  - [x] `FlowsEngine` (forward +N / reverse -N steps, consecutive collapse, Sankey nodes/links)
-  - [x] Custom Events, DataFusion expression Custom Properties, and Lookup Table dictionary joins
-- [x] **Acceptance Gate 3**:
-  - [x] Differential correctness tests matching brute-force reference oracle 100% identically
-  - [x] 1,000,000 event 4-step Funnel benchmark < 50ms in `--release` (measured 4.17ms warm / 14.63ms cold)
-  - [x] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p pulse-exec --release`
+  - [ ] `FlowsEngine` (honoring `top_n_per_step` & bounded event scan)
+  - [ ] Custom Events, case-preserving DataFusion Custom Properties, and qualified `table.col` pre-indexed Lookup Tables
+- [ ] **Acceptance Gate 3** *(open: Section 5 independent `proptest` oracle, `limits.rs`)*:
+  - [ ] Independent zero-shared-code randomized differential oracle (`proptest`) covering filters, cohorts, `first_time_ever`, percentiles, `Neq`, window boundaries
+  - [x] 1,000,000 event 4-step Funnel benchmark < 50ms in `--release`
 
 ## Milestone 4: `pulse-control`, `pulse-sdk-core`, `sdks/ts-web`, and `pulse-node`
-- [x] Implement `crates/pulse-control`:
-  - [x] SQLite/Postgres `sqlx` schema & migrations (Orgs, Projects, API Keys, Lexicon, Custom Events/Props, Lookup Tables, Cohorts, Saved Reports, Dashboards, Feature Flags, Experiments)
-  - [x] Frequentist Z-test + Bayesian Monte Carlo Beta-Binomial Experimentation engine
-  - [x] Deterministic ETag-cached Edge Flag Bundle endpoint (`GET /v1/flags/:project_api_key`)
-  - [x] Built-in MCP JSON-RPC 2.0 server (`POST /v1/mcp` with 5 tools)
-- [x] Implement `crates/pulse-sdk-core` & `sdks/bindings-gen`:
-  - [x] Thread-safe `PulseClient` (ring buffer, bounded 10 MB disk WAL, 30-min session rotation, Rage Tap & Dead Tap detector, `████` PII masking)
+- [ ] Implement `crates/pulse-control` *(open: P0-01..P0-04, P2-02, P2-10, Section 5 `sqlx::migrate!`, Section 6)*:
+  - [ ] Versioned `sqlx::migrate!` schema & deduplicated DB layer with SHA-256 hashed `pk_`/`sk_` keys & tenant-scoped queries/upserts
+  - [ ] Frequentist Z-test + Bayesian Experimentation engine with SRM check, Bonferroni/Holm multi-variant correction, variance-propagated lift CI & peeking notice
+  - [ ] Deterministic ETag-cached Edge Flag Bundle endpoint (`GET /v1/flags/:project_api_key`) with cohort targeting
+  - [ ] Principal-scoped MCP JSON-RPC 2.0 server (`POST /v1/mcp`)
+- [ ] Implement `crates/pulse-sdk-core` & `sdks/bindings-gen` *(open: P1-08, P1-13, P2-03, P2-06, P2-07, P2-08, P3-01, P3-05)*:
+  - [ ] Thread-safe `PulseClient` (owned Tokio runtime for UniFFI, append-only CRC-verified 10 MB disk WAL off caller thread, mutex-serialized ID-tracked flush, 4xx drop / 5xx backoff, `reset()`, transmit-time `sent_ts`)
   - [x] UniFFI Kotlin & Swift binding generator CLI
-- [x] Implement `sdks/ts-web`:
-  - [x] Zero-dependency TypeScript SDK + DOM wireframe walker + PII regex/attribute masker + rage-click listener
-- [x] Implement `crates/pulse-node`:
-  - [x] Unified single-binary Control + Data Plane + QUIC + Static UI server
-  - [x] Realistic 100,000+ event Indian Fintech & Quick-Commerce deterministic auto-seeder
-- [x] **Acceptance Gate 4**:
-  - [x] Full `pulse-node` ephemeral integration test (SDK batches, wireframe diffs, `identify`, Lexicon drop, A/B lift, MCP tools)
-  - [x] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --release`
+- [ ] Implement `sdks/ts-web` *(open: P2-03, P2-04, P2-05, P3-01, P3-05)*:
+  - [ ] Zero-dependency TypeScript SDK (shared `xxh3_64` bucketing, `localStorage` persistence, failure requeue + backoff, default-deny DOM text masking, listener cleanup)
+- [ ] Implement `crates/pulse-node` *(open: P0-01, P0-02, P0-07, P3-05, Section 6)*:
+  - [ ] Secure defaults (`127.0.0.1` bind, random first-boot `pk_`/`sk_` keys, `--seed` opt-in, `--quic` opt-in, restricted admin CORS, SIGTERM graceful shutdown)
+- [ ] **Acceptance Gate 4** *(open: P0-01..P0-04, P2-02..P2-10)*
 
 ## Milestone 5: `web/` Full Analytics Studio, Production Build & End-to-End Verification
 - [x] Scaffold `web/` (Vite + React + TypeScript + Tailwind dark-mode `#090d16` studio)
-- [x] Build Global Topbar + all 8 Workspaces:
-  - [x] Insights
-  - [x] Funnels (with clickable Drop-Off -> Wireframe Replay drawer)
-  - [x] Flows (interactive SVG Sankey diagram)
-  - [x] Retention (color-graded Cohort Heatmap Triangle)
-  - [x] Sessions & Interactive Phone Wireframe Player
-  - [x] Cohorts & Lookup Tables
-  - [x] Experiments & Feature Flags
-  - [x] Lexicon & Ask Pulse (MCP Playground)
-- [x] Wire `pulse-node` static asset serving (`web/dist`) & create `scripts/verify_e2e.sh`
-- [x] **Acceptance Gate 5**:
-  - [x] `npm --prefix web run typecheck && npm --prefix web run build`
-  - [x] `cargo test --workspace --release`
-  - [x] `scripts/verify_e2e.sh` against live `pulse-node`
+- [ ] Update Studio & `scripts/verify_e2e.sh` for bearer admin auth, opt-in `--seed`, and removal of production demo routes *(open: P0-01, P0-02, P3-05, Section 6)*
+- [ ] **Acceptance Gate 5**:
+  - [ ] `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --release && npm --prefix web run typecheck`
+  - [ ] `scripts/verify_e2e.sh` against live `pulse-node`
+
+---
+
+## First-Principles Review Remediation Checklist
+- [ ] **P0**: P0-01, P0-02, P0-03, P0-04, P0-05, P0-06, P0-07, P0-08, P0-09
+- [ ] **P1**: P1-01, P1-02, P1-03, P1-04, P1-05, P1-06, P1-07, P1-08, P1-09, P1-10, P1-11, P1-12, P1-13, P1-14, P1-15, P1-16
+- [ ] **P2**: P2-01, P2-02, P2-03, P2-04, P2-05, P2-06, P2-07, P2-08, P2-09 (a..l), P2-10
+- [ ] **P3**: P3-01, P3-02, P3-03, P3-04, P3-05
+- [ ] **Section 5 & 6**: Independent `proptest` oracle, `hostile_input.rs`, `limits.rs`, `sqlx::migrate!`, dead-code & demo cleanup
