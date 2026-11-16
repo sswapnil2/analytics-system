@@ -205,6 +205,7 @@ impl WalQueueEntry {
 enum WalIoCmd {
     Append(Vec<u8>),
     Compact(Vec<u8>),
+    PersistIdentity(Vec<u8>),
     Sync(oneshot::Sender<Result<(), String>>),
 }
 
@@ -275,7 +276,9 @@ fn load_wal_entries(wal_path: &Path) -> (VecDeque<WalQueueEntry>, usize, u64, bo
 }
 
 fn write_atomic_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{seq}"));
     {
         let mut f = File::create(&tmp)?;
         f.write_all(data)?;
@@ -290,11 +293,12 @@ fn write_atomic_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn spawn_wal_io_worker(wal_path: PathBuf) -> mpsc::UnboundedSender<WalIoCmd> {
+fn spawn_wal_io_worker(wal_path: PathBuf, state_path: PathBuf) -> mpsc::UnboundedSender<WalIoCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WalIoCmd>();
     sdk_runtime().spawn(async move {
         while let Some(cmd) = rx.recv().await {
             let path = wal_path.clone();
+            let id_path = state_path.clone();
             match cmd {
                 WalIoCmd::Append(frame) => {
                     let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -309,10 +313,19 @@ fn spawn_wal_io_worker(wal_path: PathBuf) -> mpsc::UnboundedSender<WalIoCmd> {
                         tokio::task::spawn_blocking(move || write_atomic_file(&path, &snapshot))
                             .await;
                 }
+                WalIoCmd::PersistIdentity(bytes) => {
+                    let _ =
+                        tokio::task::spawn_blocking(move || write_atomic_file(&id_path, &bytes))
+                            .await;
+                }
                 WalIoCmd::Sync(reply) => {
                     let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
                         if path.exists() {
                             let f = File::open(&path).map_err(|e| e.to_string())?;
+                            f.sync_data().map_err(|e| e.to_string())?;
+                        }
+                        if id_path.exists() {
+                            let f = File::open(&id_path).map_err(|e| e.to_string())?;
                             f.sync_data().map_err(|e| e.to_string())?;
                         }
                         Ok(())
@@ -375,7 +388,6 @@ struct TapPoint {
 #[derive(uniffi::Object)]
 pub struct PulseClient {
     config: SdkConfig,
-    state_path: PathBuf,
     wal_path: PathBuf,
     identity: RwLock<PersistedIdentityState>,
     event_ring: Mutex<Vec<WireEvent>>,
@@ -425,7 +437,7 @@ impl PulseClient {
             let _ = write_atomic_file(&wal_path, &compacted);
         }
 
-        let wal_io_tx = spawn_wal_io_worker(wal_path.clone());
+        let wal_io_tx = spawn_wal_io_worker(wal_path.clone(), state_path.clone());
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -435,7 +447,6 @@ impl PulseClient {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let client = Arc::new(Self {
             config: config.clone(),
-            state_path,
             wal_path,
             identity: RwLock::new(identity),
             event_ring: Mutex::new(Vec::with_capacity(config.flush_batch_size as usize)),
@@ -958,12 +969,9 @@ impl PulseClient {
     }
 
     fn persist_identity_async(&self, state: PersistedIdentityState) {
-        let path = self.state_path.clone();
-        sdk_runtime().spawn(async move {
-            if let Ok(bytes) = serde_json::to_vec(&state) {
-                let _ = tokio::task::spawn_blocking(move || write_atomic_file(&path, &bytes)).await;
-            }
-        });
+        if let Ok(bytes) = serde_json::to_vec(&state) {
+            let _ = self.wal_io_tx.send(WalIoCmd::PersistIdentity(bytes));
+        }
     }
 
     fn record_transient_backoff(&self) {
@@ -1370,5 +1378,58 @@ mod tests {
             futures::executor::block_on(client.shutdown()).unwrap();
         });
         handle.join().expect("bare OS thread must not panic");
+    }
+
+    #[tokio::test]
+    async fn en1_rapid_identity_persistence_never_races_or_rotates_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SdkConfig {
+            endpoint_url: "http://127.0.0.1:9".to_string(),
+            api_key: "pk_en1".to_string(),
+            storage_dir: dir.path().to_string_lossy().to_string(),
+            flush_batch_size: 50,
+            flush_interval_ms: 0,
+        };
+
+        let expected_session_id = {
+            let client = PulseClient::new(cfg.clone()).unwrap();
+            let sid = client.session_id();
+            client
+                .record_wireframe_snapshot(
+                    390,
+                    844,
+                    vec![SdkWireNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        kind: "masked_input".into(),
+                        x: 10,
+                        y: 10,
+                        w: 100,
+                        h: 40,
+                        bg_rgba: 0x1122_33FF,
+                        label: "secret".into(),
+                        unmasked: false,
+                    }],
+                )
+                .unwrap();
+            let now = Utc::now().timestamp_millis();
+            for i in 0..50 {
+                client.record_touch(100, 100, true, now + i * 20).unwrap();
+            }
+            client.identify("+919900099999".into()).unwrap();
+            client
+                .track("Quick_Event".into(), r#"{"ok":true}"#.into())
+                .unwrap();
+            let _ = client.flush().await;
+            sid
+        };
+
+        let reopened = PulseClient::new(cfg).unwrap();
+        assert_eq!(
+            reopened.session_id(),
+            expected_session_id,
+            "rapid concurrent identity updates must preserve session_id across restart"
+        );
+        assert_eq!(reopened.distinct_id(), "+919900099999");
     }
 }

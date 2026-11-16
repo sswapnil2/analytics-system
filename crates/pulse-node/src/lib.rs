@@ -470,15 +470,18 @@ mod tests {
         );
 
         // Verify SDK wireframe replay stored masked PAN (`ZZZZZ9999Z` must NEVER appear!)
-        let replay_resp: Value = http
+        let replay_http = http
             .get(format!("{base_url}/v1/replay/{sdk_session_id}"))
             .bearer_auth(&admin_token)
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
             .unwrap();
+        assert_eq!(
+            replay_http.status(),
+            reqwest::StatusCode::OK,
+            "expected HTTP 200 for /v1/replay/{sdk_session_id}"
+        );
+        let replay_resp: Value = replay_http.json().await.unwrap();
         let replay_text = replay_resp.to_string();
         assert!(!replay_text.contains("ZZZZZ9999Z"));
         assert!(replay_text.contains("████"));
