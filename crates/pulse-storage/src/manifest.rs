@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dictionary::ProjectDictSnapshot;
 use crate::error::{Result, StorageError};
+use crate::mem_bucket::StoredRow;
 use crate::segment::SegmentMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,8 @@ struct PartitionEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestWire {
     epoch: u64,
+    #[serde(default)]
+    fenced_wal_epoch: u64,
     partitions: Vec<PartitionEntry>,
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
@@ -33,6 +36,7 @@ struct ManifestWire {
 #[derive(Debug, Clone, Default)]
 pub struct Manifest {
     pub epoch: u64,
+    pub fenced_wal_epoch: u64,
     pub active_segments: HashMap<(NaiveDate, u8), Vec<SegmentMeta>>,
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
@@ -77,6 +81,7 @@ impl Manifest {
         partitions.sort_by_key(|p| (p.date, p.bucket_id));
         ManifestWire {
             epoch: self.epoch,
+            fenced_wal_epoch: self.fenced_wal_epoch,
             partitions,
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -91,6 +96,7 @@ impl Manifest {
         }
         Self {
             epoch: w.epoch,
+            fenced_wal_epoch: w.fenced_wal_epoch,
             active_segments,
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,
@@ -118,10 +124,6 @@ impl ManifestStore {
             "manifests/{}/epoch_{:012}.json",
             self.project_id, epoch
         ))
-    }
-
-    fn latest_hint_path(&self) -> ObjectPath {
-        ObjectPath::from(format!("manifests/{}/LATEST", self.project_id))
     }
 
     pub async fn load_latest(&self) -> Result<Manifest> {
@@ -159,16 +161,7 @@ impl ManifestStore {
             .put_opts(&path, PutPayload::from_bytes(Bytes::from(payload)), opts)
             .await
         {
-            Ok(_) => {
-                let _ = self
-                    .object_store
-                    .put(
-                        &self.latest_hint_path(),
-                        PutPayload::from_bytes(Bytes::from(next.epoch.to_string())),
-                    )
-                    .await;
-                Ok(next)
-            }
+            Ok(_) => Ok(next),
             Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
                 Err(StorageError::ManifestConflict)
             }
@@ -183,7 +176,7 @@ fn parse_epoch_from_path(path: &str) -> Option<u64> {
     body.parse::<u64>().ok()
 }
 
-/// Pin tracker ensuring compacted/superseded L1 segments are deleted ONLY once all active readers finish.
+/// Pin tracker ensuring compacted/superseded L1 segments are deleted ONLY once all active readers finish (`P1-05`).
 #[derive(Default)]
 pub struct ReaderPinTracker {
     segment_pins: DashMap<String, usize>,
@@ -200,12 +193,9 @@ impl ReaderPinTracker {
         for p in segment_paths {
             if let Some(mut entry) = self.segment_pins.get_mut(p) {
                 *entry = entry.saturating_sub(1);
-                let is_zero = *entry == 0;
-                drop(entry);
-                if is_zero {
-                    self.segment_pins.remove(p);
-                }
             }
+            // Atomic shard-locked conditional removal so a concurrent `0 -> 1` pin is NEVER erased (`P1-05`)!
+            self.segment_pins.remove_if(p, |_, v| *v == 0);
         }
     }
 
@@ -214,16 +204,22 @@ impl ReaderPinTracker {
     }
 }
 
-/// Consistent read-after-write MVCC snapshot acquired at the start of every query.
+/// Consistent read-after-write MVCC snapshot acquired atomically at the start of every query (`P1-05`, `P1-07`).
 pub struct StorageSnapshot {
     pub manifest: Arc<Manifest>,
     pub l0_watermark: u64,
+    l0_buckets: Vec<Arc<[Arc<StoredRow>]>>,
     pinned_paths: Vec<String>,
     tracker: Arc<ReaderPinTracker>,
 }
 
 impl StorageSnapshot {
-    pub fn new(manifest: Arc<Manifest>, l0_watermark: u64, tracker: Arc<ReaderPinTracker>) -> Self {
+    pub fn new(
+        manifest: Arc<Manifest>,
+        l0_watermark: u64,
+        l0_buckets: Vec<Arc<[Arc<StoredRow>]>>,
+        tracker: Arc<ReaderPinTracker>,
+    ) -> Self {
         let pinned_paths: Vec<String> = manifest
             .active_segments
             .values()
@@ -233,6 +229,7 @@ impl StorageSnapshot {
         Self {
             manifest,
             l0_watermark,
+            l0_buckets,
             pinned_paths,
             tracker,
         }
@@ -240,6 +237,19 @@ impl StorageSnapshot {
 
     pub fn epoch(&self) -> u64 {
         self.manifest.epoch
+    }
+
+    /// Returns captured L0 rows for `bucket_id` strictly inside `(bucket_l0_floor, l0_watermark]` (`P1-07`).
+    pub fn l0_bucket_rows(&self, bucket_id: u8) -> Vec<StoredRow> {
+        let Some(slice) = self.l0_buckets.get(bucket_id as usize) else {
+            return Vec::new();
+        };
+        let floor = self.bucket_l0_floor(bucket_id);
+        slice
+            .iter()
+            .filter(|r| r.l0_seq > floor && r.l0_seq <= self.l0_watermark)
+            .map(|r| (**r).clone())
+            .collect()
     }
 
     pub fn segments_for_range(

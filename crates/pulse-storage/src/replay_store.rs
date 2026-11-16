@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
-use chrono::{DateTime, NaiveDate, Utc};
-use dashmap::DashMap;
+use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{Error as OsError, ObjectStore, PutPayload};
+use object_store::{Error as OsError, ObjectStore, PutMode, PutOptions, PutPayload};
 use pulse_wire::ReplayChunk;
-use tokio::sync::Mutex;
 
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 
 #[derive(Debug, Clone)]
 pub struct ReplayAppendResult {
@@ -19,115 +16,135 @@ pub struct ReplayAppendResult {
     pub chunk_bytes: usize,
 }
 
-/// Object-store backed `.plsr` wireframe replay store supporting exact byte-range jumps.
+#[derive(Debug, Clone)]
+struct ReplayChunkMeta {
+    seq: u64,
+    location: ObjectPath,
+    size: u64,
+}
+
+/// Validates `project_id` and `session_id` against `[A-Za-z0-9_-]{1,128}` (`P1-16`).
+pub fn validate_replay_identifier(field: &'static str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(StorageError::InvalidIdentifier(format!(
+            "invalid {field}: must match [A-Za-z0-9_-]{{1,128}}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_chunk_seq(path: &str) -> Option<u64> {
+    let fname = path.rsplit('/').next()?;
+    let stem = fname.strip_suffix(".plsr")?;
+    stem.parse::<u64>().ok()
+}
+
+/// Object-store backed `.plsr` wireframe replay store storing immutable per-chunk objects
+/// at `replays/{project_id}/{session_id}/{seq:010}.plsr` (`P1-16`).
+///
+/// Eliminates O(n^2) read-modify-write object amplification, prevents multi-writer chunk loss via
+/// conditional `PutMode::Create`, and avoids UTC midnight file splits across process restarts.
 pub struct ReplayStore {
     object_store: Arc<dyn ObjectStore>,
-    session_paths: DashMap<(String, String), String>,
-    write_locks: DashMap<(String, String), Arc<Mutex<()>>>,
 }
 
 impl ReplayStore {
     pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            object_store,
-            session_paths: DashMap::new(),
-            write_locks: DashMap::new(),
-        }
+        Self { object_store }
     }
 
-    fn lock_for(&self, project_id: &str, session_id: &str) -> Arc<Mutex<()>> {
-        self.write_locks
-            .entry((project_id.to_string(), session_id.to_string()))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    fn path_for(project_id: &str, date: NaiveDate, session_id: &str) -> String {
-        format!(
-            "replays/{}/{}/{}.plsr",
-            project_id,
-            date.format("%Y%m%d"),
-            session_id
-        )
-    }
-
-    /// Appends a `ReplayChunk` frame to `replays/<project_id>/<yyyymmdd>/<session_id>.plsr`
-    /// and returns its starting byte offset (`replay_offset_kb`).
-    pub async fn append_chunk(&self, chunk: &ReplayChunk) -> Result<ReplayAppendResult> {
-        let lock = self.lock_for(&chunk.project_id, &chunk.session_id);
-        let _guard = lock.lock().await;
-
-        let date = DateTime::<Utc>::from_timestamp_millis(chunk.chunk_start_ts_ms)
-            .map(|dt| dt.date_naive())
-            .unwrap_or_else(|| Utc::now().date_naive());
-
-        let rel_path = self
-            .session_paths
-            .get(&(chunk.project_id.clone(), chunk.session_id.clone()))
-            .map(|r| r.clone())
-            .unwrap_or_else(|| Self::path_for(&chunk.project_id, date, &chunk.session_id));
-
-        let obj_path = ObjectPath::from(rel_path.as_str());
-        let existing = match self.object_store.get(&obj_path).await {
-            Ok(res) => res.bytes().await?.to_vec(),
-            Err(OsError::NotFound { .. }) => Vec::new(),
-            Err(other) => return Err(other.into()),
-        };
-
-        let byte_offset = existing.len() as u64;
-        let encoded = chunk.encode_binary(3)?;
-        let chunk_bytes = encoded.len();
-
-        let mut combined = Vec::with_capacity(existing.len() + encoded.len());
-        combined.extend_from_slice(&existing);
-        combined.extend_from_slice(&encoded);
-
-        self.object_store
-            .put(&obj_path, PutPayload::from_bytes(Bytes::from(combined)))
-            .await?;
-
-        self.session_paths.insert(
-            (chunk.project_id.clone(), chunk.session_id.clone()),
-            rel_path.clone(),
-        );
-
-        Ok(ReplayAppendResult {
-            object_path: rel_path,
-            byte_offset,
-            replay_offset_kb: (byte_offset / 1024) as u32,
-            chunk_bytes,
-        })
-    }
-
-    pub async fn resolve_session_path(
+    async fn list_session_chunks(
         &self,
         project_id: &str,
         session_id: &str,
-    ) -> Result<Option<String>> {
-        if let Some(p) = self
-            .session_paths
-            .get(&(project_id.to_string(), session_id.to_string()))
-        {
-            return Ok(Some(p.clone()));
-        }
-
-        let prefix = ObjectPath::from(format!("replays/{project_id}/"));
-        let suffix = format!("/{session_id}.plsr");
+    ) -> Result<Vec<ReplayChunkMeta>> {
+        validate_replay_identifier("project_id", project_id)?;
+        validate_replay_identifier("session_id", session_id)?;
+        let prefix = ObjectPath::from(format!("replays/{project_id}/{session_id}/"));
         let metas: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
+        let mut chunks = Vec::with_capacity(metas.len());
         for m in metas {
-            let loc = m.location.as_ref();
-            if loc.ends_with(&suffix) {
-                self.session_paths.insert(
-                    (project_id.to_string(), session_id.to_string()),
-                    loc.to_string(),
-                );
-                return Ok(Some(loc.to_string()));
+            if let Some(seq) = parse_chunk_seq(m.location.as_ref()) {
+                chunks.push(ReplayChunkMeta {
+                    seq,
+                    location: m.location,
+                    size: m.size,
+                });
             }
         }
-        Ok(None)
+        chunks.sort_by_key(|c| c.seq);
+        Ok(chunks)
     }
 
-    /// Performs a byte-range read starting at `start_byte_offset` (`offset_kb * 1024`) on `.plsr`.
+    /// Appends an immutable `ReplayChunk` object to `replays/<project_id>/<session_id>/<seq:010>.plsr`
+    /// using `PutMode::Create` and returns its virtual stream byte offset (`replay_offset_kb`).
+    pub async fn append_chunk(&self, chunk: &ReplayChunk) -> Result<ReplayAppendResult> {
+        validate_replay_identifier("project_id", &chunk.project_id)?;
+        validate_replay_identifier("session_id", &chunk.session_id)?;
+
+        let encoded = Bytes::from(chunk.encode_binary(3)?);
+        let chunk_bytes = encoded.len();
+
+        for _attempt in 0..32u8 {
+            let existing = self
+                .list_session_chunks(&chunk.project_id, &chunk.session_id)
+                .await?;
+            let byte_offset: u64 = existing.iter().map(|c| c.size).sum();
+            let next_seq: u64 = existing.last().map(|c| c.seq + 1).unwrap_or(0);
+
+            let rel_path = format!(
+                "replays/{}/{}/{:010}.plsr",
+                chunk.project_id, chunk.session_id, next_seq
+            );
+            let obj_path = ObjectPath::from(rel_path.as_str());
+            let opts = PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            };
+
+            match self
+                .object_store
+                .put_opts(&obj_path, PutPayload::from_bytes(encoded.clone()), opts)
+                .await
+            {
+                Ok(_) => {
+                    return Ok(ReplayAppendResult {
+                        object_path: rel_path,
+                        byte_offset,
+                        replay_offset_kb: (byte_offset / 1024) as u32,
+                        chunk_bytes,
+                    });
+                }
+                Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
+                    continue;
+                }
+                Err(other) => return Err(StorageError::ObjectStore(other)),
+            }
+        }
+
+        Err(StorageError::ManifestConflict)
+    }
+
+    /// Returns total concatenated byte length across all chunks of `session_id`, or `None` if session has no chunks.
+    pub async fn total_session_bytes(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<u64>> {
+        let chunks = self.list_session_chunks(project_id, session_id).await?;
+        if chunks.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(chunks.iter().map(|c| c.size).sum()))
+        }
+    }
+
+    /// Performs a virtual byte-range read across immutable chunk objects starting at `start_byte_offset`.
     pub async fn read_bytes_from(
         &self,
         project_id: &str,
@@ -135,46 +152,73 @@ impl ReplayStore {
         start_byte_offset: u64,
         max_len: Option<u64>,
     ) -> Result<Option<Bytes>> {
-        let Some(rel_path) = self.resolve_session_path(project_id, session_id).await? else {
+        let chunks = self.list_session_chunks(project_id, session_id).await?;
+        if chunks.is_empty() {
             return Ok(None);
-        };
-        let obj_path = ObjectPath::from(rel_path.as_str());
-        let head = match self.object_store.head(&obj_path).await {
-            Ok(h) => h,
-            Err(OsError::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
+        }
 
-        let total = head.size;
+        let total: u64 = chunks.iter().map(|c| c.size).sum();
         if start_byte_offset >= total {
             return Ok(Some(Bytes::new()));
         }
         let end = max_len
-            .map(|m| (start_byte_offset + m).min(total))
+            .map(|m| start_byte_offset.saturating_add(m).min(total))
             .unwrap_or(total);
-        let bytes = self
-            .object_store
-            .get_range(&obj_path, start_byte_offset..end)
-            .await?;
-        Ok(Some(bytes))
+
+        let mut out = BytesMut::with_capacity((end - start_byte_offset) as usize);
+        let mut cursor = 0u64;
+        for c in chunks {
+            let chunk_start = cursor;
+            let chunk_end = cursor + c.size;
+            cursor = chunk_end;
+
+            if chunk_end <= start_byte_offset {
+                continue;
+            }
+            if chunk_start >= end {
+                break;
+            }
+
+            let rel_start = start_byte_offset.saturating_sub(chunk_start);
+            let rel_end = (end - chunk_start).min(c.size);
+            if rel_start == 0 && rel_end == c.size {
+                let b = self.object_store.get(&c.location).await?.bytes().await?;
+                out.extend_from_slice(&b);
+            } else {
+                let b = self
+                    .object_store
+                    .get_range(&c.location, rel_start..rel_end)
+                    .await?;
+                out.extend_from_slice(&b);
+            }
+        }
+        Ok(Some(out.freeze()))
     }
 
     /// Reads and decodes `ReplayChunk` frames starting from `start_byte_offset`.
+    /// If `start_byte_offset` falls inside a chunk (e.g., `offset_kb * 1024`), snaps down to the
+    /// enclosing chunk boundary so binary Zstd `PLSR` frames always decode cleanly!
     pub async fn read_chunks(
         &self,
         project_id: &str,
         session_id: &str,
         start_byte_offset: u64,
     ) -> Result<Vec<ReplayChunk>> {
-        let Some(bytes) = self
-            .read_bytes_from(project_id, session_id, start_byte_offset, None)
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-        if bytes.is_empty() {
+        let chunks = self.list_session_chunks(project_id, session_id).await?;
+        if chunks.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(ReplayChunk::decode_stream(&bytes)?)
+        let mut out = Vec::new();
+        let mut cursor = 0u64;
+        for c in chunks {
+            let chunk_end = cursor + c.size;
+            if chunk_end > start_byte_offset {
+                let raw = self.object_store.get(&c.location).await?.bytes().await?;
+                let mut decoded = ReplayChunk::decode_stream(&raw)?;
+                out.append(&mut decoded);
+            }
+            cursor = chunk_end;
+        }
+        Ok(out)
     }
 }

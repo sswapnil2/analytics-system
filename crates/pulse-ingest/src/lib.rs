@@ -277,7 +277,7 @@ mod tests {
         for seg in post_snap.manifest.active_segments.values().flatten() {
             let sidx = reader.read_session_index(seg).await.unwrap();
             total_sessions += sidx.headers.len();
-            let matched = sidx.matching_session_ranges(|h| h.may_contain_all_events(needle_mask));
+            let matched = sidx.matching_session_ranges(|h| h.may_contain_any_event(needle_mask));
             skipped_sessions += sidx.headers.len() - matched.len();
         }
 

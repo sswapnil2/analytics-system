@@ -124,7 +124,7 @@ pub struct WireEvent {
 }
 
 impl WireEvent {
-    /// Computes a deterministic 128-bit `event_uuid` from key event fields when a client omits one.
+    /// Computes a deterministic 128-bit `event_uuid` from key event fields and salt.
     pub fn deterministic_uuid(
         distinct_id: &str,
         session_id: &str,
@@ -141,6 +141,49 @@ impl WireEvent {
         buf.extend_from_slice(event_name.as_bytes());
         buf.extend_from_slice(&client_event_ts_ms.to_le_bytes());
         buf.extend_from_slice(&seq_salt.to_le_bytes());
+        xxh3_128(&buf).to_le_bytes()
+    }
+
+    /// Computes a canonical 128-bit content hash over all event fields AND sorted properties (`P1-14`)
+    /// so JSON events without a client-supplied `event_uuid` never collide across distinct payloads.
+    pub fn canonical_content_uuid(
+        distinct_id: &str,
+        session_id: &str,
+        event_name: &str,
+        client_event_ts_ms: i64,
+        replay_offset_kb: u32,
+        props: &[(String, PropValue)],
+    ) -> [u8; 16] {
+        let mut sorted_indices: Vec<usize> = (0..props.len()).collect();
+        sorted_indices.sort_by(|&a, &b| props[a].0.cmp(&props[b].0));
+
+        let mut buf =
+            Vec::with_capacity(distinct_id.len() + session_id.len() + event_name.len() + 64);
+        buf.extend_from_slice(&(distinct_id.len() as u32).to_le_bytes());
+        buf.extend_from_slice(distinct_id.as_bytes());
+        buf.extend_from_slice(&(session_id.len() as u32).to_le_bytes());
+        buf.extend_from_slice(session_id.as_bytes());
+        buf.extend_from_slice(&(event_name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(event_name.as_bytes());
+        buf.extend_from_slice(&client_event_ts_ms.to_le_bytes());
+        buf.extend_from_slice(&replay_offset_kb.to_le_bytes());
+        buf.extend_from_slice(&(props.len() as u32).to_le_bytes());
+        for idx in sorted_indices {
+            let (k, v) = &props[idx];
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k.as_bytes());
+            buf.push(v.tag());
+            match v {
+                PropValue::Null => {}
+                PropValue::Bool(b) => buf.push(u8::from(*b)),
+                PropValue::Int(i) => buf.extend_from_slice(&i.to_le_bytes()),
+                PropValue::Float(f) => buf.extend_from_slice(&f.to_bits().to_le_bytes()),
+                PropValue::Str(s) => {
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
         xxh3_128(&buf).to_le_bytes()
     }
 
@@ -225,7 +268,8 @@ impl<'de> Deserialize<'de> for WireEvent {
         } else {
             input.session_id
         };
-        let client_sent_ts_ms = input.client_sent_ts_ms.unwrap_or(input.client_event_ts_ms);
+        // `0` indicates no client transmission timestamp was supplied (e.g., server-side or historical backfill JSON) (`P1-13`).
+        let client_sent_ts_ms = input.client_sent_ts_ms.unwrap_or(0);
 
         let props = match input.props {
             Some(PropsInput::Map(m)) => m
@@ -245,12 +289,13 @@ impl<'de> Deserialize<'de> for WireEvent {
                     xxh3_128(s.as_bytes()).to_le_bytes()
                 }
             }
-            None => Self::deterministic_uuid(
+            None => Self::canonical_content_uuid(
                 &input.distinct_id,
                 &session_id,
                 &input.event_name,
                 input.client_event_ts_ms,
-                props.len() as u64,
+                input.replay_offset_kb,
+                &props,
             ),
         };
 

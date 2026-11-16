@@ -83,7 +83,15 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             IngestError::Unauthorized => StatusCode::UNAUTHORIZED,
-            IngestError::Wire(_) | IngestError::Json(_) => StatusCode::BAD_REQUEST,
+            IngestError::Wire(_)
+            | IngestError::Json(_)
+            | IngestError::Storage(pulse_storage::StorageError::InvalidIdentifier(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            IngestError::SchemaGovernanceLimit(_)
+            | IngestError::Storage(pulse_storage::StorageError::DictionaryFull { .. }) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict) => {
                 StatusCode::CONFLICT
             }

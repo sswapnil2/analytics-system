@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -34,7 +35,8 @@ impl StoredRow {
 }
 
 struct BucketInner {
-    rows: Vec<StoredRow>,
+    rows: Vec<Arc<StoredRow>>,
+    cached_slice: Option<Arc<[Arc<StoredRow>]>>,
     oldest_unflushed_at: Option<Instant>,
 }
 
@@ -50,6 +52,7 @@ impl MemBucket {
             bucket_id,
             inner: RwLock::new(BucketInner {
                 rows: Vec::new(),
+                cached_slice: Some(Arc::from(&[][..])),
                 oldest_unflushed_at: None,
             }),
         }
@@ -59,7 +62,7 @@ impl MemBucket {
         self.bucket_id
     }
 
-    pub fn append_batch(&self, mut rows: Vec<StoredRow>) -> usize {
+    pub fn append_batch(&self, rows: Vec<StoredRow>) -> usize {
         if rows.is_empty() {
             return 0;
         }
@@ -67,7 +70,8 @@ impl MemBucket {
         if guard.oldest_unflushed_at.is_none() {
             guard.oldest_unflushed_at = Some(Instant::now());
         }
-        guard.rows.append(&mut rows);
+        guard.rows.extend(rows.into_iter().map(Arc::new));
+        guard.cached_slice = None;
         guard.rows.len()
     }
 
@@ -95,6 +99,24 @@ impl MemBucket {
         false
     }
 
+    /// Captures an immutable `Arc<[Arc<StoredRow>]>` snapshot of this bucket's L0 rows (`P1-07`, `P3-04`).
+    /// Cached across consecutive readers so repeated snapshots take O(1) atomic refcount increments!
+    pub fn arc_snapshot(&self) -> Arc<[Arc<StoredRow>]> {
+        {
+            let guard = self.inner.read();
+            if let Some(cached) = &guard.cached_slice {
+                return cached.clone();
+            }
+        }
+        let mut guard = self.inner.write();
+        if let Some(cached) = &guard.cached_slice {
+            return cached.clone();
+        }
+        let snap: Arc<[Arc<StoredRow>]> = Arc::from(guard.rows.as_slice());
+        guard.cached_slice = Some(snap.clone());
+        snap
+    }
+
     /// Reads all rows strictly inside the MVCC window `(floor_l0_seq, max_l0_seq]`.
     pub fn snapshot_rows(&self, floor_l0_seq: u64, max_l0_seq: u64) -> Vec<StoredRow> {
         let guard = self.inner.read();
@@ -102,17 +124,22 @@ impl MemBucket {
             .rows
             .iter()
             .filter(|r| r.l0_seq > floor_l0_seq && r.l0_seq <= max_l0_seq)
-            .cloned()
+            .map(|r| (**r).clone())
             .collect()
     }
 
-    /// Updates session frustration flags on in-memory events matching `session_hash`.
+    /// Updates session frustration flags on in-memory events matching `session_hash` using copy-on-write `Arc::make_mut`.
     pub fn add_session_flags(&self, session_hash: u64, flags: u16) {
         let mut guard = self.inner.write();
+        let mut changed = false;
         for row in &mut guard.rows {
-            if row.session_hash == session_hash {
-                row.session_flags |= flags;
+            if row.session_hash == session_hash && (row.session_flags & flags) != flags {
+                Arc::make_mut(row).session_flags |= flags;
+                changed = true;
             }
+        }
+        if changed {
+            guard.cached_slice = None;
         }
     }
 
@@ -123,7 +150,7 @@ impl MemBucket {
             .rows
             .iter()
             .filter(|r| r.l0_seq > floor_l0_seq)
-            .cloned()
+            .map(|r| (**r).clone())
             .collect();
         if staged.is_empty() {
             return None;
@@ -141,7 +168,11 @@ impl MemBucket {
     /// Evicts rows with `l0_seq <= committed_l0_seq` AFTER the new MVCC Manifest epoch is durable.
     pub fn complete_flush(&self, committed_l0_seq: u64) {
         let mut guard = self.inner.write();
+        let prev_len = guard.rows.len();
         guard.rows.retain(|r| r.l0_seq > committed_l0_seq);
+        if guard.rows.len() != prev_len {
+            guard.cached_slice = None;
+        }
         if guard.rows.is_empty() {
             guard.oldest_unflushed_at = None;
         } else {

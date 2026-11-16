@@ -4,8 +4,8 @@ pub mod event;
 pub mod replay;
 
 pub use batch::{
-    DictionaryRegistry, WireBatch, BATCH_MAGIC, DEFAULT_DICT_ID, FLAG_DICT_ZSTD, FLAG_RAW_ZSTD,
-    WIRE_VERSION,
+    decode_zstd_bounded, DictionaryRegistry, WireBatch, BATCH_MAGIC, DEFAULT_DICT_ID,
+    FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
 pub use error::{Result, WireError};
 pub use event::{PropValue, WireEvent};

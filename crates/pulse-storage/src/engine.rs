@@ -3,14 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use dashmap::DashMap;
+use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use pulse_identity::IdentityRouter;
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -25,6 +26,9 @@ use crate::segment::{write_vortex_segment, SegmentMeta, VortexSegmentReader};
 use crate::wal::BucketWal;
 
 pub const DEFAULT_NUM_BUCKETS: u16 = 256;
+/// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback (`P3-04`).
+const DEDUP_SEED_LOOKBACK_MS: i64 = 30 * 60 * 1_000;
+const MAX_SESSION_FLAGS_CACHE_ENTRIES: u64 = 262_144;
 
 /// Deterministic entity-centric bucket router (`xxh3_64(routing_seed) % num_buckets`).
 #[inline]
@@ -73,11 +77,15 @@ pub struct ProjectStorage {
     dictionary: Arc<ProjectDictionary>,
     wals: Vec<BucketWal>,
     mem_buckets: Vec<MemBucket>,
+    /// Per-bucket append mutex serializing `wal_seq` allocation, durable `wal.append`, `l0_seq` assignment,
+    /// `MemBucket` insertion, and `DedupRegistry` commit (`P1-01`, `P1-02`).
+    bucket_append_locks: Vec<AsyncMutex<()>>,
     bucket_flush_locks: Vec<AsyncMutex<()>>,
+    compaction_locks: DashMap<(NaiveDate, u8), Arc<AsyncMutex<()>>>,
     l0_seq: AtomicU64,
     pin_tracker: Arc<ReaderPinTracker>,
     pending_gc: Mutex<Vec<String>>,
-    session_flags: DashMap<u64, u16>,
+    session_flags: Cache<u64, u16>,
     recovered_uuid_fps: Mutex<Vec<(u8, u64)>>,
 }
 
@@ -105,6 +113,7 @@ impl ProjectStorage {
 
         let mut wals = Vec::with_capacity(config.num_buckets as usize);
         let mut mem_buckets = Vec::with_capacity(config.num_buckets as usize);
+        let mut bucket_append_locks = Vec::with_capacity(config.num_buckets as usize);
         let mut bucket_flush_locks = Vec::with_capacity(config.num_buckets as usize);
 
         for b in 0..config.num_buckets {
@@ -114,14 +123,17 @@ impl ProjectStorage {
                 .get(&bucket_id)
                 .copied()
                 .unwrap_or(0);
-            wals.push(BucketWal::new(
+            let wal = BucketWal::new(
                 &project_id,
                 bucket_id,
                 manifest.epoch,
                 committed_wal,
                 object_store.clone(),
-            ));
+            );
+            wal.set_min_valid_epoch(manifest.fenced_wal_epoch);
+            wals.push(wal);
             mem_buckets.push(MemBucket::new(bucket_id));
+            bucket_append_locks.push(AsyncMutex::new(()));
             bucket_flush_locks.push(AsyncMutex::new(()));
         }
 
@@ -135,11 +147,16 @@ impl ProjectStorage {
             dictionary,
             wals,
             mem_buckets,
+            bucket_append_locks,
             bucket_flush_locks,
+            compaction_locks: DashMap::new(),
             l0_seq,
             pin_tracker: Arc::new(ReaderPinTracker::default()),
             pending_gc: Mutex::new(Vec::new()),
-            session_flags: DashMap::new(),
+            session_flags: Cache::builder()
+                .max_capacity(MAX_SESSION_FLAGS_CACHE_ENTRIES)
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
             recovered_uuid_fps: Mutex::new(Vec::new()),
         });
 
@@ -147,26 +164,32 @@ impl ProjectStorage {
         let id_graph = identity_router.get_or_open(&project_id).await?;
         let mut seen_replay_fps: HashSet<u64> = HashSet::new();
 
-        // Also seed seen_replay_fps from existing L1 segments so duplicate retries of already-flushed
-        // batches after an abrupt restart are also idempotently suppressed!
+        // Seed dedup ONLY from recent L1 segments (`max_ts_ms >= now - 30 min`) so startup cost is O(recent),
+        // not O(total history) (`P3-04`).
+        let cutoff_ts_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(DEDUP_SEED_LOOKBACK_MS);
         let reader = VortexSegmentReader::new(object_store);
-        let active_segs: Vec<SegmentMeta> = ps
+        let recent_segs: Vec<SegmentMeta> = ps
             .manifest
             .read()
             .active_segments
             .values()
-            .flat_map(|v| v.iter().cloned())
+            .flat_map(|v| v.iter())
+            .filter(|s| s.footer.max_ts_ms >= cutoff_ts_ms)
+            .cloned()
             .collect();
-        for seg in &active_segs {
+        for seg in &recent_segs {
             if let Ok(batch) = reader.project_columns(seg, &["event_uuid_fp"]).await {
                 if let Some(col) = batch.column_by_name("event_uuid_fp") {
                     use arrow_array::cast::AsArray;
                     use arrow_array::types::UInt64Type;
                     let arr = col.as_primitive::<UInt64Type>();
+                    let mut rec_guard = ps.recovered_uuid_fps.lock();
                     for i in 0..arr.len() {
                         let fp = arr.value(i);
                         seen_replay_fps.insert(fp);
-                        ps.recovered_uuid_fps.lock().push((seg.bucket_id, fp));
+                        rec_guard.push((seg.bucket_id, fp));
                     }
                 }
             }
@@ -191,7 +214,7 @@ impl ProjectStorage {
                     }
                     ps.recovered_uuid_fps.lock().push((bucket_id, fp));
                     let uid = id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-                    rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp));
+                    rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp)?);
                 }
                 ps.mem_buckets[b as usize].append_batch(rows);
             }
@@ -218,20 +241,24 @@ impl ProjectStorage {
         std::mem::take(&mut *self.recovered_uuid_fps.lock())
     }
 
-    /// Acquires a strict read-after-write MVCC `StorageSnapshot`.
+    /// Acquires a strict read-after-write MVCC `StorageSnapshot` inside a single `manifest.read()` critical section (`P1-05`, `P1-07`).
+    /// Pins active segments AND captures `Arc` L0 bucket slices atomically so concurrent flushes or GC can never
+    /// delete a pinned segment or evict unflushed rows before the reader scans them!
     pub fn snapshot(&self) -> StorageSnapshot {
-        let manifest = self.manifest.read().clone();
+        let mf_guard = self.manifest.read();
+        let manifest = mf_guard.clone();
         let watermark = self.l0_seq.load(Ordering::Acquire);
-        StorageSnapshot::new(manifest, watermark, self.pin_tracker.clone())
+        let l0_buckets: Vec<Arc<[Arc<StoredRow>]>> = self
+            .mem_buckets
+            .iter()
+            .map(|mb| mb.arc_snapshot())
+            .collect();
+        StorageSnapshot::new(manifest, watermark, l0_buckets, self.pin_tracker.clone())
     }
 
-    /// Reads L0 rows for `bucket_id` strictly within the MVCC snapshot window.
+    /// Reads L0 rows for `bucket_id` strictly from the snapshot's captured MVCC state (`P1-07`).
     pub fn snapshot_l0_bucket(&self, snap: &StorageSnapshot, bucket_id: u8) -> Vec<StoredRow> {
-        let Some(mb) = self.mem_buckets.get(bucket_id as usize) else {
-            return Vec::new();
-        };
-        let floor = snap.bucket_l0_floor(bucket_id);
-        mb.snapshot_rows(floor, snap.l0_watermark)
+        snap.l0_bucket_rows(bucket_id)
     }
 
     pub fn total_l0_rows(&self) -> usize {
@@ -244,31 +271,25 @@ impl ProjectStorage {
         uid_internal: u32,
         wal_seq: u64,
         event_uuid_fp: u64,
-    ) -> StoredRow {
-        let l0_seq = self.l0_seq.fetch_add(1, Ordering::AcqRel) + 1;
+    ) -> Result<StoredRow> {
         let session_hash = xxh3_64(ev.session_id.as_bytes());
-        let event_id = self.dictionary.get_or_intern_event(&ev.event_name);
+        let event_id = self.dictionary.try_get_or_intern_event(&ev.event_name)?;
 
-        let mut flags = self
-            .session_flags
-            .get(&session_hash)
-            .map(|f| *f)
-            .unwrap_or(0);
+        let mut flags = self.session_flags.get(&session_hash).unwrap_or(0);
         if is_error_event(&ev.event_name, &ev.props) {
             flags |= SESSION_FLAG_ERROR;
-            self.session_flags
-                .entry(session_hash)
-                .and_modify(|f| *f |= SESSION_FLAG_ERROR)
-                .or_insert(SESSION_FLAG_ERROR);
+            self.session_flags.insert(session_hash, flags);
         }
 
         let mut props = Vec::with_capacity(ev.props.len());
         for (k, v) in &ev.props {
-            let pk = self.dictionary.get_or_intern_prop_key(k);
+            let pk = self.dictionary.try_get_or_intern_prop_key(k)?;
             props.push((pk, v.clone()));
         }
 
-        StoredRow {
+        let l0_seq = self.l0_seq.fetch_add(1, Ordering::AcqRel) + 1;
+
+        Ok(StoredRow {
             l0_seq,
             wal_seq,
             event_uuid_fp,
@@ -280,7 +301,7 @@ impl ProjectStorage {
             replay_offset_kb: ev.replay_offset_kb,
             session_flags: flags,
             props,
-        }
+        })
     }
 
     pub fn record_session_flags(&self, session_id: &str, flags: u16) {
@@ -288,18 +309,24 @@ impl ProjectStorage {
             return;
         }
         let session_hash = xxh3_64(session_id.as_bytes());
-        self.session_flags
-            .entry(session_hash)
-            .and_modify(|f| *f |= flags)
-            .or_insert(flags);
+        let prev = self.session_flags.get(&session_hash).unwrap_or(0);
+        self.session_flags.insert(session_hash, prev | flags);
         for mb in &self.mem_buckets {
             mb.add_session_flags(session_hash, flags);
         }
     }
 
-    /// Appends a pre-filtered, deduplicated bucket batch durably to `BucketWal` and `MemBucket`.
-    pub async fn append_bucket_events(
+    /// Acquires the per-bucket append mutex (`P1-01`, `P1-02`).
+    pub async fn lock_bucket_append(&self, bucket_id: u8) -> AsyncMutexGuard<'_, ()> {
+        self.bucket_append_locks[bucket_id as usize].lock().await
+    }
+
+    /// Appends events while the caller holds `lock_bucket_append(bucket_id)` (`P1-01`, `P1-02`).
+    /// Guarantees `wal_seq` allocation, durable `BucketWal::append`, `l0_seq` allocation, and `MemBucket` insertion
+    /// execute in strict total order for `bucket_id`.
+    pub async fn append_bucket_events_locked(
         &self,
+        _append_guard: &AsyncMutexGuard<'_, ()>,
         bucket_id: u8,
         events: Vec<(WireEvent, u32)>,
     ) -> Result<usize> {
@@ -310,25 +337,46 @@ impl ProjectStorage {
         let wire_events: Vec<WireEvent> = events.iter().map(|(e, _)| e.clone()).collect();
         let batch = WireBatch::new(wire_events);
 
-        // 1. Durable WAL write BEFORE mutating L0 or returning 200 OK
+        // 1. Durable WAL write BEFORE allocating l0_seq or mutating L0
         let wal_seq = self.wals[b_idx].append(&batch).await?;
 
-        // 2. Append into L0 MemBucket
+        // 2. Allocate monotonic `l0_seq`s and append into L0 MemBucket while still holding `bucket_append_locks[b_idx]`
         let mut rows = Vec::with_capacity(events.len());
         for (ev, uid) in &events {
             let fp = event_uuid_fingerprint(&ev.event_uuid);
-            rows.push(self.wire_event_to_row(ev, *uid, wal_seq, fp));
+            rows.push(self.wire_event_to_row(ev, *uid, wal_seq, fp)?);
         }
         let count = rows.len();
         self.mem_buckets[b_idx].append_batch(rows);
+        Ok(count)
+    }
 
-        if self.mem_buckets[b_idx].should_flush(
-            self.config.l0_flush_row_threshold,
-            self.config.l0_flush_max_age,
-        ) {
+    pub fn should_flush_bucket(&self, bucket_id: u8) -> bool {
+        self.mem_buckets.get(bucket_id as usize).is_some_and(|mb| {
+            mb.should_flush(
+                self.config.l0_flush_row_threshold,
+                self.config.l0_flush_max_age,
+            )
+        })
+    }
+
+    /// Appends a pre-filtered bucket batch durably to `BucketWal` and `MemBucket` under the per-bucket append lock.
+    pub async fn append_bucket_events(
+        &self,
+        bucket_id: u8,
+        events: Vec<(WireEvent, u32)>,
+    ) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let count = {
+            let guard = self.lock_bucket_append(bucket_id).await;
+            self.append_bucket_events_locked(&guard, bucket_id, events)
+                .await?
+        };
+        if self.should_flush_bucket(bucket_id) {
             self.flush_bucket(bucket_id).await?;
         }
-
         Ok(count)
     }
 
@@ -353,7 +401,6 @@ impl ProjectStorage {
             return Ok(Vec::new());
         };
 
-        // Group staged rows by event calendar date (`yyyymmdd`)
         let mut by_date: BTreeMap<NaiveDate, Vec<StoredRow>> = BTreeMap::new();
         for row in staged_rows {
             by_date.entry(row.event_date()).or_default().push(row);
@@ -404,7 +451,6 @@ impl ProjectStorage {
             *self.manifest.write() = Arc::new(committed);
         }
 
-        // Safe to prune L0 rows and committed WAL records now that MVCC Manifest includes the L1 segments.
         self.mem_buckets[b_idx].complete_flush(max_l0);
         let _ = self.wals[b_idx].purge_up_to(max_wal).await;
 
@@ -481,7 +527,6 @@ impl ProjectStorage {
             }
         }
 
-        // Single atomic MVCC Manifest commit across all flushed buckets!
         {
             let _commit_guard = self.manifest_commit_lock.lock().await;
             let mut next_manifest = (**self.manifest.read()).clone();
@@ -523,7 +568,7 @@ impl ProjectStorage {
     }
 
     /// Background/manual Late-Data Compactor: merges any `(date, bucket)` partition with `>= min_segments`
-    /// overlapping L1 segments into a single sorted Vortex segment and bumps the MVCC Manifest epoch.
+    /// overlapping L1 segments into a single sorted Vortex segment under a per-partition lock (`P1-06`).
     pub async fn compact_overdue(&self, reader: &VortexSegmentReader) -> Result<usize> {
         let candidates = self
             .manifest
@@ -532,6 +577,13 @@ impl ProjectStorage {
 
         let mut compacted_partitions = 0usize;
         for (date, bucket_id) in candidates {
+            let part_lock = self
+                .compaction_locks
+                .entry((date, bucket_id))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone();
+            let _part_guard = part_lock.lock().await;
+
             let source_segments = {
                 let mf = self.manifest.read();
                 match mf.active_segments.get(&(date, bucket_id)) {
@@ -570,19 +622,37 @@ impl ProjectStorage {
                 .map(|s| s.object_path.clone())
                 .collect();
 
-            {
+            let committed_ok = {
                 let _commit_guard = self.manifest_commit_lock.lock().await;
                 let mut next_manifest = (**self.manifest.read()).clone();
                 let entry = next_manifest
                     .active_segments
                     .entry((date, bucket_id))
                     .or_default();
-                entry.retain(|s| !source_ids.contains(&s.segment_id));
-                entry.push(new_meta);
-                next_manifest.dict_snapshot = self.dictionary.snapshot();
 
-                let committed = self.manifest_store.commit_next(next_manifest).await?;
-                *self.manifest.write() = Arc::new(committed);
+                // Verify ALL `source_ids` are still active before replacing them (`P1-06`).
+                let active_ids: HashSet<&str> =
+                    entry.iter().map(|s| s.segment_id.as_str()).collect();
+                if !source_ids
+                    .iter()
+                    .all(|sid| active_ids.contains(sid.as_str()))
+                {
+                    false
+                } else {
+                    entry.retain(|s| !source_ids.contains(&s.segment_id));
+                    entry.push(new_meta.clone());
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+
+                    let committed = self.manifest_store.commit_next(next_manifest).await?;
+                    *self.manifest.write() = Arc::new(committed);
+                    true
+                }
+            };
+
+            if !committed_ok {
+                let orphan = ObjectPath::from(new_meta.object_path.as_str());
+                let _ = self.object_store.delete(&orphan).await;
+                continue;
             }
 
             self.pending_gc.lock().extend(superseded_paths);
@@ -593,17 +663,23 @@ impl ProjectStorage {
         Ok(compacted_partitions)
     }
 
-    /// Deletes superseded segment files whose active reader pin count is 0.
+    /// Deletes superseded segment files whose active reader pin count is 0, re-checked under `manifest.read()` (`P1-05`).
     pub async fn run_gc(&self) -> Result<usize> {
         let candidates = {
+            let mf_guard = self.manifest.read();
             let mut guard = self.pending_gc.lock();
             if guard.is_empty() {
                 return Ok(0);
             }
+            let active_paths: HashSet<&str> = mf_guard
+                .active_segments
+                .values()
+                .flat_map(|v| v.iter().map(|s| s.object_path.as_str()))
+                .collect();
             let mut ready = Vec::new();
             let mut still_pinned = Vec::new();
             for path in guard.drain(..) {
-                if self.pin_tracker.is_pinned(&path) {
+                if active_paths.contains(path.as_str()) || self.pin_tracker.is_pinned(&path) {
                     still_pinned.push(path);
                 } else {
                     ready.push(path);
@@ -735,16 +811,16 @@ impl StorageEngine {
     }
 
     pub async fn flush_all_projects(&self) -> Result<usize> {
+        self.identity_router
+            .flush_all()
+            .await
+            .map_err(StorageError::Identity)?;
         let list: Vec<Arc<ProjectStorage>> =
             self.projects.iter().map(|e| e.value().clone()).collect();
         let mut total = 0usize;
         for p in list {
             total += p.flush_all().await?;
         }
-        self.identity_router
-            .flush_all()
-            .await
-            .map_err(StorageError::Identity)?;
         Ok(total)
     }
 
@@ -769,15 +845,13 @@ impl StorageEngine {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        let _ = engine.identity_router.flush_all().await;
                         let projects: Vec<Arc<ProjectStorage>> =
                             engine.projects.iter().map(|e| e.value().clone()).collect();
                         for p in projects {
                             for b in 0..p.config().num_buckets {
                                 let bid = b as u8;
-                                if p.mem_buckets[b as usize].should_flush(
-                                    p.config().l0_flush_row_threshold,
-                                    p.config().l0_flush_max_age,
-                                ) {
+                                if p.should_flush_bucket(bid) {
                                     let _ = p.flush_bucket(bid).await;
                                 }
                             }

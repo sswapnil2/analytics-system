@@ -16,7 +16,7 @@ use bytes::Bytes;
 use chrono::NaiveDate;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
-use pulse_wire::PropValue;
+use pulse_wire::{decode_zstd_bounded, PropValue, MAX_DECOMPRESSED_BYTES};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use vortex::expr::{root, select};
@@ -31,13 +31,10 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::error::{Result, StorageError};
 use crate::mem_bucket::StoredRow;
 
-pub const SEGMENT_CONTAINER_MAGIC: [u8; 4] = *b"PVTX";
-pub const SEGMENT_CONTAINER_VERSION: u32 = 1;
-pub const TRAILER_LEN: usize = 48;
 pub const MAX_TIER_B_KEYS: usize = 512;
 pub const MAX_INVERTED_INDEX_CARDINALITY: usize = 16_384;
 
-/// Fixed 56-byte `Pod` struct stored contiguously in every segment's `SessionIndex` footer.
+/// Fixed 56-byte `Pod` struct stored contiguously in every segment's `SessionIndex` section.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 pub struct SessionHeader {
@@ -62,11 +59,6 @@ impl SessionHeader {
     }
 
     #[inline]
-    pub fn may_contain_all_events(&self, required_mask: u64) -> bool {
-        (self.event_bloom_64 & required_mask) == required_mask
-    }
-
-    #[inline]
     pub fn may_contain_any_event(&self, mask: u64) -> bool {
         mask == 0 || (self.event_bloom_64 & mask) != 0
     }
@@ -84,7 +76,12 @@ pub struct TierBColumnEntry {
     pub has_f64: bool,
     pub has_bool: bool,
     pub has_str: bool,
-    pub has_inverted_index: bool,
+    #[serde(default)]
+    pub has_null: bool,
+    #[serde(default)]
+    pub bool_indexed: bool,
+    #[serde(default)]
+    pub str_indexed_complete: bool,
 }
 
 impl TierBColumnEntry {
@@ -100,9 +97,12 @@ impl TierBColumnEntry {
     pub fn col_str_name(prop_key_id: u16) -> String {
         format!("p_{prop_key_id}_str")
     }
+    pub fn col_null_name(prop_key_id: u16) -> String {
+        format!("p_{prop_key_id}_null")
+    }
 }
 
-/// Metadata stored inside the segment footer and mirrored into MVCC `SegmentMeta`.
+/// Segment statistics and Tier B/C column catalog stored in `Manifest` `SegmentMeta`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentFooterMeta {
     pub row_count: u32,
@@ -126,7 +126,6 @@ pub struct SegmentMeta {
     pub vortex_len: u64,
     pub inverted_idx_offset: u64,
     pub session_idx_offset: u64,
-    pub footer_meta_offset: u64,
     pub footer: SegmentFooterMeta,
 }
 
@@ -163,23 +162,52 @@ impl SegmentSessionIndex {
     }
 }
 
-/// Decoded per-segment Tier B categorical inverted `RoaringBitmap` index.
+/// Type discriminator preventing `PropValue::Bool(true)` and `PropValue::Str("true")` from colliding
+/// in `SegmentInvertedIndex` (`P1-15`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum InvertedValueTag {
+    Bool = 1,
+    Str = 2,
+}
+
+impl InvertedValueTag {
+    fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            1 => Ok(Self::Bool),
+            2 => Ok(Self::Str),
+            other => Err(StorageError::Corrupted(format!(
+                "invalid inverted index value tag {other}"
+            ))),
+        }
+    }
+}
+
+/// Decoded per-segment Tier B categorical inverted `RoaringBitmap` index (`P1-15`, `P2-01`).
 #[derive(Debug, Clone, Default)]
 pub struct SegmentInvertedIndex {
-    /// `(prop_key_id, categorical_string_or_bool) -> matching segment row indices`.
-    pub bitmaps: HashMap<(u16, String), RoaringBitmap>,
+    /// `(prop_key_id, value_type_tag, value_repr) -> matching segment row indices`.
+    pub bitmaps: HashMap<(u16, InvertedValueTag, String), RoaringBitmap>,
 }
 
 impl SegmentInvertedIndex {
-    pub fn get(&self, prop_key_id: u16, value: &str) -> Option<&RoaringBitmap> {
-        self.bitmaps.get(&(prop_key_id, value.to_string()))
+    pub fn get_bool(&self, prop_key_id: u16, value: bool) -> Option<&RoaringBitmap> {
+        let s = if value { "true" } else { "false" };
+        self.bitmaps
+            .get(&(prop_key_id, InvertedValueTag::Bool, s.to_string()))
+    }
+
+    pub fn get_str(&self, prop_key_id: u16, value: &str) -> Option<&RoaringBitmap> {
+        self.bitmaps
+            .get(&(prop_key_id, InvertedValueTag::Str, value.to_string()))
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
         let mut raw = Vec::new();
         raw.extend_from_slice(&(self.bitmaps.len() as u32).to_le_bytes());
-        for ((key_id, val), bm) in &self.bitmaps {
+        for ((key_id, tag, val), bm) in &self.bitmaps {
             raw.extend_from_slice(&key_id.to_le_bytes());
+            raw.push(*tag as u8);
             raw.extend_from_slice(&(val.len() as u32).to_le_bytes());
             raw.extend_from_slice(val.as_bytes());
             let mut bm_bytes = Vec::with_capacity(bm.serialized_size());
@@ -194,7 +222,7 @@ impl SegmentInvertedIndex {
         if compressed.is_empty() {
             return Ok(Self::default());
         }
-        let raw = zstd::stream::decode_all(compressed)?;
+        let raw = decode_zstd_bounded(compressed, None, MAX_DECOMPRESSED_BYTES)?;
         if raw.len() < 4 {
             return Err(StorageError::Corrupted(
                 "truncated inverted index".to_string(),
@@ -202,15 +230,16 @@ impl SegmentInvertedIndex {
         }
         let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
         let mut pos = 4usize;
-        let mut bitmaps = HashMap::with_capacity(count);
+        let mut bitmaps = HashMap::with_capacity(count.min((raw.len() - 4) / 11));
         for _ in 0..count {
-            if pos + 6 > raw.len() {
+            if pos + 7 > raw.len() {
                 return Err(StorageError::Corrupted(
                     "inverted index header EOF".to_string(),
                 ));
             }
             let key_id = u16::from_le_bytes([raw[pos], raw[pos + 1]]);
-            pos += 2;
+            let tag = InvertedValueTag::from_byte(raw[pos + 2])?;
+            pos += 3;
             let s_len =
                 u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
             pos += 4;
@@ -232,7 +261,7 @@ impl SegmentInvertedIndex {
             }
             let bm = RoaringBitmap::deserialize_from(&raw[pos..pos + bm_len])?;
             pos += bm_len;
-            bitmaps.insert((key_id, val), bm);
+            bitmaps.insert((key_id, tag, val), bm);
         }
         Ok(Self { bitmaps })
     }
@@ -320,7 +349,6 @@ pub async fn write_vortex_segment(
 
     let n = entries.len();
     let mut uid_vec = Vec::with_capacity(n);
-    let mut sseq_vec = Vec::with_capacity(n);
     let mut shash_vec = Vec::with_capacity(n);
     let mut uuid_fp_vec = Vec::with_capacity(n);
     let mut event_id_vec = Vec::with_capacity(n);
@@ -331,8 +359,9 @@ pub async fn write_vortex_segment(
     let mut max_ts_ms = i64::MIN;
     let mut segment_event_bloom_64 = 0u64;
 
-    // Count property key frequencies to promote Top 512 keys into Tier B columns.
-    let mut key_freq: HashMap<u16, (usize, bool, bool, bool, bool)> = HashMap::new();
+    // Count property key frequencies to promote Top 512 keys into Tier B columns (`P2-09l` includes Null).
+    // Tuple: `(count, has_i64, has_f64, has_bool, has_str, has_null)`
+    let mut key_freq: HashMap<u16, (usize, bool, bool, bool, bool, bool)> = HashMap::new();
     for e in &entries {
         let r = &e.row;
         min_ts_ms = min_ts_ms.min(r.event_ts_ms);
@@ -340,7 +369,6 @@ pub async fn write_vortex_segment(
         segment_event_bloom_64 |= SessionHeader::event_bit(r.event_id);
 
         uid_vec.push(r.uid_internal);
-        sseq_vec.push(e.session_seq);
         shash_vec.push(r.session_hash);
         uuid_fp_vec.push(r.event_uuid_fp);
         event_id_vec.push(r.event_id);
@@ -350,37 +378,37 @@ pub async fn write_vortex_segment(
         for (pk, pv) in &r.props {
             let stat = key_freq
                 .entry(*pk)
-                .or_insert((0, false, false, false, false));
+                .or_insert((0, false, false, false, false, false));
             stat.0 += 1;
             match pv {
-                PropValue::Null => {}
                 PropValue::Int(_) => stat.1 = true,
                 PropValue::Float(_) => stat.2 = true,
                 PropValue::Bool(_) => stat.3 = true,
                 PropValue::Str(_) => stat.4 = true,
+                PropValue::Null => stat.5 = true,
             }
         }
     }
 
-    let mut ranked_keys: Vec<(u16, usize, bool, bool, bool, bool)> = key_freq
+    let mut ranked_keys: Vec<(u16, usize, bool, bool, bool, bool, bool)> = key_freq
         .into_iter()
-        .map(|(k, (cnt, hi, hf, hb, hs))| (k, cnt, hi, hf, hb, hs))
+        .map(|(k, (cnt, hi, hf, hb, hs, hn))| (k, cnt, hi, hf, hb, hs, hn))
         .collect();
     ranked_keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let promoted: BTreeMap<u16, (bool, bool, bool, bool)> = ranked_keys
+    let promoted: BTreeMap<u16, (bool, bool, bool, bool, bool)> = ranked_keys
         .into_iter()
         .take(MAX_TIER_B_KEYS)
-        .filter(|(_, _, hi, hf, hb, hs)| *hi || *hf || *hb || *hs)
-        .map(|(k, _, hi, hf, hb, hs)| (k, (hi, hf, hb, hs)))
+        .filter(|(_, _, hi, hf, hb, hs, hn)| *hi || *hf || *hb || *hs || *hn)
+        .map(|(k, _, hi, hf, hb, hs, hn)| (k, (hi, hf, hb, hs, hn)))
         .collect();
 
-    // Build Tier B builders
     struct TierBBuilders {
         i64_b: Option<Int64Builder>,
         f64_b: Option<Float64Builder>,
         bool_b: Option<BooleanBuilder>,
         str_b: Option<StringBuilder>,
+        null_b: Option<BooleanBuilder>,
         str_card: HashMap<String, RoaringBitmap>,
         str_overflowed_card: bool,
         bool_true: RoaringBitmap,
@@ -388,7 +416,7 @@ pub async fn write_vortex_segment(
     }
 
     let mut tier_b_builders: BTreeMap<u16, TierBBuilders> = BTreeMap::new();
-    for (&pk, &(hi, hf, hb, hs)) in &promoted {
+    for (&pk, &(hi, hf, hb, hs, hn)) in &promoted {
         tier_b_builders.insert(
             pk,
             TierBBuilders {
@@ -396,6 +424,7 @@ pub async fn write_vortex_segment(
                 f64_b: hf.then(|| Float64Builder::with_capacity(n)),
                 bool_b: hb.then(|| BooleanBuilder::with_capacity(n)),
                 str_b: hs.then(|| StringBuilder::with_capacity(n, n * 8)),
+                null_b: hn.then(|| BooleanBuilder::with_capacity(n)),
                 str_card: HashMap::new(),
                 str_overflowed_card: false,
                 bool_true: RoaringBitmap::new(),
@@ -441,14 +470,14 @@ pub async fn write_vortex_segment(
             hdr.flags |= r.session_flags;
         }
 
-        // Per-row property dispatch
+        // Per-row property dispatch (preserving explicit `PropValue::Null` in both Tier B and Tier C — `P2-09l`)
         let mut row_promoted_seen: HashMap<u16, &PropValue> = HashMap::new();
         let mut overflow_props: Vec<(u16, &PropValue)> = Vec::new();
 
         for (pk, pv) in &r.props {
             if promoted.contains_key(pk) {
                 row_promoted_seen.insert(*pk, pv);
-            } else if !matches!(pv, PropValue::Null) {
+            } else {
                 tier_c_bloom_64 |= tier_c_key_bit(*pk);
                 overflow_props.push((*pk, pv));
             }
@@ -486,10 +515,8 @@ pub async fn write_vortex_segment(
                 if let Some(PropValue::Str(s)) = val {
                     b.append_value(s);
                     if !builders.str_overflowed_card {
-                        if builders.str_card.contains_key(s) {
-                            if let Some(bm) = builders.str_card.get_mut(s) {
-                                bm.insert(row_idx as u32);
-                            }
+                        if let Some(bm) = builders.str_card.get_mut(s) {
+                            bm.insert(row_idx as u32);
                         } else if builders.str_card.len() < MAX_INVERTED_INDEX_CARDINALITY {
                             let mut bm = RoaringBitmap::new();
                             bm.insert(row_idx as u32);
@@ -499,6 +526,13 @@ pub async fn write_vortex_segment(
                             builders.str_overflowed_card = true;
                         }
                     }
+                } else {
+                    b.append_null();
+                }
+            }
+            if let Some(b) = &mut builders.null_b {
+                if matches!(val, Some(PropValue::Null)) {
+                    b.append_value(true);
                 } else {
                     b.append_null();
                 }
@@ -515,7 +549,6 @@ pub async fn write_vortex_segment(
     // Assemble Arrow Schema + Arrays -> Vortex Columnar File
     let mut fields: Vec<Field> = vec![
         Field::new("uid_internal", DataType::UInt32, false),
-        Field::new("session_seq", DataType::UInt32, false),
         Field::new("session_hash", DataType::UInt64, false),
         Field::new("event_uuid_fp", DataType::UInt64, false),
         Field::new("event_id", DataType::UInt16, false),
@@ -524,7 +557,6 @@ pub async fn write_vortex_segment(
     ];
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(UInt32Array::from(uid_vec)),
-        Arc::new(UInt32Array::from(sseq_vec)),
         Arc::new(UInt64Array::from(shash_vec)),
         Arc::new(UInt64Array::from(uuid_fp_vec)),
         Arc::new(UInt16Array::from(event_id_vec)),
@@ -540,7 +572,9 @@ pub async fn write_vortex_segment(
         let has_f64 = b.f64_b.is_some();
         let has_bool = b.bool_b.is_some();
         let has_str = b.str_b.is_some();
-        let mut has_inv = false;
+        let has_null = b.null_b.is_some();
+        let mut bool_indexed = false;
+        let mut str_indexed_complete = false;
 
         if let Some(mut ib) = b.i64_b.take() {
             fields.push(Field::new(
@@ -566,17 +600,18 @@ pub async fn write_vortex_segment(
             ));
             columns.push(Arc::new(bb.finish()));
             if !b.bool_true.is_empty() {
-                inverted_idx
-                    .bitmaps
-                    .insert((pk, "true".to_string()), b.bool_true);
-                has_inv = true;
+                inverted_idx.bitmaps.insert(
+                    (pk, InvertedValueTag::Bool, "true".to_string()),
+                    b.bool_true,
+                );
             }
             if !b.bool_false.is_empty() {
-                inverted_idx
-                    .bitmaps
-                    .insert((pk, "false".to_string()), b.bool_false);
-                has_inv = true;
+                inverted_idx.bitmaps.insert(
+                    (pk, InvertedValueTag::Bool, "false".to_string()),
+                    b.bool_false,
+                );
             }
+            bool_indexed = true;
         }
         if let Some(mut sb) = b.str_b.take() {
             fields.push(Field::new(
@@ -585,12 +620,22 @@ pub async fn write_vortex_segment(
                 true,
             ));
             columns.push(Arc::new(sb.finish()));
-            if !b.str_overflowed_card && !b.str_card.is_empty() {
+            if !b.str_overflowed_card {
                 for (val, bm) in b.str_card {
-                    inverted_idx.bitmaps.insert((pk, val), bm);
+                    inverted_idx
+                        .bitmaps
+                        .insert((pk, InvertedValueTag::Str, val), bm);
                 }
-                has_inv = true;
+                str_indexed_complete = true;
             }
+        }
+        if let Some(mut nb) = b.null_b.take() {
+            fields.push(Field::new(
+                TierBColumnEntry::col_null_name(pk),
+                DataType::Boolean,
+                true,
+            ));
+            columns.push(Arc::new(nb.finish()));
         }
 
         tier_b_catalog.push(TierBColumnEntry {
@@ -599,7 +644,9 @@ pub async fn write_vortex_segment(
             has_f64,
             has_bool,
             has_str,
-            has_inverted_index: has_inv,
+            has_null,
+            bool_indexed,
+            str_indexed_complete,
         });
     }
 
@@ -638,28 +685,16 @@ pub async fn write_vortex_segment(
         has_tier_c_column,
         tier_b_columns: tier_b_catalog,
     };
-    let footer_meta_bytes = serde_json::to_vec(&footer_meta)?;
 
     let vortex_len = vortex_bytes.len() as u64;
     let inverted_idx_offset = vortex_len;
     let session_idx_offset = inverted_idx_offset + inverted_bytes.len() as u64;
-    let footer_meta_offset = session_idx_offset + session_idx_bytes.len() as u64;
-    let total_size = footer_meta_offset + footer_meta_bytes.len() as u64 + TRAILER_LEN as u64;
+    let total_size = session_idx_offset + session_idx_bytes.len() as u64;
 
     let mut container = Vec::with_capacity(total_size as usize);
     container.extend_from_slice(vortex_bytes);
     container.extend_from_slice(&inverted_bytes);
     container.extend_from_slice(&session_idx_bytes);
-    container.extend_from_slice(&footer_meta_bytes);
-
-    // 48-byte fixed trailer
-    container.extend_from_slice(&SEGMENT_CONTAINER_MAGIC);
-    container.extend_from_slice(&SEGMENT_CONTAINER_VERSION.to_le_bytes());
-    container.extend_from_slice(&vortex_len.to_le_bytes());
-    container.extend_from_slice(&inverted_idx_offset.to_le_bytes());
-    container.extend_from_slice(&session_idx_offset.to_le_bytes());
-    container.extend_from_slice(&footer_meta_offset.to_le_bytes());
-    container.extend_from_slice(&(n as u64).to_le_bytes());
 
     let yyyymmdd = date.format("%Y%m%d").to_string();
     let rel_path =
@@ -678,7 +713,6 @@ pub async fn write_vortex_segment(
         vortex_len,
         inverted_idx_offset,
         session_idx_offset,
-        footer_meta_offset,
         footer: footer_meta,
     }))
 }
@@ -697,14 +731,16 @@ fn encode_session_index(headers: &[SessionHeader], session_ids: &[String]) -> Re
 }
 
 pub fn decode_session_index(compressed: &[u8]) -> Result<SegmentSessionIndex> {
-    let raw = zstd::stream::decode_all(compressed)?;
+    let raw = decode_zstd_bounded(compressed, None, MAX_DECOMPRESSED_BYTES)?;
     if raw.len() < 4 {
         return Err(StorageError::Corrupted(
             "session index shorter than 4 bytes".to_string(),
         ));
     }
     let hdr_count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    let hdr_byte_len = hdr_count * std::mem::size_of::<SessionHeader>();
+    let hdr_byte_len = hdr_count
+        .checked_mul(std::mem::size_of::<SessionHeader>())
+        .ok_or_else(|| StorageError::Corrupted("session index header count overflow".into()))?;
     if raw.len() < 4 + hdr_byte_len + 4 {
         return Err(StorageError::Corrupted(
             "session index truncated headers".to_string(),
@@ -718,7 +754,7 @@ pub fn decode_session_index(compressed: &[u8]) -> Result<SegmentSessionIndex> {
     let str_count =
         u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
     pos += 4;
-    let mut session_ids = Vec::with_capacity(str_count);
+    let mut session_ids = Vec::with_capacity(str_count.min((raw.len() - pos) / 4));
     for _ in 0..str_count {
         if pos + 4 > raw.len() {
             return Err(StorageError::Corrupted(
@@ -771,7 +807,7 @@ pub fn decode_tier_c_row(bytes: &[u8]) -> Result<Vec<(u16, PropValue)>> {
     }
     let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
     let mut pos = 2usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min((bytes.len() - 2) / 3));
     for _ in 0..count {
         if pos + 3 > bytes.len() {
             return Err(StorageError::Corrupted("tier_c header EOF".to_string()));
@@ -857,13 +893,13 @@ impl VortexSegmentReader {
         &self.object_store
     }
 
-    /// Reads ONLY the `SessionIndex` footer byte-range without touching Tier A/B Vortex columns.
+    /// Reads ONLY the `SessionIndex` byte-range without touching Tier A/B Vortex columns.
     pub async fn read_session_index(&self, meta: &SegmentMeta) -> Result<SegmentSessionIndex> {
         self.session_index_reads.fetch_add(1, Ordering::Relaxed);
         let path = ObjectPath::from(meta.object_path.as_str());
         let bytes = self
             .object_store
-            .get_range(&path, meta.session_idx_offset..meta.footer_meta_offset)
+            .get_range(&path, meta.session_idx_offset..meta.file_size)
             .await?;
         decode_session_index(&bytes)
     }
@@ -929,7 +965,7 @@ impl VortexSegmentReader {
     pub async fn scan_sessions_pruned(
         &self,
         meta: &SegmentMeta,
-        required_events_mask: u64,
+        any_events_mask: u64,
         required_flags: u16,
     ) -> Result<(
         usize,
@@ -939,7 +975,7 @@ impl VortexSegmentReader {
         let sidx = self.read_session_index(meta).await?;
         let total = sidx.headers.len();
         let matched = sidx.matching_session_ranges(|hdr| {
-            hdr.may_contain_all_events(required_events_mask)
+            hdr.may_contain_any_event(any_events_mask)
                 && (hdr.flags & required_flags) == required_flags
         });
         let skipped = total.saturating_sub(matched.len());
@@ -951,7 +987,6 @@ impl VortexSegmentReader {
                 meta,
                 &[
                     "uid_internal",
-                    "session_seq",
                     "session_hash",
                     "event_id",
                     "event_ts_ms",
@@ -996,7 +1031,6 @@ impl VortexSegmentReader {
             .ok_or_else(|| StorageError::Corrupted("missing replay_offset_kb".into()))?
             .as_primitive::<UInt32Type>();
 
-        // Map row ranges back to session_id & flags from SessionIndex
         let mut row_session_meta: Vec<(&str, u16)> = Vec::with_capacity(n);
         for hdr in &sidx.headers {
             let sid = sidx.session_id(hdr);
@@ -1013,7 +1047,6 @@ impl VortexSegmentReader {
             None
         };
 
-        // Pre-resolve Tier B columns
         let mut tb_cols = Vec::with_capacity(meta.footer.tier_b_columns.len());
         for entry in &meta.footer.tier_b_columns {
             let pk = entry.prop_key_id;
@@ -1033,13 +1066,17 @@ impl VortexSegmentReader {
                 .has_str
                 .then(|| batch.column_by_name(&TierBColumnEntry::col_str_name(pk)))
                 .flatten();
-            tb_cols.push((pk, c_i64, c_f64, c_bool, c_str));
+            let c_null = entry
+                .has_null
+                .then(|| batch.column_by_name(&TierBColumnEntry::col_null_name(pk)))
+                .flatten();
+            tb_cols.push((pk, c_i64, c_f64, c_bool, c_str, c_null));
         }
 
         let mut out = Vec::with_capacity(n);
         for row_idx in 0..n {
             let mut props = Vec::new();
-            for &(pk, c_i64, c_f64, c_bool, c_str) in &tb_cols {
+            for &(pk, c_i64, c_f64, c_bool, c_str, c_null) in &tb_cols {
                 if let Some(col) = c_i64 {
                     if !col.is_null(row_idx) {
                         props.push((
@@ -1076,6 +1113,12 @@ impl VortexSegmentReader {
                             String::new()
                         };
                         props.push((pk, PropValue::Str(s)));
+                        continue;
+                    }
+                }
+                if let Some(col) = c_null {
+                    if !col.is_null(row_idx) && col.as_boolean().value(row_idx) {
+                        props.push((pk, PropValue::Null));
                     }
                 }
             }

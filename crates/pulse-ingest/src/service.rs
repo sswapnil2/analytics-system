@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -6,12 +6,21 @@ use chrono::Utc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use pulse_storage::{event_uuid_fingerprint, route_bucket, StorageEngine, StorageError};
-use pulse_wire::{DictionaryRegistry, PropValue, ReplayChunk, WireBatch, WireError, WireEvent};
+use pulse_wire::{
+    mask_input_value, DictionaryRegistry, PropValue, ReplayChunk, WireBatch, WireError, WireEvent,
+    WireframeOp,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dedup::{normalize_event_timestamp, DedupRegistry};
-use crate::governance::{DiscoveredEventSchema, GovernanceProvider};
+use crate::governance::{DiscoveredEventSchema, GovernanceProvider, ProjectLexiconRules};
+
+/// Per-batch and per-project schema cardinality caps preventing dictionary exhaustion (`P1-12`).
+pub const MAX_NEW_EVENTS_PER_BATCH: usize = 128;
+pub const MAX_NEW_PROP_KEYS_PER_BATCH: usize = 256;
+pub const MAX_EVENTS_PER_PROJECT: usize = 8_192;
+pub const MAX_PROP_KEYS_PER_PROJECT: usize = 16_384;
 
 #[derive(Debug, Error)]
 pub enum IngestError {
@@ -29,6 +38,9 @@ pub enum IngestError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("schema governance limit exceeded: {0}")]
+    SchemaGovernanceLimit(String),
 
     #[error("quic transport error: {0}")]
     Quic(String),
@@ -199,14 +211,17 @@ impl IngestService {
             .await?;
         let rules = self.governance.lexicon_rules(project_id);
         let num_buckets = ps.config().num_buckets;
+        let dict = ps.dictionary();
 
         let mut accepted = 0usize;
         let mut deduped = 0usize;
         let mut dropped = 0usize;
 
         type PropTypeList = Vec<(String, &'static str)>;
-        let mut by_bucket: HashMap<u8, Vec<(WireEvent, u32)>> = HashMap::new();
-        let mut discovery_map: HashMap<String, (u64, PropTypeList)> = HashMap::new();
+        let mut by_bucket: BTreeMap<u8, Vec<(WireEvent, u32, u64)>> = BTreeMap::new();
+        let mut intra_batch_seen: HashSet<(u8, u64)> = HashSet::with_capacity(batch.len());
+        let mut new_events_in_batch: HashSet<String> = HashSet::new();
+        let mut new_prop_keys_in_batch: HashSet<String> = HashSet::new();
 
         for mut ev in batch.events {
             // 1. Lexicon Governance Check
@@ -215,7 +230,7 @@ impl IngestService {
                 continue;
             }
 
-            // 2. Deterministic Bucket Routing & Rotating 15-Min Dedup Ring
+            // 2. Deterministic Bucket Routing & Non-Mutating Dedup Pre-Check (`P1-01`)
             let seed = if ev.routing_seed.is_empty() {
                 ev.distinct_id.as_str()
             } else {
@@ -224,54 +239,115 @@ impl IngestService {
             let bucket_id = route_bucket(seed, num_buckets);
             let fp = event_uuid_fingerprint(&ev.event_uuid);
 
-            if !self
-                .dedup
-                .check_and_insert(project_id, bucket_id, fp, server_now_ms)
+            if !intra_batch_seen.insert((bucket_id, fp))
+                || self
+                    .dedup
+                    .contains(project_id, bucket_id, fp, server_now_ms)
             {
                 deduped += 1;
                 continue;
             }
 
-            // 3. Mobile Clock-Skew Normalization
+            // 3. Enforce per-batch and per-project schema cardinality governance (`P1-12`)
+            if dict.lookup_event(&ev.event_name).is_none() {
+                new_events_in_batch.insert(ev.event_name.clone());
+                if new_events_in_batch.len() > MAX_NEW_EVENTS_PER_BATCH
+                    || dict.event_count() + new_events_in_batch.len() > MAX_EVENTS_PER_PROJECT
+                {
+                    return Err(IngestError::SchemaGovernanceLimit(format!(
+                        "batch exceeds maximum new or total event names ({MAX_NEW_EVENTS_PER_BATCH} new/batch, {MAX_EVENTS_PER_PROJECT}/project)"
+                    )));
+                }
+            }
+            for (k, _) in &ev.props {
+                if dict.lookup_prop_key(k).is_none() {
+                    new_prop_keys_in_batch.insert(k.clone());
+                    if new_prop_keys_in_batch.len() > MAX_NEW_PROP_KEYS_PER_BATCH
+                        || dict.prop_key_count() + new_prop_keys_in_batch.len()
+                            > MAX_PROP_KEYS_PER_PROJECT
+                    {
+                        return Err(IngestError::SchemaGovernanceLimit(format!(
+                            "batch exceeds maximum new or total property keys ({MAX_NEW_PROP_KEYS_PER_BATCH} new/batch, {MAX_PROP_KEYS_PER_PROJECT}/project)"
+                        )));
+                    }
+                }
+            }
+
+            // 4. Mobile Clock-Skew Normalization (`P1-13`)
             ev.client_event_ts_ms = normalize_event_timestamp(
                 ev.client_event_ts_ms,
                 ev.client_sent_ts_ms,
                 server_now_ms,
             );
 
-            // 4. Schema Discovery Tracking
-            let disc = discovery_map
-                .entry(ev.event_name.clone())
-                .or_insert_with(|| {
-                    let ptypes = ev
-                        .props
-                        .iter()
-                        .map(|(k, v)| {
-                            let t = match v {
-                                PropValue::Null => "null",
-                                PropValue::Bool(_) => "bool",
-                                PropValue::Int(_) => "int",
-                                PropValue::Float(_) => "float",
-                                PropValue::Str(_) => "string",
-                            };
-                            (k.clone(), t)
-                        })
-                        .collect();
-                    (0, ptypes)
-                });
-            disc.0 += 1;
-
             // 5. Dense u32 Identity Interning
             let uid = id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-            by_bucket.entry(bucket_id).or_default().push((ev, uid));
-            accepted += 1;
+            by_bucket.entry(bucket_id).or_default().push((ev, uid, fp));
         }
 
-        // 6. Persist to BucketWal (durable before 200 OK) -> append to MemBucket
-        for (bucket_id, bucket_events) in by_bucket {
-            ps.append_bucket_events(bucket_id, bucket_events).await?;
+        // 6. Flush interned u32 identities durably BEFORE writing WAL or inline L1 segments (`P1-10`)!
+        if !by_bucket.is_empty() {
+            id_graph.flush().await?;
         }
-        id_graph.flush().await?;
+
+        // 7. Under per-bucket append lock: re-check dedup -> durable WAL append -> L0 append -> commit dedup (`P1-01`, `P1-02`)!
+        let mut discovery_map: HashMap<String, (u64, PropTypeList)> = HashMap::new();
+        for (bucket_id, candidates) in by_bucket {
+            let should_flush = {
+                let append_guard = ps.lock_bucket_append(bucket_id).await;
+                let mut to_append = Vec::with_capacity(candidates.len());
+                let mut committed_fps = Vec::with_capacity(candidates.len());
+
+                for (ev, uid, fp) in candidates {
+                    if self
+                        .dedup
+                        .contains(project_id, bucket_id, fp, server_now_ms)
+                    {
+                        deduped += 1;
+                        continue;
+                    }
+                    committed_fps.push(fp);
+                    to_append.push((ev, uid));
+                }
+
+                if !to_append.is_empty() {
+                    ps.append_bucket_events_locked(&append_guard, bucket_id, to_append.clone())
+                        .await?;
+                    self.dedup
+                        .commit_batch(project_id, bucket_id, &committed_fps, server_now_ms);
+                    accepted += to_append.len();
+
+                    for (ev, _) in &to_append {
+                        let disc =
+                            discovery_map
+                                .entry(ev.event_name.clone())
+                                .or_insert_with(|| {
+                                    let ptypes = ev
+                                        .props
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            let t = match v {
+                                                PropValue::Null => "null",
+                                                PropValue::Bool(_) => "bool",
+                                                PropValue::Int(_) => "int",
+                                                PropValue::Float(_) => "float",
+                                                PropValue::Str(_) => "string",
+                                            };
+                                            (k.clone(), t)
+                                        })
+                                        .collect();
+                                    (0, ptypes)
+                                });
+                        disc.0 += 1;
+                    }
+                }
+                ps.should_flush_bucket(bucket_id)
+            };
+
+            if should_flush {
+                ps.flush_bucket(bucket_id).await?;
+            }
+        }
 
         if !discovery_map.is_empty() {
             let items = discovery_map
@@ -369,6 +445,8 @@ impl IngestService {
     ) -> Result<ReplayIngestResponse> {
         let mut chunk = ReplayChunk::decode_auto(body, content_type)?;
         chunk.project_id = project_id.to_string();
+        let rules = self.governance.lexicon_rules(project_id);
+        apply_lexicon_to_replay_chunk(&mut chunk, &rules);
         let res = self.storage.append_replay_chunk(&chunk).await?;
         Ok(ReplayIngestResponse {
             status: "ok".to_string(),
@@ -377,5 +455,45 @@ impl IngestService {
             replay_offset_kb: res.replay_offset_kb,
             chunk_bytes: res.chunk_bytes,
         })
+    }
+}
+
+/// Applies project Lexicon PII rules and input masking to wireframe replay labels on ingest (`P3-01`).
+fn apply_lexicon_to_replay_chunk(chunk: &mut ReplayChunk, rules: &ProjectLexiconRules) {
+    let mask_label = |label: &mut String, kind: pulse_wire::NodeKind| {
+        if label.is_empty() || label == "████" {
+            return;
+        }
+        if kind == pulse_wire::NodeKind::MaskedInput {
+            *label = mask_input_value(label);
+            return;
+        }
+        let lower = label.to_ascii_lowercase();
+        for prop in &rules.pii_masked_properties {
+            if !prop.is_empty() && lower.contains(&prop.to_ascii_lowercase()) {
+                *label = mask_input_value(label);
+                return;
+            }
+        }
+        for dropped in &rules.dropped_properties {
+            if !dropped.is_empty() && lower.contains(&dropped.to_ascii_lowercase()) {
+                label.clear();
+                return;
+            }
+        }
+    };
+
+    for op in &mut chunk.ops {
+        match op {
+            WireframeOp::FullSnapshot { nodes, .. } => {
+                for node in nodes {
+                    mask_label(&mut node.masked_label, node.kind);
+                }
+            }
+            WireframeOp::NodeUpsert(node) => {
+                mask_label(&mut node.masked_label, node.kind);
+            }
+            _ => {}
+        }
     }
 }

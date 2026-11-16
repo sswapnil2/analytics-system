@@ -34,6 +34,12 @@ pub enum StorageError {
 
     #[error("mvcc manifest conflict after retries")]
     ManifestConflict,
+
+    #[error("project dictionary capacity exceeded for {kind} (max 65536)")]
+    DictionaryFull { kind: &'static str },
+
+    #[error("invalid storage identifier: {0}")]
+    InvalidIdentifier(String),
 }
 
 impl From<vortex_error::VortexError> for StorageError {

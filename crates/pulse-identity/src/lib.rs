@@ -385,7 +385,7 @@ impl GraphState {
         }
     }
 
-    fn to_checkpoint(&mut self, next_chunk_seq: u64) -> IdentityCheckpoint {
+    fn build_checkpoint(&mut self, next_chunk_seq: u64) -> IdentityCheckpoint {
         let _ = self.compress_all_and_build_snapshot();
         IdentityCheckpoint {
             next_chunk_seq,
@@ -767,7 +767,7 @@ impl ProjectIdentityGraph {
                 let mut st = self.state.write();
                 let cur_pending = self.pending_mutations.lock().len();
                 if cur_pending == flushed_len {
-                    bincode::serialize(&st.to_checkpoint(new_seq)).ok()
+                    bincode::serialize(&st.build_checkpoint(new_seq)).ok()
                 } else {
                     None
                 }

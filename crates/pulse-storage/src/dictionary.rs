@@ -2,6 +2,10 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Result, StorageError};
+
+pub const MAX_DICTIONARY_ENTRIES: usize = (u16::MAX as usize) + 1;
+
 /// Serializable snapshot of a project's `event_id` (`u16`) and `prop_key_id` (`u16`) dictionaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectDictSnapshot {
@@ -28,14 +32,24 @@ impl ProjectDictionary {
         let dict = Self::new();
         {
             let mut ev_guard = dict.events.write();
-            for (idx, name) in snap.events.into_iter().enumerate() {
+            for (idx, name) in snap
+                .events
+                .into_iter()
+                .take(MAX_DICTIONARY_ENTRIES)
+                .enumerate()
+            {
                 dict.event_to_id.insert(name.clone(), idx as u16);
                 ev_guard.push(name);
             }
         }
         {
             let mut pk_guard = dict.prop_keys.write();
-            for (idx, name) in snap.prop_keys.into_iter().enumerate() {
+            for (idx, name) in snap
+                .prop_keys
+                .into_iter()
+                .take(MAX_DICTIONARY_ENTRIES)
+                .enumerate()
+            {
                 dict.prop_to_id.insert(name.clone(), idx as u16);
                 pk_guard.push(name);
             }
@@ -43,19 +57,29 @@ impl ProjectDictionary {
         dict
     }
 
+    /// Fallible event interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX` (`P1-12`).
     #[inline]
-    pub fn get_or_intern_event(&self, event_name: &str) -> u16 {
+    pub fn try_get_or_intern_event(&self, event_name: &str) -> Result<u16> {
         if let Some(id) = self.event_to_id.get(event_name) {
-            return *id;
+            return Ok(*id);
         }
         let mut guard = self.events.write();
         if let Some(id) = self.event_to_id.get(event_name) {
-            return *id;
+            return Ok(*id);
         }
-        let id = guard.len().min(u16::MAX as usize) as u16;
+        if guard.len() >= MAX_DICTIONARY_ENTRIES {
+            return Err(StorageError::DictionaryFull { kind: "events" });
+        }
+        let id = guard.len() as u16;
         guard.push(event_name.to_string());
         self.event_to_id.insert(event_name.to_string(), id);
-        id
+        Ok(id)
+    }
+
+    #[inline]
+    pub fn get_or_intern_event(&self, event_name: &str) -> u16 {
+        self.try_get_or_intern_event(event_name)
+            .expect("project event dictionary exceeded 65536 entries")
     }
 
     #[inline]
@@ -76,19 +100,29 @@ impl ProjectDictionary {
             .collect()
     }
 
+    /// Fallible property-key interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX` (`P1-12`).
     #[inline]
-    pub fn get_or_intern_prop_key(&self, key: &str) -> u16 {
+    pub fn try_get_or_intern_prop_key(&self, key: &str) -> Result<u16> {
         if let Some(id) = self.prop_to_id.get(key) {
-            return *id;
+            return Ok(*id);
         }
         let mut guard = self.prop_keys.write();
         if let Some(id) = self.prop_to_id.get(key) {
-            return *id;
+            return Ok(*id);
         }
-        let id = guard.len().min(u16::MAX as usize) as u16;
+        if guard.len() >= MAX_DICTIONARY_ENTRIES {
+            return Err(StorageError::DictionaryFull { kind: "prop_keys" });
+        }
+        let id = guard.len() as u16;
         guard.push(key.to_string());
         self.prop_to_id.insert(key.to_string(), id);
-        id
+        Ok(id)
+    }
+
+    #[inline]
+    pub fn get_or_intern_prop_key(&self, key: &str) -> u16 {
+        self.try_get_or_intern_prop_key(key)
+            .expect("project property key dictionary exceeded 65536 entries")
     }
 
     #[inline]
@@ -107,6 +141,14 @@ impl ProjectDictionary {
             .enumerate()
             .map(|(i, s)| (i as u16, s.clone()))
             .collect()
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.read().len()
+    }
+
+    pub fn prop_key_count(&self) -> usize {
+        self.prop_keys.read().len()
     }
 
     pub fn snapshot(&self) -> ProjectDictSnapshot {

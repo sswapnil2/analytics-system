@@ -328,15 +328,13 @@ impl ControlPlaneService {
         }
     }
 
-    fn authorize_and_check<'a>(
-        &'a self,
-        principal: &'a AuthPrincipal,
-        project_id: &'a str,
-    ) -> impl std::future::Future<Output = Result<(), CtrlError>> + Send + 'a {
-        async move {
-            principal.authorize_project(project_id)?;
-            self.ensure_known_project(project_id).await
-        }
+    async fn authorize_and_check(
+        &self,
+        principal: &AuthPrincipal,
+        project_id: &str,
+    ) -> Result<(), CtrlError> {
+        principal.authorize_project(project_id)?;
+        self.ensure_known_project(project_id).await
     }
 
     fn verify_admin_token(&self, token: &str) -> Result<AuthPrincipal, CtrlError> {
@@ -1216,19 +1214,23 @@ async fn serve_replay(
     params: &HashMap<String, String>,
 ) -> std::result::Result<Response, CtrlError> {
     let rstore = ctrl.qengine.storage().replay_store();
+    let map_replay_err = |err: pulse_storage::StorageError| match err {
+        pulse_storage::StorageError::InvalidIdentifier(msg) => CtrlError::bad(msg),
+        other => CtrlError::internal(other),
+    };
 
     if let Some(range_hdr) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         let Some(spec) = range_hdr.strip_prefix("bytes=") else {
             return Ok((StatusCode::RANGE_NOT_SATISFIABLE, "invalid range unit").into_response());
         };
-        let Some(full_bytes) = rstore
-            .read_bytes_from(project_id, session_id, 0, None)
+        let Some(total_u64) = rstore
+            .total_session_bytes(project_id, session_id)
             .await
-            .map_err(CtrlError::internal)?
+            .map_err(map_replay_err)?
         else {
             return Err(CtrlError::not_found("replay session not found"));
         };
-        let total = full_bytes.len();
+        let total = total_u64 as usize;
         let Ok((start, end)) = resolve_http_byte_range(spec.trim(), total) else {
             return Ok((
                 StatusCode::RANGE_NOT_SATISFIABLE,
@@ -1237,7 +1239,12 @@ async fn serve_replay(
             )
                 .into_response());
         };
-        let slice = full_bytes.slice(start..=end);
+        let len = (end - start + 1) as u64;
+        let slice = rstore
+            .read_bytes_from(project_id, session_id, start as u64, Some(len))
+            .await
+            .map_err(map_replay_err)?
+            .unwrap_or_default();
         return Ok((
             StatusCode::PARTIAL_CONTENT,
             [

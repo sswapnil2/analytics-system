@@ -245,7 +245,6 @@ pub async fn load_project_chunks(
 
         let n = l0_rows.len();
         let mut uid_internal = Vec::with_capacity(n);
-        let mut session_seq = Vec::with_capacity(n);
         let mut session_hash = Vec::with_capacity(n);
         let mut event_id = Vec::with_capacity(n);
         let mut event_ts_ms = Vec::with_capacity(n);
@@ -253,7 +252,6 @@ pub async fn load_project_chunks(
 
         for r in &l0_rows {
             uid_internal.push(r.uid_internal);
-            session_seq.push(0);
             session_hash.push(r.session_hash);
             event_id.push(r.event_id);
             event_ts_ms.push(r.event_ts_ms);
@@ -289,7 +287,6 @@ pub async fn load_project_chunks(
             bucket_id,
             tier_a: Arc::new(TierAColumns {
                 uid_internal,
-                session_seq,
                 session_hash,
                 event_id,
                 event_ts_ms,
@@ -359,7 +356,12 @@ pub fn row_matches_predicates(chunk: &DataChunk, row_idx: usize, preds: &[PropPr
     true
 }
 
-/// Computes segment-level `RoaringBitmap` row mask if any `Eq(Str/Bool)` predicate has a Tier B inverted index!
+/// Computes segment-level `RoaringBitmap` row mask ONLY when the Tier B inverted index is strictly
+/// complete AND unmixed for the predicate's exact value type (`P1-15`, `P2-01`).
+///
+/// Because `values_equal_coalesced` coerces `Int(2) == Str("2")` and `Bool(true) == Str("true")`,
+/// an inverted index on `Str` or `Bool` is ONLY sound for row-skipping when no other value types
+/// exist for `pk` in that segment and string cardinality did not overflow `MAX_INVERTED_INDEX_CARDINALITY`.
 pub async fn precompute_segment_row_mask(
     chunk: &DataChunk,
     preds: &[PropPredicate],
@@ -375,27 +377,40 @@ pub async fn precompute_segment_row_mask(
 
     let mut combined: Option<RoaringBitmap> = None;
     for pred in preds {
+        // Never use physical Tier B index if a virtual custom property shadows/computes this name.
         let PropFilterOp::Eq(target) = &pred.filter else {
             continue;
-        };
-        let key_str = match target {
-            PropValue::Str(s) => s.clone(),
-            PropValue::Bool(b) => b.to_string(),
-            _ => continue,
         };
         let Some(pk) = dict.lookup_prop_key(&pred.prop_name) else {
             continue;
         };
-        let has_inv = meta
+        let Some(entry) = meta
             .footer
             .tier_b_columns
             .iter()
-            .any(|c| c.prop_key_id == pk && c.has_inverted_index);
-        if !has_inv {
+            .find(|c| c.prop_key_id == pk)
+        else {
             continue;
-        }
-        let inv = cache.get_inverted_index(meta).await?;
-        let bm = inv.get(pk, &key_str).cloned().unwrap_or_default();
+        };
+
+        let bm = match target {
+            PropValue::Bool(b) => {
+                if !entry.bool_indexed || entry.has_str || entry.has_i64 || entry.has_f64 {
+                    continue;
+                }
+                let inv = cache.get_inverted_index(meta).await?;
+                inv.get_bool(pk, *b).cloned().unwrap_or_default()
+            }
+            PropValue::Str(s) => {
+                if !entry.str_indexed_complete || entry.has_i64 || entry.has_f64 || entry.has_bool {
+                    continue;
+                }
+                let inv = cache.get_inverted_index(meta).await?;
+                inv.get_str(pk, s).cloned().unwrap_or_default()
+            }
+            _ => continue,
+        };
+
         combined = Some(match combined {
             Some(mut prev) => {
                 prev &= &bm;
