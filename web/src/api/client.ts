@@ -32,13 +32,13 @@ export interface TimeRange {
 
 export interface TimePoint {
   bucket_ts_ms: number;
-  value: number;
+  value: number | null;
 }
 
 export interface SeriesOutput {
   label: string;
   breakdown_key: string;
-  overall_value: number;
+  overall_value: number | null;
   points: TimePoint[];
 }
 

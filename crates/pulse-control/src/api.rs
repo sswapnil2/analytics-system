@@ -10,8 +10,9 @@ use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
 use pulse_exec::{
-    BehavioralCohortDef, CustomEventDef, CustomPropertyDef, FlowsQuery, FunnelQuery, InsightsQuery,
-    LookupTableDef, QueryEngine, RetentionQuery, SessionSearchQuery, TimeRange,
+    validate_cohort_acyclic, BehavioralCohortDef, CustomEventDef, CustomPropertyDef, FlowsQuery,
+    FunnelQuery, InsightsQuery, LookupTableDef, QueryEngine, RetentionQuery, SessionSearchQuery,
+    TimeRange,
 };
 use pulse_ingest::{DiscoveredEventSchema, GovernanceProvider, IngestService, ProjectLexiconRules};
 use pulse_wire::{
@@ -1206,10 +1207,15 @@ async fn handle_create_cohort(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<CreateCohortReq>,
 ) -> ApiRes<CohortRecord> {
+    let cohort_id = req
+        .id
+        .unwrap_or_else(|| format!("coh_{}", &Uuid::new_v4().simple().to_string()[..8]));
+    let cat = ctrl.qengine.catalogs().for_project(&id);
+    validate_cohort_acyclic(Some(&cohort_id), &req.definition, &cat)
+        .map_err(|e| CtrlError::bad(e.to_string()))?;
+
     let rec = CohortRecord {
-        id: req
-            .id
-            .unwrap_or_else(|| format!("coh_{}", &Uuid::new_v4().simple().to_string()[..8])),
+        id: cohort_id,
         project_id: id.clone(),
         name: req.name,
         description: req.description,
@@ -1237,11 +1243,14 @@ async fn handle_preview_cohort(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<PreviewCohortReq>,
 ) -> ApiRes<Value> {
+    let cat = ctrl.qengine.catalogs().for_project(&id);
+    validate_cohort_acyclic(None, &req.definition, &cat)
+        .map_err(|e| CtrlError::bad(e.to_string()))?;
     let (user_count, exec_time_us) = ctrl
         .qengine
         .preview_cohort_count(&id, &req.definition, req.time_range)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(|e| CtrlError::bad(e.to_string()))?;
     Ok(Json(json!({
         "user_count": user_count,
         "exec_time_us": exec_time_us

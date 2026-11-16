@@ -407,6 +407,60 @@ pub async fn precompute_segment_row_mask(
     Ok(combined)
 }
 
+pub const MAX_COHORT_DEPTH: usize = 32;
+
+/// Validates synchronously at save/preview time that a `BehavioralCohortDef` contains no reference cycles
+/// and does not exceed `MAX_COHORT_DEPTH` (`P0-09`).
+pub fn validate_cohort_acyclic(
+    self_id: Option<&str>,
+    def: &BehavioralCohortDef,
+    catalog: &VirtualCatalog,
+) -> Result<()> {
+    fn walk(
+        node: &BehavioralCohortDef,
+        catalog: &VirtualCatalog,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_COHORT_DEPTH {
+            return Err(ExecError::InvalidQuery(format!(
+                "cohort nesting depth exceeds maximum of {MAX_COHORT_DEPTH}"
+            )));
+        }
+        match node {
+            BehavioralCohortDef::PerformedEvent { .. }
+            | BehavioralCohortDef::NotPerformedEvent { .. }
+            | BehavioralCohortDef::PropertyMatch { .. } => Ok(()),
+            BehavioralCohortDef::CohortRef { cohort_id } => {
+                if !visited.insert(cohort_id.clone()) {
+                    return Err(ExecError::InvalidQuery(format!(
+                        "cyclic cohort reference detected involving '{cohort_id}'"
+                    )));
+                }
+                if let Some(target) = catalog.saved_cohorts.get(cohort_id) {
+                    let target_def = target.clone();
+                    drop(target);
+                    walk(&target_def, catalog, visited, depth + 1)?;
+                }
+                visited.remove(cohort_id);
+                Ok(())
+            }
+            BehavioralCohortDef::And { clauses } | BehavioralCohortDef::Or { clauses } => {
+                for c in clauses {
+                    walk(c, catalog, visited, depth + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut visited = HashSet::new();
+    if let Some(id) = self_id {
+        visited.insert(id.to_string());
+    }
+    walk(def, catalog, &mut visited, 0)
+}
+
 /// Evaluates recursive `BehavioralCohortDef` into an exact `RoaringBitmap` of canonical `u32` user IDs!
 pub fn evaluate_cohort<'a>(
     def: &'a BehavioralCohortDef,
@@ -417,7 +471,37 @@ pub fn evaluate_cohort<'a>(
     cache: &'a SegmentBlockCache,
     catalog: &'a VirtualCatalog,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringBitmap>> + Send + 'a>> {
+    evaluate_cohort_bounded(
+        def,
+        default_range,
+        ps,
+        snap,
+        id_snap,
+        cache,
+        catalog,
+        HashSet::new(),
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_cohort_bounded<'a>(
+    def: &'a BehavioralCohortDef,
+    default_range: Option<TimeRange>,
+    ps: &'a ProjectStorage,
+    snap: &'a StorageSnapshot,
+    id_snap: &'a IdentitySnapshot,
+    cache: &'a SegmentBlockCache,
+    catalog: &'a VirtualCatalog,
+    visited: HashSet<String>,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringBitmap>> + Send + 'a>> {
     Box::pin(async move {
+        if depth > MAX_COHORT_DEPTH {
+            return Err(ExecError::InvalidQuery(format!(
+                "cohort nesting depth exceeds maximum of {MAX_COHORT_DEPTH}"
+            )));
+        }
         match def {
             BehavioralCohortDef::PerformedEvent {
                 event_name,
@@ -502,7 +586,7 @@ pub fn evaluate_cohort<'a>(
                         }
                     }
                 }
-                let performed = evaluate_cohort(
+                let performed = evaluate_cohort_bounded(
                     &BehavioralCohortDef::PerformedEvent {
                         event_name: event_name.clone(),
                         min_count: 1,
@@ -515,6 +599,8 @@ pub fn evaluate_cohort<'a>(
                     id_snap,
                     cache,
                     catalog,
+                    visited,
+                    depth + 1,
                 )
                 .await?;
                 universe -= performed;
@@ -548,6 +634,12 @@ pub fn evaluate_cohort<'a>(
                 Ok(out)
             }
             BehavioralCohortDef::CohortRef { cohort_id } => {
+                let mut next_visited = visited;
+                if !next_visited.insert(cohort_id.clone()) {
+                    return Err(ExecError::InvalidQuery(format!(
+                        "cyclic cohort reference detected involving '{cohort_id}'"
+                    )));
+                }
                 let Some(saved) = catalog.saved_cohorts.get(cohort_id) else {
                     return Err(ExecError::InvalidQuery(format!(
                         "unknown saved cohort_id: {cohort_id}"
@@ -555,13 +647,34 @@ pub fn evaluate_cohort<'a>(
                 };
                 let cloned = saved.clone();
                 drop(saved);
-                evaluate_cohort(&cloned, default_range, ps, snap, id_snap, cache, catalog).await
+                evaluate_cohort_bounded(
+                    &cloned,
+                    default_range,
+                    ps,
+                    snap,
+                    id_snap,
+                    cache,
+                    catalog,
+                    next_visited,
+                    depth + 1,
+                )
+                .await
             }
             BehavioralCohortDef::And { clauses } => {
                 let mut acc: Option<RoaringBitmap> = None;
                 for c in clauses {
-                    let bm = evaluate_cohort(c, default_range, ps, snap, id_snap, cache, catalog)
-                        .await?;
+                    let bm = evaluate_cohort_bounded(
+                        c,
+                        default_range,
+                        ps,
+                        snap,
+                        id_snap,
+                        cache,
+                        catalog,
+                        visited.clone(),
+                        depth + 1,
+                    )
+                    .await?;
                     acc = Some(match acc {
                         Some(mut prev) => {
                             prev &= bm;
@@ -575,8 +688,18 @@ pub fn evaluate_cohort<'a>(
             BehavioralCohortDef::Or { clauses } => {
                 let mut acc = RoaringBitmap::new();
                 for c in clauses {
-                    let bm = evaluate_cohort(c, default_range, ps, snap, id_snap, cache, catalog)
-                        .await?;
+                    let bm = evaluate_cohort_bounded(
+                        c,
+                        default_range,
+                        ps,
+                        snap,
+                        id_snap,
+                        cache,
+                        catalog,
+                        visited.clone(),
+                        depth + 1,
+                    )
+                    .await?;
                     acc |= bm;
                 }
                 Ok(acc)

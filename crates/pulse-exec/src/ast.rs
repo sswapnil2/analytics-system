@@ -217,14 +217,14 @@ pub struct InsightsQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimePoint {
     pub bucket_ts_ms: i64,
-    pub value: f64,
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesOutput {
     pub label: String,
     pub breakdown_key: String,
-    pub overall_value: f64,
+    pub overall_value: Option<f64>,
     pub points: Vec<TimePoint>,
 }
 

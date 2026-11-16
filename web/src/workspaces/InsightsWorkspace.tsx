@@ -103,8 +103,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
       rows.push([
         s.label,
         s.breakdown_key,
-        s.overall_value.toFixed(2),
-        ...s.points.map((p) => p.value.toFixed(2)),
+        s.overall_value === null ? "" : s.overall_value.toFixed(2),
+        ...s.points.map((p) => (p.value === null ? "" : p.value.toFixed(2))),
       ]);
     }
     const csv = rows.map((r) => r.join(",")).join("\n");
@@ -123,7 +123,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
   const maxY = Math.max(
     1,
-    ...displayedSeries.flatMap((s) => s.points.map((p) => p.value)),
+    ...displayedSeries.flatMap((s) => s.points.map((p) => p.value ?? 0)),
   );
 
   return (
@@ -338,7 +338,11 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   {s.label}: {s.breakdown_key}
                 </span>
                 <span className="font-mono text-slate-400">
-                  ({s.overall_value.toLocaleString(undefined, { maximumFractionDigits: 2 })})
+                  (
+                  {s.overall_value === null
+                    ? "—"
+                    : s.overall_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  )
                 </span>
               </div>
             ))}
@@ -376,7 +380,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 return (
                   <g key={`${s.label}-${s.breakdown_key}`}>
                     {pts.map((p, pIdx) => {
-                      const h = (p.value / maxY) * 180;
+                      const h = ((p.value ?? 0) / maxY) * 180;
                       const x = 56 + pIdx * xStep - groupW / 2 + sIdx * barW;
                       return (
                         <rect
@@ -397,7 +401,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
               const coords = pts.map((p, i) => {
                 const x = 56 + i * xStep;
-                const y = 200 - (p.value / maxY) * 180;
+                const y = 200 - ((p.value ?? 0) / maxY) * 180;
                 return `${x},${y}`;
               });
               const areaPath = `M 56,200 L ${coords.join(" L ")} L ${56 + (pts.length - 1) * xStep},200 Z`;
@@ -469,11 +473,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     <td className="py-2 pr-4 font-mono text-blue-300">{row.label}</td>
                     <td className="py-2 pr-4 text-slate-200 font-medium">{row.breakdown_key}</td>
                     <td className="py-2 pr-4 text-right font-mono font-semibold text-emerald-300">
-                      {row.overall_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                      {row.overall_value === null
+                        ? "—"
+                        : row.overall_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                     </td>
                     {row.points.slice(-7).map((pt) => (
                       <td key={pt.bucket_ts_ms} className="py-2 px-2 text-right font-mono text-slate-300">
-                        {pt.value.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                        {pt.value === null
+                          ? "—"
+                          : pt.value.toLocaleString(undefined, { maximumFractionDigits: 1 })}
                       </td>
                     ))}
                   </tr>

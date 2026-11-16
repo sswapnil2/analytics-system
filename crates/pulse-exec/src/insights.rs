@@ -456,13 +456,13 @@ async fn evaluate_single_series(
             };
             points.push(TimePoint {
                 bucket_ts_ms: bts,
-                value: val,
+                value: Some(val),
             });
         }
         let overall_value = if is_rolling {
-            points.last().map(|p| p.value).unwrap_or(0.0)
+            points.last().and_then(|p| p.value).or(Some(0.0))
         } else {
-            overall_acc.finish(&spec.metric)
+            Some(overall_acc.finish(&spec.metric))
         };
 
         out.push(SeriesOutput {
@@ -476,12 +476,21 @@ async fn evaluate_single_series(
     Ok(out)
 }
 
+pub const MAX_FORMULA_LEN: usize = 1_024;
+pub const MAX_FORMULA_DEPTH: usize = 64;
+
 /// Evaluates multi-series mathematical formulas like `(B / A) * 100` per breakdown group & time bucket.
 fn evaluate_formulas(
     formula_str: &str,
     buckets: &[i64],
     series: &[SeriesOutput],
 ) -> Result<Vec<SeriesOutput>> {
+    if series.is_empty() {
+        let empty = HashMap::new();
+        let _ = eval_math_expr_opt(formula_str, &empty)?;
+        return Ok(Vec::new());
+    }
+
     let mut by_breakdown: BTreeMap<String, HashMap<String, &SeriesOutput>> = BTreeMap::new();
     for s in series {
         by_breakdown
@@ -492,20 +501,20 @@ fn evaluate_formulas(
 
     let mut out = Vec::with_capacity(by_breakdown.len());
     for (bkey, map) in by_breakdown {
-        let mut overall_vars = HashMap::new();
+        let mut overall_vars: HashMap<String, Option<f64>> = HashMap::new();
         for (lbl, s) in &map {
             overall_vars.insert(lbl.clone(), s.overall_value);
         }
-        let overall_value = eval_math_expr(formula_str, &overall_vars)?;
+        let overall_value = eval_math_expr_opt(formula_str, &overall_vars)?;
 
         let mut points = Vec::with_capacity(buckets.len());
         for (idx, &bts) in buckets.iter().enumerate() {
-            let mut pt_vars = HashMap::new();
+            let mut pt_vars: HashMap<String, Option<f64>> = HashMap::new();
             for (lbl, s) in &map {
-                let v = s.points.get(idx).map(|p| p.value).unwrap_or(0.0);
+                let v = s.points.get(idx).and_then(|p| p.value);
                 pt_vars.insert(lbl.clone(), v);
             }
-            let val = eval_math_expr(formula_str, &pt_vars)?;
+            let val = eval_math_expr_opt(formula_str, &pt_vars)?;
             points.push(TimePoint {
                 bucket_ts_ms: bts,
                 value: val,
@@ -523,23 +532,61 @@ fn evaluate_formulas(
     Ok(out)
 }
 
-/// Recursive-descent arithmetic expression evaluator (`+`, `-`, `*`, `/`, unary `-`, parens, numbers, and series variables `A`, `B`, ...).
-pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
+/// Recursive-descent arithmetic expression evaluator (`+`, `-`, `*`, `/`, unary `+/-`, parens, numbers, and series variables).
+///
+/// Enforces length (`<= 1024` bytes) and recursion depth (`<= 64`), rejects unknown variables and trailing tokens,
+/// and returns `Ok(None)` on division by zero or non-finite values (`P0-08`).
+pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<Option<f64>> {
+    let opt_vars: HashMap<String, Option<f64>> =
+        vars.iter().map(|(k, &v)| (k.clone(), Some(v))).collect();
+    eval_math_expr_opt(expr, &opt_vars)
+}
+
+pub fn eval_math_expr_opt(expr: &str, vars: &HashMap<String, Option<f64>>) -> Result<Option<f64>> {
+    if expr.len() > MAX_FORMULA_LEN {
+        return Err(ExecError::Expression(format!(
+            "formula length {} exceeds maximum of {MAX_FORMULA_LEN} bytes",
+            expr.len()
+        )));
+    }
+
     struct Parser<'a> {
         bytes: &'a [u8],
         pos: usize,
-        vars: &'a HashMap<String, f64>,
+        vars: &'a HashMap<String, Option<f64>>,
+    }
+
+    #[inline]
+    fn combine(
+        lhs: Option<f64>,
+        rhs: Option<f64>,
+        f: impl FnOnce(f64, f64) -> Option<f64>,
+    ) -> Option<f64> {
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => f(a, b).filter(|v| v.is_finite()),
+            _ => None,
+        }
     }
 
     impl<'a> Parser<'a> {
+        fn check_depth(depth: usize) -> Result<()> {
+            if depth > MAX_FORMULA_DEPTH {
+                return Err(ExecError::Expression(format!(
+                    "formula nesting depth exceeds maximum of {MAX_FORMULA_DEPTH}"
+                )));
+            }
+            Ok(())
+        }
+
         fn skip_ws(&mut self) {
             while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
                 self.pos += 1;
             }
         }
 
-        fn parse_expr(&mut self) -> Result<f64> {
-            let mut val = self.parse_term()?;
+        fn parse_expr(&mut self, depth: usize) -> Result<Option<f64>> {
+            Self::check_depth(depth)?;
+            let mut val = self.parse_term(depth + 1)?;
             loop {
                 self.skip_ws();
                 if self.pos >= self.bytes.len() {
@@ -548,11 +595,13 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
                 match self.bytes[self.pos] {
                     b'+' => {
                         self.pos += 1;
-                        val += self.parse_term()?;
+                        let rhs = self.parse_term(depth + 1)?;
+                        val = combine(val, rhs, |a, b| Some(a + b));
                     }
                     b'-' => {
                         self.pos += 1;
-                        val -= self.parse_term()?;
+                        let rhs = self.parse_term(depth + 1)?;
+                        val = combine(val, rhs, |a, b| Some(a - b));
                     }
                     _ => break,
                 }
@@ -560,8 +609,9 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
             Ok(val)
         }
 
-        fn parse_term(&mut self) -> Result<f64> {
-            let mut val = self.parse_factor()?;
+        fn parse_term(&mut self, depth: usize) -> Result<Option<f64>> {
+            Self::check_depth(depth)?;
+            let mut val = self.parse_factor(depth + 1)?;
             loop {
                 self.skip_ws();
                 if self.pos >= self.bytes.len() {
@@ -570,16 +620,19 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
                 match self.bytes[self.pos] {
                     b'*' => {
                         self.pos += 1;
-                        val *= self.parse_factor()?;
+                        let rhs = self.parse_factor(depth + 1)?;
+                        val = combine(val, rhs, |a, b| Some(a * b));
                     }
                     b'/' => {
                         self.pos += 1;
-                        let denom = self.parse_factor()?;
-                        val = if denom.abs() < 1e-12 {
-                            0.0
-                        } else {
-                            val / denom
-                        };
+                        let rhs = self.parse_factor(depth + 1)?;
+                        val = combine(val, rhs, |a, b| {
+                            if b == 0.0 || b.abs() < 1e-15 {
+                                None
+                            } else {
+                                Some(a / b)
+                            }
+                        });
                     }
                     _ => break,
                 }
@@ -587,7 +640,8 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
             Ok(val)
         }
 
-        fn parse_factor(&mut self) -> Result<f64> {
+        fn parse_factor(&mut self, depth: usize) -> Result<Option<f64>> {
+            Self::check_depth(depth)?;
             self.skip_ws();
             if self.pos >= self.bytes.len() {
                 return Err(ExecError::Expression("unexpected end of formula".into()));
@@ -595,15 +649,16 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
             let b = self.bytes[self.pos];
             if b == b'-' {
                 self.pos += 1;
-                return Ok(-self.parse_factor()?);
+                let inner = self.parse_factor(depth + 1)?;
+                return Ok(inner.map(|v| -v).filter(|v| v.is_finite()));
             }
             if b == b'+' {
                 self.pos += 1;
-                return self.parse_factor();
+                return self.parse_factor(depth + 1);
             }
             if b == b'(' {
                 self.pos += 1;
-                let inner = self.parse_expr()?;
+                let inner = self.parse_expr(depth + 1)?;
                 self.skip_ws();
                 if self.pos < self.bytes.len() && self.bytes[self.pos] == b')' {
                     self.pos += 1;
@@ -620,10 +675,15 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
                 {
                     self.pos += 1;
                 }
-                let s = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or("0");
-                return s
+                let s = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or("");
+                let parsed = s
                     .parse::<f64>()
-                    .map_err(|e| ExecError::Expression(format!("invalid formula number: {e}")));
+                    .map_err(|e| ExecError::Expression(format!("invalid formula number: {e}")))?;
+                return Ok(if parsed.is_finite() {
+                    Some(parsed)
+                } else {
+                    None
+                });
             }
             if b.is_ascii_alphabetic() || b == b'_' {
                 let start = self.pos;
@@ -634,7 +694,12 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
                     self.pos += 1;
                 }
                 let name = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or("");
-                return Ok(self.vars.get(name).copied().unwrap_or(0.0));
+                let Some(&val) = self.vars.get(name) else {
+                    return Err(ExecError::Expression(format!(
+                        "unknown formula variable '{name}'"
+                    )));
+                };
+                return Ok(val.filter(|v| v.is_finite()));
             }
             Err(ExecError::Expression(format!(
                 "unexpected token '{}' in formula",
@@ -648,6 +713,13 @@ pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<f64> {
         pos: 0,
         vars,
     };
-    let res = parser.parse_expr()?;
-    Ok(if res.is_finite() { res } else { 0.0 })
+    let res = parser.parse_expr(0)?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return Err(ExecError::Expression(format!(
+            "unexpected trailing token at byte {} in formula",
+            parser.pos
+        )));
+    }
+    Ok(res.filter(|v| v.is_finite()))
 }

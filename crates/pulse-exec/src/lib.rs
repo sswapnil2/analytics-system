@@ -19,7 +19,7 @@ pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;
 pub use insights::{eval_math_expr, InsightsEngine};
 pub use retention::RetentionEngine;
-pub use scanner::{ExecError, Result};
+pub use scanner::{validate_cohort_acyclic, ExecError, Result, MAX_COHORT_DEPTH};
 
 #[cfg(test)]
 mod tests {
@@ -929,7 +929,7 @@ mod tests {
         assert!(ins_res
             .series
             .iter()
-            .any(|s| s.breakdown_key == "High | Food_Delivery" && s.overall_value == 20.0));
+            .any(|s| s.breakdown_key == "High | Food_Delivery" && s.overall_value == Some(20.0)));
         assert!(!ins_res.formula_series.is_empty());
 
         id_router.close_all().await.unwrap();
