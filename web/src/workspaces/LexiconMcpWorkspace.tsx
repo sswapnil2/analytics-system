@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Bot, Play } from "lucide-react";
 import { api, LexiconEvent, LexiconProperty } from "../api/client";
+import { BatchImportExportPanel } from "../components/BatchImportExportPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { displayUserId, errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
@@ -273,6 +274,8 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
               </div>
             )}
           </Panel>
+
+          <BatchImportExportPanel projectId={projectId} />
         </div>
 
         <Panel title="AI tools" className="xl:col-span-5">

@@ -400,6 +400,53 @@ export class ApiAuthError extends Error {
   }
 }
 
+export interface UserProfileItem {
+  project_id: string;
+  distinct_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  props: Record<string, unknown>;
+  total_revenue: number;
+  updated_at_ms: number;
+}
+
+export interface UserEventItem {
+  event_ts_ms: number;
+  event_name: string;
+  distinct_id: string;
+  canonical_uid: number;
+  session_id: string;
+  props: Record<string, unknown>;
+}
+
+export interface UserDetailResponse {
+  distinct_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  profile: UserProfileItem | null;
+  events: UserEventItem[];
+  replay_sessions: string[];
+}
+
+export interface DeletionAuditRecord {
+  id: string;
+  project_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  events_purged: number;
+  replays_purged: number;
+  requested_by: string;
+  deleted_at_ms: number;
+}
+
+export interface BatchImportResponse {
+  status: string;
+  accepted: number;
+  deduped: number;
+  dropped: number;
+  server_ts_ms: number;
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAdminToken();
   const authHeaders: Record<string, string> = token
@@ -422,6 +469,28 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   }
   const body = await res.text();
   return (body ? JSON.parse(body) : null) as T;
+}
+
+async function fetchText(url: string, init?: RequestInit): Promise<string> {
+  const token = getStoredAdminToken();
+  const authHeaders: Record<string, string> = token
+    ? { Authorization: `Bearer ${token}` }
+    : {};
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      ...authHeaders,
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 401 || res.status === 403) {
+      throw new ApiAuthError(res.status, text || `HTTP ${res.status}`);
+    }
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.text();
 }
 
 export function default14DayRange(): TimeRange {
@@ -642,6 +711,50 @@ export const api = {
   getExperimentResults: (projectId: string, expId: string) =>
     fetchJson<ExperimentResults>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results`,
+    ),
+
+  listUsers: (projectId: string, search = "", limit = 100) =>
+    fetchJson<UserProfileItem[]>(
+      `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}`,
+    ),
+
+  getUserDetail: (projectId: string, distinctId: string) =>
+    fetchJson<UserDetailResponse>(
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+    ),
+
+  deleteUserDpdp: (projectId: string, distinctId: string) =>
+    fetchJson<DeletionAuditRecord>(
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+      { method: "DELETE" },
+    ),
+
+  listDeletionAudit: (projectId: string) =>
+    fetchJson<DeletionAuditRecord[]>(`/v1/projects/${projectId}/deletions`),
+
+  exportCohortCsv: (projectId: string, cohortId: string) =>
+    fetchText(
+      `/v1/projects/${projectId}/cohorts/${encodeURIComponent(cohortId)}/export?format=csv`,
+    ),
+
+  importEvents: (
+    projectId: string,
+    body: string,
+    contentType: "application/json" | "application/x-ndjson" | "text/csv",
+  ) =>
+    fetchJson<BatchImportResponse>(`/v1/projects/${projectId}/import`, {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body,
+    }),
+
+  exportRawEvents: (
+    projectId: string,
+    format: "ndjson" | "csv" | "json" = "ndjson",
+    limit = 2000,
+  ) =>
+    fetchText(
+      `/v1/projects/${projectId}/export?format=${format}&limit=${limit}`,
     ),
 
   callMcp: (method: string, params: unknown = {}) =>

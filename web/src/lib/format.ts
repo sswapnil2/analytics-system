@@ -90,3 +90,26 @@ export function isNotFound(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /\b404\b|not found/i.test(err.message);
 }
+
+/** Trigger a browser download for a generated CSV, NDJSON, or JSON text payload. */
+export function downloadTextFile(
+  filename: string,
+  content: string,
+  mimeType = "text/plain;charset=utf-8",
+): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+/** Format epoch milliseconds into a readable local date/time string. */
+export function formatTimestamp(ms: number | null | undefined): string {
+  if (!ms || ms <= 0) return "—";
+  return new Date(ms).toLocaleString();
+}
