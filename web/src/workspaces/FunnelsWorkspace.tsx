@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ArrowDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
-import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
@@ -86,6 +86,20 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const openError = useSavedReport(
+    projectId,
+    (q) => {
+      const s = q as { steps?: { event_name: string }[]; order_mode?: OrderMode; conversion_window_ms?: number;
+        exclusions?: { event_name: string }[]; hold_constant_props?: string[]; breakdown_by?: string | null };
+      if (s.steps?.length) setSteps(s.steps.map((x) => x.event_name));
+      if (s.order_mode) setOrderMode(s.order_mode);
+      if (s.conversion_window_ms) setWindowHours(s.conversion_window_ms / 3_600_000);
+      setExcludeEvent(s.exclusions?.[0]?.event_name ?? "");
+      setHoldConstant(s.hold_constant_props?.[0] ?? "");
+      setBreakdownBy(s.breakdown_by ?? "");
+    },
+    setRange,
+  );
 
   const runFunnel = useCallback(async () => {
     const id = ++reqId.current;
@@ -264,6 +278,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
         }
       >
 
+      {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={`The funnel didn't run: ${error}`} onRetry={() => void runFunnel()} />}
 
       {!result && loading && (

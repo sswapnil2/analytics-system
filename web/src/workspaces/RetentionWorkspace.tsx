@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
-import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
@@ -47,6 +47,17 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const openError = useSavedReport(
+    projectId,
+    (q) => {
+      const s = q as { start_event?: string; return_event?: string; mode?: Mode; num_periods?: number };
+      if (s.start_event) setStartEvent(s.start_event);
+      if (s.return_event) setReturnEvent(s.return_event);
+      if (s.mode) setMode(s.mode);
+      if (s.num_periods) setNumPeriods(s.num_periods);
+    },
+    setRange,
+  );
 
   const runRetention = useCallback(async () => {
     const id = ++reqId.current;
@@ -155,6 +166,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
         }
       >
 
+      {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={error} onRetry={() => void runRetention()} />}
 
       {!stickiness && cohorts.length > 0 && (

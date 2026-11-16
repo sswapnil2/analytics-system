@@ -3,6 +3,7 @@ import { LayoutDashboard } from "lucide-react";
 import { api, Dashboard, ReportKind } from "../api/client";
 import { btn, field, fieldLabel } from "../components/ui";
 import { errorMessage } from "../lib/format";
+import type { RangeSel } from "./ReportCard";
 
 const NEW = "__new__";
 
@@ -157,3 +158,39 @@ export const SaveToDashboard: React.FC<{
     </div>
   );
 };
+
+/**
+ * Opens a saved report on its report page: `#/funnels?report=<id>&range=<sel>` (from a
+ * dashboard card) loads that report's query into the page once, through `apply`.
+ */
+export function useSavedReport(
+  projectId: string,
+  apply: (query: Record<string, unknown>) => void,
+  setRange: (r: RangeSel) => void,
+): string | null {
+  const [error, setError] = useState<string | null>(null);
+  const applyRef = useRef(apply);
+  applyRef.current = apply;
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+    const id = params.get("report");
+    const range = params.get("range");
+    if (range && /^(today|yesterday|\d+|custom:\d{4}-\d\d-\d\d:\d{4}-\d\d-\d\d)$/.test(range)) setRange(range as RangeSel);
+    if (!id) return;
+    let live = true;
+    api
+      .listReports(projectId)
+      .then((list) => {
+        if (!live) return;
+        const r = list.find((x) => x.id === id);
+        if (r) applyRef.current(r.query_json);
+        else setError("That saved report was deleted. Showing a new report instead.");
+      })
+      .catch((err) => live && setError(`Couldn't open the saved report: ${errorMessage(err)}`));
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+  return error;
+}

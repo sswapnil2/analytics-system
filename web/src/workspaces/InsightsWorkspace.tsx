@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
-import { SaveToDashboard } from "../dashboards/SaveToDashboard";
+import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
@@ -64,6 +64,15 @@ const FALLBACK_EVENTS = [
 ];
 
 const BREAKDOWN_DEFAULTS = ["city", "platform", "payment_method", "network", "ticket_band", "category"];
+
+/** Inverse of buildMetricSpec, for opening a saved report. */
+function metricKindOf(m: { type?: string; quantile?: number } | undefined): string {
+  if (!m?.type) return "uniques";
+  if (m.type === "prop_sum") return "sum";
+  if (m.type === "prop_avg") return "avg";
+  if (m.type === "prop_percentile") return m.quantile === 0.5 ? "p50" : m.quantile === 0.99 ? "p99" : "p90";
+  return m.type;
+}
 
 function buildMetricSpec(kind: string, prop: string) {
   switch (kind) {
@@ -166,6 +175,19 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const openError = useSavedReport(
+    projectId,
+    (q) => {
+      const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
+        breakdown_by?: string[]; compare_previous_period?: boolean; formula?: string | null };
+      if (s.series?.length)
+        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? "amount" })));
+      setBreakdown(s.breakdown_by?.[0] ?? "");
+      setComparePrev(!!s.compare_previous_period);
+      setFormula(s.formula ?? "");
+    },
+    setRange,
+  );
 
   const runQuery = useCallback(async () => {
     const id = ++reqId.current;
@@ -409,6 +431,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         }
       >
 
+      {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
 
       <Panel

@@ -36,6 +36,10 @@ const REPORT_PAGE: Record<SavedReport["report_kind"], string> = {
 const KIND_ICON = { funnel: Filter, insights: LineChart, retention: CalendarCheck, flows: GitBranch } as const;
 
 /** "Funnel · 5 steps · Last 14 days", like Mixpanel's card subtitle. */
+/** The report's own page, with this report and the board's date range loaded. */
+const reportHref = (r: SavedReport, range: RangeSel) =>
+  `#/${REPORT_PAGE[r.report_kind]}?report=${encodeURIComponent(r.id)}&range=${encodeURIComponent(range)}`;
+
 function cardSubtitle(r: SavedReport, range: RangeSel): string {
   const q = r.query_json as Record<string, unknown>;
   const n = (k: string) => (Array.isArray(q[k]) ? (q[k] as unknown[]).length : 0);
@@ -553,7 +557,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                 triggerClass={`${iconBtn} shrink-0`}
                 trigger={<MoreVertical className="h-4 w-4" />}
                 items={[
-                  ...(report ? [{ label: "Open report", href: `#/${REPORT_PAGE[report.report_kind]}` }] : []),
+                  ...(report ? [{ label: "Open report", href: reportHref(report, range) }] : []),
                   ...(card.kind === "text" && card.id ? [{ label: "Edit note", onSelect: () => setEditingTextId(card.id ?? null) }] : []),
                   {
                     label: card.width === 2 ? "Half width" : "Full width",
@@ -610,7 +614,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                   <div className="min-w-0 flex-1">
                     {report ? (
                       <a
-                        href={`#/${REPORT_PAGE[report.report_kind]}`}
+                        href={reportHref(report, range)}
                         className="block truncate text-[0.9375rem] font-semibold text-ink hover:underline"
                       >
                         {report.name}
