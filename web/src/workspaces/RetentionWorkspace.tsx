@@ -1,6 +1,18 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { CalendarCheck } from "lucide-react";
 import { api, default14DayRange, RetentionResult } from "../api/client";
+import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import {
+  btn,
+  EmptyState,
+  ErrorNotice,
+  field,
+  fieldLabel,
+  PageHeader,
+  Panel,
+  RanIn,
+  Spinner,
+} from "../components/ui";
 
 interface Props {
   projectId: string;
@@ -8,30 +20,26 @@ interface Props {
   refreshToken: number;
 }
 
-function heatBg(pct: number): string {
-  if (pct >= 65) return "rgba(37, 99, 235, 0.85)";
-  if (pct >= 45) return "rgba(37, 99, 235, 0.65)";
-  if (pct >= 30) return "rgba(37, 99, 235, 0.48)";
-  if (pct >= 20) return "rgba(37, 99, 235, 0.32)";
-  if (pct >= 10) return "rgba(37, 99, 235, 0.18)";
-  if (pct > 0) return "rgba(37, 99, 235, 0.09)";
-  return "transparent";
-}
+type Mode = "n_day" | "unbounded" | "frequency_stickiness";
 
-export const RetentionWorkspace: React.FC<Props> = ({
-  projectId,
-  availableEvents,
-  refreshToken,
-}) => {
+const MODES: [Mode, string][] = [
+  ["n_day", "Returned on day N"],
+  ["unbounded", "Returned on or after day N"],
+  ["frequency_stickiness", "Days active per week"],
+];
+
+export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
   const [startEvent, setStartEvent] = useState<string>("App_Open");
   const [returnEvent, setReturnEvent] = useState<string>("Quick_Grocery_Browse");
-  const [mode, setMode] = useState<"n_day" | "unbounded" | "frequency_stickiness">("n_day");
+  const [mode, setMode] = useState<Mode>("n_day");
   const [numPeriods, setNumPeriods] = useState<number>(10);
   const [result, setResult] = useState<RetentionResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
 
   const runRetention = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await api.queryRetention(projectId, {
         time_range: default14DayRange(),
@@ -42,6 +50,8 @@ export const RetentionWorkspace: React.FC<Props> = ({
         num_periods: numPeriods,
       });
       setResult(res);
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -60,145 +70,163 @@ export const RetentionWorkspace: React.FC<Props> = ({
     ...availableEvents,
   ].filter((v, i, a) => a.indexOf(v) === i);
 
+  const stickiness = mode === "frequency_stickiness";
+  const cohorts = result?.cohorts ?? [];
+
   return (
     <div className="space-y-5">
-      <div className="bg-[#0e1422] border border-slate-800/80 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="bg-[#090d16] border border-slate-800 rounded-lg px-3 py-1.5">
-            <span className="text-slate-400 mr-2">Cohort Entry:</span>
-            <select
-              value={startEvent}
-              onChange={(e) => setStartEvent(e.target.value)}
-              className="bg-transparent text-slate-100 font-medium focus:outline-none"
-            >
+      <PageHeader
+        title="Retention"
+        description="How many users come back after their first action."
+        actions={
+          <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.primary}>
+            {loading ? "Running…" : "Run"}
+          </button>
+        }
+      />
+
+      <Panel>
+        <div className="flex flex-wrap items-end gap-4">
+          <label className="flex min-w-0 flex-col gap-1">
+            <span className={fieldLabel}>First action</span>
+            <select value={startEvent} onChange={(e) => setStartEvent(e.target.value)} className={field}>
               {eventOptions.map((ev) => (
-                <option key={ev} value={ev} className="bg-slate-900">
-                  {ev}
+                <option key={ev} value={ev}>
+                  {humanizeEvent(ev)}
                 </option>
               ))}
             </select>
-          </div>
-
-          <div className="bg-[#090d16] border border-slate-800 rounded-lg px-3 py-1.5">
-            <span className="text-slate-400 mr-2">Return Event:</span>
-            <select
-              value={returnEvent}
-              onChange={(e) => setReturnEvent(e.target.value)}
-              className="bg-transparent text-slate-100 font-medium focus:outline-none"
-            >
+          </label>
+          <label className="flex min-w-0 flex-col gap-1">
+            <span className={fieldLabel}>Came back and did</span>
+            <select value={returnEvent} onChange={(e) => setReturnEvent(e.target.value)} className={field}>
               {eventOptions.map((ev) => (
-                <option key={ev} value={ev} className="bg-slate-900">
-                  {ev}
+                <option key={ev} value={ev}>
+                  {humanizeEvent(ev)}
                 </option>
               ))}
             </select>
-          </div>
-
-          <div className="flex items-center bg-[#090d16] border border-slate-800 rounded-lg p-1">
-            {(
-              [
-                ["n_day", "N-Day Exact"],
-                ["unbounded", "Unbounded"],
-                ["frequency_stickiness", "Stickiness"],
-              ] as const
-            ).map(([k, lbl]) => (
-              <button
-                key={k}
-                onClick={() => setMode(k)}
-                className={`px-2.5 py-1 rounded ${
-                  mode === k ? "bg-blue-600 text-white" : "text-slate-400"
-                }`}
-              >
-                {lbl}
-              </button>
-            ))}
-          </div>
-
-          <select
-            value={numPeriods}
-            onChange={(e) => setNumPeriods(Number(e.target.value))}
-            className="bg-[#090d16] border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200"
-          >
-            <option value={7}>7 Days</option>
-            <option value={10}>10 Days</option>
-            <option value={13}>13 Days</option>
-          </select>
-        </div>
-
-        <button
-          onClick={() => void runRetention()}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
-          Compute Cohorts
-        </button>
-      </div>
-
-      {/* Cohort Retention Heatmap Triangle */}
-      <div className="bg-[#0e1422] border border-slate-800/80 rounded-xl p-4 overflow-x-auto">
-        <div className="flex items-center justify-between mb-3">
-          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-            Exact Unsampled RoaringBitmap Cohort Triangle ({mode.replace("_", " ")})
-          </div>
-          {result && (
-            <span className="font-mono text-xs text-emerald-400">
-              Latency: {(result.exec_time_us / 1000).toFixed(2)} ms
+          </label>
+          <div className="flex flex-col gap-1">
+            <span className={fieldLabel} id="retention-mode">
+              Count users who
             </span>
-          )}
-        </div>
-
-        <table className="w-full text-xs border-collapse">
-          <thead>
-            <tr className="border-b border-slate-800 text-slate-400">
-              <th className="py-2 pr-3 text-left">Cohort Date</th>
-              <th className="py-2 px-3 text-right">Users</th>
-              {Array.from({ length: numPeriods + 1 }, (_, i) => (
-                <th key={i} className="py-2 px-2 text-center font-mono">
-                  {mode === "frequency_stickiness" ? `≥${i + 1}d` : `D${i}`}
-                </th>
+            <div
+              className="flex flex-wrap rounded-md border border-line-strong p-0.5"
+              role="group"
+              aria-labelledby="retention-mode"
+            >
+              {MODES.map(([k, text]) => (
+                <button
+                  key={k}
+                  type="button"
+                  aria-pressed={mode === k}
+                  onClick={() => setMode(k)}
+                  className={`rounded px-2.5 py-1 text-sm ${
+                    mode === k ? "bg-brand text-on-brand" : "text-muted hover:text-ink"
+                  }`}
+                >
+                  {text}
+                </button>
               ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-800/40">
-            {result?.cohorts.map((row, rIdx) => {
-              const maxValidPeriod =
-                mode === "frequency_stickiness"
-                  ? numPeriods
-                  : Math.max(0, result.cohorts.length - 1 - rIdx);
-              return (
-                <tr key={row.cohort_start_ts_ms}>
-                  <td className="py-1.5 pr-3 font-mono text-slate-200 whitespace-nowrap">
-                    {row.cohort_label}
-                  </td>
-                  <td className="py-1.5 px-3 text-right font-mono text-slate-300">
-                    {row.cohort_size.toLocaleString()}
-                  </td>
-                  {row.retained_pcts.slice(0, numPeriods + 1).map((pct, cIdx) => {
-                    if (cIdx > maxValidPeriod && row.retained_counts[cIdx] === 0) {
-                      return (
-                        <td key={cIdx} className="py-1.5 px-1 text-center text-slate-700 font-mono">
-                          —
-                        </td>
-                      );
-                    }
-                    return (
-                      <td key={cIdx} className="p-1">
-                        <div
-                          style={{ backgroundColor: heatBg(pct) }}
-                          title={`${row.retained_counts[cIdx]} / ${row.cohort_size} users`}
-                          className="rounded py-1.5 px-1.5 text-center font-mono text-[11px] text-white border border-slate-800/40"
-                        >
-                          {pct.toFixed(1)}%
-                        </div>
-                      </td>
-                    );
-                  })}
+            </div>
+          </div>
+          <label className="flex flex-col gap-1">
+            <span className={fieldLabel}>Days to show</span>
+            <select value={numPeriods} onChange={(e) => setNumPeriods(Number(e.target.value))} className={field}>
+              <option value={7}>7 days</option>
+              <option value={10}>10 days</option>
+              <option value={13}>13 days</option>
+            </select>
+          </label>
+        </div>
+      </Panel>
+
+      {error && <ErrorNotice message={error} onRetry={() => void runRetention()} />}
+
+      <Panel
+        title="Users who came back, by start date"
+        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+      >
+        {cohorts.length === 0 ? (
+          loading ? (
+            <div className="flex h-48 items-center justify-center">
+              <Spinner />
+            </div>
+          ) : (
+            <EmptyState
+              icon={CalendarCheck}
+              title="No users to follow yet"
+              body={`Nobody did ${humanizeEvent(startEvent)} in the last 14 days. Pick a different first action.`}
+            />
+          )
+        ) : (
+          <div className="-mx-4 overflow-x-auto px-4">
+            <table className="w-full border-separate border-spacing-1 text-sm">
+              <thead>
+                <tr className="text-xs text-muted">
+                  <th className="sticky left-0 z-10 bg-panel py-1.5 pr-3 text-left font-medium">Start date</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Users</th>
+                  {Array.from({ length: numPeriods + 1 }, (_, i) => (
+                    <th key={i} className="whitespace-nowrap px-1 py-1.5 text-center font-medium">
+                      {stickiness ? `${i + 1}+ days` : `Day ${i}`}
+                    </th>
+                  ))}
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+              </thead>
+              <tbody>
+                {cohorts.map((row, rIdx) => {
+                  // Later cohorts have not had time to reach later days yet.
+                  const maxValidPeriod = stickiness ? numPeriods : Math.max(0, cohorts.length - 1 - rIdx);
+                  return (
+                    <tr key={row.cohort_start_ts_ms}>
+                      <td className="sticky left-0 z-10 whitespace-nowrap bg-panel py-1 pr-3 text-ink">
+                        {new Date(row.cohort_start_ts_ms).toLocaleDateString(undefined, {
+                          day: "numeric",
+                          month: "short",
+                          timeZone: "UTC",
+                        })}
+                      </td>
+                      <td className="tabular px-2 py-1 text-right text-ink-2">{formatCount(row.cohort_size)}</td>
+                      {row.retained_pcts.slice(0, numPeriods + 1).map((pct, cIdx) => {
+                        if (cIdx > maxValidPeriod && row.retained_counts[cIdx] === 0) {
+                          return <td key={cIdx} aria-label="Not reached yet" />;
+                        }
+                        const tip = `${formatCount(row.retained_counts[cIdx])} of ${formatCount(row.cohort_size)} users`;
+                        // The first column is the starting group itself, so keep it neutral.
+                        if (cIdx === 0) {
+                          return (
+                            <td
+                              key={cIdx}
+                              title={tip}
+                              className="tabular rounded bg-sunken px-1.5 py-1.5 text-center text-xs text-ink-2"
+                            >
+                              {pct.toFixed(1)}%
+                            </td>
+                          );
+                        }
+                        const v = Math.min(1, Math.max(0, pct / 100));
+                        return (
+                          <td
+                            key={cIdx}
+                            title={tip}
+                            style={{ backgroundColor: `rgb(var(--brand) / ${0.08 + v * 0.85})` }}
+                            className={`tabular rounded px-1.5 py-1.5 text-center text-xs ${
+                              v > 0.55 ? "text-on-brand" : "text-ink"
+                            }`}
+                          >
+                            {pct.toFixed(1)}%
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
     </div>
   );
 };

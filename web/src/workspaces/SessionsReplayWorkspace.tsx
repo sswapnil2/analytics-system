@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Cpu, RefreshCw, Zap } from "lucide-react";
-import { api, ReplayChunk, SessionSearchResult, SessionSummaryItem } from "../api/client";
-import { WireframePlayer } from "../components/WireframePlayer";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, RefreshCw, Search, Zap } from "lucide-react";
+import { api, SessionSearchResult, SessionSummaryItem } from "../api/client";
+import { SessionReplay } from "../components/WireframePlayer";
+import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Spinner } from "../components/ui";
+import { displayUserId, errorMessage, formatCount, formatDuration, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
@@ -9,34 +11,50 @@ interface Props {
   refreshToken: number;
 }
 
-export const SessionsReplayWorkspace: React.FC<Props> = ({
-  projectId,
-  availableEvents,
-  refreshToken,
-}) => {
+const Toggle: React.FC<{
+  pressed: boolean;
+  onChange: () => void;
+  icon: React.ComponentType<{ className?: string }>;
+  tone: "danger" | "warn";
+  children: React.ReactNode;
+}> = ({ pressed, onChange, icon: Icon, tone, children }) => (
+  <button
+    type="button"
+    aria-pressed={pressed}
+    onClick={onChange}
+    className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm ${
+      pressed
+        ? tone === "danger"
+          ? "border-danger bg-danger-soft text-danger"
+          : "border-warn bg-warn-soft text-warn"
+        : "border-line-strong bg-panel text-ink-2 hover:bg-hover"
+    }`}
+  >
+    <Icon className="h-4 w-4" />
+    {children}
+  </button>
+);
+
+export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
   const [eventFilter, setEventFilter] = useState<string>("NSDL_Gateway_504_Timeout");
   const [onlyRage, setOnlyRage] = useState<boolean>(true);
   const [onlyErrors, setOnlyErrors] = useState<boolean>(false);
   const [searchRes, setSearchRes] = useState<SessionSearchResult | null>(null);
   const [selected, setSelected] = useState<SessionSummaryItem | null>(null);
-  const [chunks, setChunks] = useState<ReplayChunk[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const loadReplay = useCallback(
-    async (sess: SessionSummaryItem) => {
-      setSelected(sess);
-      try {
-        const res = await api.getReplay(projectId, sess.session_id, 0);
-        setChunks(res.chunks);
-      } catch {
-        setChunks([]);
-      }
-    },
-    [projectId],
+  const eventOptions = useMemo(
+    () =>
+      Array.from(new Set(["NSDL_Gateway_504_Timeout", "KYC_PAN_Submitted", ...availableEvents])).filter(
+        (e) => !e.startsWith("$"),
+      ),
+    [availableEvents],
   );
 
   const runSearch = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await api.searchSessions(projectId, {
         event_name: eventFilter || null,
@@ -45,182 +63,140 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({
         limit: 30,
       });
       setSearchRes(res);
-      if (res.sessions.length > 0) {
-        await loadReplay(res.sessions[0]);
-      } else {
-        setSelected(null);
-        setChunks([]);
-      }
+      setSelected(res.sessions[0] ?? null);
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [projectId, eventFilter, onlyRage, onlyErrors, loadReplay]);
+  }, [projectId, eventFilter, onlyRage, onlyErrors]);
 
   useEffect(() => {
     void runSearch();
   }, [runSearch, refreshToken]);
 
-  const prunePct =
-    searchRes && searchRes.total_sessions_inspected > 0
-      ? ((searchRes.sessions_pruned_by_bloom / searchRes.total_sessions_inspected) * 100).toFixed(1)
-      : "0.0";
+  const sessions = searchRes?.sessions ?? [];
 
   return (
     <div className="space-y-5">
-      {/* Filter Bar + 64-bit SessionIndex Bloom Pruning Telemetry */}
-      <div className="bg-[#0e1422] border border-slate-800/80 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="bg-[#090d16] border border-slate-800 rounded-lg px-3 py-1.5">
-            <span className="text-slate-400 mr-2">Contains Event:</span>
-            <select
-              value={eventFilter}
-              onChange={(e) => setEventFilter(e.target.value)}
-              className="bg-transparent text-slate-100 font-medium focus:outline-none"
-            >
-              <option value="" className="bg-slate-900">
-                Any Event
-              </option>
-              {[
-                "NSDL_Gateway_504_Timeout",
-                "KYC_PAN_Submitted",
-                "UPI_Autopay_Mandate_Approved",
-                "First_Disbursal_Success",
-                ...availableEvents,
-              ]
-                .filter((v, i, a) => a.indexOf(v) === i)
-                .map((ev) => (
-                  <option key={ev} value={ev} className="bg-slate-900">
-                    {ev}
-                  </option>
-                ))}
+      <PageHeader
+        title="Session replays"
+        description="Watch what users saw and tapped, starting with the sessions where something went wrong."
+      />
+
+      <Panel>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex min-w-[14rem] flex-col gap-1">
+            <span className={fieldLabel}>Sessions that include</span>
+            <select value={eventFilter} onChange={(e) => setEventFilter(e.target.value)} className={field}>
+              <option value="">Any event</option>
+              {eventOptions.map((ev) => (
+                <option key={ev} value={ev}>
+                  {humanizeEvent(ev)}
+                </option>
+              ))}
             </select>
-          </div>
-
-          <button
-            onClick={() => setOnlyRage((v) => !v)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition ${
-              onlyRage
-                ? "bg-amber-500/20 border-amber-500/60 text-amber-200"
-                : "bg-[#090d16] border-slate-800 text-slate-400"
-            }`}
-          >
-            <Zap className="w-3.5 h-3.5" /> Rage Tap Sessions
-          </button>
-
-          <button
-            onClick={() => setOnlyErrors((v) => !v)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition ${
-              onlyErrors
-                ? "bg-red-500/20 border-red-500/60 text-red-200"
-                : "bg-[#090d16] border-slate-800 text-slate-400"
-            }`}
-          >
-            <AlertTriangle className="w-3.5 h-3.5" /> 5xx / Timeout Errors
+          </label>
+          <Toggle pressed={onlyRage} onChange={() => setOnlyRage((v) => !v)} icon={Zap} tone="danger">
+            Rage taps
+          </Toggle>
+          <Toggle pressed={onlyErrors} onChange={() => setOnlyErrors((v) => !v)} icon={AlertTriangle} tone="warn">
+            Errors and timeouts
+          </Toggle>
+          <button type="button" onClick={() => void runSearch()} disabled={loading} className={btn.secondary}>
+            <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
+            Refresh
           </button>
         </div>
+      </Panel>
 
-        <div className="flex items-center gap-3">
-          {searchRes && (
-            <div className="flex items-center gap-2 bg-indigo-950/50 border border-indigo-800/60 text-indigo-200 px-3 py-1.5 rounded-lg font-mono">
-              <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-              <span>
-                64-bit SessionIndex Pruned:{" "}
-                <strong className="text-white">
-                  {searchRes.sessions_pruned_by_bloom.toLocaleString()}
-                </strong>{" "}
-                / {searchRes.total_sessions_inspected.toLocaleString()} ({prunePct}%)
-              </span>
-            </div>
-          )}
+      {error && <ErrorNotice message={`Couldn't search sessions: ${error}`} onRetry={() => void runSearch()} />}
 
-          <button
-            onClick={() => void runSearch()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
-            Filter
-          </button>
-        </div>
-      </div>
-
-      {/* Split Session List + Interactive Phone Wireframe Player */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
-        <div className="xl:col-span-4 bg-[#0e1422] border border-slate-800/80 rounded-xl p-3 space-y-2 max-h-[680px] overflow-y-auto">
-          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400 px-1 pb-1">
-            Matched Sessions ({searchRes?.sessions.length ?? 0})
-          </div>
-          {searchRes?.sessions.map((s) => {
-            const isSel = selected?.session_id === s.session_id;
-            return (
-              <button
-                key={s.session_id}
-                onClick={() => void loadReplay(s)}
-                className={`w-full text-left p-3 rounded-lg border transition space-y-1.5 ${
-                  isSel
-                    ? "bg-blue-950/40 border-blue-500/70"
-                    : "bg-[#090d16] border-slate-800/70 hover:border-slate-700"
-                }`}
-              >
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-mono font-semibold text-slate-100 truncate">
-                    {s.distinct_id}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    {s.has_rage_tap && (
-                      <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">
-                        RAGE
-                      </span>
-                    )}
-                    {s.has_error && (
-                      <span className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 text-[10px] font-bold">
-                        504
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <div className="font-mono text-[11px] text-slate-400 truncate">{s.session_id}</div>
-                <div className="flex items-center justify-between text-[11px] text-slate-500">
-                  <span>{s.event_count} events</span>
-                  <span>{(s.duration_ms / 1000).toFixed(1)}s duration</span>
-                </div>
-              </button>
-            );
-          })}
-        </div>
-
-        <div className="xl:col-span-8 space-y-4">
-          {selected && chunks.length > 0 ? (
-            <WireframePlayer sessionId={selected.session_id} chunks={chunks} />
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
+        <Panel
+          title="Sessions"
+          meta={
+            searchRes ? `${formatCount(sessions.length)} found` : undefined
+          }
+          className="xl:col-span-4"
+        >
+          {loading && !searchRes ? (
+            <Spinner label="Searching" />
+          ) : sessions.length === 0 ? (
+            <EmptyState
+              icon={Search}
+              title="No sessions match"
+              body="Turn off a filter or choose a different event."
+            />
           ) : (
-            <div className="bg-[#0e1422] border border-slate-800/80 rounded-xl p-12 text-center text-xs text-slate-400">
-              Select a session with recorded wireframe chunks (or click &ldquo;Simulate Traffic
-              Burst&rdquo; in the topbar) to watch the binary wireframe replay.
-            </div>
+            <ul className="-m-4 max-h-[640px] divide-y divide-line overflow-y-auto" aria-label="Matching sessions">
+              {sessions.map((s) => {
+                const active = selected?.session_id === s.session_id;
+                return (
+                  <li key={s.session_id}>
+                    <button
+                      type="button"
+                      onClick={() => setSelected(s)}
+                      aria-current={active ? "true" : undefined}
+                      className={`w-full border-l-2 px-4 py-3 text-left ${
+                        active ? "border-brand bg-brand-soft" : "border-transparent hover:bg-hover"
+                      }`}
+                    >
+                      <span className="flex items-center justify-between gap-2">
+                        <span className="truncate text-sm font-medium text-ink tabular">
+                          {displayUserId(s.distinct_id)}
+                        </span>
+                        <span className="flex shrink-0 gap-1">
+                          {s.has_rage_tap && (
+                            <span className="rounded bg-danger-soft px-1.5 py-0.5 text-xs font-medium text-danger">
+                              Rage taps
+                            </span>
+                          )}
+                          {s.has_error && (
+                            <span className="rounded bg-warn-soft px-1.5 py-0.5 text-xs font-medium text-warn">
+                              Error
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                      <span className="mt-1 block text-xs text-muted tabular">
+                        {new Date(s.start_ts_ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+                        {", "}
+                        {formatDuration(s.duration_ms)}, {formatCount(s.event_count)} events
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
           )}
+        </Panel>
+
+        <div className="space-y-5 xl:col-span-8">
+          <Panel title="Recording">
+            {selected ? (
+              <SessionReplay key={selected.session_id} projectId={projectId} sessionId={selected.session_id} />
+            ) : (
+              <EmptyState title="Pick a session" body="Its screen recording plays here." />
+            )}
+          </Panel>
 
           {selected && (
-            <div className="bg-[#0e1422] border border-slate-800/80 rounded-xl p-4">
-              <div className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                Chronological Analytical Event Timeline ({selected.events.length})
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {selected.events.map(([ts, evName, rkb], idx) => (
-                  <div
-                    key={idx}
-                    className={`px-2.5 py-1 rounded-lg border text-xs font-mono ${
-                      evName.includes("504") || evName.includes("Timeout")
-                        ? "bg-red-950/40 border-red-800/60 text-red-200"
-                        : "bg-[#090d16] border-slate-800 text-slate-300"
-                    }`}
-                  >
-                    {evName}{" "}
-                    <span className="text-slate-500 text-[10px]">
-                      ({new Date(ts).toISOString().slice(11, 19)} • {rkb}KB)
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <Panel title="Events in this session" meta={formatCount(selected.events.length)}>
+              <ol className="space-y-1.5">
+                {selected.events.map(([ts, evName], idx) => {
+                  const bad = /504|timeout|error|fail/i.test(evName);
+                  return (
+                    <li key={idx} className="flex items-baseline gap-3 text-sm">
+                      <span className="w-20 shrink-0 text-muted tabular">
+                        {new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                      </span>
+                      <span className={bad ? "font-medium text-danger" : "text-ink"}>{humanizeEvent(evName)}</span>
+                    </li>
+                  );
+                })}
+              </ol>
+            </Panel>
           )}
         </div>
       </div>
