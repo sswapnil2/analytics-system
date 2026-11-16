@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
+  Check,
+  Copy,
   FlaskConical,
   GitBranch,
   CalendarCheck,
@@ -12,7 +14,9 @@ import {
   PlayCircle,
   ShieldCheck,
   Sun,
+  Terminal,
   Users,
+  X,
 } from "lucide-react";
 import {
   api,
@@ -23,7 +27,7 @@ import {
   setStoredAdminToken,
 } from "./api/client";
 import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
-import { btn } from "./components/ui";
+import { btn, Panel } from "./components/ui";
 import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
@@ -130,6 +134,9 @@ export const App: React.FC = () => {
   const [theme, setTheme] = useState<ThemePref>(readTheme);
   const [flushing, setFlushing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [quickstartOpen, setQuickstartOpen] = useState(false);
+  const [quickstartDismissed, setQuickstartDismissed] = useState(false);
+  const [copiedQuickstart, setCopiedQuickstart] = useState(false);
 
   useEffect(() => applyTheme(theme), [theme]);
 
@@ -282,8 +289,41 @@ export const App: React.FC = () => {
       .map((w) => w[0]?.toUpperCase())
       .join("") || "A";
 
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8080";
+  const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
+  const curlSnippet = `curl -X POST "${origin}/v1/ingest" \\
+  -H "Content-Type: application/json" \\
+  -H "x-pulse-key: YOUR_INGEST_KEY" \\
+  -d '{
+    "event": "KYC_PAN_Submitted",
+    "userId": "usr_1042",
+    "properties": { "city": "Bengaluru", "plan": "pro" }
+  }'`;
+
+  const copyQuickstart = async () => {
+    try {
+      await navigator.clipboard.writeText(curlSnippet);
+      setCopiedQuickstart(true);
+      window.setTimeout(() => setCopiedQuickstart(false), 2000);
+    } catch {
+      // Clipboard may be restricted in headless contexts.
+    }
+  };
+
   const accountControls = (
     <div className="flex items-center gap-0.5">
+      <button
+        type="button"
+        onClick={() => {
+          setQuickstartDismissed(false);
+          setQuickstartOpen((v) => !v);
+        }}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label="Send events quickstart"
+        title="Send events quickstart"
+      >
+        <Terminal className="h-4 w-4" />
+      </button>
       <button
         type="button"
         onClick={() => setTheme(nextTheme[theme])}
@@ -426,7 +466,56 @@ export const App: React.FC = () => {
       </aside>
 
       <main id="main" tabIndex={-1} className="min-w-0 flex-1 px-4 py-7 outline-none md:px-8">
-        <div className="mx-auto max-w-[1200px]">
+        <div className="mx-auto max-w-[1200px] space-y-5">
+          {showQuickstart && (
+            <Panel
+              title={totalEvents === 0 ? "Send your first event" : "Send events to this project"}
+              meta={activePid || undefined}
+              actions={
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      go("events");
+                      setQuickstartOpen(false);
+                    }}
+                    className={btn.ghost}
+                  >
+                    Create API key
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQuickstartOpen(false);
+                      setQuickstartDismissed(true);
+                    }}
+                    className={`${btn.ghost} h-8 w-8 px-0`}
+                    aria-label="Close quickstart"
+                    title="Close"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              }
+            >
+              <p className="mb-3 text-sm text-ink-2">
+                Accepts Segment, Mixpanel arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
+              </p>
+              <div className="relative rounded-lg border border-line bg-sunken p-3.5">
+                <button
+                  type="button"
+                  onClick={() => void copyQuickstart()}
+                  className={`${btn.ghost} absolute right-2 top-2 h-7 px-2 text-xs`}
+                >
+                  {copiedQuickstart ? <Check className="h-3.5 w-3.5 text-ok" /> : <Copy className="h-3.5 w-3.5" />}
+                  {copiedQuickstart ? "Copied" : "Copy"}
+                </button>
+                <pre className="overflow-x-auto pr-20 font-mono text-xs leading-relaxed text-ink">
+                  {curlSnippet}
+                </pre>
+              </div>
+            </Panel>
+          )}
             {!activePid ? (
               <p className="text-sm text-muted" role="status">
                 Loading your workspace…
