@@ -196,9 +196,17 @@ impl QueryEngine {
             let id_snap = id_graph.snapshot();
             let cat = self.catalogs.for_project(project_id);
 
-            let res =
-                FunnelEngine::execute(query, &ps, &snap, &id_graph, &id_snap, &self.cache, &cat)
-                    .await?;
+            let res = FunnelEngine::execute(
+                query,
+                &ps,
+                &snap,
+                &id_graph,
+                &id_snap,
+                &self.cache,
+                &cat,
+                self.storage.replay_store(),
+            )
+            .await?;
             self.record_latency(res.exec_time_us);
             Ok(res)
         })
@@ -450,6 +458,7 @@ impl QueryEngine {
                         has_rage_tap: (flags & SESSION_FLAG_RAGE_TAP) != 0,
                         has_dead_tap: (flags & SESSION_FLAG_DEAD_TAP) != 0,
                         has_error: (flags & SESSION_FLAG_ERROR) != 0,
+                        has_replay: false,
                         events: mapped_evs,
                     },
                     limit,
@@ -554,6 +563,7 @@ impl QueryEngine {
                             has_rage_tap: (hdr.flags & SESSION_FLAG_RAGE_TAP) != 0,
                             has_dead_tap: (hdr.flags & SESSION_FLAG_DEAD_TAP) != 0,
                             has_error: (hdr.flags & SESSION_FLAG_ERROR) != 0,
+                            has_replay: false,
                             events: ev_list,
                         },
                         limit,
@@ -568,6 +578,10 @@ impl QueryEngine {
                     .cmp(&a.end_ts_ms)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             });
+            let rstore = self.storage.replay_store();
+            for s in &mut sessions {
+                s.has_replay = rstore.has_session(project_id, &s.session_id).await;
+            }
 
             let exec_time_us = t0.elapsed().as_micros() as u64;
             self.record_latency(exec_time_us);

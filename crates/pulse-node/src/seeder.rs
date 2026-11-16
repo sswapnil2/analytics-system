@@ -170,15 +170,18 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     };
     ctrl.meta().upsert_experiment(&exp).await?;
 
-    // 2. Seed Multi-Frame Frustrated Wireframe Replay Sessions (with PAN: ██████████ + 4x Rage Taps!)
+    // 2. Seed Multi-Frame Frustrated Wireframe Replay Sessions across ALL funnel drop-off steps (`PR-1`)
     let total_users = 8_000usize;
     let replay_session_count = 32usize;
     let mut replay_offsets_by_sess: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    let mut kyc_timeout_sessions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for r_idx in 0..replay_session_count {
         let u = 200 + r_idx * 17;
         let sess_id = format!("sess_kyc_timeout_{u:05}");
+        kyc_timeout_sessions.insert(sess_id.clone());
         let base_t = start_day_ms + ((u % 14) as i64) * 86_400_000 + 38_000_000;
 
         let chunk1 = ReplayChunk {
@@ -330,6 +333,164 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             .append_replay_chunk(&chunk2)
             .await?;
         replay_offsets_by_sess.insert(sess_id, r2.replay_offset_kb);
+    }
+
+    // Seed recordings for Step 0->1 (Calculator/PAN Gate), Step 2->3 (UPI Autopay Sheet), and Step 3->4 (Disbursal e-Sign) (`PR-1`)
+    let extra_step_replays: &[(usize, &str, &str, &str)] = &[
+        (
+            6005,
+            "Instant Line Offer — Verify PAN",
+            "Camera & CKYC permission prompt stalled",
+            "/api/v2/kyc/ckyc-consent",
+        ),
+        (
+            6022,
+            "Instant Line Offer — Verify PAN",
+            "Camera & CKYC permission prompt stalled",
+            "/api/v2/kyc/ckyc-consent",
+        ),
+        (
+            6039,
+            "Instant Line Offer — Verify PAN",
+            "Camera & CKYC permission prompt stalled",
+            "/api/v2/kyc/ckyc-consent",
+        ),
+        (
+            6056,
+            "Instant Line Offer — Verify PAN",
+            "Camera & CKYC permission prompt stalled",
+            "/api/v2/kyc/ckyc-consent",
+        ),
+        (
+            300,
+            "UPI Autopay — Confirm Mandate",
+            "NPCI VPA intent app switch returned 502",
+            "/api/v2/upi/mandate-create",
+        ),
+        (
+            304,
+            "UPI Autopay — Confirm Mandate",
+            "NPCI VPA intent app switch returned 502",
+            "/api/v2/upi/mandate-create",
+        ),
+        (
+            306,
+            "UPI Autopay — Confirm Mandate",
+            "NPCI VPA intent app switch returned 502",
+            "/api/v2/upi/mandate-create",
+        ),
+        (
+            308,
+            "UPI Autopay — Confirm Mandate",
+            "NPCI VPA intent app switch returned 502",
+            "/api/v2/upi/mandate-create",
+        ),
+        (
+            164,
+            "Sanction Letter — Final e-Sign",
+            "IMPS penny-drop verification timed out",
+            "/api/v2/disbursal/penny-drop",
+        ),
+        (
+            166,
+            "Sanction Letter — Final e-Sign",
+            "IMPS penny-drop verification timed out",
+            "/api/v2/disbursal/penny-drop",
+        ),
+        (
+            168,
+            "Sanction Letter — Final e-Sign",
+            "IMPS penny-drop verification timed out",
+            "/api/v2/disbursal/penny-drop",
+        ),
+        (
+            170,
+            "Sanction Letter — Final e-Sign",
+            "IMPS penny-drop verification timed out",
+            "/api/v2/disbursal/penny-drop",
+        ),
+    ];
+    for &(u, screen_title, err_msg, api_path) in extra_step_replays {
+        let sess_id = format!("sess_onboard_{u:05}");
+        let base_t = start_day_ms + ((u % 14) as i64) * 86_400_000 + 38_000_000;
+        let chunk = ReplayChunk {
+            project_id: project_id.to_string(),
+            session_id: sess_id.clone(),
+            chunk_start_ts_ms: base_t,
+            ops: vec![
+                WireframeOp::FullSnapshot {
+                    width: 390,
+                    height: 844,
+                    nodes: vec![
+                        WireNode {
+                            node_id: 1,
+                            parent_id: 0,
+                            kind: NodeKind::Screen,
+                            x: 0,
+                            y: 0,
+                            w: 390,
+                            h: 844,
+                            bg_rgba: 0x090D_16FF,
+                            masked_label: screen_title.to_string(),
+                        },
+                        WireNode {
+                            node_id: 2,
+                            parent_id: 1,
+                            kind: NodeKind::MaskedInput,
+                            x: 24,
+                            y: 200,
+                            w: 342,
+                            h: 52,
+                            bg_rgba: 0x1E29_3BFF,
+                            masked_label: "████".to_string(),
+                        },
+                        WireNode {
+                            node_id: 3,
+                            parent_id: 1,
+                            kind: NodeKind::Button,
+                            x: 24,
+                            y: 340,
+                            w: 342,
+                            h: 52,
+                            bg_rgba: 0x3B82_F6FF,
+                            masked_label: "Continue".to_string(),
+                        },
+                        WireNode {
+                            node_id: 4,
+                            parent_id: 1,
+                            kind: NodeKind::ErrorBanner,
+                            x: 24,
+                            y: 420,
+                            w: 342,
+                            h: 56,
+                            bg_rgba: 0xDC26_26FF,
+                            masked_label: err_msg.to_string(),
+                        },
+                    ],
+                },
+                WireframeOp::PointerInteraction {
+                    ts_offset_ms: 1_200,
+                    x: 195,
+                    y: 366,
+                    kind: InteractionKind::Tap,
+                },
+                WireframeOp::PointerInteraction {
+                    ts_offset_ms: 2_800,
+                    x: 196,
+                    y: 368,
+                    kind: InteractionKind::DeadTap,
+                },
+                WireframeOp::NetworkBreadcrumb {
+                    ts_offset_ms: 4_100,
+                    method: "POST".to_string(),
+                    path: api_path.to_string(),
+                    status_code: 502,
+                    duration_ms: 3_420,
+                },
+            ],
+        };
+        let res = ctrl.qengine().storage().append_replay_chunk(&chunk).await?;
+        replay_offsets_by_sess.insert(sess_id, res.replay_offset_kb);
     }
 
     // 3. Generate 100,000+ Analytical Events + Retroactive Aliases across 8,000 Users over 14 Days
@@ -513,9 +674,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 replay_offset_kb: replay_kb,
             });
 
-            // Frustration cohort (~380 users, including all 32 recorded replay sessions) hits `NSDL_Gateway_504_Timeout`!
-            let hit_nsdl_timeout =
-                replay_offsets_by_sess.contains_key(&sess_onboard) || (u % 16 == 5);
+            // Frustration cohort (~380 users, including all 32 KYC-timeout replay sessions) hits `NSDL_Gateway_504_Timeout`!
+            let hit_nsdl_timeout = kyc_timeout_sessions.contains(&sess_onboard) || (u % 16 == 5);
             if hit_nsdl_timeout {
                 seq += 1;
                 all_events.push(WireEvent {
@@ -538,7 +698,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             }
 
             // --- Funnel Step 2: `Video_KYC_Completed` & A/B Experiment Exposure (`5,000` users: 2,500 control vs 2,500 one_tap_sheet) ---
-            if u < 5_000 && !replay_offsets_by_sess.contains_key(&sess_onboard) {
+            if u < 5_000 && !kyc_timeout_sessions.contains(&sess_onboard) {
                 seq += 1;
                 all_events.push(WireEvent {
                     event_uuid: WireEvent::deterministic_uuid(

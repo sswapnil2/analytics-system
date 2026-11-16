@@ -126,7 +126,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
       <Panel title="Steps">
         <ol className="flex flex-wrap items-center gap-2">
           {steps.map((st, idx) => (
-            <li key={idx} className="flex items-center gap-1.5 rounded-md border border-line-strong bg-field py-1 pl-1.5 pr-1">
+            <li key={idx} className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-field py-1 pl-1.5 pr-1">
               <span
                 className="flex h-5 w-5 items-center justify-center rounded bg-brand-soft text-xs font-semibold text-brand tabular"
                 aria-hidden="true"
@@ -272,7 +272,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
                       </div>
 
                       <div
-                        className="relative flex h-40 items-end overflow-hidden rounded-md bg-sunken"
+                        className="relative flex h-40 items-end overflow-hidden rounded-lg bg-sunken"
                         role="img"
                         aria-label={`${formatCount(st.entered_users)} users, ${pct(st.conversion_from_start_pct)} of start`}
                       >
@@ -293,7 +293,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
                         <button
                           type="button"
                           onClick={() => setDrawerStep(idx)}
-                          className={`mt-2 rounded-md border px-2.5 py-2 text-left text-sm ${
+                          className={`mt-2 rounded-lg border px-2.5 py-2 text-left text-sm ${
                             isBiggest
                               ? "border-danger bg-danger-soft text-danger hover:bg-danger/15"
                               : "border-line text-ink-2 hover:border-danger/60 hover:bg-danger-soft"
@@ -431,7 +431,9 @@ const DropOffDrawer: React.FC<{
   samples: DroppedSessionSample[];
   onClose: () => void;
 }> = ({ projectId, fromStep, toStep, droppedCount, samples, onClose }) => {
-  const [selected, setSelected] = useState<DroppedSessionSample | null>(samples[0] ?? null);
+  const [selected, setSelected] = useState<DroppedSessionSample | null>(
+    () => samples.find((d) => d.has_replay) ?? samples[0] ?? null,
+  );
   const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -487,7 +489,18 @@ const DropOffDrawer: React.FC<{
                           active ? "border-brand bg-brand-soft" : "border-transparent hover:bg-hover"
                         }`}
                       >
-                        <span className="block text-sm font-medium text-ink tabular">{displayUserId(d.distinct_id)}</span>
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="truncate text-sm font-medium text-ink tabular">{displayUserId(d.distinct_id)}</span>
+                          <span
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                              d.has_replay
+                                ? "bg-ok-soft text-ok"
+                                : "bg-sunken text-faint"
+                            }`}
+                          >
+                            {d.has_replay ? "Recording" : "No video"}
+                          </span>
+                        </span>
                         <span className="block text-xs text-muted">
                           Left {new Date(d.drop_ts_ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
                         </span>

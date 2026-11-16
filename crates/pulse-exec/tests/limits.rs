@@ -901,3 +901,127 @@ async fn p3_02_per_query_deadline_enforces_timeout() {
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn pr1_funnel_drop_off_prioritizes_recorded_sessions() {
+    use pulse_wire::{InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp};
+
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    // Record session for only the 26th dropped user (`u_025`), after 25 unrecorded dropped users (`u_000..u_024`)
+    storage
+        .append_replay_chunk(&ReplayChunk {
+            project_id: "proj_pr1".to_string(),
+            session_id: "sess_rec_025".to_string(),
+            chunk_start_ts_ms: ts,
+            ops: vec![
+                WireframeOp::FullSnapshot {
+                    width: 390,
+                    height: 844,
+                    nodes: vec![WireNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        kind: NodeKind::Screen,
+                        x: 0,
+                        y: 0,
+                        w: 390,
+                        h: 844,
+                        bg_rgba: 0x090D_16FF,
+                        masked_label: "Checkout".to_string(),
+                    }],
+                },
+                WireframeOp::PointerInteraction {
+                    ts_offset_ms: 400,
+                    x: 100,
+                    y: 200,
+                    kind: InteractionKind::RageTap { count: 3 },
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    let mut batch = Vec::new();
+    for u in 0..30u64 {
+        let uid = format!("u_{u:03}");
+        let sid = if u == 25 {
+            "sess_rec_025".to_string()
+        } else {
+            format!("sess_unrec_{u:03}")
+        };
+        batch.push(ev(
+            u + 1,
+            &uid,
+            &sid,
+            "Step_A",
+            ts + (u as i64) * 100,
+            Vec::new(),
+        ));
+    }
+    ingest
+        .ingest_for_project("proj_pr1", WireBatch::new(batch), ts + 10_000)
+        .await
+        .unwrap();
+
+    let res = qengine
+        .query_funnel(
+            "proj_pr1",
+            &FunnelQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ts - 1_000,
+                    end_ts_ms: ts + 10_000,
+                },
+                steps: vec![
+                    FunnelStepSpec {
+                        event_name: "Step_A".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                    FunnelStepSpec {
+                        event_name: "Step_B".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                ],
+                order_mode: FunnelOrderMode::LooseOrder,
+                conversion_window_ms: 60_000,
+                exclusions: Vec::new(),
+                hold_constant_props: Vec::new(),
+                breakdown_by: None,
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let step1_samples: Vec<_> = res
+        .dropped_sample_sessions
+        .iter()
+        .filter(|d| d.dropped_before_step == 1)
+        .collect();
+    assert!(!step1_samples.is_empty());
+    assert!(
+        step1_samples[0].has_replay && step1_samples[0].session_id == "sess_rec_025",
+        "recorded session must appear first in dropped samples even after 25 unrecorded drops: {step1_samples:?}"
+    );
+
+    id_router.close_all().await.unwrap();
+}

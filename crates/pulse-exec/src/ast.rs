@@ -433,6 +433,8 @@ pub struct DroppedSessionSample {
     pub distinct_id: String,
     pub drop_ts_ms: i64,
     pub replay_offset_kb: u32,
+    #[serde(default)]
+    pub has_replay: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,6 +562,8 @@ pub struct SessionSummaryItem {
     pub has_rage_tap: bool,
     pub has_dead_tap: bool,
     pub has_error: bool,
+    #[serde(default)]
+    pub has_replay: bool,
     pub events: Vec<(i64, String, u32)>,
 }
 

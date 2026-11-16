@@ -71,6 +71,7 @@ export interface DroppedSessionSample {
   distinct_id: string;
   drop_ts_ms: number;
   replay_offset_kb: number;
+  has_replay?: boolean;
 }
 
 export interface FunnelResult {
@@ -135,6 +136,7 @@ export interface SessionSummaryItem {
   has_rage_tap: boolean;
   has_dead_tap: boolean;
   has_error: boolean;
+  has_replay?: boolean;
   events: [number, string, number][];
 }
 
@@ -292,24 +294,65 @@ export interface ExperimentResults {
 
 const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
 
-export function getStoredAdminToken(): string {
+// Signed-in user sessions (ps_ tokens) last 30 days, so they live in localStorage.
+// Pasted admin tokens stay in sessionStorage and die with the tab.
+function storages(): Storage[] {
   try {
-    return window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
+    return [window.sessionStorage, window.localStorage];
   } catch {
-    return "";
+    return [];
   }
 }
 
-export function setStoredAdminToken(token: string): void {
-  try {
-    if (token.trim()) {
-      window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token.trim());
-    } else {
-      window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+export function getStoredAdminToken(): string {
+  for (const st of storages()) {
+    try {
+      const v = st.getItem(ADMIN_TOKEN_STORAGE_KEY);
+      if (v) return v;
+    } catch {
+      // storage blocked
     }
+  }
+  return "";
+}
+
+export function setStoredAdminToken(token: string): void {
+  const value = token.trim();
+  for (const st of storages()) {
+    try {
+      st.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    } catch {
+      // storage blocked
+    }
+  }
+  if (!value) return;
+  try {
+    (value.startsWith("ps_") ? window.localStorage : window.sessionStorage).setItem(
+      ADMIN_TOKEN_STORAGE_KEY,
+      value,
+    );
   } catch {
     // Ignore storage quota / sandbox restrictions
   }
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string | null;
+  has_password: boolean;
+  has_google: boolean;
+}
+
+export interface AuthConfig {
+  password: boolean;
+  google: boolean;
+  signup_open: boolean;
+}
+
+export interface AuthSession {
+  token: string;
+  user: AuthUser;
 }
 
 export class ApiAuthError extends Error {
@@ -352,6 +395,16 @@ export function default14DayRange(): TimeRange {
 }
 
 export const api = {
+  getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
+  signUp: (body: { email: string; password: string; name?: string }) =>
+    fetchJson<AuthSession>("/v1/auth/signup", { method: "POST", body: JSON.stringify(body) }),
+  logIn: (body: { email: string; password: string }) =>
+    fetchJson<AuthSession>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) }),
+  exchangeLoginCode: (code: string) =>
+    fetchJson<AuthSession>("/v1/auth/exchange", { method: "POST", body: JSON.stringify({ code }) }),
+  getMe: () => fetchJson<AuthUser>("/v1/auth/me"),
+  logOut: () => fetchJson<unknown>("/v1/auth/logout", { method: "POST" }),
+
   getStatus: (projectId?: string) =>
     fetchJson<NodeStatus>(
       projectId ? `/v1/status?project_id=${encodeURIComponent(projectId)}` : "/v1/status",
