@@ -1,0 +1,34 @@
+[package]
+name = "pulse-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pulse-wire.workspace = true
+pulse-identity.workspace = true
+pulse-storage.workspace = true
+pulse-ingest.workspace = true
+pulse-exec.workspace = true
+
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

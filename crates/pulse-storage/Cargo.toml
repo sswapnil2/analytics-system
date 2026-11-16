@@ -1,0 +1,43 @@
+[package]
+name = "pulse-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pulse-wire.workspace = true
+pulse-identity.workspace = true
+
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+bincode.workspace = true
+bytemuck.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+crc32fast.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+vortex.workspace = true
+vortex-array.workspace = true
+vortex-buffer.workspace = true
+vortex-dtype.workspace = true
+vortex-error.workspace = true
+vortex-file.workspace = true
+xxhash-rust.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true

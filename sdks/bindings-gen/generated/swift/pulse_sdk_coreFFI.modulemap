@@ -1,0 +1,4 @@
+module pulse_sdk_coreFFI {
+    header "pulse_sdk_coreFFI.h"
+    export *
+}

@@ -1,0 +1,41 @@
+[package]
+name = "pulse-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pulse-wire.workspace = true
+pulse-identity.workspace = true
+pulse-storage.workspace = true
+
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+csv.workspace = true
+dashmap.workspace = true
+datafusion.workspace = true
+foyer.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+parquet.workspace = true
+rayon.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sketches-ddsketch.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+pulse-ingest.workspace = true
+rand.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,7 @@
+/target/
+/pulse_data/
+/web/node_modules/
+/web/dist/
+/sdks/ts-web/node_modules/
+/sdks/ts-web/dist/
+*.DS_Store

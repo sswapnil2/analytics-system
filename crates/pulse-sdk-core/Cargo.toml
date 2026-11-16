@@ -1,0 +1,27 @@
+[package]
+name = "pulse-sdk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+pulse-wire.workspace = true
+
+chrono.workspace = true
+crc32fast.workspace = true
+parking_lot.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
