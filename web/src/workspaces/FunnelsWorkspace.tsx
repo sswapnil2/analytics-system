@@ -13,6 +13,7 @@ import {
   PageHeader,
   Panel,
   RanIn,
+  ReportLayout,
   Spinner,
 } from "../components/ui";
 import {
@@ -120,32 +121,37 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     return best;
   }, [overall]);
 
+  const reportTitle = `${humanizeEvent(steps[0] ?? "")} → ${humanizeEvent(steps[steps.length - 1] ?? "")}`;
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Funnels"
-        description="Where users drop out of a multi-step flow, with recordings of the ones who left."
+        title={reportTitle}
+        description="Funnel: where users drop out, with recordings of the ones who left."
         actions={
           <>
             <RangePresets days={days} onChange={setDays} />
             <SaveToDashboard
               projectId={projectId}
               kind="funnel"
-              defaultName={`${humanizeEvent(steps[0] ?? "")} to ${humanizeEvent(steps[steps.length - 1] ?? "")}`}
+              defaultName={reportTitle}
               query={buildQuery}
             />
-            <button type="button" onClick={() => void runFunnel()} disabled={loading} className={btn.primary}>
+            <button type="button" onClick={() => void runFunnel()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
               <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
-              {loading ? "Running…" : "Run funnel"}
             </button>
           </>
         }
       />
 
+      <ReportLayout
+        query={
       <Panel title="Steps">
-        <ol className="flex flex-wrap items-center gap-2">
+        <ol className="flex flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
           {steps.map((st, idx) => (
-            <li key={idx} className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-field py-1 pl-1.5 pr-1">
+            <li key={idx} className="flex items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
+              {idx > 0 && <span className="text-xs text-faint xl:pl-2">then</span>}
+              <span className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-field py-1 pl-1.5 pr-1">
               <span
                 className="flex h-5 w-5 items-center justify-center rounded bg-brand-soft text-xs font-semibold text-brand tabular"
                 aria-hidden="true"
@@ -160,7 +166,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
                   next[idx] = e.target.value;
                   setSteps(next);
                 }}
-                className="max-w-[14rem] truncate bg-transparent text-sm text-ink focus:outline-none"
+                className="min-w-0 flex-1 truncate bg-transparent text-sm text-ink focus:outline-none"
               >
                 {eventOptions.map((ev) => (
                   <option key={ev} value={ev}>
@@ -178,6 +184,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
               )}
+              </span>
             </li>
           ))}
           <li>
@@ -191,7 +198,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
           </li>
         </ol>
 
-        <div className="mt-4 grid grid-cols-1 gap-3 border-t border-line pt-4 sm:grid-cols-2 xl:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-3 border-t border-line pt-4 sm:grid-cols-2 xl:grid-cols-1">
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Step order</span>
             <select value={orderMode} onChange={(e) => setOrderMode(e.target.value as OrderMode)} className={field}>
@@ -211,7 +218,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             </select>
           </label>
           <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Exclude users who did, between steps 2 and 3</span>
+            <span className={fieldLabel}>Exclude users who did (between steps 2 and 3)</span>
             <select value={excludeEvent} onChange={(e) => setExcludeEvent(e.target.value)} className={field}>
               <option value="">Nothing excluded</option>
               {Array.from(new Set(["NSDL_Gateway_504_Timeout", ...availableEvents]))
@@ -247,6 +254,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
           </label>
         </div>
       </Panel>
+        }
+      >
 
       {error && <ErrorNotice message={`The funnel didn't run: ${error}`} onRetry={() => void runFunnel()} />}
 
@@ -262,7 +271,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
         <Panel title="Conversion" meta={<RanIn us={result.exec_time_us} />}>
           {first.entered_users === 0 ? (
             <EmptyState
-              title="No one did the first step in the last 14 days"
+              title={`No one did the first step in the last ${days} days`}
               body={`Check that "${humanizeEvent(first.event_name)}" is being sent, or pick a different first step.`}
             />
           ) : (
@@ -371,7 +380,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
       )}
 
       {result && first && first.entered_users > 0 && (
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+        <div className="grid grid-cols-1 gap-5 2xl:grid-cols-2">
           <Panel title={breakdownBy ? `By ${humanizeEvent(breakdownBy)}` : "By segment"}>
             {result.breakdowns.length === 0 ? (
               <p className="text-sm text-muted">Choose a property in "Split by" to compare segments.</p>
@@ -459,6 +468,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
           </Panel>
         </div>
       )}
+      </ReportLayout>
 
       {drawerStep !== null && result && (
         <DropOffDrawer

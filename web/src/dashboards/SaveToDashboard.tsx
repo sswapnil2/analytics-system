@@ -36,7 +36,9 @@ export const SaveToDashboard: React.FC<{
       .listDashboards(projectId)
       .then((list) => {
         setDashboards(list);
-        setTarget(list[0]?.id ?? NEW);
+        // `#/funnels?dashboard=<id>` comes from a dashboard's Add menu: preselect it.
+        const wanted = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("dashboard");
+        setTarget(list.find((d) => d.id === wanted)?.id ?? list[0]?.id ?? NEW);
       })
       .catch((err) => setError(errorMessage(err)));
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);

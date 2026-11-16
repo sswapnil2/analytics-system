@@ -29,6 +29,9 @@ export const KIND_LABEL: Record<SavedReport["report_kind"], string> = {
   flows: "Journey",
 };
 
+/** "Formula((B / A) * 100)" → "(B / A) * 100" */
+const seriesLabel = (l: string) => l.replace(/^Formula\((.*)\)$/, "$1");
+
 const SERIES_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn))"];
 
 type CardResult =
@@ -37,10 +40,11 @@ type CardResult =
   | { kind: "retention"; data: RetentionResult };
 
 /** Runs a saved report with the dashboard's date range and draws a compact version of it. */
-export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; days: number }> = ({
+export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; days: number; refreshKey?: number }> = ({
   projectId,
   report,
   days,
+  refreshKey = 0,
 }) => {
   const [result, setResult] = useState<CardResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +76,7 @@ export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; 
 
   useEffect(() => {
     void run();
-  }, [run]);
+  }, [run, refreshKey]);
 
   if (error) {
     return (
@@ -183,7 +187,7 @@ const TrendMini: React.FC<{ data: InsightsResult }> = ({ data }) => {
             {Math.abs(change).toFixed(0)}%
           </span>
         )}
-        <span className="text-sm text-muted">{change !== null ? "vs previous period" : main.label}</span>
+        <span className="text-sm text-muted">{change !== null ? "vs previous period" : seriesLabel(main.label)}</span>
       </Headline>
       {n > 1 ? (
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`${main.label} over time`}>
@@ -208,7 +212,7 @@ const TrendMini: React.FC<{ data: InsightsResult }> = ({ data }) => {
           {series.map((s, i) => (
             <span key={`${s.label}-${s.breakdown_key}`} className="inline-flex items-center gap-1.5">
               <span className="h-[3px] w-3.5" style={{ background: SERIES_COLORS[i] }} />
-              {s.breakdown_key ? `${s.label}: ${s.breakdown_key}` : s.label}
+              {s.breakdown_key ? `${seriesLabel(s.label)}: ${s.breakdown_key}` : seriesLabel(s.label)}
             </span>
           ))}
         </div>

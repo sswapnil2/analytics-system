@@ -99,3 +99,16 @@ export const field =
   "rounded-lg border border-line-strong bg-field px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-brand focus:outline-none";
 
 export const fieldLabel = "text-[0.8125rem] font-semibold text-ink-2";
+
+/**
+ * Report page body: results on the left, the query on a sticky rail on the
+ * right (Mixpanel's layout). On narrow screens the query comes first.
+ */
+export const ReportLayout: React.FC<{ query: React.ReactNode; children: React.ReactNode }> = ({ query, children }) => (
+  <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_20rem]">
+    <aside aria-label="Query" className="space-y-5 xl:sticky xl:top-4 xl:order-2">
+      {query}
+    </aside>
+    <div className="min-w-0 space-y-5 xl:order-1">{children}</div>
+  </div>
+);

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { GitBranch } from "lucide-react";
+import { GitBranch, RefreshCw } from "lucide-react";
 import { api, default14DayRange, FlowsResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import {
@@ -11,6 +11,7 @@ import {
   PageHeader,
   Panel,
   RanIn,
+  ReportLayout,
   Spinner,
 } from "../components/ui";
 
@@ -197,17 +198,19 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Journeys"
-        description="What users do before or after a key event."
+        title={`${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)}`}
+        description="Journey: what users do before or after a key event."
         actions={
-          <button type="button" onClick={() => void runFlows()} disabled={loading} className={btn.primary}>
-            {loading ? "Running…" : "Run"}
+          <button type="button" onClick={() => void runFlows()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
+            <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
           </button>
         }
       />
 
-      <Panel>
-        <div className="flex flex-wrap items-end gap-4">
+      <ReportLayout
+        query={
+      <Panel title="Query">
+        <div className="flex flex-col gap-4">
           <label className="flex min-w-0 flex-col gap-1">
             <span className={fieldLabel}>Key event</span>
             <select value={anchorEvent} onChange={(e) => setAnchorEvent(e.target.value)} className={field}>
@@ -274,6 +277,8 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
           </label>
         </div>
       </Panel>
+        }
+      >
 
       {error && <ErrorNotice message={error} onRetry={() => void runFlows()} />}
 
@@ -355,6 +360,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
           />
         )}
       </Panel>
+      </ReportLayout>
     </div>
   );
 };

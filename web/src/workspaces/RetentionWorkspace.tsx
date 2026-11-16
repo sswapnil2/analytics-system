@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { CalendarCheck } from "lucide-react";
+import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import { SaveToDashboard } from "../dashboards/SaveToDashboard";
@@ -13,6 +13,7 @@ import {
   PageHeader,
   Panel,
   RanIn,
+  ReportLayout,
   Spinner,
 } from "../components/ui";
 
@@ -80,8 +81,8 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Retention"
-        description="How many users come back after their first action."
+        title={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`}
+        description="Retention: how many users come back after their first action."
         actions={
           <>
             <RangePresets days={days} onChange={setDays} />
@@ -91,15 +92,17 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
               defaultName={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`}
               query={buildQuery}
             />
-            <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.primary}>
-              {loading ? "Running…" : "Run retention"}
+            <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
+              <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
             </button>
           </>
         }
       />
 
-      <Panel>
-        <div className="flex flex-wrap items-end gap-4">
+      <ReportLayout
+        query={
+      <Panel title="Query">
+        <div className="flex flex-col gap-4">
           <label className="flex min-w-0 flex-col gap-1">
             <span className={fieldLabel}>First action</span>
             <select value={startEvent} onChange={(e) => setStartEvent(e.target.value)} className={field}>
@@ -154,8 +157,16 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
           </label>
         </div>
       </Panel>
+        }
+      >
 
       {error && <ErrorNotice message={error} onRetry={() => void runRetention()} />}
+
+      {!stickiness && cohorts.length > 0 && (
+        <Panel title="Average return by day" meta="Weighted by users, only start dates old enough to reach each day">
+          <RetentionCurve cohorts={cohorts} numPeriods={numPeriods} />
+        </Panel>
+      )}
 
       <Panel
         title="Users who came back, by start date"
@@ -170,7 +181,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
             <EmptyState
               icon={CalendarCheck}
               title="No users to follow yet"
-              body={`Nobody did ${humanizeEvent(startEvent)} in the last 14 days. Pick a different first action.`}
+              body={`Nobody did ${humanizeEvent(startEvent)} in the last ${days} days. Pick a different first action.`}
             />
           )
         ) : (
@@ -240,6 +251,56 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
           </div>
         )}
       </Panel>
+      </ReportLayout>
     </div>
+  );
+};
+
+/** Mixpanel-style retention curve: average % back on each day, weighted by users. */
+const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods: number }> = ({ cohorts, numPeriods }) => {
+  const pts: (number | null)[] = Array.from({ length: numPeriods + 1 }, (_, d) => {
+    let users = 0;
+    let back = 0;
+    cohorts.forEach((c, i) => {
+      if (d > 0 && d > cohorts.length - 1 - i) return; // not reached yet
+      users += c.cohort_size;
+      back += c.retained_counts[d] ?? 0;
+    });
+    return users ? (back / users) * 100 : null;
+  });
+  const W = 640;
+  const H = 180;
+  const pad = { l: 36, r: 8, t: 10, b: 24 };
+  const max = Math.max(10, ...pts.slice(1).map((v) => v ?? 0)) * 1.1;
+  const x = (d: number) => pad.l + (d / numPeriods) * (W - pad.l - pad.r);
+  const y = (v: number) => H - pad.b - (v / max) * (H - pad.t - pad.b);
+  const known = pts.map((v, d) => [d, v] as const).filter(([d, v]) => d > 0 && v !== null) as [number, number][];
+  if (known.length === 0) return <p className="text-sm text-muted">Not enough days have passed to draw a curve.</p>;
+  const line = known.map(([d, v], i) => `${i ? "L" : "M"}${x(d).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area = `${line} L${x(known[known.length - 1][0])},${y(0)} L${x(known[0][0])},${y(0)} Z`;
+  const ticks = [0, max / 2, max].map((t) => Math.round(t));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Average retention by day; exact values are in the table below">
+      {ticks.map((t) => (
+        <g key={t}>
+          <line x1={pad.l} x2={W - pad.r} y1={y(t)} y2={y(t)} stroke="rgb(var(--line))" />
+          <text x={pad.l - 6} y={y(t) + 4} textAnchor="end" className="fill-faint text-[11px]">
+            {t}%
+          </text>
+        </g>
+      ))}
+      <path d={area} fill="rgb(var(--brand) / 0.1)" />
+      <path d={line} fill="none" stroke="rgb(var(--brand))" strokeWidth={2.5} strokeLinejoin="round" />
+      {known.map(([d, v]) => (
+        <circle key={d} cx={x(d)} cy={y(v)} r={3} fill="rgb(var(--brand))">
+          <title>{`Day ${d}: ${v.toFixed(1)}%`}</title>
+        </circle>
+      ))}
+      {pts.map((_, d) => (
+        <text key={d} x={x(d)} y={H - 6} textAnchor="middle" className="fill-faint text-[11px]">
+          {d === 0 ? "Day 0" : d}
+        </text>
+      ))}
+    </svg>
   );
 };

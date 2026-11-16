@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Download, LineChart, Plus, Trash2 } from "lucide-react";
+import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
 import { SaveToDashboard } from "../dashboards/SaveToDashboard";
@@ -13,6 +13,7 @@ import {
   PageHeader,
   Panel,
   RanIn,
+  ReportLayout,
   Spinner,
 } from "../components/ui";
 
@@ -138,7 +139,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [formula, setFormula] = useState<string>("(B / A) * 100");
   const [breakdown, setBreakdown] = useState<string>("city");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
-  const [chartType, setChartType] = useState<"line" | "bar">("line");
+  const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [result, setResult] = useState<InsightsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -234,27 +235,31 @@ export const InsightsWorkspace: React.FC<Props> = ({
   );
   const eventOptions = availableEvents.length > 0 ? availableEvents : FALLBACK_EVENTS;
 
+  const reportTitle = series.map((s) => humanizeEvent(s.eventName)).join(" and ");
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Trends"
-        description="How an event or metric changes over time, by segment."
+        title={reportTitle}
+        description="Trend: how an event or metric changes over time, by segment."
         actions={
           <>
             <RangePresets days={days} onChange={setDays} />
             <SaveToDashboard
               projectId={projectId}
               kind="insights"
-              defaultName={series.map((s) => humanizeEvent(s.eventName)).join(" and ")}
+              defaultName={reportTitle}
               query={buildQuery}
             />
-            <button type="button" onClick={() => void runQuery()} disabled={loading} className={btn.primary}>
-              {loading ? "Running…" : "Update chart"}
+            <button type="button" onClick={() => void runQuery()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
+              <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
             </button>
           </>
         }
       />
 
+      <ReportLayout
+        query={
       <Panel
         title="Metrics"
         actions={
@@ -281,7 +286,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
           {series.map((s, idx) => (
             <div
               key={s.label}
-              className="flex flex-wrap items-end gap-2 rounded-lg border border-line bg-sunken px-3 py-2"
+              className="flex flex-col gap-2 rounded-lg border border-line bg-sunken px-3 py-2.5"
             >
               <span
                 className="mb-1 flex h-6 w-6 items-center justify-center rounded text-xs font-semibold text-on-brand"
@@ -348,7 +353,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
           ))}
         </div>
 
-        <div className="grid grid-cols-1 gap-3 pt-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 pt-4 sm:grid-cols-2 xl:grid-cols-1">
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Formula (optional)</span>
             <input
@@ -379,11 +384,24 @@ export const InsightsWorkspace: React.FC<Props> = ({
               />
               Compare with previous period
             </label>
+          </div>
+        </div>
+      </Panel>
+        }
+      >
+
+      {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
+
+      <Panel
+        title={chartType === "number" ? "Total" : "Over time"}
+        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        actions={
             <div className="flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Chart type">
               {(
                 [
                   ["line", "Line"],
                   ["bar", "Bar"],
+                  ["number", "Number"],
                 ] as const
               ).map(([k, text]) => (
                 <button
@@ -399,15 +417,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 </button>
               ))}
             </div>
-          </div>
-        </div>
-      </Panel>
-
-      {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
-
-      <Panel
-        title="Over time"
-        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        }
       >
         {!result ? (
           loading ? (
@@ -420,9 +430,36 @@ export const InsightsWorkspace: React.FC<Props> = ({
         ) : !hasData ? (
           <EmptyState
             title="No activity in this period"
-            body="None of these events happened in the last 14 days. Try a different event or remove the breakdown."
+            body={`None of these events happened in the last ${days} days. Try a different event or remove the breakdown.`}
             icon={LineChart}
           />
+        ) : chartType === "number" ? (
+          <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
+            {displayedSeries.map((s, idx) => {
+              const prev = result.previous_series.find((p) => p.label === s.label && p.breakdown_key === s.breakdown_key);
+              const change =
+                prev?.overall_value && s.overall_value !== null
+                  ? ((s.overall_value - prev.overall_value) / prev.overall_value) * 100
+                  : null;
+              return (
+                <li key={`${s.label}-${s.breakdown_key}`} className="border-l-[3px] pl-4" style={{ borderColor: color(idx) }}>
+                  <p className="text-sm text-ink-2">
+                    {seriesName(s)}
+                    {s.breakdown_key && <span className="text-muted">, {s.breakdown_key}</span>}
+                  </p>
+                  <p className="tabular text-[2.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
+                    {formatValue(s.overall_value)}
+                  </p>
+                  {change !== null && Number.isFinite(change) && (
+                    <p className={`text-sm font-semibold ${change >= 0 ? "text-ok" : "text-danger"}`}>
+                      {change >= 0 ? "+" : "−"}
+                      {Math.abs(change).toFixed(0)}% <span className="font-normal text-muted">vs previous {days} days</span>
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
         ) : (
           <>
             <ul className="mb-3 flex flex-wrap gap-x-4 gap-y-1.5 text-sm">
@@ -487,7 +524,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   // Null points (e.g. formula with a zero denominator) break the line instead of dropping to 0.
                   let d = "";
                   let pen = false;
+                  // The last bucket is today and still filling up, so draw it dotted.
+                  const lastI = s.points.length - 1;
+                  const tail =
+                    lastI > 0 && s.points[lastI].value !== null && s.points[lastI - 1].value !== null
+                      ? `M${xAt(lastI - 1)},${yAt(s.points[lastI - 1].value!)} L${xAt(lastI)},${yAt(s.points[lastI].value!)}`
+                      : "";
                   s.points.forEach((p, i) => {
+                    if (i === lastI && tail) return;
                     if (p.value === null) {
                       pen = false;
                       return;
@@ -498,6 +542,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   return (
                     <g key={key}>
                       <path d={d} fill="none" stroke={c} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+                      {tail && <path d={tail} fill="none" stroke={c} strokeWidth={2} strokeDasharray="3 4" strokeLinecap="round" />}
                       {s.points.map((p, i) =>
                         p.value === null ? null : (
                           <circle key={p.bucket_ts_ms} cx={xAt(i)} cy={yAt(p.value)} r={2.5} fill={c}>
@@ -579,6 +624,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
           </div>
         </Panel>
       )}
+      </ReportLayout>
     </div>
   );
 };
