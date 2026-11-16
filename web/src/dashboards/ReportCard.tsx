@@ -27,22 +27,27 @@ const PRESETS: [RangeSel, string][] = [
 
 const DAY_MS = 86_400_000;
 const startOfToday = () => new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+// Calendar-day step, so a daylight-saving day (23 or 25 hours) still ends at local midnight.
+const addDays = (ms: number, n: number) => {
+  const d = new Date(ms);
+  return d.setDate(d.getDate() + n);
+};
 const parseDay = (d: string) => new Date(`${d}T00:00:00`).getTime();
 const fmtDay = (ms: number) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
 
 export function rangeFor(sel: RangeSel): TimeRange {
   const now = Date.now();
   if (sel === "today") return { start_ts_ms: startOfToday(), end_ts_ms: now + 3_600_000 };
-  if (sel === "yesterday") return { start_ts_ms: startOfToday() - DAY_MS, end_ts_ms: startOfToday() };
+  if (sel === "yesterday") return { start_ts_ms: addDays(startOfToday(), -1), end_ts_ms: startOfToday() };
   if (sel.startsWith("custom:")) {
     const [, from, to] = sel.split(":");
-    return { start_ts_ms: parseDay(from), end_ts_ms: parseDay(to) + DAY_MS };
+    return { start_ts_ms: parseDay(from), end_ts_ms: addDays(parseDay(to), 1) };
   }
   return { start_ts_ms: now - Number(sel) * DAY_MS, end_ts_ms: now + 3_600_000 };
 }
 
 /** Length of the range in days, for picking day or week buckets. */
-export function rangeDays(sel: RangeSel): number {
+function rangeDays(sel: RangeSel): number {
   const r = rangeFor(sel);
   return Math.max(1, Math.round((r.end_ts_ms - r.start_ts_ms) / DAY_MS));
 }
@@ -103,7 +108,14 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
             {label}
           </button>
         ))}
-        <button type="button" aria-pressed={custom} aria-expanded={open} onClick={() => setOpen((v) => !v)} className={seg(custom)}>
+        <button type="button" aria-pressed={custom} aria-expanded={open} onClick={() => {
+            // Start the picker from the range on screen, not the one when the bar mounted.
+            if (!open) {
+              setFrom(iso(r.start_ts_ms));
+              setTo(iso(Math.min(Date.now(), r.end_ts_ms - 1)));
+            }
+            setOpen((v) => !v);
+          }} className={seg(custom)}>
           {custom ? rangeLabel(value) : "Custom"}
         </button>
       </div>
@@ -170,29 +182,35 @@ export const ReportCardBody: React.FC<{
   const [result, setResult] = useState<CardResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const latest = useRef(0);
 
   const run = useCallback(async () => {
+    // Only the newest request may write, so a slow 90D reply can't land under a 7D label.
+    const id = ++latest.current;
+    const set = <T,>(fn: (v: T) => void) => (v: T) => id === latest.current && fn(v);
     setLoading(true);
     setError(null);
     const body = { ...report.query_json, time_range: rangeFor(range) };
     try {
       if (report.report_kind === "funnel") {
-        setResult({ kind: "funnel", data: await api.queryFunnel(projectId, body) });
+        set(setResult)({ kind: "funnel", data: await api.queryFunnel(projectId, body) });
       } else if (report.report_kind === "insights") {
-        setResult({
+        set(setResult)({
           kind: "insights",
           data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }),
         });
       } else if (report.report_kind === "retention") {
-        setResult({ kind: "retention", data: await api.queryRetention(projectId, body) });
+        set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body) });
       } else {
-        setError("Journeys can't be shown on a dashboard yet. Open it in Journeys.");
+        set(setError)("Journeys can't be shown on a dashboard yet. Open it in Journeys.");
       }
     } catch (err) {
-      setError(errorMessage(err));
+      set(setError)(errorMessage(err));
     } finally {
-      setLoading(false);
-      onLoaded?.();
+      if (id === latest.current) {
+        setLoading(false);
+        onLoaded?.();
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, report, range]);
@@ -238,9 +256,11 @@ const FunnelMini: React.FC<{ data: FunnelResult }> = ({ data }) => {
     return <p className="py-6 text-sm text-muted">No users entered this funnel in the selected dates.</p>;
   }
   const first = steps[0].entered_users;
+  // Loss into step i (users who reached i-1 but not i), so the bold row, strong hatch and sentence agree.
+  const lostBefore = (i: number) => steps[i - 1].entered_users - steps[i].entered_users;
   let worst = -1;
   for (let i = 1; i < steps.length; i++) {
-    if (worst < 0 || steps[i].dropped_users > steps[worst].dropped_users) worst = i;
+    if (lostBefore(i) > 0 && (worst < 0 || lostBefore(i) > lostBefore(worst))) worst = i;
   }
   const last = steps[steps.length - 1];
   return (
@@ -268,7 +288,7 @@ const FunnelMini: React.FC<{ data: FunnelResult }> = ({ data }) => {
       </div>
       {worst > 0 && (
         <p className="text-[0.8125rem] text-danger">
-          Biggest drop: {formatCount(steps[worst].dropped_users)} users before {humanizeEvent(steps[worst].event_name)}.
+          Biggest drop: {formatCount(lostBefore(worst))} users between {humanizeEvent(steps[worst - 1].event_name)} and {humanizeEvent(steps[worst].event_name)}.
         </p>
       )}
     </div>
@@ -350,7 +370,7 @@ const RetentionMini: React.FC<{ data: RetentionResult }> = ({ data }) => {
   const periods = Math.min(8, Math.max(...rows.map((r) => r.retained_pcts.length)));
   // Average each day over the start dates old enough to have reached it.
   const avg = Array.from({ length: periods }, (_, d) => {
-    const reached = rows.filter((_, idx) => idx <= rows.length - 1 - d || d === 0);
+    const reached = rows.filter((r) => d === 0 || addDays(r.cohort_start_ts_ms, d) <= Date.now());
     const vals = reached.map((r) => r.retained_pcts[d]).filter((v) => typeof v === "number");
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   });

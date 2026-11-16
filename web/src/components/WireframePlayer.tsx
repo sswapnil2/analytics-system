@@ -9,6 +9,16 @@ interface TimelineAction {
   op: ReplayChunk["ops"][number];
 }
 
+/** Text colour that stays readable on a recorded button colour (light buttons get dark text). */
+function onColor(bgRgba: number): string {
+  const r = (bgRgba >>> 24) & 0xff;
+  const g = (bgRgba >>> 16) & 0xff;
+  const b = (bgRgba >>> 8) & 0xff;
+  const a = (bgRgba & 0xff) / 255;
+  if (a < 0.5) return "rgb(var(--ink))";
+  return 0.299 * r + 0.587 * g + 0.114 * b > 160 ? "#141A17" : "#FFFFFF";
+}
+
 function rgbaHex(bgRgba: number): string {
   const r = (bgRgba >>> 24) & 0xff;
   const g = (bgRgba >>> 16) & 0xff;
@@ -234,6 +244,7 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
                     width: Math.round(n.w * scale),
                     height: Math.round(n.h * scale),
                     backgroundColor: isScreen ? undefined : rgbaHex(n.bg_rgba),
+                    color: isBtn && !isErr && !isScreen ? onColor(n.bg_rgba) : undefined,
                   }}
                   className={
                     isScreen
@@ -241,7 +252,7 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
                       : isErr
                         ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
                         : isBtn
-                          ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold text-white"
+                          ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold"
                           : isMasked
                             ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
                             : "z-10 flex items-center px-1 text-[11px] text-ink-2"

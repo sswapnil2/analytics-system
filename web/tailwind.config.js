@@ -23,6 +23,8 @@ export default {
         "on-brand": token("on-brand"),
         danger: token("danger"),
         "danger-soft": token("danger-soft"),
+        destructive: token("destructive"),
+        "destructive-soft": token("destructive-soft"),
         warn: token("warn"),
         "warn-soft": token("warn-soft"),
         ok: token("ok"),

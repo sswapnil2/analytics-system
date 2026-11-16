@@ -103,7 +103,7 @@ const Menu: React.FC<{
   }, [open]);
   const itemClass = (danger?: boolean) =>
     `block w-full whitespace-nowrap rounded-md px-3 py-2 text-left text-sm outline-none disabled:opacity-40 ${
-      danger ? "text-danger hover:bg-danger-soft focus:bg-danger-soft" : "text-ink hover:bg-hover focus:bg-hover"
+      danger ? "text-destructive hover:bg-destructive-soft focus:bg-destructive-soft" : "text-ink hover:bg-hover focus:bg-hover"
     }`;
   return (
     <div className="relative" ref={ref}>
@@ -142,6 +142,10 @@ const Menu: React.FC<{
                 onClick={() => {
                   close(true);
                   it.onSelect?.();
+                  // Removing a card unmounts this menu's button; keep keyboard focus on the page.
+                  requestAnimationFrame(() => {
+                    if (!triggerRef.current?.isConnected) document.getElementById("main")?.focus();
+                  });
                 }}
               >
                 {it.label}
@@ -343,10 +347,13 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
     return () => window.clearInterval(id);
   }, [tv]);
 
+  const confirmed = useRef<Dashboard | null>(null);
+  const saveSeq = useRef(0);
   const load = useCallback(async () => {
     setLoadError(null);
     try {
       const [d, reps] = await Promise.all([api.getDashboard(projectId, dashboardId), api.listReports(projectId)]);
+      confirmed.current = d;
       setDash(d);
       setReports(new Map(reps.map((r) => [r.id, r])));
     } catch (err) {
@@ -359,8 +366,10 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
   }, [load, refreshToken]);
 
   /** Optimistic save: show the change now, roll back if the server refuses it. */
+  // Only the newest save touches the screen. A failure rolls back to the last state the
+  // server confirmed, not to whatever was on screen when that save started.
   const persist = async (next: Dashboard) => {
-    const before = dash;
+    const id = ++saveSeq.current;
     setDash(next);
     setSaveError(null);
     try {
@@ -369,11 +378,14 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
         description: next.description,
         cards: next.cards,
       });
-      setDash(saved);
+      confirmed.current = saved;
+      if (id === saveSeq.current) setDash(saved);
       return saved;
     } catch (err) {
-      setDash(before);
-      setSaveError(`Couldn't save your change: ${errorMessage(err)}`);
+      if (id === saveSeq.current) {
+        setDash(confirmed.current);
+        setSaveError(`Couldn't save your change: ${errorMessage(err)}`);
+      }
       return null;
     }
   };
@@ -475,7 +487,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
               </button>
             </>
           )}
-          {!tv && <button type="button" onClick={() => setSharing((v) => !v)} className={btn.primary} aria-expanded={sharing}>
+          {!tv && <button type="button" onClick={() => setSharing((v) => !v)} className={btn.primary} aria-expanded={sharing} data-share-trigger>
             <Link2 className="h-4 w-4" />
             Share
           </button>}
@@ -639,7 +651,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             <span className="text-ink">Delete this dashboard? Its reports stay saved.</span>
             <button
               type="button"
-              className="font-semibold text-danger hover:underline"
+              className="font-semibold text-destructive hover:underline"
               onClick={async () => {
                 try {
                   await api.deleteDashboard(projectId, dash.id);
@@ -657,7 +669,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             </button>
           </span>
         ) : (
-          <button type="button" className="inline-flex items-center gap-1 hover:text-danger" onClick={() => setConfirmDelete(true)}>
+          <button type="button" className="inline-flex items-center gap-1 hover:text-destructive" onClick={() => setConfirmDelete(true)}>
             <Trash2 className="h-3.5 w-3.5" />
             Delete dashboard
           </button>
@@ -799,9 +811,15 @@ const SharePopover: React.FC<{ dashboardId: string; onClose: () => void }> = ({ 
   const link = `${window.location.origin}${window.location.pathname}#/dashboards/${encodeURIComponent(dashboardId)}`;
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    ref.current?.querySelector<HTMLElement>("input")?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      onClose();
+      document.querySelector<HTMLElement>("[data-share-trigger]")?.focus();
+    };
     const onClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node) && !(e.target as HTMLElement).closest("[aria-expanded]"))
+      // The Share button toggles itself; any other click outside closes the popover.
+      if (ref.current && !ref.current.contains(e.target as Node) && !(e.target as HTMLElement).closest("[data-share-trigger]"))
         onClose();
     };
     window.addEventListener("keydown", onKey);

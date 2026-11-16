@@ -34,7 +34,7 @@ interface SeriesDraft {
 }
 
 // Theme tokens, so the chart follows light and dark mode.
-const COLORS = ["brand", "info", "warn", "danger", "ink-2", "muted"].map((v) => `rgb(var(--${v}))`);
+const COLORS = ["brand", "info", "warn", "ink-2", "muted"] /* no orange: it means drop-offs */.map((v) => `rgb(var(--${v}))`);
 const color = (i: number) => COLORS[i % COLORS.length];
 
 const METRIC_OPTIONS: [string, string][] = [
@@ -143,7 +143,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const sort = useSort<"metric" | "segment" | "overall">("overall");
+  const sort = useSort<"metric" | "segment" | "overall">("overall", true, ["metric", "segment"]);
   const [result, setResult] = useState<InsightsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -363,7 +363,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   type="button"
                   onClick={() => setSeries(series.filter((_, i) => i !== idx))}
                   aria-label={`Remove metric ${s.label}`}
-                  className={`${btn.ghost} ml-auto mb-0.5 hover:text-danger`}
+                  className={`${btn.ghost} ml-auto mb-0.5 hover:bg-destructive-soft hover:text-destructive`}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>

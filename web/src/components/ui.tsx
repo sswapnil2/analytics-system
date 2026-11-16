@@ -154,21 +154,25 @@ export const ChartSkeleton: React.FC<{ rows?: number }> = ({ rows }) => (
 );
 
 /** Sort state for a table; click the same column again to flip direction. */
-export function useSort<K extends string>(initial: K, initialDesc = true) {
+/** Number columns start high-to-low on first click; `textKeys` start A→Z. */
+export function useSort<K extends string>(initial: K, initialDesc = true, textKeys: K[] = []) {
   const [key, setKey] = useState<K>(initial);
   const [desc, setDesc] = useState(initialDesc);
   const toggle = (k: K) => {
     if (k === key) setDesc((d) => !d);
     else {
       setKey(k);
-      setDesc(true);
+      setDesc(!textKeys.includes(k));
     }
   };
   const sortBy = <T,>(rows: T[], get: (r: T, k: K) => number | string) =>
     [...rows].sort((a, b) => {
       const x = get(a, key);
       const y = get(b, key);
-      const c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y));
+      const c =
+        typeof x === "number" && typeof y === "number"
+          ? x === y ? 0 : x < y ? -1 : 1 // not x - y: -Infinity - -Infinity is NaN
+          : String(x).localeCompare(String(y), undefined, { numeric: true });
       return desc ? -c : c;
     });
   return { key, desc, toggle, sortBy };

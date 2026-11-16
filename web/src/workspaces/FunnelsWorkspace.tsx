@@ -185,7 +185,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
                 <button
                   type="button"
                   onClick={() => setSteps(steps.filter((_, i) => i !== idx))}
-                  className="rounded p-1 text-faint hover:bg-hover hover:text-danger"
+                  className="rounded p-1 text-faint hover:bg-destructive-soft hover:text-destructive"
                   aria-label={`Remove step ${idx + 1}`}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
@@ -466,23 +466,46 @@ const DropOffDrawer: React.FC<{
     () => samples.find((d) => d.has_replay) ?? samples[0] ?? null,
   );
   const closeRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
+  // Runs once per open: focus moves in, Tab stays inside, and focus goes back to the opener on close.
   useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
     closeRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") return onCloseRef.current();
+      if (e.key !== "Tab" || !dialogRef.current) return;
+      const els = dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      if (els.length === 0) return;
+      const first = els[0];
+      const last = els[els.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
     window.addEventListener("keydown", onKey);
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       window.removeEventListener("keydown", onKey);
       document.body.style.overflow = prevOverflow;
+      opener?.focus?.();
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-ink/40" tabIndex={-1} />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="dropoff-title"
@@ -572,7 +595,7 @@ type SegKey = "segment" | "started" | "completed" | "rate";
 
 /** Funnel split by a property: per-step bars for the biggest segments, then a sortable table. */
 const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ groups }) => {
-  const sort = useSort<SegKey>("rate");
+  const sort = useSort<SegKey>("rate", true, ["segment"]);
   const started = (g: FunnelResult["breakdowns"][number]) => g.steps[0]?.entered_users ?? 0;
   const done = (g: FunnelResult["breakdowns"][number]) => g.steps[g.steps.length - 1]?.entered_users ?? 0;
   const rate = (g: FunnelResult["breakdowns"][number]) => g.steps[g.steps.length - 1]?.conversion_from_start_pct ?? 0;

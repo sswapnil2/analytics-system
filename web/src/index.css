@@ -28,6 +28,8 @@
   --on-brand: 255 255 255;
   --danger: 184 60 10; /* orange: lost users, failures. Nothing else is orange. */
   --danger-soft: 251 231 218;
+  --destructive: 180 35 24; /* red: delete and remove actions only */
+  --destructive-soft: 253 236 234;
   --warn: 138 84 6;
   --warn-soft: 246 236 212;
   --ok: 11 110 95;
@@ -56,6 +58,8 @@
   --on-brand: 6 26 22;
   --danger: 240 128 74;
   --danger-soft: 60 30 18;
+  --destructive: 248 113 102;
+  --destructive-soft: 66 24 22;
   --warn: 230 178 80;
   --warn-soft: 52 40 16;
   --ok: 52 184 160;
@@ -84,6 +88,8 @@
     --on-brand: 6 26 22;
     --danger: 240 128 74;
     --danger-soft: 60 30 18;
+    --destructive: 248 113 102;
+    --destructive-soft: 66 24 22;
     --warn: 230 178 80;
     --warn-soft: 52 40 16;
     --ok: 52 184 160;
