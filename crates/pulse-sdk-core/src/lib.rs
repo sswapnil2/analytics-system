@@ -87,12 +87,14 @@ enum QueuedPacket {
         routing_seed: String,
     },
     Replay(Vec<u8>),
+    Engage(Vec<u8>),
 }
 
 impl QueuedPacket {
     const TAG_EVENTS: u8 = 1;
     const TAG_IDENTIFY: u8 = 2;
     const TAG_REPLAY: u8 = 3;
+    const TAG_ENGAGE: u8 = 4;
 
     fn encode_payload(&self) -> Vec<u8> {
         match self {
@@ -122,6 +124,12 @@ impl QueuedPacket {
                 out.extend_from_slice(bin);
                 out
             }
+            QueuedPacket::Engage(json) => {
+                let mut out = Vec::with_capacity(1 + json.len());
+                out.push(Self::TAG_ENGAGE);
+                out.extend_from_slice(json);
+                out
+            }
         }
     }
 
@@ -130,6 +138,7 @@ impl QueuedPacket {
         match tag {
             Self::TAG_EVENTS => Some(QueuedPacket::Events(rest.to_vec())),
             Self::TAG_REPLAY => Some(QueuedPacket::Replay(rest.to_vec())),
+            Self::TAG_ENGAGE => Some(QueuedPacket::Engage(rest.to_vec())),
             Self::TAG_IDENTIFY => {
                 let mut pos = 0usize;
                 let mut parts = Vec::with_capacity(3);
@@ -347,6 +356,10 @@ struct PersistedIdentityState {
     identified_user_id: Option<String>,
     session_id: String,
     last_activity_ts_ms: i64,
+    #[serde(default)]
+    opted_out: bool,
+    #[serde(default)]
+    super_props: Vec<(String, PropValue)>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -400,6 +413,7 @@ pub struct PulseClient {
     consecutive_failures: AtomicU32,
     backoff_until_ms: AtomicI64,
     tap_history: Mutex<VecDeque<TapPoint>>,
+    timed_events: Mutex<HashMap<String, i64>>,
     flag_cache: RwLock<FlagCache>,
     replay_offset_kb: AtomicU32,
     seq_counter: AtomicU32,
@@ -458,6 +472,7 @@ impl PulseClient {
             consecutive_failures: AtomicU32::new(0),
             backoff_until_ms: AtomicI64::new(0),
             tap_history: Mutex::new(VecDeque::with_capacity(16)),
+            timed_events: Mutex::new(HashMap::new()),
             flag_cache: RwLock::new(FlagCache::default()),
             replay_offset_kb: AtomicU32::new(0),
             seq_counter: AtomicU32::new(1),
@@ -517,8 +532,134 @@ impl PulseClient {
         self.track_at(event_name, props, Utc::now().timestamp_millis())
     }
 
+    pub fn opt_out(&self) -> Result<(), SdkError> {
+        let snap = {
+            let mut id = self.identity.write();
+            id.opted_out = true;
+            id.clone()
+        };
+        self.event_ring.lock().clear();
+        {
+            let mut r = self.replay_ops_ring.lock();
+            r.0 = None;
+            r.1 = None;
+            r.2.clear();
+        }
+        {
+            let mut dq = self.disk_queue.lock();
+            dq.0.clear();
+            dq.1 = 0;
+        }
+        self.timed_events.lock().clear();
+        let _ = self.wal_io_tx.send(WalIoCmd::Compact(Vec::new()));
+        self.persist_identity_async(snap);
+        Ok(())
+    }
+
+    pub fn opt_in(&self) -> Result<(), SdkError> {
+        let snap = {
+            let mut id = self.identity.write();
+            id.opted_out = false;
+            id.clone()
+        };
+        self.persist_identity_async(snap);
+        Ok(())
+    }
+
+    pub fn is_opted_out(&self) -> bool {
+        self.identity.read().opted_out
+    }
+
+    pub fn register_super_props(&self, props_json: String) -> Result<(), SdkError> {
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&props_json)
+            .map_err(|e| SdkError::Serialization(e.to_string()))?;
+        let snap = {
+            let mut id = self.identity.write();
+            for (k, v) in map {
+                let pv = PropValue::from_json_value(v);
+                if let Some(pos) = id.super_props.iter().position(|(ek, _)| ek == &k) {
+                    id.super_props[pos].1 = pv;
+                } else {
+                    id.super_props.push((k, pv));
+                }
+            }
+            id.clone()
+        };
+        self.persist_identity_async(snap);
+        Ok(())
+    }
+
+    pub fn time_event(&self, event_name: String) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
+        self.timed_events
+            .lock()
+            .insert(event_name, Utc::now().timestamp_millis());
+        Ok(())
+    }
+
+    pub fn set_user_properties(&self, props_json: String) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
+        let val: serde_json::Value = serde_json::from_str(&props_json)
+            .map_err(|e| SdkError::Serialization(e.to_string()))?;
+        if !val.is_object() {
+            return Err(SdkError::Serialization(
+                "user properties payload must be a JSON object".into(),
+            ));
+        }
+        let payload = serde_json::json!({
+            "$distinct_id": self.distinct_id(),
+            "$set": val,
+        });
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|e| SdkError::Serialization(e.to_string()))?;
+        self.enqueue_packet(QueuedPacket::Engage(bytes));
+        Ok(())
+    }
+
+    pub fn track_revenue(
+        &self,
+        amount: f64,
+        currency: String,
+        product_id: Option<String>,
+    ) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
+        let mut props = vec![
+            ("amount".to_string(), PropValue::Float(amount)),
+            ("currency".to_string(), PropValue::Str(currency.clone())),
+        ];
+        if let Some(pid) = &product_id {
+            props.push(("product_id".to_string(), PropValue::Str(pid.clone())));
+        }
+        self.track_at("$revenue".to_string(), props, Utc::now().timestamp_millis())?;
+
+        let mut charge = serde_json::json!({
+            "$amount": amount,
+            "currency": currency,
+        });
+        if let Some(pid) = product_id {
+            charge["product_id"] = serde_json::Value::String(pid);
+        }
+        let payload = serde_json::json!({
+            "$distinct_id": self.distinct_id(),
+            "$track_charge": charge,
+        });
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|e| SdkError::Serialization(e.to_string()))?;
+        self.enqueue_packet(QueuedPacket::Engage(bytes));
+        Ok(())
+    }
+
     /// Identifies a logged-in user, preserving `routing_seed` (`device_install_id`) and queueing retroactive `alias`.
     pub fn identify(&self, user_id: String) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
         let now_ms = Utc::now().timestamp_millis();
         self.touch_activity_and_maybe_rotate(now_ms)?;
         let (anon_id, routing_seed) = {
@@ -566,6 +707,9 @@ impl PulseClient {
         height: u16,
         nodes: Vec<SdkWireNode>,
     ) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
         let now_ms = Utc::now().timestamp_millis();
         let cur_session = self.touch_activity_and_maybe_rotate(now_ms)?;
 
@@ -629,6 +773,9 @@ impl PulseClient {
         target_is_interactive: bool,
         ts_ms: i64,
     ) -> Result<String, SdkError> {
+        if self.is_opted_out() {
+            return Ok("opted_out".to_string());
+        }
         let cur_session = self.touch_activity_and_maybe_rotate(ts_ms)?;
 
         let kind = {
@@ -856,6 +1003,15 @@ impl PulseClient {
                                 .send()
                                 .await
                         }
+                        QueuedPacket::Engage(json_bytes) => {
+                            http_c
+                                .post(format!("{base_c}/v1/engage"))
+                                .header("x-pulse-key", &key_c)
+                                .header("content-type", "application/json")
+                                .body(json_bytes)
+                                .send()
+                                .await
+                        }
                     }
                 })
                 .await
@@ -929,6 +1085,8 @@ impl PulseClient {
             identified_user_id: None,
             session_id: sess,
             last_activity_ts_ms: 0,
+            opted_out: false,
+            super_props: Vec::new(),
         }
     }
 
@@ -995,15 +1153,35 @@ impl PulseClient {
         props: Vec<(String, PropValue)>,
         event_ts_ms: i64,
     ) -> Result<(), SdkError> {
+        if self.is_opted_out() {
+            return Ok(());
+        }
         let session_id = self.touch_activity_and_maybe_rotate(event_ts_ms)?;
-        let (routing_seed, distinct_id) = {
+        let (routing_seed, distinct_id, super_props) = {
             let id = self.identity.read();
             let did = id
                 .identified_user_id
                 .clone()
                 .unwrap_or_else(|| id.anon_id.clone());
-            (id.routing_seed.clone(), did)
+            (id.routing_seed.clone(), did, id.super_props.clone())
         };
+
+        let mut merged_props = super_props;
+        if let Some(started_ms) = self.timed_events.lock().remove(&event_name) {
+            let dur_ms = (Utc::now().timestamp_millis() - started_ms).max(0);
+            merged_props.push(("$duration_ms".to_string(), PropValue::Int(dur_ms)));
+            merged_props.push((
+                "$duration".to_string(),
+                PropValue::Float((dur_ms as f64) / 1000.0),
+            ));
+        }
+        for (k, v) in props {
+            if let Some(pos) = merged_props.iter().position(|(ek, _)| ek == &k) {
+                merged_props[pos].1 = v;
+            } else {
+                merged_props.push((k, v));
+            }
+        }
 
         let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) as u64;
         let ev = WireEvent {
@@ -1021,7 +1199,7 @@ impl PulseClient {
             client_event_ts_ms: event_ts_ms,
             // Overwritten with actual transmission timestamp in `flush()` (`P1-13`).
             client_sent_ts_ms: 0,
-            props,
+            props: merged_props,
             replay_offset_kb: self.replay_offset_kb.load(Ordering::Acquire),
         };
 
@@ -1431,5 +1609,76 @@ mod tests {
             "rapid concurrent identity updates must preserve session_id across restart"
         );
         assert_eq!(reopened.distinct_id(), "+919900099999");
+    }
+
+    #[tokio::test]
+    async fn phase3_consent_super_props_timed_events_profiles_and_revenue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SdkConfig {
+            endpoint_url: "http://127.0.0.1:9".to_string(),
+            api_key: "pk_phase3".to_string(),
+            storage_dir: dir.path().to_string_lossy().to_string(),
+            flush_batch_size: 1,
+            flush_interval_ms: 0,
+        };
+        let client = PulseClient::new(cfg.clone()).unwrap();
+        assert!(!client.is_opted_out());
+
+        client
+            .register_super_props(r#"{"app_tier":"fintech","env":"prod"}"#.into())
+            .unwrap();
+        client.time_event("KYC_Submit".into()).unwrap();
+        client
+            .track("KYC_Submit".into(), r#"{"step":1}"#.into())
+            .unwrap();
+        client
+            .set_user_properties(r#"{"plan":"credit_pro"}"#.into())
+            .unwrap();
+        client
+            .track_revenue(999.0, "INR".into(), Some("pro_sub".into()))
+            .unwrap();
+
+        // Events, engage, and revenue packets queued in WAL
+        assert!(client.queued_packet_count() >= 4);
+
+        // Verify super props and duration were stamped in the queued WireBatch
+        let has_super_and_dur = {
+            let guard = client.disk_queue.lock();
+            guard.0.iter().any(|entry| {
+                if let QueuedPacket::Events(bin) = &entry.pkt {
+                    let batch = WireBatch::decode_binary(bin).unwrap();
+                    batch.events.iter().any(|e| {
+                        e.event_name == "KYC_Submit"
+                            && e.get_prop("app_tier") == Some(&PropValue::Str("fintech".into()))
+                            && e.get_prop("$duration_ms").is_some()
+                    })
+                } else {
+                    false
+                }
+            })
+        };
+        assert!(
+            has_super_and_dur,
+            "super props + $duration_ms must be stamped on event"
+        );
+
+        // Opt-out clears queues and blocks further tracking/profile updates
+        client.opt_out().unwrap();
+        assert!(client.is_opted_out());
+        assert_eq!(client.queued_packet_count(), 0);
+        client.track("Blocked_Event".into(), "{}".into()).unwrap();
+        client
+            .set_user_properties(r#"{"blocked":true}"#.into())
+            .unwrap();
+        assert_eq!(client.queued_packet_count(), 0);
+
+        client.sync_wal_io().await.unwrap();
+        drop(client);
+
+        // Opted-out state survives SDK restart
+        let reopened = PulseClient::new(cfg).unwrap();
+        assert!(reopened.is_opted_out());
+        reopened.opt_in().unwrap();
+        assert!(!reopened.is_opted_out());
     }
 }

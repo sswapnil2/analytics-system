@@ -168,3 +168,146 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   c2.shutdown();
   assert.equal(listeners.get("click")?.size, 0, "shutdown() must remove click listener");
 });
+
+test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocapture, engage, groups, revenue, replay controls, and exposures", async () => {
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+
+  const listeners = new Map();
+  globalThis.window = {
+    innerWidth: 1440,
+    innerHeight: 900,
+    location: {
+      href: "https://app.example.in/kyc?utm_source=google_ads&utm_campaign=diwali_2026&gclid=g_123",
+      pathname: "/kyc",
+      search: "?utm_source=google_ads&utm_campaign=diwali_2026&gclid=g_123",
+    },
+    addEventListener: (evt, fn) => {
+      if (!listeners.has(evt)) listeners.set(evt, new Set());
+      listeners.get(evt).add(fn);
+    },
+    removeEventListener: (evt, fn) => {
+      listeners.get(evt)?.delete(fn);
+    },
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    value: {
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Chrome/126.0.0.0",
+      language: "en-IN",
+    },
+    configurable: true,
+  });
+  globalThis.document = {
+    visibilityState: "visible",
+    title: "Pulse KYC",
+    referrer: "https://google.com/",
+    documentElement: { hasAttribute: () => false },
+    body: { querySelectorAll: () => [] },
+  };
+
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("/v1/flags/")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => '"etag_1"' },
+        json: async () => ({
+          flags: [
+            {
+              key: "one_tap_upi_mandate",
+              enabled: true,
+              rollout_bps: 10000,
+              variants: [
+                { key: "one_tap_sheet", weight_bps: 10000, payload: { theme: "bottom_sheet" } },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ status: "ok" }), headers: { get: () => null } };
+  };
+
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://127.0.0.1:18080",
+    apiKey: "pk_live_feature_parity",
+    flushIntervalMs: 0,
+    autocapture: { pageviews: true, clicks: false, forms: false },
+    propertyBlacklist: ["secret_note"],
+    replayTriggerEvents: ["Error_Hit"],
+    beforeSend: (ev) => (ev.event_name === "DropMe" ? null : ev),
+  });
+
+  // Triggered `$pageview` captures default context + UTM attribution
+  sdk.register({ app_version: "2.4.0" });
+  sdk.registerOnce({ app_version: "1.0.0", install_channel: "play_store" });
+  sdk.setGroup("merchant", "m_zepto");
+  sdk.timeEvent("KYC_Step");
+  sdk.track("DropMe", { a: 1 });
+  sdk.track("KYC_Step", { step: 2, secret_note: "ignore_me" });
+  assert.equal(sdk.getQueuedEventCount(), 2, "DropMe dropped by beforeSend, only $pageview + KYC_Step queued");
+
+  await sdk.flush();
+  const ingestPayloads = calls.filter((c) => c.url.endsWith("/v1/ingest")).flatMap((c) => c.body.events);
+  const kycEv = ingestPayloads.find((e) => e.event_name === "KYC_Step");
+  assert.equal(kycEv.props.app_version, "2.4.0");
+  assert.equal(kycEv.props.install_channel, "play_store");
+  assert.equal(kycEv.props.$group_merchant, "m_zepto");
+  assert.equal(kycEv.props.utm_source, "google_ads");
+  assert.equal(kycEv.props.initial_utm_source, "google_ads");
+  assert.equal(kycEv.props.secret_note, undefined, "propertyBlacklist must strip keys");
+  assert.equal(typeof kycEv.props.$duration_ms, "number");
+
+  // Engage, Group Props & Revenue
+  await sdk.setUserProperties({ plan: "credit_pro" });
+  await sdk.incrementUserProperty("logins", 2);
+  await sdk.setGroupProperties("merchant", "m_zepto", { tier: "enterprise" });
+  await sdk.trackRevenue({ amount: 499, currency: "INR", productId: "pro_plan" });
+  assert.ok(calls.some((c) => c.url.endsWith("/v1/engage") && c.body.$set?.plan === "credit_pro"));
+  assert.ok(calls.some((c) => c.url.endsWith("/v1/groups") && c.body.group_id === "m_zepto"));
+  assert.ok(calls.some((c) => c.url.endsWith("/v1/engage") && c.body.$track_charge?.$amount === 499));
+
+  // Replay trigger + pause/resume + console/network breadcrumbs
+  assert.equal(sdk.isRecordingSession(), false, "paused until Error_Hit trigger fires");
+  sdk.track("Error_Hit");
+  assert.equal(sdk.isRecordingSession(), true);
+  sdk.pauseSessionRecording();
+  assert.equal(sdk.isRecordingSession(), false);
+  sdk.resumeSessionRecording();
+  assert.equal(sdk.isRecordingSession(), true);
+  sdk.recordNetworkBreadcrumb("POST", "/v1/pay", 504, 1200);
+  sdk.recordConsoleError("Unhandled payment timeout");
+  assert.ok(sdk.getSessionReplayUrl().includes(sdk.getSessionId()));
+
+  // Experiment exposure deduplication & remote config payload
+  const v1 = await sdk.getVariant("one_tap_upi_mandate", { trackExposure: true });
+  const v2 = await sdk.getVariant("one_tap_upi_mandate", { trackExposure: true });
+  assert.equal(v1, "one_tap_sheet");
+  assert.equal(v2, "one_tap_sheet");
+  assert.equal(sdk.isEnabled("one_tap_upi_mandate"), true);
+  assert.deepEqual(sdk.getVariantPayload("one_tap_upi_mandate"), { theme: "bottom_sheet" });
+  await sdk.flush();
+  const exposureEvents = calls
+    .filter((c) => c.url.endsWith("/v1/ingest"))
+    .flatMap((c) => c.body.events)
+    .filter((e) => e.event_name === "$experiment_started");
+  assert.equal(exposureEvents.length, 1, "exposure event must deduplicate per session");
+
+  // Consent opt-out blocks further tracking & clears queue
+  sdk.optOut();
+  assert.equal(sdk.hasOptedOut(), true);
+  sdk.track("Should_Not_Track", {});
+  assert.equal(sdk.getQueuedEventCount(), 0);
+  sdk.optIn();
+  assert.equal(sdk.hasOptedOut(), false);
+
+  sdk.shutdown();
+});
