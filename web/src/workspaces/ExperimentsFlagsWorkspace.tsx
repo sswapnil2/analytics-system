@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, FlaskConical, Plus, RefreshCw, ToggleLeft } from "lucide-react";
 import { api, Experiment, ExperimentResults, FeatureFlag } from "../api/client";
-import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel } from "../components/ui";
+import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability } from "../lib/format";
 
 interface Props {
@@ -145,7 +145,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
         }
       >
         {!loaded ? (
-          <Spinner />
+          <ListSkeleton rows={3} />
         ) : experiments.length === 0 ? (
           <EmptyState
             icon={FlaskConical}
@@ -153,7 +153,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
             body="Experiments appear here once one is attached to a feature flag below."
           />
         ) : !expResults ? (
-          loading ? <Spinner /> : <EmptyState title="No results for this experiment yet" />
+          loading ? <ChartSkeleton rows={2} /> : <EmptyState title="No results for this experiment yet" />
         ) : (
           <div className="space-y-4">
             {rolloutBreaksTest && selectedFlag && (
@@ -303,7 +303,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, refreshT
           {flagError && <ErrorNotice message={flagError} />}
 
           {!loaded ? (
-            <Spinner />
+            <ListSkeleton />
           ) : flags.length === 0 ? (
             <EmptyState
               icon={ToggleLeft}

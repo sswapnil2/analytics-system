@@ -16,9 +16,9 @@ import {
   X,
 } from "lucide-react";
 import { api, Dashboard, DashboardCard, SavedReport } from "../api/client";
-import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Spinner } from "../components/ui";
+import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Skeleton } from "../components/ui";
 import { errorMessage, formatCount } from "../lib/format";
-import { KIND_LABEL, RangePresets, ReportCardBody } from "./ReportCard";
+import { KIND_LABEL, RangePresets, RangeSel, rangeLabel, ReportCardBody } from "./ReportCard";
 
 /** `#/dashboards` lists them; `#/dashboards/<id>` opens one. */
 export function dashboardIdFromHash(): string | null {
@@ -36,7 +36,7 @@ const REPORT_PAGE: Record<SavedReport["report_kind"], string> = {
 const KIND_ICON = { funnel: Filter, insights: LineChart, retention: CalendarCheck, flows: GitBranch } as const;
 
 /** "Funnel · 5 steps · Last 14 days", like Mixpanel's card subtitle. */
-function cardSubtitle(r: SavedReport, days: number): string {
+function cardSubtitle(r: SavedReport, range: RangeSel): string {
   const q = r.query_json as Record<string, unknown>;
   const n = (k: string) => (Array.isArray(q[k]) ? (q[k] as unknown[]).length : 0);
   const detail =
@@ -45,7 +45,7 @@ function cardSubtitle(r: SavedReport, days: number): string {
       : r.report_kind === "insights"
         ? `${n("series")} metric${n("series") === 1 ? "" : "s"}`
         : null;
-  return [KIND_LABEL[r.report_kind], detail, `Last ${days} days`].filter(Boolean).join(" · ");
+  return [KIND_LABEL[r.report_kind], detail, rangeLabel(range)].filter(Boolean).join(" · ");
 }
 
 function ago(ms: number): string {
@@ -62,6 +62,34 @@ const Menu: React.FC<{
 }> = ({ label, trigger, triggerClass, items }) => {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const close = (refocus: boolean) => {
+    setOpen(false);
+    if (refocus) triggerRef.current?.focus();
+  };
+  const menuItems = () =>
+    Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? []);
+  // Arrow keys move through items, Home/End jump, Escape returns focus to the button.
+  const onMenuKey = (e: React.KeyboardEvent) => {
+    const list = menuItems();
+    const i = list.indexOf(document.activeElement as HTMLElement);
+    const go = (n: number) => {
+      e.preventDefault();
+      list[(n + list.length) % list.length]?.focus();
+    };
+    if (e.key === "ArrowDown") go(i + 1);
+    else if (e.key === "ArrowUp") go(i - 1);
+    else if (e.key === "Home") go(0);
+    else if (e.key === "End") go(list.length - 1);
+    else if (e.key === "Escape") {
+      e.preventDefault();
+      close(true);
+    } else if (e.key === "Tab") close(false);
+  };
+  useEffect(() => {
+    if (open) menuItems()[0]?.focus();
+  }, [open]);
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
@@ -74,17 +102,33 @@ const Menu: React.FC<{
     };
   }, [open]);
   const itemClass = (danger?: boolean) =>
-    `block w-full whitespace-nowrap rounded-md px-3 py-2 text-left text-sm disabled:opacity-40 ${danger ? "text-danger hover:bg-danger-soft" : "text-ink hover:bg-hover"}`;
+    `block w-full whitespace-nowrap rounded-md px-3 py-2 text-left text-sm outline-none disabled:opacity-40 ${
+      danger ? "text-danger hover:bg-danger-soft focus:bg-danger-soft" : "text-ink hover:bg-hover focus:bg-hover"
+    }`;
   return (
     <div className="relative" ref={ref}>
-      <button type="button" className={triggerClass} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={triggerClass}
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown" && !open) {
+            e.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
         {trigger}
       </button>
       {open && (
-        <div role="menu" className="absolute right-0 top-full z-40 mt-1 min-w-[12rem] rounded-xl border border-line-strong bg-panel p-1 shadow-[0_12px_32px_rgb(0_0_0/0.16)]">
+        <div ref={menuRef} role="menu" aria-label={label} onKeyDown={onMenuKey} className="absolute right-0 top-full z-40 mt-1 min-w-[12rem] rounded-xl border border-line-strong bg-panel p-1 shadow-[0_12px_32px_rgb(0_0_0/0.16)]">
           {items.map((it) =>
             it.href ? (
-              <a key={it.label} role="menuitem" href={it.href} className={itemClass(it.danger)} onClick={() => setOpen(false)}>
+              <a key={it.label} role="menuitem" tabIndex={-1} href={it.href} className={itemClass(it.danger)} onClick={() => setOpen(false)}>
                 {it.label}
               </a>
             ) : (
@@ -92,10 +136,11 @@ const Menu: React.FC<{
                 key={it.label}
                 type="button"
                 role="menuitem"
+                tabIndex={-1}
                 disabled={it.disabled}
                 className={itemClass(it.danger)}
                 onClick={() => {
-                  setOpen(false);
+                  close(true);
                   it.onSelect?.();
                 }}
               >
@@ -208,7 +253,13 @@ const DashboardList: React.FC<{ projectId: string; refreshToken: number }> = ({ 
       {error && <ErrorNotice message={error} onRetry={() => void load()} />}
 
       {!list ? (
-        !error && <Spinner />
+        !error && (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3" role="status" aria-label="Loading dashboards">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-28 rounded-xl" />
+            ))}
+          </div>
+        )
       ) : list.length === 0 ? (
         <Panel>
           <EmptyState
@@ -262,7 +313,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
   const [reports, setReports] = useState<Map<string, SavedReport>>(new Map());
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [days, setDays] = useState<number>(14);
+  const [range, setRange] = useState<RangeSel>("14");
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [sharing, setSharing] = useState(false);
@@ -274,10 +325,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
   const [tv, setTv] = useState(false);
   const boardRef = useRef<HTMLDivElement>(null);
 
-  const refresh = () => {
-    setTick((t) => t + 1);
-    setRefreshedAt(Date.now());
-  };
+  const refresh = () => setTick((t) => t + 1);
 
   // Keep "Updated N min ago" honest, and refresh every 5 minutes in TV mode.
   useEffect(() => {
@@ -340,7 +388,16 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
       </div>
     );
   }
-  if (!dash) return <Spinner />;
+  if (!dash)
+    return (
+      <div className="space-y-5" role="status" aria-label="Loading dashboard">
+        <Skeleton className="h-9 w-72" />
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+          <Skeleton className="h-72 rounded-xl" />
+          <Skeleton className="h-72 rounded-xl" />
+        </div>
+      </div>
+    );
 
   const cards = dash.cards;
   const updateCards = (fn: (c: DashboardCard[]) => DashboardCard[]) => void persist({ ...dash, cards: fn(cards) });
@@ -427,7 +484,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
       </header>
 
       <div className="flex flex-wrap items-center gap-3">
-        <RangePresets days={days} onChange={setDays} />
+        <RangePresets value={range} onChange={setRange} />
         <span className="text-[0.8125rem] text-muted">Updated {ago(refreshedAt)}</span>
         <button type="button" onClick={refresh} className="inline-flex items-center gap-1 text-[0.8125rem] font-medium text-brand hover:underline">
           <RefreshCw className="h-3.5 w-3.5" /> Refresh
@@ -455,11 +512,22 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
           <EmptyState
             icon={LayoutDashboard}
             title="This dashboard is empty"
-            body="Add a saved report, or open Funnels, Trends or Retention and choose Save to dashboard."
+            body="Start a new report here, or add one you've already saved."
             action={
-              <button type="button" onClick={() => setAdding(true)} className={btn.primary}>
-                Add report
-              </button>
+              <div className="flex flex-wrap justify-center gap-2">
+                <a href={`#/funnels?dashboard=${dash.id}`} className={btn.primary}>
+                  New funnel
+                </a>
+                <a href={`#/trends?dashboard=${dash.id}`} className={btn.secondary}>
+                  New trend
+                </a>
+                <a href={`#/retention?dashboard=${dash.id}`} className={btn.secondary}>
+                  New retention
+                </a>
+                <button type="button" onClick={() => setAdding(true)} className={btn.secondary}>
+                  Saved report
+                </button>
+              </div>
             }
           />
         </Panel>
@@ -538,13 +606,19 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                     ) : (
                       <span className="text-[0.9375rem] font-semibold text-muted">Report removed</span>
                     )}
-                    <span className="text-xs text-muted">{report ? cardSubtitle(report, days) : "It was deleted"}</span>
+                    <span className="text-xs text-muted">{report ? cardSubtitle(report, range) : "It was deleted"}</span>
                   </div>
                   {controls}
                 </div>
                 <div className="px-5 pb-5 pt-3">
                   {report ? (
-                    <ReportCardBody projectId={projectId} report={report} days={days} refreshKey={tick} />
+                    <ReportCardBody
+                      projectId={projectId}
+                      report={report}
+                      range={range}
+                      refreshKey={tick}
+                      onLoaded={() => setRefreshedAt(Date.now())}
+                    />
                   ) : (
                     <p className="text-sm text-muted">Remove this card or add the report again.</p>
                   )}

@@ -346,7 +346,7 @@ export const App: React.FC = () => {
 
         <nav
           aria-label="Workspaces"
-          className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-[18px] md:overflow-y-auto md:px-0 md:pb-0"
+          className="no-scrollbar flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-[18px] md:overflow-y-auto md:px-0 md:pb-0"
         >
           {NAV_GROUPS.map((group) => (
             <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">

@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import { GitBranch, RefreshCw } from "lucide-react";
-import { api, default14DayRange, FlowsResult } from "../api/client";
+import { api, FlowsResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import {
   btn,
@@ -12,7 +13,7 @@ import {
   Panel,
   RanIn,
   ReportLayout,
-  Spinner,
+  ChartSkeleton,
 } from "../components/ui";
 
 interface Props {
@@ -52,23 +53,27 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [range, setRange] = useState<RangeSel>("14");
+  const reqId = useRef(0);
+
   const runFlows = useCallback(async () => {
+    const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
       const res = await api.queryFlows(projectId, {
-        time_range: default14DayRange(),
+        time_range: rangeFor(range),
         anchor_event: anchorEvent,
         direction,
         steps,
       });
-      setResult(res);
+      if (id === reqId.current) setResult(res);
     } catch (err) {
-      setError(errorMessage(err));
+      if (id === reqId.current) setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, anchorEvent, direction, steps]);
+  }, [projectId, anchorEvent, direction, steps, range]);
 
   useEffect(() => {
     void runFlows();
@@ -201,13 +206,19 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
         title={`${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)}`}
         description="Journey: what users do before or after a key event."
         actions={
+          <>
+          <RangePresets value={range} onChange={setRange} />
           <button type="button" onClick={() => void runFlows()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
             <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
           </button>
+          </>
         }
       />
 
       <ReportLayout
+        summary={`${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)} · ${steps} steps${
+          hideSystem ? " · system events hidden" : ""
+        }`}
         query={
       <Panel title="Query">
         <div className="flex flex-col gap-4">
@@ -349,14 +360,12 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
             </div>
           </>
         ) : loading ? (
-          <div className="flex h-64 items-center justify-center">
-            <Spinner />
-          </div>
+          <ChartSkeleton />
         ) : (
           <EmptyState
             icon={GitBranch}
             title="No journeys found"
-            body={`Nobody did ${humanizeEvent(anchorEvent)} in the last 14 days. Pick a different key event.`}
+            body={`Nobody did ${humanizeEvent(anchorEvent)} ${rangePhrase(range)}. Pick a different key event.`}
           />
         )}
       </Panel>

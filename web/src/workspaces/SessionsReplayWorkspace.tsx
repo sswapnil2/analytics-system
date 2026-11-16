@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, RefreshCw, Search, Zap } from "lucide-react";
 import { api, SessionSearchResult, SessionSummaryItem } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
-import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Spinner } from "../components/ui";
+import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, ListSkeleton } from "../components/ui";
 import { displayUserId, errorMessage, formatCount, formatDuration, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -121,7 +121,7 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
           className="xl:col-span-4"
         >
           {loading && !searchRes ? (
-            <Spinner label="Searching" />
+            <ListSkeleton rows={6} />
           ) : sessions.length === 0 ? (
             <EmptyState
               icon={Search}

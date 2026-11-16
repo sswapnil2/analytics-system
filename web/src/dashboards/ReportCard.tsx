@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   FunnelResult,
@@ -7,20 +7,140 @@ import {
   SavedReport,
   TimeRange,
 } from "../api/client";
-import { Spinner } from "../components/ui";
+import { btn, ChartSkeleton, field, fieldLabel } from "../components/ui";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
-export const RANGE_OPTIONS = [
-  { days: 7, label: "Last 7 days" },
-  { days: 14, label: "Last 14 days" },
-  { days: 30, label: "Last 30 days" },
-  { days: 90, label: "Last 90 days" },
-] as const;
+/**
+ * A date range choice: "today", "yesterday", a number of days ("7", "14"…),
+ * or "custom:YYYY-MM-DD:YYYY-MM-DD" (inclusive local dates).
+ */
+export type RangeSel = string;
 
-export function rangeForDays(days: number): TimeRange {
+const PRESETS: [RangeSel, string][] = [
+  ["today", "Today"],
+  ["yesterday", "Yesterday"],
+  ["7", "7D"],
+  ["14", "14D"],
+  ["30", "30D"],
+  ["90", "90D"],
+];
+
+const DAY_MS = 86_400_000;
+const startOfToday = () => new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+const parseDay = (d: string) => new Date(`${d}T00:00:00`).getTime();
+const fmtDay = (ms: number) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+
+export function rangeFor(sel: RangeSel): TimeRange {
   const now = Date.now();
-  return { start_ts_ms: now - days * 86_400_000, end_ts_ms: now + 3_600_000 };
+  if (sel === "today") return { start_ts_ms: startOfToday(), end_ts_ms: now + 3_600_000 };
+  if (sel === "yesterday") return { start_ts_ms: startOfToday() - DAY_MS, end_ts_ms: startOfToday() };
+  if (sel.startsWith("custom:")) {
+    const [, from, to] = sel.split(":");
+    return { start_ts_ms: parseDay(from), end_ts_ms: parseDay(to) + DAY_MS };
+  }
+  return { start_ts_ms: now - Number(sel) * DAY_MS, end_ts_ms: now + 3_600_000 };
 }
+
+/** Length of the range in days, for picking day or week buckets. */
+export function rangeDays(sel: RangeSel): number {
+  const r = rangeFor(sel);
+  return Math.max(1, Math.round((r.end_ts_ms - r.start_ts_ms) / DAY_MS));
+}
+
+/** "Last 14 days", "Today", "3 Nov – 15 Nov". */
+export function rangeLabel(sel: RangeSel): string {
+  if (sel === "today") return "Today";
+  if (sel === "yesterday") return "Yesterday";
+  if (sel.startsWith("custom:")) {
+    const [, from, to] = sel.split(":");
+    return `${fmtDay(parseDay(from))} – ${fmtDay(parseDay(to))}`;
+  }
+  return `Last ${sel} days`;
+}
+
+/** For sentences: "in the last 14 days", "today", "between 3 Nov and 15 Nov". */
+export function rangePhrase(sel: RangeSel): string {
+  if (sel === "today" || sel === "yesterday") return sel;
+  if (sel.startsWith("custom:")) {
+    const [, from, to] = sel.split(":");
+    return `between ${fmtDay(parseDay(from))} and ${fmtDay(parseDay(to))}`;
+  }
+  return `in the last ${sel} days`;
+}
+
+const iso = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+/** Mixpanel-style date preset bar with a Custom from/to popover. */
+export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) => void }> = ({ value, onChange }) => {
+  const [open, setOpen] = useState(false);
+  const r = rangeFor(value);
+  const [from, setFrom] = useState(iso(r.start_ts_ms));
+  const [to, setTo] = useState(iso(Math.min(Date.now(), r.end_ts_ms - 1)));
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    const onDown = (e: MouseEvent) => ref.current && !ref.current.contains(e.target as Node) && setOpen(false);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+  const custom = value.startsWith("custom:");
+  const seg = (on: boolean) =>
+    `whitespace-nowrap rounded-md px-2.5 py-1.5 font-medium ${on ? "bg-brand text-on-brand" : "text-ink-2 hover:bg-hover"}`;
+  const valid = from && to && from <= to;
+  return (
+    <div className="relative max-w-full" ref={ref}>
+      <div role="group" aria-label="Date range" className="no-scrollbar flex max-w-full overflow-x-auto rounded-lg border border-line bg-panel p-0.5 text-[0.8125rem]">
+        {PRESETS.map(([k, label]) => (
+          <button key={k} type="button" aria-pressed={value === k} onClick={() => onChange(k)} className={seg(value === k)}>
+            {label}
+          </button>
+        ))}
+        <button type="button" aria-pressed={custom} aria-expanded={open} onClick={() => setOpen((v) => !v)} className={seg(custom)}>
+          {custom ? rangeLabel(value) : "Custom"}
+        </button>
+      </div>
+      {open && (
+        <form
+          className="absolute left-0 top-full z-40 mt-2 flex w-[min(20rem,calc(100vw-2rem))] flex-col gap-3 rounded-xl border border-line-strong bg-panel p-4 shadow-[0_12px_32px_rgb(0_0_0/0.16)]"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!valid) return;
+            onChange(`custom:${from}:${to}`);
+            setOpen(false);
+          }}
+        >
+          <div className="grid grid-cols-2 gap-3">
+            <label className="flex flex-col gap-1.5">
+              <span className={fieldLabel}>From</span>
+              <input type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} className={field} />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className={fieldLabel}>To</span>
+              <input type="date" value={to} min={from || undefined} max={iso(Date.now())} onChange={(e) => setTo(e.target.value)} className={field} />
+            </label>
+          </div>
+          {!valid && <p className="text-[0.8125rem] text-danger">Pick a start date on or before the end date.</p>}
+          <div className="flex justify-end gap-2">
+            <button type="button" className={btn.ghost} onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+            <button type="submit" className={btn.primary} disabled={!valid}>
+              Apply
+            </button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+};
 
 export const KIND_LABEL: Record<SavedReport["report_kind"], string> = {
   funnel: "Funnel",
@@ -40,12 +160,13 @@ type CardResult =
   | { kind: "retention"; data: RetentionResult };
 
 /** Runs a saved report with the dashboard's date range and draws a compact version of it. */
-export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; days: number; refreshKey?: number }> = ({
-  projectId,
-  report,
-  days,
-  refreshKey = 0,
-}) => {
+export const ReportCardBody: React.FC<{
+  projectId: string;
+  report: SavedReport;
+  range: RangeSel;
+  refreshKey?: number;
+  onLoaded?: () => void;
+}> = ({ projectId, report, range, refreshKey = 0, onLoaded }) => {
   const [result, setResult] = useState<CardResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -53,14 +174,14 @@ export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; 
   const run = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const body = { ...report.query_json, time_range: rangeForDays(days) };
+    const body = { ...report.query_json, time_range: rangeFor(range) };
     try {
       if (report.report_kind === "funnel") {
         setResult({ kind: "funnel", data: await api.queryFunnel(projectId, body) });
       } else if (report.report_kind === "insights") {
         setResult({
           kind: "insights",
-          data: await api.queryInsights(projectId, { ...body, interval: days > 30 ? "week" : "day" }),
+          data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }),
         });
       } else if (report.report_kind === "retention") {
         setResult({ kind: "retention", data: await api.queryRetention(projectId, body) });
@@ -71,8 +192,10 @@ export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; 
       setError(errorMessage(err));
     } finally {
       setLoading(false);
+      onLoaded?.();
     }
-  }, [projectId, report, days]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, report, range]);
 
   useEffect(() => {
     void run();
@@ -90,9 +213,7 @@ export const ReportCardBody: React.FC<{ projectId: string; report: SavedReport; 
   }
   if (!result) {
     return (
-      <div className="flex h-32 items-center justify-center">
-        <Spinner />
-      </div>
+      <ChartSkeleton />
     );
   }
   return (
@@ -258,20 +379,3 @@ const RetentionMini: React.FC<{ data: RetentionResult }> = ({ data }) => {
     </div>
   );
 };
-
-/** Mixpanel-style date preset bar for report pages. */
-export const RangePresets: React.FC<{ days: number; onChange: (days: number) => void }> = ({ days, onChange }) => (
-  <div role="group" aria-label="Date range" className="inline-flex rounded-lg border border-line bg-panel p-0.5 text-[0.8125rem]">
-    {RANGE_OPTIONS.map((o) => (
-      <button
-        key={o.days}
-        type="button"
-        aria-pressed={days === o.days}
-        onClick={() => onChange(o.days)}
-        className={`rounded-md px-2.5 py-1 font-medium ${days === o.days ? "bg-brand text-on-brand" : "text-ink-2 hover:bg-sunken"}`}
-      >
-        {o.days}D
-      </button>
-    ))}
-  </div>
-);

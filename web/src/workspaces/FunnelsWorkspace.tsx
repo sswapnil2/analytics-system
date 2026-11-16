@@ -3,7 +3,7 @@ import { ArrowDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { SaveToDashboard } from "../dashboards/SaveToDashboard";
-import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
+import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -14,7 +14,9 @@ import {
   Panel,
   RanIn,
   ReportLayout,
-  Spinner,
+  ChartSkeleton,
+  SortHeader,
+  useSort,
 } from "../components/ui";
 import {
   displayUserId,
@@ -82,7 +84,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     [steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy],
   );
 
-  const [days, setDays] = useState(14);
+  const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
 
   const runFunnel = useCallback(async () => {
@@ -90,14 +92,14 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFunnel(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      const res = await api.queryFunnel(projectId, { time_range: rangeFor(range), ...buildQuery() });
       if (id === reqId.current) setResult(res);
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, days]);
+  }, [projectId, buildQuery, range]);
 
   useEffect(() => {
     void runFunnel();
@@ -130,7 +132,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
         description="Funnel: where users drop out, with recordings of the ones who left."
         actions={
           <>
-            <RangePresets days={days} onChange={setDays} />
+            <RangePresets value={range} onChange={setRange} />
             <SaveToDashboard
               projectId={projectId}
               kind="funnel"
@@ -145,6 +147,11 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
       />
 
       <ReportLayout
+        summary={[
+          `${steps.length} steps`,
+          `within ${WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}`,
+          breakdownBy ? `split by ${humanizeEvent(breakdownBy)}` : "no split",
+        ].join(" · ")}
         query={
       <Panel title="Steps">
         <ol className="flex flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
@@ -261,9 +268,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
 
       {!result && loading && (
         <Panel>
-          <div className="flex h-48 items-center justify-center">
-            <Spinner label="Running funnel" />
-          </div>
+          <ChartSkeleton rows={5} />
         </Panel>
       )}
 
@@ -271,7 +276,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
         <Panel title="Conversion" meta={<RanIn us={result.exec_time_us} />}>
           {first.entered_users === 0 ? (
             <EmptyState
-              title={`No one did the first step in the last ${days} days`}
+              title={`No one did the first step ${rangePhrase(range)}`}
               body={`Check that "${humanizeEvent(first.event_name)}" is being sent, or pick a different first step.`}
             />
           ) : (
@@ -385,46 +390,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             {result.breakdowns.length === 0 ? (
               <p className="text-sm text-muted">Choose a property in "Split by" to compare segments.</p>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-line text-left text-xs text-muted">
-                      <th className="py-2 pr-3 font-medium">Segment</th>
-                      <th className="py-2 pr-3 text-right font-medium">Started</th>
-                      <th className="py-2 pr-3 text-right font-medium">Completed</th>
-                      <th className="py-2 text-right font-medium">Conversion</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-line">
-                    {[...result.breakdowns]
-                      .sort(
-                        (a, b) =>
-                          (b.steps[b.steps.length - 1]?.conversion_from_start_pct ?? 0) -
-                          (a.steps[a.steps.length - 1]?.conversion_from_start_pct ?? 0),
-                      )
-                      .map((bg) => {
-                        const started = bg.steps[0]?.entered_users ?? 0;
-                        const done = bg.steps[bg.steps.length - 1]?.entered_users ?? 0;
-                        const rate = bg.steps[bg.steps.length - 1]?.conversion_from_start_pct ?? 0;
-                        return (
-                          <tr key={bg.breakdown_value}>
-                            <td className="py-2 pr-3 text-ink">{bg.breakdown_value || "(not set)"}</td>
-                            <td className="py-2 pr-3 text-right text-ink-2">{formatCount(started)}</td>
-                            <td className="py-2 pr-3 text-right text-ink-2">{formatCount(done)}</td>
-                            <td className="py-2 text-right">
-                              <span className="inline-flex items-center gap-2">
-                                <span className="hidden h-1.5 w-16 overflow-hidden rounded-full bg-sunken sm:block">
-                                  <span className="block h-full bg-brand" style={{ width: `${Math.min(100, rate)}%` }} />
-                                </span>
-                                <span className="font-medium text-ink">{pct(rate)}</span>
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
-              </div>
+              <SegmentCompare groups={result.breakdowns} />
             )}
           </Panel>
 
@@ -595,6 +561,82 @@ const DropOffDrawer: React.FC<{
             )}
           </div>
         </div>
+      </div>
+    </div>
+  );
+};
+
+const SEG_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn))", "rgb(var(--ink-2))"];
+
+type SegKey = "segment" | "started" | "completed" | "rate";
+
+/** Funnel split by a property: per-step bars for the biggest segments, then a sortable table. */
+const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ groups }) => {
+  const sort = useSort<SegKey>("rate");
+  const started = (g: FunnelResult["breakdowns"][number]) => g.steps[0]?.entered_users ?? 0;
+  const done = (g: FunnelResult["breakdowns"][number]) => g.steps[g.steps.length - 1]?.entered_users ?? 0;
+  const rate = (g: FunnelResult["breakdowns"][number]) => g.steps[g.steps.length - 1]?.conversion_from_start_pct ?? 0;
+  const top = [...groups].sort((a, b) => started(b) - started(a)).slice(0, SEG_COLORS.length);
+  const stepNames = top[0]?.steps.map((st) => humanizeEvent(st.event_name)) ?? [];
+  const rows = sort.sortBy(groups, (g, k) =>
+    k === "segment" ? g.breakdown_value || "(not set)" : k === "started" ? started(g) : k === "completed" ? done(g) : rate(g),
+  );
+  return (
+    <div className="space-y-5">
+      <div>
+        <ul className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[0.8125rem] text-ink-2">
+          {top.map((g, i) => (
+            <li key={g.breakdown_value} className="inline-flex items-center gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-sm" style={{ background: SEG_COLORS[i] }} aria-hidden="true" />
+              {g.breakdown_value || "(not set)"}
+            </li>
+          ))}
+        </ul>
+        <ol className="space-y-3">
+          {stepNames.slice(1).map((name, si) => (
+            <li key={name + si}>
+              <p className="mb-1 text-[0.8125rem] font-medium text-ink">
+                {si + 2}. {name}
+              </p>
+              <div className="space-y-1">
+                {top.map((g, i) => {
+                  const p = g.steps[si + 1]?.conversion_from_start_pct ?? 0;
+                  return (
+                    <div key={g.breakdown_value} className="flex items-center gap-2">
+                      <span className="h-2.5 flex-1 overflow-hidden rounded-sm bg-sunken">
+                        <span className="block h-full" style={{ width: `${Math.min(100, p)}%`, background: SEG_COLORS[i] }} />
+                      </span>
+                      <span className="tabular w-12 text-right text-xs text-ink-2">{pct(p)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </li>
+          ))}
+        </ol>
+        <p className="mt-2 text-xs text-muted">Share of each segment's starters who reached the step.</p>
+      </div>
+      <div className="max-h-[24rem] overflow-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-line text-xs text-muted">
+              <SortHeader label="Segment" active={sort.key === "segment"} desc={sort.desc} onClick={() => sort.toggle("segment")} />
+              <SortHeader label="Started" align="right" active={sort.key === "started"} desc={sort.desc} onClick={() => sort.toggle("started")} />
+              <SortHeader label="Completed" align="right" active={sort.key === "completed"} desc={sort.desc} onClick={() => sort.toggle("completed")} />
+              <SortHeader label="Conversion" align="right" active={sort.key === "rate"} desc={sort.desc} onClick={() => sort.toggle("rate")} />
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-line">
+            {rows.map((g) => (
+              <tr key={g.breakdown_value}>
+                <td className="py-2 pr-3 text-ink">{g.breakdown_value || "(not set)"}</td>
+                <td className="tabular py-2 pl-3 text-right text-ink-2">{formatCount(started(g))}</td>
+                <td className="tabular py-2 pl-3 text-right text-ink-2">{formatCount(done(g))}</td>
+                <td className="tabular py-2 pl-3 text-right font-medium text-ink">{pct(rate(g))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );

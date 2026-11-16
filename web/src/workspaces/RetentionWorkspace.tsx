@@ -3,7 +3,7 @@ import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import { SaveToDashboard } from "../dashboards/SaveToDashboard";
-import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
+import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -14,7 +14,7 @@ import {
   Panel,
   RanIn,
   ReportLayout,
-  Spinner,
+  ChartSkeleton,
 } from "../components/ui";
 
 interface Props {
@@ -45,7 +45,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     [startEvent, returnEvent, mode, numPeriods],
   );
 
-  const [days, setDays] = useState(14);
+  const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
 
   const runRetention = useCallback(async () => {
@@ -53,14 +53,14 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryRetention(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      const res = await api.queryRetention(projectId, { time_range: rangeFor(range), ...buildQuery() });
       if (id === reqId.current) setResult(res);
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, days]);
+  }, [projectId, buildQuery, range]);
 
   useEffect(() => {
     void runRetention();
@@ -85,7 +85,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
         description="Retention: how many users come back after their first action."
         actions={
           <>
-            <RangePresets days={days} onChange={setDays} />
+            <RangePresets value={range} onChange={setRange} />
             <SaveToDashboard
               projectId={projectId}
               kind="retention"
@@ -100,6 +100,9 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       />
 
       <ReportLayout
+        summary={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)} · ${
+          MODES.find(([k]) => k === mode)?.[1].toLowerCase() ?? ""
+        }`}
         query={
       <Panel title="Query">
         <div className="flex flex-col gap-4">
@@ -123,30 +126,22 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
               ))}
             </select>
           </label>
-          <div className="flex flex-col gap-1">
-            <span className={fieldLabel} id="retention-mode">
-              Count users who
-            </span>
-            <div
-              className="flex flex-wrap rounded-lg border border-line-strong p-0.5"
-              role="group"
-              aria-labelledby="retention-mode"
-            >
-              {MODES.map(([k, text]) => (
-                <button
-                  key={k}
-                  type="button"
-                  aria-pressed={mode === k}
-                  onClick={() => setMode(k)}
-                  className={`rounded px-2.5 py-1 text-sm ${
-                    mode === k ? "bg-brand text-on-brand" : "text-muted hover:text-ink"
-                  }`}
-                >
-                  {text}
-                </button>
-              ))}
-            </div>
-          </div>
+          <fieldset className="flex flex-col gap-1.5">
+            <legend className={`${fieldLabel} mb-1.5`}>Count users who</legend>
+            {MODES.map(([k, text]) => (
+              <label key={k} className="flex cursor-pointer items-center gap-2.5 py-0.5 text-sm text-ink">
+                <input
+                  type="radio"
+                  name="retention-mode"
+                  value={k}
+                  checked={mode === k}
+                  onChange={() => setMode(k)}
+                  className="h-4 w-4 accent-brand"
+                />
+                {text}
+              </label>
+            ))}
+          </fieldset>
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Days to show</span>
             <select value={numPeriods} onChange={(e) => setNumPeriods(Number(e.target.value))} className={field}>
@@ -174,14 +169,12 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       >
         {cohorts.length === 0 ? (
           loading ? (
-            <div className="flex h-48 items-center justify-center">
-              <Spinner />
-            </div>
+            <ChartSkeleton rows={6} />
           ) : (
             <EmptyState
               icon={CalendarCheck}
               title="No users to follow yet"
-              body={`Nobody did ${humanizeEvent(startEvent)} in the last ${days} days. Pick a different first action.`}
+              body={`Nobody did ${humanizeEvent(startEvent)} ${rangePhrase(range)}. Pick a different first action.`}
             />
           )
         ) : (
@@ -258,6 +251,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
 
 /** Mixpanel-style retention curve: average % back on each day, weighted by users. */
 const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods: number }> = ({ cohorts, numPeriods }) => {
+  const [hover, setHover] = useState<number | null>(null);
   const pts: (number | null)[] = Array.from({ length: numPeriods + 1 }, (_, d) => {
     let users = 0;
     let back = 0;
@@ -279,8 +273,22 @@ const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods
   const line = known.map(([d, v], i) => `${i ? "L" : "M"}${x(d).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
   const area = `${line} L${x(known[known.length - 1][0])},${y(0)} L${x(known[0][0])},${y(0)} Z`;
   const ticks = [0, max / 2, max].map((t) => Math.round(t));
+  const hv = hover !== null ? known.find(([d]) => d === hover) : undefined;
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Average retention by day; exact values are in the table below">
+    <div className="relative">
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="w-full"
+      role="img"
+      aria-label="Average retention by day; exact values are in the table below"
+      onMouseMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const vx = ((e.clientX - r.left) / r.width) * W;
+        const d = Math.round(((vx - pad.l) / (W - pad.l - pad.r)) * numPeriods);
+        setHover(d >= 1 && d <= numPeriods ? d : null);
+      }}
+      onMouseLeave={() => setHover(null)}
+    >
       {ticks.map((t) => (
         <g key={t}>
           <line x1={pad.l} x2={W - pad.r} y1={y(t)} y2={y(t)} stroke="rgb(var(--line))" />
@@ -291,10 +299,9 @@ const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods
       ))}
       <path d={area} fill="rgb(var(--brand) / 0.1)" />
       <path d={line} fill="none" stroke="rgb(var(--brand))" strokeWidth={2.5} strokeLinejoin="round" />
+      {hv && <line x1={x(hv[0])} x2={x(hv[0])} y1={pad.t} y2={y(0)} stroke="rgb(var(--line-strong))" strokeWidth={1.5} />}
       {known.map(([d, v]) => (
-        <circle key={d} cx={x(d)} cy={y(v)} r={3} fill="rgb(var(--brand))">
-          <title>{`Day ${d}: ${v.toFixed(1)}%`}</title>
-        </circle>
+        <circle key={d} cx={x(d)} cy={y(v)} r={hover === d ? 5 : 3} fill="rgb(var(--brand))" />
       ))}
       {pts.map((_, d) => (
         <text key={d} x={x(d)} y={H - 6} textAnchor="middle" className="fill-faint text-[11px]">
@@ -302,5 +309,15 @@ const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods
         </text>
       ))}
     </svg>
+    {hv && (
+      <div
+        className="pointer-events-none absolute top-0 rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-[0_8px_24px_rgb(0_0_0/0.12)]"
+        style={x(hv[0]) / W > 0.6 ? { right: `${100 - (x(hv[0]) / W) * 100 + 2}%` } : { left: `${(x(hv[0]) / W) * 100 + 2}%` }}
+      >
+        <p className="font-semibold text-ink">Day {hv[0]}</p>
+        <p className="tabular text-ink-2">{hv[1].toFixed(1)}% came back</p>
+      </div>
+    )}
+    </div>
   );
 };

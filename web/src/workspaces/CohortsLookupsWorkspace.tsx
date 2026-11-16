@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, Upload, Users } from "lucide-react";
 import { api } from "../api/client";
-import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel } from "../components/ui";
+import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -269,7 +269,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               Saved cohorts <span className="tabular text-muted">({formatCount(cohorts.length)})</span>
             </h3>
             {loading && cohorts.length === 0 ? (
-              <Spinner />
+              <ListSkeleton />
             ) : cohorts.length === 0 ? (
               <EmptyState
                 icon={Users}

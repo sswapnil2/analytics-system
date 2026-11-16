@@ -3,7 +3,7 @@ import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
 import { SaveToDashboard } from "../dashboards/SaveToDashboard";
-import { RangePresets, rangeForDays } from "../dashboards/ReportCard";
+import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -14,7 +14,9 @@ import {
   Panel,
   RanIn,
   ReportLayout,
-  Spinner,
+  ChartSkeleton,
+  SortHeader,
+  useSort,
 } from "../components/ui";
 
 interface Props {
@@ -140,6 +142,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [breakdown, setBreakdown] = useState<string>("city");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const sort = useSort<"metric" | "segment" | "overall">("overall");
   const [result, setResult] = useState<InsightsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,7 +164,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
     [series, formula, breakdown, comparePrev],
   );
 
-  const [days, setDays] = useState(14);
+  const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
 
   const runQuery = useCallback(async () => {
@@ -168,14 +172,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryInsights(projectId, { time_range: rangeForDays(days), ...buildQuery() });
+      const res = await api.queryInsights(projectId, { time_range: rangeFor(range), ...buildQuery() });
       if (id === reqId.current) setResult(res);
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, days]);
+  }, [projectId, buildQuery, range]);
 
   useEffect(() => {
     void runQuery();
@@ -235,7 +239,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
   );
   const eventOptions = availableEvents.length > 0 ? availableEvents : FALLBACK_EVENTS;
 
-  const reportTitle = series.map((s) => humanizeEvent(s.eventName)).join(" and ");
+  const reportTitle = formula.trim()
+    ? formula
+        .trim()
+        .replace(/\b([A-Z])\b/g, (m) => {
+          const d = series.find((x) => x.label === m);
+          return d ? humanizeEvent(d.eventName) : m;
+        })
+        .replace(/\*/g, "×")
+    : series.map((s) => humanizeEvent(s.eventName)).join(" and ");
 
   return (
     <div className="space-y-5">
@@ -244,7 +256,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         description="Trend: how an event or metric changes over time, by segment."
         actions={
           <>
-            <RangePresets days={days} onChange={setDays} />
+            <RangePresets value={range} onChange={setRange} />
             <SaveToDashboard
               projectId={projectId}
               kind="insights"
@@ -259,6 +271,13 @@ export const InsightsWorkspace: React.FC<Props> = ({
       />
 
       <ReportLayout
+        summary={[
+          `${series.length} metric${series.length === 1 ? "" : "s"}`,
+          formula.trim() ? `formula ${formula.trim()}` : null,
+          breakdown ? `by ${breakdown.replace(/_/g, " ")}` : "no breakdown",
+        ]
+          .filter(Boolean)
+          .join(" · ")}
         query={
       <Panel
         title="Metrics"
@@ -393,7 +412,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
 
       <Panel
-        title={chartType === "number" ? "Total" : "Over time"}
+        title={chartType === "number" ? "For the whole period" : "Over time"}
         meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
         actions={
             <div className="flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Chart type">
@@ -421,16 +440,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
       >
         {!result ? (
           loading ? (
-            <div className="flex h-64 items-center justify-center">
-              <Spinner />
-            </div>
+            <ChartSkeleton />
           ) : (
             <EmptyState title="No results yet" body="Pick an event and run the query." icon={LineChart} />
           )
         ) : !hasData ? (
           <EmptyState
             title="No activity in this period"
-            body={`None of these events happened in the last ${days} days. Try a different event or remove the breakdown.`}
+            body={`None of these events happened ${rangePhrase(range)}. Try a different event or remove the breakdown.`}
             icon={LineChart}
           />
         ) : chartType === "number" ? (
@@ -453,7 +470,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   {change !== null && Number.isFinite(change) && (
                     <p className={`text-sm font-semibold ${change >= 0 ? "text-ok" : "text-danger"}`}>
                       {change >= 0 ? "+" : "−"}
-                      {Math.abs(change).toFixed(0)}% <span className="font-normal text-muted">vs previous {days} days</span>
+                      {Math.abs(change).toFixed(0)}% <span className="font-normal text-muted">vs the previous period</span>
                     </p>
                   )}
                 </li>
@@ -472,13 +489,30 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 </li>
               ))}
             </ul>
-            <div className="h-64 w-full">
+            <div className="relative h-64 w-full">
               <svg
                 viewBox="0 0 900 230"
                 className="h-full w-full overflow-visible"
                 role="img"
                 aria-label="Trend chart; values are listed in the table below"
+                onMouseMove={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const x = ((e.clientX - r.left) / r.width) * 900;
+                  const i = Math.floor((x - PLOT.left) / bandW);
+                  setHoverIdx(i >= 0 && i < n ? i : null);
+                }}
+                onMouseLeave={() => setHoverIdx(null)}
               >
+                {hoverIdx !== null && (
+                  <line
+                    x1={xAt(hoverIdx)}
+                    x2={xAt(hoverIdx)}
+                    y1={PLOT.bottom - PLOT_H}
+                    y2={PLOT.bottom}
+                    stroke="rgb(var(--line-strong))"
+                    strokeWidth={1.5}
+                  />
+                )}
                 {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
                   const y = yAt(maxY * frac);
                   return (
@@ -573,6 +607,32 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   ),
                 )}
               </svg>
+              {hoverIdx !== null && (
+                <div
+                  className="pointer-events-none absolute top-2 z-10 min-w-[11rem] rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-[0_8px_24px_rgb(0_0_0/0.12)]"
+                  style={
+                    xAt(hoverIdx) / 900 > 0.6
+                      ? { right: `${100 - (xAt(hoverIdx) / 900) * 100 + 1.5}%` }
+                      : { left: `${(xAt(hoverIdx) / 900) * 100 + 1.5}%` }
+                  }
+                >
+                  <p className="mb-1.5 font-semibold text-ink">
+                    {new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}
+                    {hoverIdx === n - 1 && <span className="font-normal text-muted"> (so far)</span>}
+                  </p>
+                  <ul className="space-y-1">
+                    {displayedSeries.map((s, idx) => (
+                      <li key={`${s.label}-${s.breakdown_key}`} className="flex items-center gap-2">
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color(idx) }} aria-hidden="true" />
+                        <span className="min-w-0 flex-1 truncate text-ink-2">
+                          {s.breakdown_key || seriesName(s)}
+                        </span>
+                        <span className="tabular font-semibold text-ink">{formatValue(s.points[hoverIdx]?.value ?? null)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           </>
         )}
@@ -588,28 +648,30 @@ export const InsightsWorkspace: React.FC<Props> = ({
             </button>
           }
         >
-          <div className="-mx-4 overflow-x-auto px-4">
+          <div className="-mx-4 max-h-[28rem] overflow-auto px-4">
             <table className="w-full min-w-[720px] text-left text-sm">
               <thead>
                 <tr className="border-b border-line text-xs text-muted">
-                  <th className="sticky left-0 z-10 bg-panel py-2 pr-4 font-medium">Metric</th>
-                  <th className="py-2 pr-4 font-medium">Segment</th>
-                  <th className="py-2 pr-4 text-right font-medium">Overall</th>
+                  <SortHeader label="Metric" active={sort.key === "metric"} desc={sort.desc} onClick={() => sort.toggle("metric")} />
+                  <SortHeader label="Segment" active={sort.key === "segment"} desc={sort.desc} onClick={() => sort.toggle("segment")} />
+                  <SortHeader label="Overall" align="right" active={sort.key === "overall"} desc={sort.desc} onClick={() => sort.toggle("overall")} />
                   {tableBuckets.map((ts) => (
-                    <th key={ts} className="whitespace-nowrap px-2 py-2 text-right font-medium">
+                    <th key={ts} className="sticky top-0 z-10 whitespace-nowrap bg-panel px-2 py-2 text-right font-medium">
                       {formatDay(ts)}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {tableRows.map((row, idx) => (
+                {sort.sortBy(tableRows, (r, k) =>
+                  k === "metric" ? seriesName(r) : k === "segment" ? r.breakdown_key || "All users" : r.overall_value ?? -Infinity,
+                ).map((row, idx) => (
                   <tr key={`${row.label}-${row.breakdown_key}-${idx}`} className="hover:bg-hover">
-                    <td className="sticky left-0 z-10 whitespace-nowrap bg-panel py-2 pr-4 text-ink">
+                    <td className="whitespace-nowrap py-2 pr-4 text-ink">
                       {seriesName(row)}
                     </td>
                     <td className="whitespace-nowrap py-2 pr-4 text-ink-2">{row.breakdown_key || "All users"}</td>
-                    <td className="tabular py-2 pr-4 text-right font-semibold text-ink">
+                    <td className="tabular py-2 pl-3 text-right font-semibold text-ink">
                       {formatValue(row.overall_value)}
                     </td>
                     {row.points.slice(-7).map((pt) => (

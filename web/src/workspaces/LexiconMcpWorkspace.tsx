@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Bot, Play } from "lucide-react";
 import { api, LexiconEvent, LexiconProperty } from "../api/client";
-import { EmptyState, ErrorNotice, PageHeader, Panel, Spinner, btn, field, fieldLabel } from "../components/ui";
+import { EmptyState, ErrorNotice, PageHeader, Panel, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { displayUserId, errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -177,7 +177,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
 
   const tableState = (count: number, emptyTitle: string, emptyBody: string) =>
     lexLoading && count === 0 ? (
-      <Spinner />
+      <ListSkeleton rows={6} />
     ) : lexError ? (
       <ErrorNotice message={lexError} onRetry={() => void loadLexicon()} />
     ) : count === 0 ? (
@@ -187,7 +187,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
   return (
     <div>
       <PageHeader
-        title="Events & privacy"
+        title="Events and privacy"
         description="Control which events are kept and which properties are masked. Includes the AI tools endpoint."
       />
 
