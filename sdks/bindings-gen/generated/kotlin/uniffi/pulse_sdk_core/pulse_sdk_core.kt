@@ -745,6 +745,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -786,6 +788,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_refresh_flags(`ptr`: Pointer,
     ): Long
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_session_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_shutdown(`ptr`: Pointer,
@@ -920,6 +924,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags(
     ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_reset(
+    ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id(
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_shutdown(
@@ -948,10 +954,10 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_distinct_id() != 8695.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_evaluate_flag() != 47825.toShort()) {
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_evaluate_flag() != 38866.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 27482.toShort()) {
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 13927.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_identify() != 25556.toShort()) {
@@ -963,10 +969,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_touch() != 7099.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 26495.toShort()) {
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 32896.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054.toShort()) {
@@ -1410,12 +1419,13 @@ public interface PulseClientInterface {
     fun `distinctId`(): kotlin.String
     
     /**
-     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms.
+     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms (`P2-02`, `P2-03`).
      */
     suspend fun `evaluateFlag`(`flagKey`: kotlin.String): kotlin.String?
     
     /**
-     * Seals active in-memory rings into the bounded 10 MB circular disk WAL and transmits all queued packets.
+     * Seals active in-memory rings into the bounded 10 MB binary disk WAL and transmits all queued packets
+     * under a single flush mutex, removing packets strictly by ID (`P2-06`, `P2-07`, `P1-13`).
      */
     suspend fun `flush`(): kotlin.UInt
     
@@ -1432,11 +1442,17 @@ public interface PulseClientInterface {
     fun `recordTouch`(`x`: kotlin.UShort, `y`: kotlin.UShort, `targetIsInteractive`: kotlin.Boolean, `tsMs`: kotlin.Long): kotlin.String
     
     /**
-     * Records a wireframe layout snapshot strictly masking all `masked_input` labels into `████` on client!
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
      */
     fun `recordWireframeSnapshot`(`width`: kotlin.UShort, `height`: kotlin.UShort, `nodes`: List<SdkWireNode>)
     
     suspend fun `refreshFlags`()
+    
+    /**
+     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
+     */
+    fun `reset`()
     
     fun `sessionId`(): kotlin.String
     
@@ -1555,7 +1571,7 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
-     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms.
+     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms (`P2-02`, `P2-03`).
      */
     @Throws(SdkException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -1579,7 +1595,8 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
-     * Seals active in-memory rings into the bounded 10 MB circular disk WAL and transmits all queued packets.
+     * Seals active in-memory rings into the bounded 10 MB binary disk WAL and transmits all queued packets
+     * under a single flush mutex, removing packets strictly by ID (`P2-06`, `P2-07`, `P1-13`).
      */
     @Throws(SdkException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -1646,7 +1663,7 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
-     * Records a wireframe layout snapshot strictly masking all `masked_input` labels into `████` on client!
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
      */
     @Throws(SdkException::class)override fun `recordWireframeSnapshot`(`width`: kotlin.UShort, `height`: kotlin.UShort, `nodes`: List<SdkWireNode>)
         = 
@@ -1680,6 +1697,22 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
         SdkException.ErrorHandler,
     )
     }
+
+    
+    /**
+     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
+     */
+    @Throws(SdkException::class)override fun `reset`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_reset(
+        it, _status)
+}
+    }
+    
+    
 
     override fun `sessionId`(): kotlin.String {
             return FfiConverterString.lift(
@@ -1824,7 +1857,12 @@ data class SdkWireNode (
     var `w`: kotlin.UShort, 
     var `h`: kotlin.UShort, 
     var `bgRgba`: kotlin.UInt, 
-    var `label`: kotlin.String
+    var `label`: kotlin.String, 
+    /**
+     * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+     * any non-empty `label` is replaced on client with fixed-length `"████"`.
+     */
+    var `unmasked`: kotlin.Boolean = false
 ) {
     
     companion object
@@ -1845,6 +1883,7 @@ public object FfiConverterTypeSdkWireNode: FfiConverterRustBuffer<SdkWireNode> {
             FfiConverterUShort.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1857,7 +1896,8 @@ public object FfiConverterTypeSdkWireNode: FfiConverterRustBuffer<SdkWireNode> {
             FfiConverterUShort.allocationSize(value.`w`) +
             FfiConverterUShort.allocationSize(value.`h`) +
             FfiConverterUInt.allocationSize(value.`bgRgba`) +
-            FfiConverterString.allocationSize(value.`label`)
+            FfiConverterString.allocationSize(value.`label`) +
+            FfiConverterBoolean.allocationSize(value.`unmasked`)
     )
 
     override fun write(value: SdkWireNode, buf: ByteBuffer) {
@@ -1870,6 +1910,7 @@ public object FfiConverterTypeSdkWireNode: FfiConverterRustBuffer<SdkWireNode> {
             FfiConverterUShort.write(value.`h`, buf)
             FfiConverterUInt.write(value.`bgRgba`, buf)
             FfiConverterString.write(value.`label`, buf)
+            FfiConverterBoolean.write(value.`unmasked`, buf)
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod bucketing;
 pub mod error;
 pub mod event;
 pub mod replay;
@@ -7,11 +8,12 @@ pub use batch::{
     decode_zstd_bounded, DictionaryRegistry, WireBatch, BATCH_MAGIC, DEFAULT_DICT_ID,
     FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
+pub use bucketing::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
 pub use error::{Result, WireError};
 pub use event::{PropValue, WireEvent};
 pub use replay::{
-    mask_input_value, InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp, MASK_CHAR,
-    REPLAY_MAGIC,
+    mask_input_value, InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp,
+    FIXED_MASK_PLACEHOLDER, MASK_CHAR, REPLAY_MAGIC,
 };
 
 #[cfg(test)]
@@ -251,7 +253,7 @@ mod tests {
         assert!(all_chunks[0].has_error());
 
         if let WireframeOp::FullSnapshot { nodes, .. } = &all_chunks[0].ops[0] {
-            assert_eq!(nodes[1].masked_label, "PAN: ██████████");
+            assert_eq!(nodes[1].masked_label, "████");
             assert!(!nodes[1].masked_label.contains("ABCDE1234F"));
         } else {
             panic!("expected FullSnapshot");

@@ -306,6 +306,11 @@ void uniffi_pulse_sdk_core_fn_method_pulseclient_record_wireframe_snapshot(void*
 uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_refresh_flags(void*_Nonnull ptr
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_RESET
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_RESET
+void uniffi_pulse_sdk_core_fn_method_pulseclient_reset(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SESSION_ID
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SESSION_ID
 RustBuffer uniffi_pulse_sdk_core_fn_method_pulseclient_session_id(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -646,6 +651,12 @@ uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snap
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_REFRESH_FLAGS
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_REFRESH_FLAGS
 uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_RESET
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_RESET
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_reset(void
     
 );
 #endif

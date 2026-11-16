@@ -7,6 +7,7 @@ use crate::error::{Result, WireError};
 
 pub const REPLAY_MAGIC: [u8; 4] = *b"PLSR";
 pub const MASK_CHAR: char = '█';
+pub const FIXED_MASK_PLACEHOLDER: &str = "████";
 pub const MAX_REPLAY_OPS_PER_CHUNK: usize = 100_000;
 pub const MAX_SNAPSHOT_NODES: usize = 50_000;
 
@@ -112,30 +113,10 @@ impl WireNode {
     }
 }
 
-/// Masks non-whitespace input characters into `█` blocks while preserving prefix labels like `"PAN: "`.
-pub fn mask_input_value(raw: &str) -> String {
-    if raw.is_empty() {
-        return "████".to_string();
-    }
-    if raw
-        .chars()
-        .all(|c| c == MASK_CHAR || c.is_whitespace() || c == ':')
-    {
-        return raw.to_string();
-    }
-    if let Some((prefix, rest)) = raw.split_once(": ") {
-        if prefix.len() <= 16
-            && prefix
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '_')
-        {
-            let count = rest.chars().count().clamp(4, 16);
-            let blocks: String = std::iter::repeat_n(MASK_CHAR, count).collect();
-            return format!("{prefix}: {blocks}");
-        }
-    }
-    let count = raw.chars().count().clamp(4, 16);
-    std::iter::repeat_n(MASK_CHAR, count).collect()
+/// Masks sensitive text or input values to a constant-length `"████"` placeholder (`P3-01`),
+/// never preserving prefix labels or character counts that could leak PII.
+pub fn mask_input_value(_raw: &str) -> String {
+    FIXED_MASK_PLACEHOLDER.to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

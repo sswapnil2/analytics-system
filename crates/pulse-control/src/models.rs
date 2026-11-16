@@ -253,6 +253,9 @@ pub struct EdgeFlagRule {
     pub rollout_bps: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targeting_cohort_id: Option<String>,
+    /// Materialized sorted external `distinct_id` allowlist when `targeting_cohort_id` is set (`P2-02`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort_members: Option<Vec<String>>,
     pub variants: Vec<VariantAllocation>,
 }
 

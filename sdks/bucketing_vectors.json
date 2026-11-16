@@ -1,0 +1,98 @@
+[
+  {
+    "flag_key": "one_tap_upi",
+    "distinct_id": "",
+    "xxh3_rollout_hex": "3b05b4c968896f25",
+    "rollout_slot": 5029,
+    "variant_slot_10000": 7920,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "a",
+    "distinct_id": "b",
+    "xxh3_rollout_hex": "35a5819dd7f7c459",
+    "rollout_slot": 6521,
+    "variant_slot_10000": 3873,
+    "variant_50_50": "control"
+  },
+  {
+    "flag_key": "flag",
+    "distinct_id": "u1",
+    "xxh3_rollout_hex": "790aa19f6790ded8",
+    "rollout_slot": 6296,
+    "variant_slot_10000": 6046,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "one_tap_upi_mandate",
+    "distinct_id": "anon_839201abcdef",
+    "xxh3_rollout_hex": "93a9cc18a59d1b00",
+    "rollout_slot": 5568,
+    "variant_slot_10000": 5518,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "one_tap_upi_mandate",
+    "distinct_id": "+919876543210",
+    "xxh3_rollout_hex": "00154e4f6287fa78",
+    "rollout_slot": 5336,
+    "variant_slot_10000": 4074,
+    "variant_50_50": "control"
+  },
+  {
+    "flag_key": "kyc_video_v2",
+    "distinct_id": "user_bengaluru_00042",
+    "xxh3_rollout_hex": "515cae0014f518ee",
+    "rollout_slot": 3214,
+    "variant_slot_10000": 2183,
+    "variant_50_50": "control"
+  },
+  {
+    "flag_key": "hindi_utf8",
+    "distinct_id": "उपयोगकर्ता_भारत_🚀_12345",
+    "xxh3_rollout_hex": "ac8234336e68f802",
+    "rollout_slot": 9714,
+    "variant_slot_10000": 2057,
+    "variant_50_50": "control"
+  },
+  {
+    "flag_key": "len_16_exact",
+    "distinct_id": "0123",
+    "xxh3_rollout_hex": "3d895f12f8be6acc",
+    "rollout_slot": 2764,
+    "variant_slot_10000": 8220,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "len_64_mid",
+    "distinct_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxh3_rollout_hex": "83814239e09f1f42",
+    "rollout_slot": 7938,
+    "variant_slot_10000": 6438,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "len_160_mid2",
+    "distinct_id": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+    "xxh3_rollout_hex": "8be46e59767f4baa",
+    "rollout_slot": 1306,
+    "variant_slot_10000": 4829,
+    "variant_50_50": "control"
+  },
+  {
+    "flag_key": "len_320_long",
+    "distinct_id": "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
+    "xxh3_rollout_hex": "c9139333d81069b8",
+    "rollout_slot": 7064,
+    "variant_slot_10000": 9137,
+    "variant_50_50": "treatment"
+  },
+  {
+    "flag_key": "len_1200_multiblock",
+    "distinct_id": "pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_pulse_analytics_india_",
+    "xxh3_rollout_hex": "3479157a63b07a21",
+    "rollout_slot": 5441,
+    "variant_slot_10000": 1241,
+    "variant_50_50": "control"
+  }
+]

@@ -386,6 +386,7 @@ mod tests {
                             h: 844,
                             bg_rgba: 0x090D_16FF,
                             label: "SDK Checkout".into(),
+                            unmasked: false,
                         },
                         SdkWireNode {
                             node_id: 2,
@@ -397,6 +398,7 @@ mod tests {
                             h: 48,
                             bg_rgba: 0x1E29_3BFF,
                             label: "PAN: ZZZZZ9999Z".into(),
+                            unmasked: false,
                         },
                     ],
                 )

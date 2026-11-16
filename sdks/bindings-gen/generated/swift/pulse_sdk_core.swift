@@ -536,12 +536,13 @@ public protocol PulseClientProtocol : AnyObject {
     func distinctId()  -> String
     
     /**
-     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms.
+     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms (`P2-02`, `P2-03`).
      */
     func evaluateFlag(flagKey: String) async throws  -> String?
     
     /**
-     * Seals active in-memory rings into the bounded 10 MB circular disk WAL and transmits all queued packets.
+     * Seals active in-memory rings into the bounded 10 MB binary disk WAL and transmits all queued packets
+     * under a single flush mutex, removing packets strictly by ID (`P2-06`, `P2-07`, `P1-13`).
      */
     func flush() async throws  -> UInt32
     
@@ -558,11 +559,17 @@ public protocol PulseClientProtocol : AnyObject {
     func recordTouch(x: UInt16, y: UInt16, targetIsInteractive: Bool, tsMs: Int64) throws  -> String
     
     /**
-     * Records a wireframe layout snapshot strictly masking all `masked_input` labels into `████` on client!
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
      */
     func recordWireframeSnapshot(width: UInt16, height: UInt16, nodes: [SdkWireNode]) throws 
     
     func refreshFlags() async throws 
+    
+    /**
+     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
+     */
+    func reset() throws 
     
     func sessionId()  -> String
     
@@ -644,7 +651,7 @@ open func distinctId() -> String {
 }
     
     /**
-     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms.
+     * Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms (`P2-02`, `P2-03`).
      */
 open func evaluateFlag(flagKey: String)async throws  -> String? {
     return
@@ -664,7 +671,8 @@ open func evaluateFlag(flagKey: String)async throws  -> String? {
 }
     
     /**
-     * Seals active in-memory rings into the bounded 10 MB circular disk WAL and transmits all queued packets.
+     * Seals active in-memory rings into the bounded 10 MB binary disk WAL and transmits all queued packets
+     * under a single flush mutex, removing packets strictly by ID (`P2-06`, `P2-07`, `P1-13`).
      */
 open func flush()async throws  -> UInt32 {
     return
@@ -715,7 +723,7 @@ open func recordTouch(x: UInt16, y: UInt16, targetIsInteractive: Bool, tsMs: Int
 }
     
     /**
-     * Records a wireframe layout snapshot strictly masking all `masked_input` labels into `████` on client!
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
      */
 open func recordWireframeSnapshot(width: UInt16, height: UInt16, nodes: [SdkWireNode])throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
     uniffi_pulse_sdk_core_fn_method_pulseclient_record_wireframe_snapshot(self.uniffiClonePointer(),
@@ -741,6 +749,16 @@ open func refreshFlags()async throws  {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeSdkError.lift
         )
+}
+    
+    /**
+     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
+     */
+open func reset()throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_reset(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func sessionId() -> String {
@@ -936,13 +954,22 @@ public struct SdkWireNode {
     public var h: UInt16
     public var bgRgba: UInt32
     public var label: String
+    /**
+     * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+     * any non-empty `label` is replaced on client with fixed-length `"████"`.
+     */
+    public var unmasked: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(nodeId: UInt32, parentId: UInt32, 
         /**
          * `"screen" | "container" | "button" | "masked_input" | "text" | "image_placeholder" | "error_banner"`
-         */kind: String, x: UInt16, y: UInt16, w: UInt16, h: UInt16, bgRgba: UInt32, label: String) {
+         */kind: String, x: UInt16, y: UInt16, w: UInt16, h: UInt16, bgRgba: UInt32, label: String, 
+        /**
+         * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+         * any non-empty `label` is replaced on client with fixed-length `"████"`.
+         */unmasked: Bool = false) {
         self.nodeId = nodeId
         self.parentId = parentId
         self.kind = kind
@@ -952,6 +979,7 @@ public struct SdkWireNode {
         self.h = h
         self.bgRgba = bgRgba
         self.label = label
+        self.unmasked = unmasked
     }
 }
 
@@ -986,6 +1014,9 @@ extension SdkWireNode: Equatable, Hashable {
         if lhs.label != rhs.label {
             return false
         }
+        if lhs.unmasked != rhs.unmasked {
+            return false
+        }
         return true
     }
 
@@ -999,6 +1030,7 @@ extension SdkWireNode: Equatable, Hashable {
         hasher.combine(h)
         hasher.combine(bgRgba)
         hasher.combine(label)
+        hasher.combine(unmasked)
     }
 }
 
@@ -1018,7 +1050,8 @@ public struct FfiConverterTypeSdkWireNode: FfiConverterRustBuffer {
                 w: FfiConverterUInt16.read(from: &buf), 
                 h: FfiConverterUInt16.read(from: &buf), 
                 bgRgba: FfiConverterUInt32.read(from: &buf), 
-                label: FfiConverterString.read(from: &buf)
+                label: FfiConverterString.read(from: &buf), 
+                unmasked: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1032,6 +1065,7 @@ public struct FfiConverterTypeSdkWireNode: FfiConverterRustBuffer {
         FfiConverterUInt16.write(value.h, into: &buf)
         FfiConverterUInt32.write(value.bgRgba, into: &buf)
         FfiConverterString.write(value.label, into: &buf)
+        FfiConverterBool.write(value.unmasked, into: &buf)
     }
 }
 
@@ -1238,10 +1272,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_distinct_id() != 8695) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_evaluate_flag() != 47825) {
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_evaluate_flag() != 38866) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 27482) {
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 13927) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_identify() != 25556) {
@@ -1253,10 +1287,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_touch() != 7099) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 26495) {
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 32896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054) {

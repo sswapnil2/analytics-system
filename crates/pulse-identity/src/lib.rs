@@ -705,6 +705,26 @@ impl ProjectIdentityGraph {
         self.state.read().u32_to_external.get(uid as usize).cloned()
     }
 
+    /// Expands a bitmap of canonical `u32` user IDs into a sorted, deduplicated `Vec<String>` of ALL
+    /// external `distinct_id`s (both pre-login `anon_id`s and identified `user_id`s) belonging to those users (`P2-02`).
+    pub fn external_ids_for_canonical_roots(&self, canonical_roots: &RoaringBitmap) -> Vec<String> {
+        if canonical_roots.is_empty() {
+            return Vec::new();
+        }
+        let snap = self.snapshot();
+        let st = self.state.read();
+        let mut out = Vec::new();
+        for (raw_uid, ext) in st.u32_to_external.iter().enumerate() {
+            let canon = snap.resolve(raw_uid as u32);
+            if canonical_roots.contains(canon) {
+                out.push(ext.clone());
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Returns an immutable `IdentitySnapshot` in < 5ms for lock-free vectorized query scans.
     pub fn snapshot(&self) -> IdentitySnapshot {
         if !self.snapshot_dirty.load(Ordering::Acquire) {

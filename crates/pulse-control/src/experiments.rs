@@ -4,7 +4,7 @@ use std::time::Instant;
 use pulse_exec::{
     ExecError, FunnelOrderMode, FunnelQuery, FunnelStepSpec, PropPredicate, QueryEngine, TimeRange,
 };
-use pulse_wire::PropValue;
+use pulse_wire::{evaluate_flag_rule, PropValue};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use xxhash_rust::xxh3::xxh3_64;
@@ -14,36 +14,21 @@ use crate::models::{
     GuardrailResult, VariantLiftRow,
 };
 
-/// Evaluates an `EdgeFlagRule` deterministically in < 1 µs using `xxh3_64("{flag_key}:{distinct_id}") % 10_000`.
+/// Evaluates an `EdgeFlagRule` deterministically via the shared `pulse_wire::evaluate_flag_rule`
+/// (`xxh3_64` bucketing + optional `cohort_members` allowlist) (`P2-02`, `P2-03`).
 pub fn evaluate_edge_flag(rule: &EdgeFlagRule, distinct_id: &str) -> Option<String> {
-    if !rule.enabled || rule.rollout_bps == 0 {
-        return None;
-    }
-    let seed = format!("{}:{distinct_id}", rule.key);
-    let hash = xxh3_64(seed.as_bytes());
-    let rollout_slot = (hash % 10_000) as u32;
-    if rollout_slot >= rule.rollout_bps {
-        return None;
-    }
-    if rule.variants.is_empty() {
-        return Some("on".to_string());
-    }
-    let variant_hash = xxh3_64(format!("var:{}:{distinct_id}", rule.key).as_bytes());
-    let total_weight: u32 = rule.variants.iter().map(|v| v.weight_bps).sum();
-    if total_weight == 0 {
-        return rule.variants.first().map(|v| v.key.clone());
-    }
-    let v_slot = (variant_hash % (total_weight as u64)) as u32;
-    let mut cumulative = 0u32;
-    for v in &rule.variants {
-        cumulative += v.weight_bps;
-        if v_slot < cumulative {
-            return Some(v.key.clone());
-        }
-    }
-    rule.variants.last().map(|v| v.key.clone())
+    evaluate_flag_rule(
+        &rule.key,
+        rule.enabled,
+        rule.rollout_bps,
+        rule.cohort_members.as_deref(),
+        rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
+        distinct_id,
+    )
 }
 
+/// Builds an `EdgeFlagBundle` without a `QueryEngine` (for non-cohort unit callers).
+/// Any flag carrying a `targeting_cohort_id` fails closed (`Some(vec![])`) rather than failing open to 100% of users (`P2-02`).
 pub fn build_edge_flag_bundle(
     project_id: &str,
     flags: &[FeatureFlag],
@@ -51,14 +36,72 @@ pub fn build_edge_flag_bundle(
 ) -> EdgeFlagBundle {
     let rules: Vec<EdgeFlagRule> = flags
         .iter()
-        .map(|f| EdgeFlagRule {
+        .map(|f| {
+            let cohort_id = f
+                .targeting_cohort_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let cohort_members = cohort_id.as_ref().map(|_| Vec::new());
+            EdgeFlagRule {
+                key: f.key.clone(),
+                enabled: f.enabled,
+                rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
+                targeting_cohort_id: cohort_id,
+                cohort_members,
+                variants: f.variants.clone(),
+            }
+        })
+        .collect();
+    finalize_bundle(project_id, rules, now_ms)
+}
+
+/// Builds an `EdgeFlagBundle` evaluating any `targeting_cohort_id` through `QueryEngine` into exact
+/// external `distinct_id` allowlists (`P2-02`).
+pub async fn build_edge_flag_bundle_with_cohorts(
+    project_id: &str,
+    flags: &[FeatureFlag],
+    qengine: &QueryEngine,
+    now_ms: i64,
+) -> Result<EdgeFlagBundle, ExecError> {
+    let mut cohort_cache: HashMap<String, Vec<String>> = HashMap::new();
+    let mut rules = Vec::with_capacity(flags.len());
+
+    for f in flags {
+        let cohort_id = f
+            .targeting_cohort_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string());
+
+        let cohort_members = if let Some(cid) = &cohort_id {
+            if let Some(cached) = cohort_cache.get(cid) {
+                Some(cached.clone())
+            } else {
+                let members = qengine
+                    .evaluate_saved_cohort_external_ids(project_id, cid)
+                    .await?;
+                cohort_cache.insert(cid.clone(), members.clone());
+                Some(members)
+            }
+        } else {
+            None
+        };
+
+        rules.push(EdgeFlagRule {
             key: f.key.clone(),
             enabled: f.enabled,
             rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
-            targeting_cohort_id: f.targeting_cohort_id.clone(),
+            targeting_cohort_id: cohort_id,
+            cohort_members,
             variants: f.variants.clone(),
-        })
-        .collect();
+        });
+    }
+
+    Ok(finalize_bundle(project_id, rules, now_ms))
+}
+
+fn finalize_bundle(project_id: &str, rules: Vec<EdgeFlagRule>, now_ms: i64) -> EdgeFlagBundle {
     let json_bytes = serde_json::to_vec(&rules).unwrap_or_default();
     let etag = format!("W/\"{:016x}\"", xxh3_64(&json_bytes));
     EdgeFlagBundle {
@@ -70,7 +113,8 @@ pub fn build_edge_flag_bundle(
 }
 
 /// Evaluates an A/B experiment's exposure & conversion lift across variants using `QueryEngine`
-/// plus Frequentist Z-test and 20,000-draw Monte Carlo Bayesian Beta-Binomial simulation.
+/// plus Chi-square SRM check, Holm-Bonferroni multi-variant Z-test, Fieller/Delta relative lift CI,
+/// and 20,000-draw Monte Carlo Bayesian Beta-Binomial simulation (`P2-09f`, `P2-10`).
 pub async fn evaluate_experiment_results(
     exp: &Experiment,
     flag: Option<&FeatureFlag>,
@@ -78,22 +122,49 @@ pub async fn evaluate_experiment_results(
 ) -> Result<ExperimentResults, ExecError> {
     let t0 = Instant::now();
 
-    let variant_keys: Vec<String> = if let Some(f) = flag {
-        if f.variants.is_empty() {
-            vec!["control".to_string(), "treatment".to_string()]
+    let (variant_keys, expected_weights): (Vec<String>, BTreeMap<String, u32>) =
+        if let Some(f) = flag {
+            if f.variants.is_empty() {
+                let mut m = BTreeMap::new();
+                m.insert("control".to_string(), 5000);
+                m.insert("treatment".to_string(), 5000);
+                (vec!["control".to_string(), "treatment".to_string()], m)
+            } else {
+                let keys = f.variants.iter().map(|v| v.key.clone()).collect();
+                let weights = f
+                    .variants
+                    .iter()
+                    .map(|v| (v.key.clone(), v.weight_bps))
+                    .collect();
+                (keys, weights)
+            }
         } else {
-            f.variants.iter().map(|v| v.key.clone()).collect()
-        }
-    } else {
-        vec!["control".to_string(), "treatment".to_string()]
-    };
+            let mut m = BTreeMap::new();
+            m.insert("control".to_string(), 5000);
+            m.insert("treatment".to_string(), 5000);
+            (vec!["control".to_string(), "treatment".to_string()], m)
+        };
 
-    let primary_rows =
+    let (mut primary_rows, observed_counts) =
         evaluate_metric_for_experiment(exp, &exp.primary_metric, &variant_keys, qengine).await?;
+
+    let (srm_p_value, sample_ratio_mismatch) =
+        compute_sample_ratio_mismatch(&observed_counts, &expected_weights);
+    if sample_ratio_mismatch {
+        for r in &mut primary_rows {
+            r.statistically_significant = false;
+        }
+    }
 
     let mut guardrails = Vec::with_capacity(exp.guardrail_metrics.len());
     for gm in &exp.guardrail_metrics {
-        let gm_rows = evaluate_metric_for_experiment(exp, gm, &variant_keys, qengine).await?;
+        let (mut gm_rows, _) =
+            evaluate_metric_for_experiment(exp, gm, &variant_keys, qengine).await?;
+        if sample_ratio_mismatch {
+            for r in &mut gm_rows {
+                r.statistically_significant = false;
+            }
+        }
         guardrails.push(GuardrailResult {
             metric_name: gm.name.clone(),
             event_name: gm.event_name.clone(),
@@ -109,10 +180,11 @@ pub async fn evaluate_experiment_results(
         hypothesis: exp.hypothesis.clone(),
         metric_name: exp.primary_metric.name.clone(),
         exec_time_us: t0.elapsed().as_micros() as u64,
-        srm_p_value: 1.0,
-        sample_ratio_mismatch: false,
+        srm_p_value,
+        sample_ratio_mismatch,
         statistical_methodology_note:
-            "Fixed-horizon two-sided Z-test / Welch t-test (not peeking-corrected)".to_string(),
+            "Fixed-horizon two-sided Z-test (not peeking-corrected; Holm-Bonferroni adjusted across treatment variants; Fieller/Delta relative lift 95% CI; Chi-square SRM check at alpha=0.001)"
+                .to_string(),
         variants: primary_rows,
         guardrails,
     })
@@ -123,14 +195,19 @@ async fn evaluate_metric_for_experiment(
     metric: &ExperimentMetricSpec,
     expected_variants: &[String],
     qengine: &QueryEngine,
-) -> Result<Vec<VariantLiftRow>, ExecError> {
+) -> Result<(Vec<VariantLiftRow>, BTreeMap<String, (u64, u64)>), ExecError> {
     let exp_prop = format!("$exp_{}", exp.flag_key);
     let range = TimeRange {
         start_ts_ms: exp.start_ts_ms,
         end_ts_ms: exp.end_ts_ms,
     };
+    // Respect exact configured conversion window, including sub-24h windows (`P2-09f`)!
+    let window_ms = if metric.conversion_window_ms > 0 {
+        metric.conversion_window_ms
+    } else {
+        7 * 86_400_000
+    };
 
-    // 1. Primary path: 2-step Funnel from `$experiment_started` (filtered by `flag_key` or broken down by `variant` / `$exp_<flag_key>`) -> `metric.event_name`
     let funnel_from_exposure = FunnelQuery {
         time_range: range,
         steps: vec![
@@ -149,7 +226,7 @@ async fn evaluate_metric_for_experiment(
             },
         ],
         order_mode: FunnelOrderMode::LooseOrder,
-        conversion_window_ms: metric.conversion_window_ms.max(86_400_000),
+        conversion_window_ms: window_ms,
         exclusions: Vec::new(),
         hold_constant_props: Vec::new(),
         breakdown_by: Some("variant".to_string()),
@@ -174,7 +251,6 @@ async fn evaluate_metric_for_experiment(
         }
     }
 
-    // 2. Fallback session-property attribution (`$exp_<flag_key>` on entry events like `App_Open`) if `$experiment_started` wasn't emitted explicitly
     if total_exposed == 0 {
         let fallback_q = FunnelQuery {
             time_range: range,
@@ -194,7 +270,7 @@ async fn evaluate_metric_for_experiment(
                 },
             ],
             order_mode: FunnelOrderMode::LooseOrder,
-            conversion_window_ms: metric.conversion_window_ms.max(86_400_000),
+            conversion_window_ms: window_ms,
             exclusions: Vec::new(),
             hold_constant_props: Vec::new(),
             breakdown_by: Some(exp_prop),
@@ -210,11 +286,54 @@ async fn evaluate_metric_for_experiment(
         }
     }
 
-    Ok(compute_statistical_lift_table(&counts_by_variant))
+    let rows = compute_statistical_lift_table(&counts_by_variant);
+    Ok((rows, counts_by_variant))
 }
 
-/// Computes Frequentist Two-Proportion Z-test (`p_value`, 95% CI) and 20,000-draw Monte Carlo Bayesian
-/// Beta-Binomial `P(Treatment > Control)` in < 2ms!
+/// Pearson's Chi-square Sample Ratio Mismatch test against configured variant `weight_bps` (`P2-10`).
+/// Flags `sample_ratio_mismatch = true` when `total_n >= 50` and `p < 0.001`.
+pub fn compute_sample_ratio_mismatch(
+    counts_by_variant: &BTreeMap<String, (u64, u64)>,
+    expected_weights: &BTreeMap<String, u32>,
+) -> (f64, bool) {
+    let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(expected_weights.len());
+    let mut total_obs = 0u64;
+    let mut total_weight = 0u64;
+
+    for (k, &w) in expected_weights {
+        if w == 0 {
+            continue;
+        }
+        let obs = counts_by_variant.get(k).map(|&(n, _)| n).unwrap_or(0);
+        total_obs += obs;
+        total_weight += u64::from(w);
+        pairs.push((obs as f64, f64::from(w)));
+    }
+
+    if pairs.len() < 2 || total_obs == 0 || total_weight == 0 {
+        return (1.0, false);
+    }
+
+    let n_f = total_obs as f64;
+    let w_f = total_weight as f64;
+    let mut chi2 = 0.0;
+    for (obs, w) in &pairs {
+        let exp_n = n_f * (*w / w_f);
+        if exp_n > 0.0 {
+            let d = *obs - exp_n;
+            chi2 += (d * d) / exp_n;
+        }
+    }
+
+    let df = (pairs.len() - 1) as f64;
+    let p_val = chi_square_survival(chi2, df);
+    let srm = total_obs >= 50 && p_val < 0.001;
+    (p_val, srm)
+}
+
+/// Computes Frequentist Two-Proportion Z-test (`p_value` with Holm-Bonferroni multi-variant adjustment),
+/// Fieller/Delta 95% relative lift CI (accounting for control `p_c` variance), and 20,000-draw Monte Carlo
+/// Bayesian Beta-Binomial `P(Treatment > Control)` (`P2-10`).
 pub fn compute_statistical_lift_table(
     counts_by_variant: &BTreeMap<String, (u64, u64)>,
 ) -> Vec<VariantLiftRow> {
@@ -241,7 +360,6 @@ pub fn compute_statistical_lift_table(
     const MC_DRAWS: usize = 20_000;
     let mut rng = StdRng::seed_from_u64(0x5055_4C53_4541_4254);
 
-    // Pre-draw 20,000 Beta(1 + x_c, 1 + n_c - x_c) samples for control once
     let alpha_c = 1.0 + x_c as f64;
     let beta_c = 1.0 + n_c.saturating_sub(x_c) as f64;
     let control_draws: Vec<f64> = (0..MC_DRAWS)
@@ -259,9 +377,9 @@ pub fn compute_statistical_lift_table(
     }
 
     let mut rows = Vec::with_capacity(ordered_keys.len());
-    let mut key_order_map: HashMap<&str, usize> = HashMap::new();
-    for (idx, k) in ordered_keys.iter().enumerate() {
-        key_order_map.insert(k.as_str(), idx);
+    let mut treatment_indices: Vec<usize> = Vec::new();
+
+    for k in &ordered_keys {
         let (n_t, x_t) = counts_by_variant.get(k).copied().unwrap_or((0, 0));
         let is_control = k == &control_key;
         let p_t = if n_t == 0 {
@@ -272,6 +390,9 @@ pub fn compute_statistical_lift_table(
         let var_t = p_t * (1.0 - p_t);
 
         if is_control || n_c == 0 || n_t == 0 {
+            if !is_control {
+                treatment_indices.push(rows.len());
+            }
             rows.push(VariantLiftRow {
                 variant_key: k.clone(),
                 is_control,
@@ -297,30 +418,19 @@ pub fn compute_statistical_lift_table(
             0.0
         };
 
-        // Unpooled SE for 95% CI
-        let se_unpooled =
-            ((p_c * (1.0 - p_c)) / (n_c as f64) + (p_t * (1.0 - p_t)) / (n_t as f64)).sqrt();
-        let margin = 1.959_964 * se_unpooled;
-        let (ci95_low_pct, ci95_high_pct) = if p_c > 1e-12 {
-            (
-                ((diff - margin) / p_c) * 100.0,
-                ((diff + margin) / p_c) * 100.0,
-            )
-        } else {
-            (0.0, 0.0)
-        };
+        // Fieller's theorem / Delta-method 95% CI on relative lift `(p_t / p_c - 1)` accounting for uncertainty in BOTH `p_t` and `p_c` (`P2-10`).
+        let (ci95_low_pct, ci95_high_pct) = relative_lift_ci95_pct(p_c, n_c, p_t, n_t);
 
         // Pooled two-proportion Z-test for two-sided p-value
         let p_pool = (x_c + x_t) as f64 / (n_c + n_t) as f64;
         let se_pool = (p_pool * (1.0 - p_pool) * (1.0 / (n_c as f64) + 1.0 / (n_t as f64))).sqrt();
-        let p_value = if se_pool > 1e-15 {
+        let raw_p = if se_pool > 1e-15 {
             let z = (diff / se_pool).abs();
             two_sided_normal_p_value(z)
         } else {
             1.0
         };
 
-        // 20,000-draw Monte Carlo Beta-Binomial Bayesian probability to beat control
         let alpha_t = 1.0 + x_t as f64;
         let beta_t = 1.0 + n_t.saturating_sub(x_t) as f64;
         let mut wins = 0usize;
@@ -332,6 +442,7 @@ pub fn compute_statistical_lift_table(
         }
         let prob_beat = wins as f64 / (MC_DRAWS as f64);
 
+        treatment_indices.push(rows.len());
         rows.push(VariantLiftRow {
             variant_key: k.clone(),
             is_control: false,
@@ -343,14 +454,139 @@ pub fn compute_statistical_lift_table(
             relative_lift_pct,
             ci95_low_pct,
             ci95_high_pct,
-            p_value,
+            p_value: raw_p,
             bayesian_prob_to_beat_control: prob_beat,
-            statistically_significant: p_value < 0.05,
+            statistically_significant: false,
         });
     }
 
-    let _ = key_order_map.len();
+    // Apply Holm-Bonferroni step-down family-wise error correction across all `m` treatment variants (`P2-10`).
+    let m = treatment_indices.len();
+    if m > 0 {
+        treatment_indices.sort_by(|&a, &b| {
+            rows[a]
+                .p_value
+                .partial_cmp(&rows[b].p_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut running_max: f64 = 0.0;
+        for (rank, &row_idx) in treatment_indices.iter().enumerate() {
+            let factor = (m - rank) as f64;
+            let adj = (rows[row_idx].p_value * factor).clamp(0.0, 1.0);
+            running_max = running_max.max(adj);
+            rows[row_idx].p_value = running_max;
+            rows[row_idx].statistically_significant = running_max < 0.05;
+        }
+    }
+
     rows
+}
+
+/// Fieller's exact 95% confidence interval for relative lift `(p_t / p_c - 1) * 100%`
+/// (with Delta-method fallback when `g >= 0.99`), propagating variance from BOTH `p_t` and `p_c` (`P2-10`).
+fn relative_lift_ci95_pct(p_c: f64, n_c: u64, p_t: f64, n_t: u64) -> (f64, f64) {
+    if p_c <= 1e-12 || n_c == 0 || n_t == 0 {
+        return (0.0, 0.0);
+    }
+    const Z: f64 = 1.959_964;
+    let v_c = (p_c * (1.0 - p_c)) / (n_c as f64);
+    let v_t = (p_t * (1.0 - p_t)) / (n_t as f64);
+    let ratio = p_t / p_c;
+    let g = (Z * Z * v_c) / (p_c * p_c);
+
+    if g < 0.99 {
+        let disc = (v_t + ratio * ratio * v_c - g * v_t).max(0.0).sqrt();
+        let half = (Z / p_c) * disc;
+        let lo = ((ratio - half) / (1.0 - g) - 1.0) * 100.0;
+        let hi = ((ratio + half) / (1.0 - g) - 1.0) * 100.0;
+        (lo, hi)
+    } else {
+        // Delta-method variance: Var(p_t / p_c) = v_t / p_c^2 + (p_t^2 / p_c^4) * v_c
+        let se_ratio = (v_t / (p_c * p_c) + (ratio * ratio * v_c) / (p_c * p_c)).sqrt();
+        let lo = (ratio - Z * se_ratio - 1.0) * 100.0;
+        let hi = (ratio + Z * se_ratio - 1.0) * 100.0;
+        (lo, hi)
+    }
+}
+
+/// Survival function `P(ChiSq_df >= x) = Q(df / 2, x / 2)` via regularized upper incomplete gamma.
+fn chi_square_survival(chi2: f64, df: f64) -> f64 {
+    if !chi2.is_finite() || chi2 <= 0.0 || df <= 0.0 {
+        return 1.0;
+    }
+    regularized_gamma_q(0.5 * df, 0.5 * chi2)
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` using series for `x < a + 1`
+/// and Lentz's continued fraction for `x >= a + 1`.
+fn regularized_gamma_q(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    let gln = ln_gamma(a);
+    if x < a + 1.0 {
+        let mut ap = a;
+        let mut sum = 1.0 / a;
+        let mut del = sum;
+        for _ in 0..200 {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() < sum.abs() * 1e-14 {
+                break;
+            }
+        }
+        let p = sum * (-x + a * x.ln() - gln).exp();
+        (1.0 - p).clamp(0.0, 1.0)
+    } else {
+        let fpmin = 1e-300_f64;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / fpmin;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..=200 {
+            let i_f = i as f64;
+            let an = -i_f * (i_f - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < fpmin {
+                d = fpmin;
+            }
+            c = b + an / c;
+            if c.abs() < fpmin {
+                c = fpmin;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() < 1e-14 {
+                break;
+            }
+        }
+        ((-x + a * x.ln() - gln).exp() * h).clamp(0.0, 1.0)
+    }
+}
+
+/// Lanczos 7-term `ln(Gamma(z))` approximation accurate to < 2e-10 across `z > 0`.
+fn ln_gamma(z: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let x_in = z - 1.0;
+    let mut sum = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        sum += c / (x_in + (i as f64));
+    }
+    let t = x_in + 7.5;
+    0.5 * std::f64::consts::TAU.ln() + (x_in + 0.5) * t.ln() - t + sum.ln()
 }
 
 /// Marsaglia-Tsang fast Gamma(shape, 1.0) sampler used to draw exact Beta(a, b) variates.

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::db::{MetaError, MetaStore};
-use crate::experiments::{build_edge_flag_bundle, evaluate_experiment_results};
+use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     generate_random_api_key, generate_root_admin_token, mask_key_prefix, sha256_bytes, sha256_hex,
@@ -1882,7 +1882,14 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    let bundle = build_edge_flag_bundle(&project_id, &flags, Utc::now().timestamp_millis());
+    let bundle = build_edge_flag_bundle_with_cohorts(
+        &project_id,
+        &flags,
+        &ctrl.qengine,
+        Utc::now().timestamp_millis(),
+    )
+    .await
+    .map_err(CtrlError::internal)?;
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)

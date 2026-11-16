@@ -183,6 +183,33 @@ impl QueryEngine {
         Ok((bm.len(), us))
     }
 
+    /// Evaluates a saved cohort (`cohort_id`) and returns the sorted list of all external `distinct_id`s
+    /// belonging to its canonical `u32` user roots (`P2-02` Edge Flag cohort targeting).
+    pub async fn evaluate_saved_cohort_external_ids(
+        &self,
+        project_id: &str,
+        cohort_id: &str,
+    ) -> Result<Vec<String>> {
+        let cat = self.catalogs.for_project(project_id);
+        let Some(def_ref) = cat.saved_cohorts.get(cohort_id) else {
+            return Ok(Vec::new());
+        };
+        let def = def_ref.clone();
+        drop(def_ref);
+
+        let ps = self.storage.get_or_open_project(project_id).await?;
+        let snap = ps.snapshot();
+        let id_graph = self
+            .storage
+            .identity_router()
+            .get_or_open(project_id)
+            .await?;
+        let id_snap = id_graph.snapshot();
+
+        let bm = evaluate_cohort(&def, None, &ps, &snap, &id_snap, &self.cache, &cat).await?;
+        Ok(id_graph.external_ids_for_canonical_roots(&bm))
+    }
+
     /// Searches sessions leveraging `SessionIndex` 64-bit event Bloom bitmasks and frustration flags
     /// BEFORE reading any Tier A/B arrays on pruned segments!
     pub async fn search_sessions(
