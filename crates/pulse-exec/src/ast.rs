@@ -1,7 +1,7 @@
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use pulse_wire::PropValue;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeRange {
@@ -34,7 +34,34 @@ impl TimeRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+fn normalize_enum_token(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| {
+            if c == '-' || c == ' ' {
+                '_'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn deserialize_str_enum<'de, D, T>(
+    deserializer: D,
+    expected: &'static str,
+    parse: fn(&str, &str) -> std::result::Result<T, String>,
+) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)
+        .map_err(|_| de::Error::custom(format!("expected {expected}")))?;
+    let norm = normalize_enum_token(&raw);
+    parse(&raw, &norm).map_err(de::Error::custom)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeInterval {
     Hour,
@@ -42,6 +69,27 @@ pub enum TimeInterval {
     Day,
     Week,
     Month,
+}
+
+impl<'de> Deserialize<'de> for TimeInterval {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_str_enum(
+            deserializer,
+            "interval string (hour, day, week, or month)",
+            |raw, norm| match norm {
+                "hour" | "hourly" | "1h" | "h" => Ok(Self::Hour),
+                "day" | "daily" | "1d" | "d" => Ok(Self::Day),
+                "week" | "weekly" | "1w" | "w" => Ok(Self::Week),
+                "month" | "monthly" | "1m" | "mo" | "m" => Ok(Self::Month),
+                _ => Err(format!(
+                    "invalid interval '{raw}': expected hour, day, week, or month"
+                )),
+            },
+        )
+    }
 }
 
 impl TimeInterval {
@@ -276,7 +324,7 @@ pub struct GlobalFilter {
 
 // ======================= INSIGHTS =======================
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InsightsMetric {
     #[default]
@@ -302,6 +350,97 @@ pub enum InsightsMetric {
         prop: String,
         quantile: f64,
     },
+}
+
+fn parse_simple_metric(norm: &str) -> Option<InsightsMetric> {
+    match norm {
+        "uniques" | "unique" | "unique_users" | "users" => Some(InsightsMetric::Uniques),
+        "totals" | "total" | "total_events" | "events" | "count" => Some(InsightsMetric::Totals),
+        "sessions" | "session" => Some(InsightsMetric::Sessions),
+        "dau" => Some(InsightsMetric::Dau),
+        "wau" => Some(InsightsMetric::Wau),
+        "mau" => Some(InsightsMetric::Mau),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for InsightsMetric {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        match val {
+            serde_json::Value::String(raw) => {
+                let norm = normalize_enum_token(&raw);
+                parse_simple_metric(&norm).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "invalid metric '{raw}': expected uniques, totals, sessions, dau, wau, mau, or a property metric object like {{\"type\":\"prop_sum\",\"prop\":\"amount\"}}"
+                    ))
+                })
+            }
+            serde_json::Value::Object(map) => {
+                let raw_ty = map
+                    .get("type")
+                    .or_else(|| map.get("metric"))
+                    .or_else(|| map.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        de::Error::custom(
+                            "metric object is missing a string \"type\" field (e.g. {\"type\":\"uniques\"})",
+                        )
+                    })?;
+                let norm = normalize_enum_token(raw_ty);
+                if let Some(simple) = parse_simple_metric(&norm) {
+                    return Ok(simple);
+                }
+                let extract_prop = || -> std::result::Result<String, D::Error> {
+                    map.get("prop")
+                        .or_else(|| map.get("property"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            de::Error::custom(format!(
+                                "metric '{raw_ty}' requires a non-empty string \"prop\" field"
+                            ))
+                        })
+                };
+                match norm.as_str() {
+                    "prop_sum" | "propsum" | "sum" => Ok(Self::PropSum {
+                        prop: extract_prop()?,
+                    }),
+                    "prop_avg" | "propavg" | "avg" | "average" => Ok(Self::PropAvg {
+                        prop: extract_prop()?,
+                    }),
+                    "prop_min" | "propmin" | "min" => Ok(Self::PropMin {
+                        prop: extract_prop()?,
+                    }),
+                    "prop_max" | "propmax" | "max" => Ok(Self::PropMax {
+                        prop: extract_prop()?,
+                    }),
+                    "prop_percentile" | "proppercentile" | "percentile" | "quantile" => {
+                        let prop = extract_prop()?;
+                        let quantile = map
+                            .get("quantile")
+                            .and_then(|v| v.as_f64())
+                            .ok_or_else(|| {
+                                de::Error::custom(format!(
+                                    "metric '{raw_ty}' requires a numeric \"quantile\" field between 0.0 and 1.0"
+                                ))
+                            })?;
+                        Ok(Self::PropPercentile { prop, quantile })
+                    }
+                    _ => Err(de::Error::custom(format!(
+                        "invalid metric type '{raw_ty}': expected uniques, totals, sessions, dau, wau, mau, prop_sum, prop_avg, prop_min, prop_max, or prop_percentile"
+                    ))),
+                }
+            }
+            _ => Err(de::Error::custom(
+                "invalid metric: expected a string (e.g. \"uniques\", \"totals\") or object (e.g. {\"type\":\"uniques\"})",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,13 +495,35 @@ pub struct InsightsResult {
 
 // ======================= FUNNELS =======================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FunnelOrderMode {
     StrictOrder,
     #[default]
     LooseOrder,
     AnyOrder,
+}
+
+impl<'de> Deserialize<'de> for FunnelOrderMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_str_enum(
+            deserializer,
+            "order_mode string (strict_order, loose_order, or any_order)",
+            |raw, norm| match norm {
+                "strict_order" | "strictorder" | "strict" => Ok(Self::StrictOrder),
+                "loose_order" | "looseorder" | "loose" | "ordered" | "in_order" => {
+                    Ok(Self::LooseOrder)
+                }
+                "any_order" | "anyorder" | "any" | "unordered" => Ok(Self::AnyOrder),
+                _ => Err(format!(
+                    "invalid order_mode '{raw}': expected strict_order, loose_order, or any_order"
+                )),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -449,13 +610,37 @@ pub struct FunnelResult {
 
 // ======================= RETENTION =======================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionMode {
     #[default]
     NDay,
     Unbounded,
     FrequencyStickiness,
+}
+
+impl<'de> Deserialize<'de> for RetentionMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_str_enum(
+            deserializer,
+            "retention mode string (n_day, unbounded, or frequency_stickiness)",
+            |raw, norm| {
+                match norm {
+                "n_day" | "nday" | "n_days" => Ok(Self::NDay),
+                "unbounded" => Ok(Self::Unbounded),
+                "frequency_stickiness" | "frequencystickiness" | "stickiness" | "frequency" => {
+                    Ok(Self::FrequencyStickiness)
+                }
+                _ => Err(format!(
+                    "invalid retention mode '{raw}': expected n_day, unbounded, or frequency_stickiness"
+                )),
+            }
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -491,12 +676,31 @@ pub struct RetentionResult {
 
 // ======================= FLOWS =======================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowDirection {
     #[default]
     Forward,
     Reverse,
+}
+
+impl<'de> Deserialize<'de> for FlowDirection {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_str_enum(
+            deserializer,
+            "flow direction string (forward or reverse)",
+            |raw, norm| match norm {
+                "forward" | "next" => Ok(Self::Forward),
+                "reverse" | "backward" | "previous" => Ok(Self::Reverse),
+                _ => Err(format!(
+                    "invalid flow direction '{raw}': expected forward or reverse"
+                )),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

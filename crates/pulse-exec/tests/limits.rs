@@ -1025,3 +1025,74 @@ async fn pr1_funnel_drop_off_prioritizes_recorded_sessions() {
 
     id_router.close_all().await.unwrap();
 }
+
+#[test]
+fn pr8_en4_flexible_query_enums_and_readable_errors() {
+    let insights_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "interval": "Hour",
+        "series": [
+            { "label": "Total", "event_name": "App_Open", "metric": "total_events" },
+            { "label": "Unique", "event_name": "App_Open", "metric": "Unique_Users" },
+            { "label": "Revenue", "event_name": "Paid", "metric": { "type": "Prop_Sum", "prop": "amount" } }
+        ]
+    });
+    let iq: InsightsQuery =
+        serde_json::from_value(insights_json).expect("flexible InsightsQuery deserialization");
+    assert_eq!(iq.interval, TimeInterval::Hour);
+    assert_eq!(iq.series[0].metric, InsightsMetric::Totals);
+    assert_eq!(iq.series[1].metric, InsightsMetric::Uniques);
+    assert_eq!(
+        iq.series[2].metric,
+        InsightsMetric::PropSum {
+            prop: "amount".into()
+        }
+    );
+
+    let funnel_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "steps": [{ "event_name": "Step_A" }, { "event_name": "Step_B" }],
+        "order_mode": "Strict_Order",
+        "conversion_window_ms": 60_000
+    });
+    let fq: FunnelQuery =
+        serde_json::from_value(funnel_json).expect("flexible FunnelQuery deserialization");
+    assert_eq!(fq.order_mode, FunnelOrderMode::StrictOrder);
+
+    let ret_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "start_event": "App_Open",
+        "return_event": "App_Open",
+        "mode": "stickiness",
+        "unit": "Weekly",
+        "num_periods": 7
+    });
+    let rq: RetentionQuery =
+        serde_json::from_value(ret_json).expect("flexible RetentionQuery deserialization");
+    assert_eq!(rq.mode, RetentionMode::FrequencyStickiness);
+    assert_eq!(rq.unit, TimeInterval::Week);
+
+    let flows_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "anchor_event": "Checkout",
+        "direction": "backward",
+        "steps": 3,
+        "top_n_per_step": 5
+    });
+    let flq: FlowsQuery =
+        serde_json::from_value(flows_json).expect("flexible FlowsQuery deserialization");
+    assert_eq!(flq.direction, FlowDirection::Reverse);
+
+    let bad_interval = serde_json::json!({
+        "time_range": { "start_ts_ms": 1, "end_ts_ms": 2 },
+        "interval": "Year",
+        "series": []
+    });
+    let err = serde_json::from_value::<InsightsQuery>(bad_interval).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid interval 'Year': expected hour, day, week, or month"),
+        "unexpected error message: {msg}"
+    );
+    assert!(!msg.contains("TimeInterval"), "leaked Rust enum: {msg}");
+}

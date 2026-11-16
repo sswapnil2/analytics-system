@@ -53,9 +53,10 @@ async fn handle_ingest(
 async fn handle_identify(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
-    Json(req): Json<IdentifyRequest>,
+    body: Bytes,
 ) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
+    let req: IdentifyRequest = serde_json::from_slice(&body).map_err(IngestError::Json)?;
     let resp = service.identify(api_key, req).await?;
     Ok(Json(resp))
 }
@@ -97,9 +98,18 @@ impl IntoResponse for ApiError {
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let message = match &self.0 {
+            IngestError::Wire(pulse_wire::WireError::Json(e)) | IngestError::Json(e) => {
+                format!(
+                    "invalid JSON payload: {}",
+                    pulse_wire::sanitize_json_error_message(&e.to_string())
+                )
+            }
+            other => other.to_string(),
+        };
         let body = serde_json::json!({
             "status": "error",
-            "message": self.0.to_string(),
+            "message": message,
         });
         (status, Json(body)).into_response()
     }
