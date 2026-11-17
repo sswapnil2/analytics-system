@@ -156,9 +156,10 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Days to show</span>
             <select value={numPeriods} onChange={(e) => setNumPeriods(Number(e.target.value))} className={field}>
-              <option value={7}>7 days</option>
-              <option value={10}>10 days</option>
-              <option value={13}>13 days</option>
+              {/* A saved report may carry a length the menu doesn't offer; show it rather than a wrong one. */}
+              {[...new Set([7, 10, 13, numPeriods])].sort((x, y) => x - y).map((n) => (
+                <option key={n} value={n}>{n} days</option>
+              ))}
             </select>
           </label>
         </div>
