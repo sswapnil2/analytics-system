@@ -337,6 +337,12 @@ export const App: React.FC = () => {
 
   const activePid = projectId || status?.active_project_id || "";
   const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
+  // The event list loads once per project; while it's empty, reload it as soon as
+  // the status poll sees events, so the first data shows up without a page reload.
+  const waitingForFirstEvents = catalogLoaded && availableEvents.length === 0 && totalEvents > 0;
+  useEffect(() => {
+    if (waitingForFirstEvents) void loadCatalog();
+  }, [waitingForFirstEvents, totalEvents, loadCatalog]);
   const projects = status?.projects ?? [];
   const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
@@ -539,7 +545,7 @@ export const App: React.FC = () => {
               "No events in the last few seconds"
             )}
           </div>
-          {(status?.l0_rows ?? 0) > 0 && (
+          {canManageKeys && (status?.l0_rows ?? 0) > 0 && (
             <button
               type="button"
               onClick={() => void handleFlush()}
@@ -547,7 +553,7 @@ export const App: React.FC = () => {
               className="text-left text-brand hover:underline disabled:opacity-50"
               title="Writes events still held in memory to durable storage"
             >
-              {flushing ? "Saving…" : `Save ${formatCount(status?.l0_rows)} buffered events now`}
+              {flushing ? "Saving…" : `${formatCount(status?.l0_rows)} recent events in memory · Save to disk`}
             </button>
           )}
           {notice && (
@@ -702,6 +708,7 @@ export const App: React.FC = () => {
                   <FlowsWorkspace
                     projectId={activePid}
                     availableEvents={availableEvents}
+                    availableProps={availableProps}
                     refreshToken={refreshToken}
                   />
                 )}
@@ -709,6 +716,7 @@ export const App: React.FC = () => {
                   <RetentionWorkspace
                     projectId={activePid}
                     availableEvents={availableEvents}
+                    availableProps={availableProps}
                     refreshToken={refreshToken}
                   />
                 )}

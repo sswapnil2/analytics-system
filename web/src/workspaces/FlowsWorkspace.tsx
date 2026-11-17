@@ -15,10 +15,12 @@ import {
   ReportLayout,
   ChartSkeleton,
 } from "../components/ui";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, toGlobalFilter } from "../components/FilterPanel";
 
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   refreshToken: number;
 }
 
@@ -44,12 +46,13 @@ function truncate(text: string, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, Math.max(1, maxChars - 1))}…` : text;
 }
 
-export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
+export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, availableProps, refreshToken }) => {
   const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
   const [anchorEvent, setAnchorEvent] = useState<string>(() => cleanEvents[0] ?? "");
   const [direction, setDirection] = useState<"forward" | "reverse">("forward");
   const [steps, setSteps] = useState<number>(3);
   const [hideSystem, setHideSystem] = useState<boolean>(true);
+  const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<FlowsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -77,6 +80,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
         anchor_event: anchorEvent,
         direction,
         steps,
+        global_filter: toGlobalFilter(filter),
       });
       if (id === reqId.current) setResult(res);
     } catch (err) {
@@ -84,7 +88,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, anchorEvent, direction, steps, range]);
+  }, [projectId, anchorEvent, direction, steps, range, filter]);
 
   useEffect(() => {
     void runFlows();
@@ -227,8 +231,9 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
       <ReportLayout
         summary={`${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)} · ${steps} steps${
           hideSystem ? " · system events hidden" : ""
-        }`}
-        query={
+        }${describeFilter(filter) ? ` · ${describeFilter(filter)}` : ""}`}
+        query={<>
+      <FilterPanel projectId={projectId} availableProps={availableProps} anchorEvent={anchorEvent} value={filter} onChange={setFilter} />
       <Panel title="Query">
         <div className="flex flex-col gap-4">
           <label className="flex min-w-0 flex-col gap-1">
@@ -297,7 +302,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
           </label>
         </div>
       </Panel>
-        }
+        </>}
       >
 
       {error && <ErrorNotice message={error} onRetry={() => void runFlows()} />}

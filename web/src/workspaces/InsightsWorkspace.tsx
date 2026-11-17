@@ -18,6 +18,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 
 interface Props {
   projectId: string;
@@ -141,6 +142,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const sort = useSort<"metric" | "segment" | "overall">("overall", true, ["metric", "segment"]);
+  const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<InsightsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -163,8 +165,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
       breakdown_by: breakdown ? [breakdown] : [],
       compare_previous_period: comparePrev,
       formula: formula.trim() ? formula.trim() : null,
+      global_filter: toGlobalFilter(filter),
     }),
-    [series, formula, breakdown, comparePrev],
+    [series, formula, breakdown, comparePrev, filter],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -179,6 +182,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       setBreakdown(s.breakdown_by?.[0] ?? "");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
+      setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
   );
@@ -298,10 +302,12 @@ export const InsightsWorkspace: React.FC<Props> = ({
           `${series.length} metric${series.length === 1 ? "" : "s"}`,
           formula.trim() ? `formula ${formula.trim()}` : null,
           breakdown ? `by ${breakdown.replace(/_/g, " ")}` : "no breakdown",
+          describeFilter(filter),
         ]
           .filter(Boolean)
           .join(" · ")}
-        query={
+        query={<>
+      <FilterPanel projectId={projectId} availableProps={availableProps} anchorEvent={series[0]?.eventName ?? ""} value={filter} onChange={setFilter} />
       <Panel
         title="Metrics"
         actions={
@@ -430,7 +436,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
           </div>
         </div>
       </Panel>
-        }
+        </>}
       >
 
       {openError && <ErrorNotice message={openError} />}
