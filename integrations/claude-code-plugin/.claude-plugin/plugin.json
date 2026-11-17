@@ -1,0 +1,10 @@
+{
+  "name": "pulse",
+  "version": "0.1.0",
+  "description": "Query a self-hosted Pulse analytics node over MCP (funnels, retention, insights, frustrated sessions, lexicon) and instrument apps with the Pulse web SDK.",
+  "author": { "name": "Pulse contributors" },
+  "homepage": "https://github.com/sswapnil2/analytics-system",
+  "repository": "https://github.com/sswapnil2/analytics-system",
+  "license": "Apache-2.0",
+  "keywords": ["analytics", "mcp", "funnels", "self-hosted"]
+}
