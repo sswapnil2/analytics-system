@@ -610,7 +610,11 @@ export const App: React.FC = () => {
                   />
                 )}
                 {activeTab === "experiments" && (
-                  <ExperimentsFlagsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                  <ExperimentsFlagsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
                 )}
                 {activeTab === "events" && (
                   <LexiconMcpWorkspace
