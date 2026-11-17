@@ -284,14 +284,14 @@ impl<'de> Deserialize<'de> for WireEvent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
 
-        // Support Pulse native (`event_name`), Segment/Mixpanel (`event`), or generic (`name`) (`PR-8`)
+        // Support Pulse native (`event_name`), Segment (`event`), or generic (`name`) (`PR-8`)
         let event_name = non_empty_str(&obj, &["event_name", "event", "name"])
             .ok_or_else(|| {
                 serde::de::Error::custom("missing event name: provide \"event_name\" or \"event\"")
             })?
             .to_string();
 
-        // Parse properties (`props` or Segment/Mixpanel `properties`) before falling back for IDs
+        // Parse properties (`props` or Segment `properties`) before falling back for IDs
         let props_val = obj.remove("props").or_else(|| obj.remove("properties"));
         let nested_props_map = match &props_val {
             Some(serde_json::Value::Object(m)) => Some(m),

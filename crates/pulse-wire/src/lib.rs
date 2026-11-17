@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn pr8_en4_segment_mixpanel_json_ingest_and_clean_errors() {
+    fn pr8_en4_segment_and_array_json_ingest_and_clean_errors() {
         // 1. Segment single object
         let seg_single = br#"{"event":"App_Open","userId":"u_seg_1","properties":{"city":"Mumbai","plan_amt":499},"timestamp":"2026-11-17T00:00:00Z"}"#;
         let b1 = WireBatch::decode_json(seg_single).expect("segment single object");
@@ -302,12 +302,12 @@ mod tests {
         assert_eq!(b2.events[0].distinct_id, "anon_9");
         assert!(b2.events[0].client_event_ts_ms > 0);
 
-        // 3. Mixpanel top-level array with distinct_id and epoch seconds nested in properties
-        let mp_arr = br#"[{"event":"SignedUp","properties":{"distinct_id":"u_mp_1","time":1760000000,"plan":"pro"}}]"#;
-        let b3 = WireBatch::decode_json(mp_arr).expect("mixpanel array");
+        // 3. Top-level array with distinct_id and epoch seconds nested in properties
+        let top_arr = br#"[{"event":"SignedUp","properties":{"distinct_id":"u_arr_1","time":1760000000,"plan":"pro"}}]"#;
+        let b3 = WireBatch::decode_json(top_arr).expect("top-level array");
         assert_eq!(b3.len(), 1);
         assert_eq!(b3.events[0].event_name, "SignedUp");
-        assert_eq!(b3.events[0].distinct_id, "u_mp_1");
+        assert_eq!(b3.events[0].distinct_id, "u_arr_1");
         assert_eq!(b3.events[0].client_event_ts_ms, 1_760_000_000_000);
 
         // 4. Clean error messages without internal serde wrapper names

@@ -78,7 +78,7 @@ const iso = (ms: number) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-/** Mixpanel-style date preset bar with a Custom from/to popover. */
+/** Date preset bar with a Custom from/to popover. */
 export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) => void }> = ({ value, onChange }) => {
   const [open, setOpen] = useState(false);
   const r = rangeFor(value);

@@ -28,9 +28,9 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser:
 - On first launch with a seeded database, sign in with the generated `sk_root_...` admin token printed in startup logs, or create the first workspace account from `/#/signup`.
 - Empty projects display an in-app **Send your first event** quickstart panel (also accessible anytime from the terminal icon in the sidebar footer).
 
-## Ingest Events (Pulse, Segment, or Mixpanel JSON)
+## Ingest Events (Pulse or Segment JSON)
 
-`/v1/ingest` accepts single event objects, Segment `{"batch": [...]}` payloads, Mixpanel top-level arrays `[...]`, or Pulse `{"events": [...]}` batches authenticated with `x-pulse-key`:
+`/v1/ingest` accepts single event objects, Segment `{"batch": [...]}` payloads, top-level arrays `[...]`, or Pulse `{"events": [...]}` batches authenticated with `x-pulse-key`:
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/v1/ingest" \

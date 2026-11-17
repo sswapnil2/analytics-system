@@ -102,7 +102,7 @@ export const fieldLabel = "text-[0.8125rem] font-semibold text-ink-2";
 
 /**
  * Report page body: results on the left, the query on a sticky rail on the
- * right (Mixpanel's layout). On narrow screens the query comes first.
+&On narrow screens the query comes first.
  */
 export const ReportLayout: React.FC<{ query: React.ReactNode; summary: string; children: React.ReactNode }> = ({
   query,

@@ -57,7 +57,7 @@ pub trait GovernanceProvider: Send + Sync {
     /// Asynchronously records newly observed event/property schema items.
     fn record_discovery(&self, items: Vec<DiscoveredEventSchema>);
 
-    /// Applies Mixpanel/Amplitude-style user profile operations from `/v1/engage` or `/v1/identify` (`Gap 1`).
+    /// Applies user profile operations from `/v1/engage` or `/v1/identify` (`Gap 1`).
     async fn apply_engage(
         &self,
         _project_id: &str,
