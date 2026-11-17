@@ -150,7 +150,7 @@ fn record_row(
     rows.push((name, stats, slo, pass));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scale_latency_percentiles_and_slo_harness() {
     let cfg = ScaleConfig::from_env();
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -417,6 +417,7 @@ async fn scale_latency_percentiles_and_slo_harness() {
         funnel_cold_us.push(t0.elapsed().as_micros() as u64);
         assert_eq!(res.overall_steps.len(), 5);
         assert!(res.overall_steps[0].entered_users > 0);
+        cold_engine.cache().close().await;
     }
 
     // 2. Warm QueryEngine across all analytics modes
@@ -523,6 +524,130 @@ async fn scale_latency_percentiles_and_slo_harness() {
         }
     }
 
+    // 4. Simultaneous Live Ingest + Background L0->L1 Segment Flushes + 16x Concurrent Mixed Queries
+    let ingest_load_task = {
+        let ing = ingest.clone();
+        let ps_bg = ps.clone();
+        let num_users = cfg.num_users;
+        tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(10);
+            for wave in 0..10usize {
+                let mut evs = Vec::with_capacity(1_000);
+                for j in 0..1_000usize {
+                    let uid = (wave * 1_000 + j) % num_users;
+                    let ts = base_ts + ((wave % 14) as i64) * 86_400_000 + (j as i64) * 100;
+                    evs.push(WireEvent {
+                        event_uuid: [
+                            (j & 0xff) as u8,
+                            ((j >> 8) & 0xff) as u8,
+                            (wave & 0xff) as u8,
+                            1,
+                            2,
+                            3,
+                            4,
+                            5,
+                            6,
+                            7,
+                            8,
+                            9,
+                            10,
+                            11,
+                            12,
+                            99,
+                        ],
+                        routing_seed: format!("seed_web_{uid:06}"),
+                        distinct_id: format!("u_{uid:06}"),
+                        session_id: format!("s_live_{uid:06}_{wave}"),
+                        event_name: match j % 4 {
+                            0 => "App_Open",
+                            1 => "KYC_PAN_Submitted",
+                            2 => "UPI_Autopay_Mandate_Approved",
+                            _ => "First_Disbursal_Success",
+                        }
+                        .to_string(),
+                        client_event_ts_ms: ts,
+                        client_sent_ts_ms: 0,
+                        props: vec![
+                            (
+                                "plan".to_string(),
+                                PropValue::Str(plans[uid % plans.len()].into()),
+                            ),
+                            (
+                                "city".to_string(),
+                                PropValue::Str(cities[(uid / 3) % cities.len()].into()),
+                            ),
+                            (
+                                "payment_method".to_string(),
+                                PropValue::Str(pay_methods[(uid / 5) % pay_methods.len()].into()),
+                            ),
+                            ("amount".to_string(), PropValue::Int(1_250)),
+                        ],
+                        replay_offset_kb: 0,
+                    });
+                }
+                let t0 = Instant::now();
+                let resp = ing
+                    .ingest_for_project(project_id, WireBatch::new(evs), server_now + 5_000)
+                    .await
+                    .expect("live ingest under query load");
+                assert_eq!(resp.accepted, 1_000);
+                samples.push(t0.elapsed().as_micros() as u64);
+                ps_bg.schedule_background_flush((wave % 16) as u8);
+            }
+            samples
+        })
+    };
+
+    let query_load_task = {
+        let qe = qengine.clone();
+        let fq = funnel_query.clone();
+        let iq = insights_query.clone();
+        let rq = retention_query.clone();
+        let flq = flows_query.clone();
+        let waves = cfg.concurrent_waves;
+        tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(waves * 16);
+            for _wave in 0..waves {
+                let mut handles = Vec::with_capacity(16);
+                for worker in 0..16 {
+                    let qe = qe.clone();
+                    let fq = fq.clone();
+                    let iq = iq.clone();
+                    let rq = rq.clone();
+                    let flq = flq.clone();
+                    handles.push(tokio::spawn(async move {
+                        let t0 = Instant::now();
+                        match worker % 4 {
+                            0 => {
+                                qe.query_funnel(project_id, &fq).await.unwrap();
+                            }
+                            1 => {
+                                qe.query_insights(project_id, &iq).await.unwrap();
+                            }
+                            2 => {
+                                qe.query_retention(project_id, &rq).await.unwrap();
+                            }
+                            _ => {
+                                qe.query_flows(project_id, &flq).await.unwrap();
+                            }
+                        }
+                        t0.elapsed().as_micros() as u64
+                    }));
+                }
+                for h in handles {
+                    samples.push(h.await.expect("query_under_ingest worker join"));
+                }
+            }
+            samples
+        })
+    };
+
+    let (ingest_under_load_res, query_under_ingest_res) =
+        tokio::join!(ingest_load_task, query_load_task);
+    let ingest_under_load_us = ingest_under_load_res.expect("ingest_load_task join");
+    let query_under_ingest_us = query_under_ingest_res.expect("query_load_task join");
+    storage.flush_all_projects().await.expect("final flush");
+
     let sf = (cfg.total_events as f64 / 1_000_000.0).max(0.5);
     let flows_sf = (sf * (flows_days as f64 / span_days as f64)).max(0.5);
 
@@ -606,6 +731,28 @@ async fn scale_latency_percentiles_and_slo_harness() {
             p99_ms: 650.0 * sf,
         },
     );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "ingest_under_load",
+        &ingest_under_load_us,
+        SloBudget {
+            p50_ms: 80.0,
+            p75_ms: 120.0,
+            p99_ms: 250.0,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "query_under_ingest",
+        &query_under_ingest_us,
+        SloBudget {
+            p50_ms: 260.0 * sf,
+            p75_ms: 400.0 * sf,
+            p99_ms: 750.0 * sf,
+        },
+    );
 
     println!();
     println!(
@@ -643,6 +790,8 @@ async fn scale_latency_percentiles_and_slo_harness() {
     }
     println!();
 
+    qengine.cache().close().await;
+    drop(qengine);
     id_router.close_all().await.unwrap();
 
     #[cfg(not(debug_assertions))]

@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use pulse_node::{start_pulse_node, NodeConfig};
+use pulse_node::{start_pulse_node, NodeConfig, NodeRole};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -58,6 +58,17 @@ async fn main() -> anyhow::Result<()> {
             }
             "--web-dir" if i + 1 < args.len() => {
                 cfg.web_dist_dir = args[i + 1].clone().into();
+                i += 1;
+            }
+            "--role" if i + 1 < args.len() => {
+                if let Some(r) = NodeRole::parse(&args[i + 1]) {
+                    cfg.role = r;
+                } else {
+                    anyhow::bail!(
+                        "invalid --role '{}': expected one of all, ingest, query, compactor",
+                        args[i + 1]
+                    );
+                }
                 i += 1;
             }
             _ => {}

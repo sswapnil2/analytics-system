@@ -81,40 +81,43 @@ impl FlowsEngine {
             .collect();
 
         // Parallelize per-chunk event filtering, then assemble user timelines in chunk order with resource bounds (`P3-02`).
-        let chunk_batches: Vec<Vec<(u32, i64, u16, bool)>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let ta = &chunk.tier_a;
-                let mut local = Vec::new();
-                for r in 0..chunk.len() {
-                    let ts = ta.event_ts_ms[r];
-                    if !query.time_range.contains(ts) {
-                        continue;
-                    }
-                    let canon_uid = id_snap.resolve(ta.uid_internal[r]);
-                    if let Some(ec) = &eligible_cohort {
-                        if !ec.contains(canon_uid) {
-                            continue;
+        let chunk_batches: Vec<Vec<(u32, i64, u16, bool)>> =
+            crate::scanner::run_rayon_compute(|| {
+                chunks
+                    .par_iter()
+                    .map(|chunk| {
+                        let ta = &chunk.tier_a;
+                        let mut local = Vec::new();
+                        for r in 0..chunk.len() {
+                            let ts = ta.event_ts_ms[r];
+                            if !query.time_range.contains(ts) {
+                                continue;
+                            }
+                            let canon_uid = id_snap.resolve(ta.uid_internal[r]);
+                            if let Some(ec) = &eligible_cohort {
+                                if !ec.contains(canon_uid) {
+                                    continue;
+                                }
+                            }
+                            if !row_matches_predicates(chunk, r, &query.global_filter.predicates) {
+                                continue;
+                            }
+
+                            let eid = ta.event_id[r];
+                            let is_anchor = anchor_tgt.matches_id(eid)
+                                && anchor_tgt.extra_filter.as_ref().is_none_or(|ef| {
+                                    row_matches_predicates(chunk, r, std::slice::from_ref(ef))
+                                });
+                            if !include_system_events && !is_anchor && system_eids.contains(&eid) {
+                                continue;
+                            }
+
+                            local.push((canon_uid, ts, eid, is_anchor));
                         }
-                    }
-                    if !row_matches_predicates(chunk, r, &query.global_filter.predicates) {
-                        continue;
-                    }
-
-                    let eid = ta.event_id[r];
-                    let is_anchor = anchor_tgt.matches_id(eid)
-                        && anchor_tgt.extra_filter.as_ref().is_none_or(|ef| {
-                            row_matches_predicates(chunk, r, std::slice::from_ref(ef))
-                        });
-                    if !include_system_events && !is_anchor && system_eids.contains(&eid) {
-                        continue;
-                    }
-
-                    local.push((canon_uid, ts, eid, is_anchor));
-                }
-                local
-            })
-            .collect();
+                        local
+                    })
+                    .collect()
+            });
 
         let mut timelines: HashMap<u32, Vec<(i64, u16, bool)>> = HashMap::new();
         let mut total_collected = 0usize;
@@ -169,57 +172,60 @@ impl FlowsEngine {
         };
 
         // Parallel per-user chronological sort, zero-allocation consecutive-event collapsing, and path construction (`Section 6`, `P3-02`).
-        let user_paths: Vec<(u32, Vec<(i32, FlowToken)>)> = timelines
-            .into_par_iter()
-            .filter_map(|(uid, mut evs)| {
-                evs.sort_by_key(|(ts, eid, _)| (*ts, *eid));
+        let user_paths: Vec<(u32, Vec<(i32, FlowToken)>)> =
+            crate::scanner::run_rayon_compute(|| {
+                timelines
+                    .into_par_iter()
+                    .filter_map(|(uid, mut evs)| {
+                        evs.sort_by_key(|(ts, eid, _)| (*ts, *eid));
 
-                let mut collapsed: Vec<(FlowToken, bool)> = Vec::with_capacity(evs.len());
-                for (_, eid, is_anchor) in evs {
-                    let tok = to_token(eid, is_anchor);
-                    if let Some((last_tok, last_anchor)) = collapsed.last_mut() {
-                        if *last_tok == tok {
-                            *last_anchor |= is_anchor;
-                            continue;
+                        let mut collapsed: Vec<(FlowToken, bool)> = Vec::with_capacity(evs.len());
+                        for (_, eid, is_anchor) in evs {
+                            let tok = to_token(eid, is_anchor);
+                            if let Some((last_tok, last_anchor)) = collapsed.last_mut() {
+                                if *last_tok == tok {
+                                    *last_anchor |= is_anchor;
+                                    continue;
+                                }
+                            }
+                            collapsed.push((tok, is_anchor));
                         }
-                    }
-                    collapsed.push((tok, is_anchor));
-                }
 
-                let anchor_idx = collapsed.iter().position(|(_, is_a)| *is_a)?;
-                let mut path: Vec<(i32, FlowToken)> = Vec::with_capacity(steps + 1);
-                path.push((0, FlowToken::Anchor));
+                        let anchor_idx = collapsed.iter().position(|(_, is_a)| *is_a)?;
+                        let mut path: Vec<(i32, FlowToken)> = Vec::with_capacity(steps + 1);
+                        path.push((0, FlowToken::Anchor));
 
-                match query.direction {
-                    FlowDirection::Forward => {
-                        for offset in 1..=steps {
-                            let pos = anchor_idx + offset;
-                            let step_off = offset as i32;
-                            if let Some(&(tok, _)) = collapsed.get(pos) {
-                                path.push((step_off, tok));
-                            } else {
-                                path.push((step_off, FlowToken::DropOff));
-                                break;
+                        match query.direction {
+                            FlowDirection::Forward => {
+                                for offset in 1..=steps {
+                                    let pos = anchor_idx + offset;
+                                    let step_off = offset as i32;
+                                    if let Some(&(tok, _)) = collapsed.get(pos) {
+                                        path.push((step_off, tok));
+                                    } else {
+                                        path.push((step_off, FlowToken::DropOff));
+                                        break;
+                                    }
+                                }
+                            }
+                            FlowDirection::Reverse => {
+                                for offset in 1..=steps {
+                                    let step_off = -(offset as i32);
+                                    if anchor_idx >= offset {
+                                        let (tok, _) = collapsed[anchor_idx - offset];
+                                        path.push((step_off, tok));
+                                    } else {
+                                        path.push((step_off, FlowToken::SessionStart));
+                                        break;
+                                    }
+                                }
                             }
                         }
-                    }
-                    FlowDirection::Reverse => {
-                        for offset in 1..=steps {
-                            let step_off = -(offset as i32);
-                            if anchor_idx >= offset {
-                                let (tok, _) = collapsed[anchor_idx - offset];
-                                path.push((step_off, tok));
-                            } else {
-                                path.push((step_off, FlowToken::SessionStart));
-                                break;
-                            }
-                        }
-                    }
-                }
 
-                Some((uid, path))
-            })
-            .collect();
+                        Some((uid, path))
+                    })
+                    .collect()
+            });
 
         let mut raw_step_counts: HashMap<i32, HashMap<FlowToken, u64>> = HashMap::new();
         for (_uid, path) in &user_paths {

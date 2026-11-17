@@ -40,6 +40,14 @@ pub enum StorageError {
 
     #[error("invalid storage identifier: {0}")]
     InvalidIdentifier(String),
+
+    #[error("L0 memory backpressure on project '{project_id}' bucket {bucket_id} ({current_rows} >= {max_rows} rows)")]
+    L0Backpressure {
+        project_id: String,
+        bucket_id: u8,
+        current_rows: usize,
+        max_rows: usize,
+    },
 }
 
 impl From<vortex_error::VortexError> for StorageError {

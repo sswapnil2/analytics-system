@@ -38,6 +38,22 @@ pub enum ExecError {
 
 pub type Result<T> = std::result::Result<T, ExecError>;
 
+/// Runs CPU-intensive Rayon parallel reductions off the async cooperative scheduler
+/// when executing on a multi-threaded Tokio runtime, preventing ingest I/O starvation.
+#[inline]
+pub fn run_rayon_compute<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Uniform columnar batch representing either an L1 Vortex segment or an L0 `MemBucket` snapshot.
 pub struct DataChunk {
     pub bucket_id: u8,
@@ -703,44 +719,46 @@ fn evaluate_cohort_bounded<'a>(
                 }))
                 .await?;
 
-                let counts: HashMap<u32, u32> = chunks
-                    .par_iter()
-                    .zip(row_masks.par_iter())
-                    .map(|(chunk, row_mask)| {
-                        let mut local: HashMap<u32, u32> = HashMap::new();
-                        for i in 0..chunk.len() {
-                            if let Some(rm) = row_mask {
-                                if !rm.contains(i as u32) {
+                let counts: HashMap<u32, u32> = run_rayon_compute(|| {
+                    chunks
+                        .par_iter()
+                        .zip(row_masks.par_iter())
+                        .map(|(chunk, row_mask)| {
+                            let mut local: HashMap<u32, u32> = HashMap::new();
+                            for i in 0..chunk.len() {
+                                if let Some(rm) = row_mask {
+                                    if !rm.contains(i as u32) {
+                                        continue;
+                                    }
+                                }
+                                if let Some(tr) = eff_range {
+                                    if !tr.contains(chunk.tier_a.event_ts_ms[i]) {
+                                        continue;
+                                    }
+                                }
+                                if !target.matches_id(chunk.tier_a.event_id[i]) {
                                     continue;
                                 }
-                            }
-                            if let Some(tr) = eff_range {
-                                if !tr.contains(chunk.tier_a.event_ts_ms[i]) {
+                                if let Some(ef) = &target.extra_filter {
+                                    if !row_matches_predicates(chunk, i, std::slice::from_ref(ef)) {
+                                        continue;
+                                    }
+                                }
+                                if !row_matches_predicates(chunk, i, where_clauses) {
                                     continue;
                                 }
+                                let canon = id_snap.resolve(chunk.tier_a.uid_internal[i]);
+                                *local.entry(canon).or_insert(0) += 1;
                             }
-                            if !target.matches_id(chunk.tier_a.event_id[i]) {
-                                continue;
+                            local
+                        })
+                        .reduce(HashMap::new, |mut acc, map| {
+                            for (uid, cnt) in map {
+                                *acc.entry(uid).or_insert(0) += cnt;
                             }
-                            if let Some(ef) = &target.extra_filter {
-                                if !row_matches_predicates(chunk, i, std::slice::from_ref(ef)) {
-                                    continue;
-                                }
-                            }
-                            if !row_matches_predicates(chunk, i, where_clauses) {
-                                continue;
-                            }
-                            let canon = id_snap.resolve(chunk.tier_a.uid_internal[i]);
-                            *local.entry(canon).or_insert(0) += 1;
-                        }
-                        local
-                    })
-                    .reduce(HashMap::new, |mut acc, map| {
-                        for (uid, cnt) in map {
-                            *acc.entry(uid).or_insert(0) += cnt;
-                        }
-                        acc
-                    });
+                            acc
+                        })
+                });
 
                 let needed = (*min_count).max(1);
                 let mut out = RoaringBitmap::new();
@@ -768,21 +786,25 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let mut universe = all_chunks
-                    .par_iter()
-                    .map(|chunk| {
-                        let mut local = RoaringBitmap::new();
-                        for i in 0..chunk.len() {
-                            if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i])) {
-                                local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                let mut universe = run_rayon_compute(|| {
+                    all_chunks
+                        .par_iter()
+                        .map(|chunk| {
+                            let mut local = RoaringBitmap::new();
+                            for i in 0..chunk.len() {
+                                if eff_range
+                                    .is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
+                                {
+                                    local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                                }
                             }
-                        }
-                        local
-                    })
-                    .reduce(RoaringBitmap::new, |mut a, b| {
-                        a |= b;
-                        a
-                    });
+                            local
+                        })
+                        .reduce(RoaringBitmap::new, |mut a, b| {
+                            a |= b;
+                            a
+                        })
+                });
                 let performed = evaluate_cohort_bounded(
                     &BehavioralCohortDef::PerformedEvent {
                         event_name: event_name.clone(),
@@ -819,23 +841,30 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let out = chunks
-                    .par_iter()
-                    .map(|chunk| {
-                        let mut local = RoaringBitmap::new();
-                        for i in 0..chunk.len() {
-                            if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
-                                && row_matches_predicates(chunk, i, std::slice::from_ref(predicate))
-                            {
-                                local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                let out = run_rayon_compute(|| {
+                    chunks
+                        .par_iter()
+                        .map(|chunk| {
+                            let mut local = RoaringBitmap::new();
+                            for i in 0..chunk.len() {
+                                if eff_range
+                                    .is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
+                                    && row_matches_predicates(
+                                        chunk,
+                                        i,
+                                        std::slice::from_ref(predicate),
+                                    )
+                                {
+                                    local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                                }
                             }
-                        }
-                        local
-                    })
-                    .reduce(RoaringBitmap::new, |mut a, b| {
-                        a |= b;
-                        a
-                    });
+                            local
+                        })
+                        .reduce(RoaringBitmap::new, |mut a, b| {
+                            a |= b;
+                            a
+                        })
+                });
                 Ok(out)
             }
             BehavioralCohortDef::CohortRef { cohort_id } => {

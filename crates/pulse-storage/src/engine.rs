@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
-use pulse_identity::IdentityRouter;
+use pulse_identity::{IdentityRouter, ProjectIdentityGraph};
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
 use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -73,6 +73,7 @@ pub struct ProjectStorage {
     project_id: String,
     config: StorageConfig,
     object_store: Arc<dyn ObjectStore>,
+    id_graph: Arc<ProjectIdentityGraph>,
     manifest_store: ManifestStore,
     manifest: RwLock<Arc<Manifest>>,
     manifest_commit_lock: AsyncMutex<()>,
@@ -85,10 +86,44 @@ pub struct ProjectStorage {
     bucket_flush_locks: Vec<AsyncMutex<()>>,
     compaction_locks: DashMap<(NaiveDate, u8), Arc<AsyncMutex<()>>>,
     l0_seq: AtomicU64,
+    max_l0_rows_per_bucket: AtomicUsize,
+    flush_in_flight: Vec<AtomicBool>,
+    bg_flush_handles: Mutex<Vec<tokio::task::AbortHandle>>,
     pin_tracker: Arc<ReaderPinTracker>,
     pending_gc: Mutex<Vec<String>>,
     session_flags: Cache<u64, u16>,
     recovered_uuid_fps: Mutex<Vec<(u8, u64)>>,
+}
+
+impl Drop for ProjectStorage {
+    fn drop(&mut self) {
+        for handle in self.bg_flush_handles.get_mut().drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+struct FlushInFlightResetGuard {
+    ps: std::sync::Weak<ProjectStorage>,
+    b_idx: usize,
+}
+
+impl Drop for FlushInFlightResetGuard {
+    fn drop(&mut self) {
+        if let Some(ps) = self.ps.upgrade() {
+            if let Some(flag) = ps.flush_in_flight.get(self.b_idx) {
+                flag.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn default_max_l0_rows_per_bucket(config: &StorageConfig) -> usize {
+    std::env::var("PULSE_L0_MAX_ROWS_PER_BUCKET")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| config.l0_flush_row_threshold.saturating_mul(4).max(1_000))
 }
 
 impl ProjectStorage {
@@ -104,6 +139,7 @@ impl ProjectStorage {
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
         ));
+        let id_graph = identity_router.get_or_open(&project_id).await?;
 
         let max_committed_l0 = manifest
             .committed_l0_seq
@@ -112,11 +148,13 @@ impl ProjectStorage {
             .max()
             .unwrap_or(0);
         let l0_seq = AtomicU64::new(max_committed_l0);
+        let max_l0_rows_per_bucket = AtomicUsize::new(default_max_l0_rows_per_bucket(&config));
 
         let mut wals = Vec::with_capacity(config.num_buckets as usize);
         let mut mem_buckets = Vec::with_capacity(config.num_buckets as usize);
         let mut bucket_append_locks = Vec::with_capacity(config.num_buckets as usize);
         let mut bucket_flush_locks = Vec::with_capacity(config.num_buckets as usize);
+        let mut flush_in_flight = Vec::with_capacity(config.num_buckets as usize);
 
         for b in 0..config.num_buckets {
             let bucket_id = b as u8;
@@ -137,12 +175,14 @@ impl ProjectStorage {
             mem_buckets.push(MemBucket::new(bucket_id));
             bucket_append_locks.push(AsyncMutex::new(()));
             bucket_flush_locks.push(AsyncMutex::new(()));
+            flush_in_flight.push(AtomicBool::new(false));
         }
 
         let ps = Arc::new(Self {
             project_id: project_id.clone(),
             config: config.clone(),
             object_store: object_store.clone(),
+            id_graph,
             manifest_store,
             manifest: RwLock::new(Arc::new(manifest)),
             manifest_commit_lock: AsyncMutex::new(()),
@@ -153,6 +193,9 @@ impl ProjectStorage {
             bucket_flush_locks,
             compaction_locks: DashMap::new(),
             l0_seq,
+            max_l0_rows_per_bucket,
+            flush_in_flight,
+            bg_flush_handles: Mutex::new(Vec::new()),
             pin_tracker: Arc::new(ReaderPinTracker::default()),
             pending_gc: Mutex::new(Vec::new()),
             session_flags: Cache::builder()
@@ -162,66 +205,67 @@ impl ProjectStorage {
             recovered_uuid_fps: Mutex::new(Vec::new()),
         });
 
-        // Replay uncommitted WAL records across all buckets (RPO = 0)
-        let id_graph = identity_router.get_or_open(&project_id).await?;
-        let mut seen_replay_fps: HashSet<u64> = HashSet::new();
+        if !identity_router.is_read_only() {
+            // Replay uncommitted WAL records across all buckets (RPO = 0)
+            let mut seen_replay_fps: HashSet<u64> = HashSet::new();
 
-        // Seed dedup ONLY from recent L1 segments (`max_ts_ms >= now - 30 min`) so startup cost is O(recent),
-        // not O(total history) (`P3-04`).
-        let cutoff_ts_ms = Utc::now()
-            .timestamp_millis()
-            .saturating_sub(DEDUP_SEED_LOOKBACK_MS);
-        let reader = VortexSegmentReader::new(object_store);
-        let recent_segs: Vec<SegmentMeta> = ps
-            .manifest
-            .read()
-            .active_segments
-            .values()
-            .flat_map(|v| v.iter())
-            .filter(|s| s.footer.max_ts_ms >= cutoff_ts_ms)
-            .cloned()
-            .collect();
-        for seg in &recent_segs {
-            if let Ok(batch) = reader.project_columns(seg, &["event_uuid_fp"]).await {
-                if let Some(col) = batch.column_by_name("event_uuid_fp") {
-                    use arrow_array::cast::AsArray;
-                    use arrow_array::types::UInt64Type;
-                    let arr = col.as_primitive::<UInt64Type>();
-                    let mut rec_guard = ps.recovered_uuid_fps.lock();
-                    for i in 0..arr.len() {
-                        let fp = arr.value(i);
-                        seen_replay_fps.insert(fp);
-                        rec_guard.push((seg.bucket_id, fp));
-                    }
-                }
-            }
-        }
-
-        for b in 0..config.num_buckets {
-            let bucket_id = b as u8;
-            let committed_wal = ps
+            // Seed dedup ONLY from recent L1 segments (`max_ts_ms >= now - 30 min`) so startup cost is O(recent),
+            // not O(total history) (`P3-04`).
+            let cutoff_ts_ms = Utc::now()
+                .timestamp_millis()
+                .saturating_sub(DEDUP_SEED_LOOKBACK_MS);
+            let reader = VortexSegmentReader::new(object_store);
+            let recent_segs: Vec<SegmentMeta> = ps
                 .manifest
                 .read()
-                .committed_wal_seq
-                .get(&bucket_id)
-                .copied()
-                .unwrap_or(0);
-            let records = ps.wals[b as usize].recover(committed_wal).await?;
-            for (wal_seq, batch) in records {
-                let mut rows = Vec::with_capacity(batch.len());
-                for ev in &batch.events {
-                    let fp = event_uuid_fingerprint(&ev.event_uuid);
-                    if !seen_replay_fps.insert(fp) {
-                        continue;
+                .active_segments
+                .values()
+                .flat_map(|v| v.iter())
+                .filter(|s| s.footer.max_ts_ms >= cutoff_ts_ms)
+                .cloned()
+                .collect();
+            for seg in &recent_segs {
+                if let Ok(batch) = reader.project_columns(seg, &["event_uuid_fp"]).await {
+                    if let Some(col) = batch.column_by_name("event_uuid_fp") {
+                        use arrow_array::cast::AsArray;
+                        use arrow_array::types::UInt64Type;
+                        let arr = col.as_primitive::<UInt64Type>();
+                        let mut rec_guard = ps.recovered_uuid_fps.lock();
+                        for i in 0..arr.len() {
+                            let fp = arr.value(i);
+                            seen_replay_fps.insert(fp);
+                            rec_guard.push((seg.bucket_id, fp));
+                        }
                     }
-                    ps.recovered_uuid_fps.lock().push((bucket_id, fp));
-                    let uid = id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-                    rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp)?);
                 }
-                ps.mem_buckets[b as usize].append_batch(rows);
             }
+
+            for b in 0..config.num_buckets {
+                let bucket_id = b as u8;
+                let committed_wal = ps
+                    .manifest
+                    .read()
+                    .committed_wal_seq
+                    .get(&bucket_id)
+                    .copied()
+                    .unwrap_or(0);
+                let records = ps.wals[b as usize].recover(committed_wal).await?;
+                for (wal_seq, batch) in records {
+                    let mut rows = Vec::with_capacity(batch.len());
+                    for ev in &batch.events {
+                        let fp = event_uuid_fingerprint(&ev.event_uuid);
+                        if !seen_replay_fps.insert(fp) {
+                            continue;
+                        }
+                        ps.recovered_uuid_fps.lock().push((bucket_id, fp));
+                        let uid = ps.id_graph.get_or_intern(&ev.distinct_id, bucket_id);
+                        rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp)?);
+                    }
+                    ps.mem_buckets[b as usize].append_batch(rows);
+                }
+            }
+            ps.id_graph.flush().await?;
         }
-        id_graph.flush().await?;
 
         Ok(ps)
     }
@@ -362,6 +406,67 @@ impl ProjectStorage {
         })
     }
 
+    pub fn bucket_l0_rows(&self, bucket_id: u8) -> usize {
+        self.mem_buckets
+            .get(bucket_id as usize)
+            .map_or(0, |mb| mb.len())
+    }
+
+    pub fn max_l0_rows_per_bucket(&self) -> usize {
+        self.max_l0_rows_per_bucket.load(Ordering::Acquire)
+    }
+
+    pub fn set_max_l0_rows_per_bucket(&self, max_rows: usize) {
+        self.max_l0_rows_per_bucket
+            .store(max_rows.max(1), Ordering::Release);
+    }
+
+    /// Rejects writes with `StorageError::L0Backpressure` if a bucket's unflushed L0 buffer hits
+    /// the high-water mark, scheduling an asynchronous background flush so ingestion recovers automatically.
+    pub fn check_l0_backpressure(self: &Arc<Self>, bucket_id: u8) -> Result<()> {
+        let current_rows = self.bucket_l0_rows(bucket_id);
+        let max_rows = self.max_l0_rows_per_bucket();
+        if current_rows >= max_rows {
+            self.schedule_background_flush(bucket_id);
+            return Err(StorageError::L0Backpressure {
+                project_id: self.project_id.clone(),
+                bucket_id,
+                current_rows,
+                max_rows,
+            });
+        }
+        Ok(())
+    }
+
+    /// Schedules an asynchronous L0 -> L1 flush for `bucket_id`, deduplicated per bucket via `flush_in_flight`.
+    /// Returns `true` if a new background flush task was spawned.
+    pub fn schedule_background_flush(self: &Arc<Self>, bucket_id: u8) -> bool {
+        let b_idx = bucket_id as usize;
+        let Some(flag) = self.flush_in_flight.get(b_idx) else {
+            return false;
+        };
+        if flag
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let ps_weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let _reset_guard = FlushInFlightResetGuard {
+                ps: ps_weak.clone(),
+                b_idx,
+            };
+            if let Some(ps) = ps_weak.upgrade() {
+                let _ = ps.flush_bucket(bucket_id).await;
+            }
+        });
+        let mut guard = self.bg_flush_handles.lock();
+        guard.retain(|h| !h.is_finished());
+        guard.push(handle.abort_handle());
+        true
+    }
+
     /// Appends a pre-filtered bucket batch durably to `BucketWal` and `MemBucket` under the per-bucket append lock.
     pub async fn append_bucket_events(
         &self,
@@ -389,6 +494,9 @@ impl ProjectStorage {
             return Ok(Vec::new());
         };
         let _bucket_guard = flush_lock.lock().await;
+
+        // Guarantee interned u32 identities are durable in SlateDB BEFORE publishing any L1 segment (`P1-10`).
+        self.id_graph.flush().await?;
 
         let floor_l0 = self
             .manifest
@@ -425,32 +533,32 @@ impl ProjectStorage {
             }
         }
 
-        // Atomically commit new MVCC Manifest epoch BEFORE evicting from L0 MemBucket!
-        {
-            let _commit_guard = self.manifest_commit_lock.lock().await;
-            let mut next_manifest = (**self.manifest.read()).clone();
-            for meta in &written_segments {
+        // Atomically commit new MVCC Manifest epoch (with CAS reload-and-merge retries) BEFORE evicting from L0 MemBucket!
+        if let Some(committed) = self
+            .commit_manifest_cas(|next_manifest| {
+                for meta in &written_segments {
+                    next_manifest
+                        .active_segments
+                        .entry((meta.date, bucket_id))
+                        .or_default()
+                        .push(meta.clone());
+                }
                 next_manifest
-                    .active_segments
-                    .entry((meta.date, bucket_id))
-                    .or_default()
-                    .push(meta.clone());
-            }
-            next_manifest
-                .committed_l0_seq
-                .entry(bucket_id)
-                .and_modify(|v| *v = (*v).max(max_l0))
-                .or_insert(max_l0);
-            next_manifest
-                .committed_wal_seq
-                .entry(bucket_id)
-                .and_modify(|v| *v = (*v).max(max_wal))
-                .or_insert(max_wal);
-            next_manifest.dict_snapshot = self.dictionary.snapshot();
-
-            let committed = self.manifest_store.commit_next(next_manifest).await?;
+                    .committed_l0_seq
+                    .entry(bucket_id)
+                    .and_modify(|v| *v = (*v).max(max_l0))
+                    .or_insert(max_l0);
+                next_manifest
+                    .committed_wal_seq
+                    .entry(bucket_id)
+                    .and_modify(|v| *v = (*v).max(max_wal))
+                    .or_insert(max_wal);
+                next_manifest.dict_snapshot = self.dictionary.snapshot();
+                true
+            })
+            .await?
+        {
             self.wals[b_idx].advance_epoch(committed.epoch);
-            *self.manifest.write() = Arc::new(committed);
         }
 
         self.mem_buckets[b_idx].complete_flush(max_l0);
@@ -459,7 +567,35 @@ impl ProjectStorage {
         Ok(written_segments)
     }
 
+    async fn commit_manifest_cas<F>(&self, mut apply: F) -> Result<Option<Arc<Manifest>>>
+    where
+        F: FnMut(&mut Manifest) -> bool,
+    {
+        let _commit_guard = self.manifest_commit_lock.lock().await;
+        for attempt in 0..8u8 {
+            let mut candidate = (**self.manifest.read()).clone();
+            if !apply(&mut candidate) {
+                return Ok(None);
+            }
+            match self.manifest_store.commit_next(candidate).await {
+                Ok(committed) => {
+                    let arc = Arc::new(committed);
+                    *self.manifest.write() = arc.clone();
+                    return Ok(Some(arc));
+                }
+                Err(StorageError::ManifestConflict) if attempt < 7 => {
+                    let latest = self.manifest_store.load_latest().await?;
+                    self.dictionary.merge_snapshot(&latest.dict_snapshot);
+                    *self.manifest.write() = Arc::new(latest);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StorageError::ManifestConflict)
+    }
+
     pub async fn flush_all(&self) -> Result<usize> {
+        self.id_graph.flush().await?;
         let mut guards = Vec::with_capacity(self.bucket_flush_locks.len());
         for lock in &self.bucket_flush_locks {
             guards.push(lock.lock().await);
@@ -529,35 +665,35 @@ impl ProjectStorage {
             }
         }
 
+        if let Some(committed) = self
+            .commit_manifest_cas(|next_manifest| {
+                for meta in &written_segments {
+                    next_manifest
+                        .active_segments
+                        .entry((meta.date, meta.bucket_id))
+                        .or_default()
+                        .push(meta.clone());
+                }
+                for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
+                    next_manifest
+                        .committed_l0_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_l0))
+                        .or_insert(max_l0);
+                    next_manifest
+                        .committed_wal_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_wal))
+                        .or_insert(max_wal);
+                }
+                next_manifest.dict_snapshot = self.dictionary.snapshot();
+                true
+            })
+            .await?
         {
-            let _commit_guard = self.manifest_commit_lock.lock().await;
-            let mut next_manifest = (**self.manifest.read()).clone();
-            for meta in &written_segments {
-                next_manifest
-                    .active_segments
-                    .entry((meta.date, meta.bucket_id))
-                    .or_default()
-                    .push(meta.clone());
-            }
-            for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
-                next_manifest
-                    .committed_l0_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_l0))
-                    .or_insert(max_l0);
-                next_manifest
-                    .committed_wal_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_wal))
-                    .or_insert(max_wal);
-            }
-            next_manifest.dict_snapshot = self.dictionary.snapshot();
-
-            let committed = self.manifest_store.commit_next(next_manifest).await?;
             for &(_, b_idx, _, _) in &bucket_watermarks {
                 self.wals[b_idx].advance_epoch(committed.epoch);
             }
-            *self.manifest.write() = Arc::new(committed);
         }
 
         for &(_, b_idx, max_l0, max_wal) in &bucket_watermarks {
@@ -636,32 +772,29 @@ impl ProjectStorage {
                 .map(|s| s.object_path.clone())
                 .collect();
 
-            let committed_ok = {
-                let _commit_guard = self.manifest_commit_lock.lock().await;
-                let mut next_manifest = (**self.manifest.read()).clone();
-                let entry = next_manifest
-                    .active_segments
-                    .entry((date, bucket_id))
-                    .or_default();
+            let committed_ok = self
+                .commit_manifest_cas(|next_manifest| {
+                    let entry = next_manifest
+                        .active_segments
+                        .entry((date, bucket_id))
+                        .or_default();
 
-                // Verify ALL `source_ids` are still active before replacing them (`P1-06`).
-                let active_ids: HashSet<&str> =
-                    entry.iter().map(|s| s.segment_id.as_str()).collect();
-                if !source_ids
-                    .iter()
-                    .all(|sid| active_ids.contains(sid.as_str()))
-                {
-                    false
-                } else {
+                    // Verify ALL `source_ids` are still active before replacing them (`P1-06`).
+                    let active_ids: HashSet<&str> =
+                        entry.iter().map(|s| s.segment_id.as_str()).collect();
+                    if !source_ids
+                        .iter()
+                        .all(|sid| active_ids.contains(sid.as_str()))
+                    {
+                        return false;
+                    }
                     entry.retain(|s| !source_ids.contains(&s.segment_id));
                     entry.push(new_meta.clone());
                     next_manifest.dict_snapshot = self.dictionary.snapshot();
-
-                    let committed = self.manifest_store.commit_next(next_manifest).await?;
-                    *self.manifest.write() = Arc::new(committed);
                     true
-                }
-            };
+                })
+                .await?
+                .is_some();
 
             if !committed_ok {
                 let orphan = ObjectPath::from(new_meta.object_path.as_str());
@@ -725,6 +858,24 @@ impl ProjectStorage {
         sessions.sort_unstable();
         sessions.dedup();
         (total_purged, sessions)
+    }
+
+    /// Refreshes the in-memory `ProjectIdentityGraph`, `Manifest`, and `ProjectDictionary` from `ObjectStore`.
+    pub async fn refresh_manifest(&self) -> Result<bool> {
+        let id_refreshed = self.id_graph.refresh().await?;
+        let latest = self.manifest_store.load_latest().await?;
+        let current_epoch = self.manifest.read().epoch;
+        if latest.epoch <= current_epoch {
+            return Ok(id_refreshed);
+        }
+        self.dictionary.merge_snapshot(&latest.dict_snapshot);
+        for (&bucket_id, &committed_l0) in &latest.committed_l0_seq {
+            if let Some(mb) = self.mem_buckets.get(bucket_id as usize) {
+                mb.complete_flush(committed_l0);
+            }
+        }
+        *self.manifest.write() = Arc::new(latest);
+        Ok(true)
     }
 }
 
@@ -880,40 +1031,49 @@ impl StorageEngine {
         Ok(res)
     }
 
+    pub fn open_projects(&self) -> Vec<Arc<ProjectStorage>> {
+        self.projects.iter().map(|e| e.value().clone()).collect()
+    }
+
     pub async fn flush_all_projects(&self) -> Result<usize> {
         self.identity_router
             .flush_all()
             .await
             .map_err(StorageError::Identity)?;
-        let list: Vec<Arc<ProjectStorage>> =
-            self.projects.iter().map(|e| e.value().clone()).collect();
         let mut total = 0usize;
-        for p in list {
+        for p in self.open_projects() {
             total += p.flush_all().await?;
         }
         Ok(total)
     }
 
     pub async fn compact_all_projects(&self) -> Result<usize> {
-        let list: Vec<Arc<ProjectStorage>> =
-            self.projects.iter().map(|e| e.value().clone()).collect();
         let mut total = 0usize;
-        for p in list {
+        for p in self.open_projects() {
             total += p.compact_overdue(&self.segment_reader).await?;
         }
         Ok(total)
     }
 
     pub async fn compact_all_with_min_segments(&self, min_segments: usize) -> Result<usize> {
-        let list: Vec<Arc<ProjectStorage>> =
-            self.projects.iter().map(|e| e.value().clone()).collect();
         let mut total = 0usize;
-        for p in list {
+        for p in self.open_projects() {
             total += p
                 .compact_min_segments(&self.segment_reader, min_segments)
                 .await?;
         }
         Ok(total)
+    }
+
+    /// Refreshes manifests for all opened projects from `ObjectStore`, returning how many projects updated.
+    pub async fn refresh_all_manifests(&self) -> Result<usize> {
+        let mut refreshed = 0usize;
+        for p in self.open_projects() {
+            if p.refresh_manifest().await? {
+                refreshed += 1;
+            }
+        }
+        Ok(refreshed)
     }
 
     /// Spawns background L0 age-based flusher and late-data compactor loop.

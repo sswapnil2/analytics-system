@@ -8,7 +8,7 @@ use arrow_array::{Array as ArrowArray, RecordBatch};
 use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy, NoopDeviceBuilder, PsyncIoEngineConfig,
+    HybridCachePolicy, PsyncIoEngineConfig, S3FifoConfig,
 };
 use moka::sync::Cache;
 use pulse_storage::{
@@ -82,11 +82,17 @@ impl SegmentBlockCache {
         disk_cache_dir: Option<&Path>,
         disk_bytes: usize,
     ) -> Result<Arc<Self>, String> {
+        let policy = if disk_cache_dir.is_some() {
+            HybridCachePolicy::WriteOnInsertion
+        } else {
+            HybridCachePolicy::WriteOnEviction
+        };
         let mem_builder = HybridCacheBuilder::new()
             .with_name("pulse-vortex-cache")
-            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .with_policy(policy)
             .with_flush_on_close(false)
             .memory(memory_bytes.max(4 * 1024 * 1024))
+            .with_eviction_config(S3FifoConfig::default())
             .with_weighter(|k: &String, v: &Vec<u8>| k.len() + v.len());
 
         let hybrid = if let Some(dir) = disk_cache_dir {
@@ -103,13 +109,8 @@ impl SegmentBlockCache {
                 .await
                 .map_err(|e| e.to_string())?
         } else {
-            let device = NoopDeviceBuilder::default()
-                .build()
-                .map_err(|e| e.to_string())?;
             mem_builder
                 .storage()
-                .with_io_engine_config(PsyncIoEngineConfig::new())
-                .with_engine_config(BlockEngineConfig::new(device))
                 .build()
                 .await
                 .map_err(|e| e.to_string())?
@@ -439,5 +440,10 @@ impl SegmentBlockCache {
             .iter()
             .map(|(k, v)| ((*k).clone(), v.len()))
             .collect()
+    }
+
+    /// Gracefully shuts down the underlying `foyer` hybrid cache before runtime teardown.
+    pub async fn close(&self) {
+        let _ = self.hybrid.close().await;
     }
 }

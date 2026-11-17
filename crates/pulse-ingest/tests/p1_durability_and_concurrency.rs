@@ -28,6 +28,7 @@ struct HookStore {
     fail_wal_puts: AtomicBool,
     fail_bucket1_wal: AtomicBool,
     delay_first_wal_ms: AtomicUsize,
+    delay_segment_put_ms: AtomicUsize,
     wal_put_counter: AtomicUsize,
     get_delay_ms: AtomicUsize,
 }
@@ -39,6 +40,7 @@ impl HookStore {
             fail_wal_puts: AtomicBool::new(false),
             fail_bucket1_wal: AtomicBool::new(false),
             delay_first_wal_ms: AtomicUsize::new(0),
+            delay_segment_put_ms: AtomicUsize::new(0),
             wal_put_counter: AtomicUsize::new(0),
             get_delay_ms: AtomicUsize::new(0),
         })
@@ -76,6 +78,11 @@ impl ObjectStore for HookStore {
             let idx = self.wal_put_counter.fetch_add(1, Ordering::SeqCst);
             let delay = self.delay_first_wal_ms.load(Ordering::SeqCst);
             if idx == 0 && delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+            }
+        } else if p.starts_with("segments/") {
+            let delay = self.delay_segment_put_ms.load(Ordering::SeqCst);
+            if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay as u64)).await;
             }
         }
@@ -703,4 +710,160 @@ async fn p1_16_replay_store_immutable_chunks_survive_midnight_restart_and_reject
         2,
         "session chunks split across midnight after restart were lost!"
     );
+}
+
+#[tokio::test]
+async fn ha_01_ingest_does_not_block_on_slow_l1_segment_flush_and_enforces_l0_backpressure() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::build_ingest_router;
+    use pulse_storage::StorageError;
+    use tower::ServiceExt;
+
+    let hook = HookStore::new();
+    hook.delay_segment_put_ms.store(250, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = hook.clone();
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 2,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_ha_01", "proj_ha_01");
+    let ingest = IngestService::new(storage.clone(), gov);
+
+    let ps = storage.get_or_open_project("proj_ha_01").await.unwrap();
+
+    // 1. Ingesting at the L0 flush threshold must NOT block waiting on the 250ms L1 segment upload!
+    let t0 = std::time::Instant::now();
+    let resp = ingest
+        .ingest_for_project(
+            "proj_ha_01",
+            WireBatch::new(vec![
+                make_event(1, "s", "u1", 1_762_000_000_000),
+                make_event(2, "s", "u2", 1_762_000_001_000),
+            ]),
+            1_762_000_001_000,
+        )
+        .await
+        .unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(resp.accepted, 2);
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "ingest blocked on background L1 flush: took {elapsed:?}"
+    );
+
+    // Wait for the background L1 segment flush to finish
+    let mut flushed = false;
+    for _ in 0..40 {
+        if ps.snapshot().manifest.total_l1_rows() == 2 && ps.total_l0_rows() == 0 {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(flushed, "background L0->L1 flush did not complete in time");
+
+    // 2. Enforce L0 high-water mark backpressure (HTTP 429 + Retry-After: 1)
+    ps.set_max_l0_rows_per_bucket(2);
+    hook.delay_segment_put_ms.store(300, Ordering::SeqCst);
+
+    let r2 = ingest
+        .ingest_for_project(
+            "proj_ha_01",
+            WireBatch::new(vec![
+                make_event(3, "s", "u3", 1_762_000_002_000),
+                make_event(4, "s", "u4", 1_762_000_003_000),
+            ]),
+            1_762_000_003_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.accepted, 2);
+
+    // Direct service call must reject with StorageError::L0Backpressure while L0 is at high-water mark
+    let err = ingest
+        .ingest_for_project(
+            "proj_ha_01",
+            WireBatch::new(vec![make_event(5, "s", "u5", 1_762_000_004_000)]),
+            1_762_000_004_000,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            pulse_ingest::IngestError::Storage(StorageError::L0Backpressure { .. })
+        ),
+        "expected L0Backpressure, got {err:?}"
+    );
+
+    // HTTP router must return 429 Too Many Requests with Retry-After: 1
+    let app = build_ingest_router(ingest.clone());
+    let payload_json = serde_json::json!({
+        "events": [{
+            "distinct_id": "u6",
+            "event_name": "Purchase",
+            "client_event_ts_ms": 1_762_000_005_000i64
+        }]
+    })
+    .to_string();
+    let http_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest")
+                .header("x-pulse-key", "pk_ha_01")
+                .header("content-type", "application/json")
+                .body(Body::from(payload_json.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        http_resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+
+    // Once background flush drains L0, subsequent ingest succeeds with 200 OK
+    let mut drained = false;
+    for _ in 0..40 {
+        if ps.total_l0_rows() == 0 {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        drained,
+        "background flush did not drain L0 after backpressure"
+    );
+
+    let ok_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest")
+                .header("x-pulse-key", "pk_ha_01")
+                .header("content-type", "application/json")
+                .body(Body::from(payload_json))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    id_router.close_all().await.unwrap();
 }

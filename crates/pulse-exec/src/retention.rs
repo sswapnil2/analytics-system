@@ -98,83 +98,85 @@ impl RetentionEngine {
         // 1. Track each canonical user's earliest qualifying `start_event` inside `query.time_range`
         // 2. Track exact `RoaringBitmap` of users performing `return_event` in every timezone-aligned calendar bucket (`P2-09d`)
         let (first_start_ts, return_by_bucket): (HashMap<u32, i64>, BTreeMap<i64, RoaringBitmap>) =
-            chunks
-                .par_iter()
-                .map(|chunk| {
-                    let ta = &chunk.tier_a;
-                    let mut local_starts: HashMap<u32, i64> = HashMap::new();
-                    let mut local_returns: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();
-                    let mut tz_cache: Option<(i64, i64)> = None;
+            crate::scanner::run_rayon_compute(|| {
+                chunks
+                    .par_iter()
+                    .map(|chunk| {
+                        let ta = &chunk.tier_a;
+                        let mut local_starts: HashMap<u32, i64> = HashMap::new();
+                        let mut local_returns: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();
+                        let mut tz_cache: Option<(i64, i64)> = None;
 
-                    for r in 0..chunk.len() {
-                        let ts = ta.event_ts_ms[r];
-                        if !scan_range.contains(ts) {
-                            continue;
-                        }
-                        let eid = ta.event_id[r];
-                        let is_start = start_tgt.matches_id(eid);
-                        let is_ret = return_tgt.matches_id(eid);
-                        if !is_start && !is_ret {
-                            continue;
-                        }
-
-                        let canon_uid = id_snap.resolve(ta.uid_internal[r]);
-                        if let Some(ec) = &eligible_cohort {
-                            if !ec.contains(canon_uid) {
+                        for r in 0..chunk.len() {
+                            let ts = ta.event_ts_ms[r];
+                            if !scan_range.contains(ts) {
                                 continue;
                             }
-                        }
-                        if !row_matches_predicates(chunk, r, &query.global_filter.predicates) {
-                            continue;
-                        }
+                            let eid = ta.event_id[r];
+                            let is_start = start_tgt.matches_id(eid);
+                            let is_ret = return_tgt.matches_id(eid);
+                            if !is_start && !is_ret {
+                                continue;
+                            }
 
-                        if is_start
-                            && query.time_range.contains(ts)
-                            && start_tgt.extra_filter.as_ref().is_none_or(|ef| {
-                                row_matches_predicates(chunk, r, std::slice::from_ref(ef))
-                            })
-                        {
-                            local_starts
-                                .entry(canon_uid)
-                                .and_modify(|e| {
-                                    if ts < *e {
-                                        *e = ts;
-                                    }
+                            let canon_uid = id_snap.resolve(ta.uid_internal[r]);
+                            if let Some(ec) = &eligible_cohort {
+                                if !ec.contains(canon_uid) {
+                                    continue;
+                                }
+                            }
+                            if !row_matches_predicates(chunk, r, &query.global_filter.predicates) {
+                                continue;
+                            }
+
+                            if is_start
+                                && query.time_range.contains(ts)
+                                && start_tgt.extra_filter.as_ref().is_none_or(|ef| {
+                                    row_matches_predicates(chunk, r, std::slice::from_ref(ef))
                                 })
-                                .or_insert(ts);
-                        }
+                            {
+                                local_starts
+                                    .entry(canon_uid)
+                                    .and_modify(|e| {
+                                        if ts < *e {
+                                            *e = ts;
+                                        }
+                                    })
+                                    .or_insert(ts);
+                            }
 
-                        if is_ret
-                            && return_tgt.extra_filter.as_ref().is_none_or(|ef| {
-                                row_matches_predicates(chunk, r, std::slice::from_ref(ef))
-                            })
-                        {
-                            let b_ts = align_floor_tz_cached(ts, query.unit, tz, &mut tz_cache);
-                            local_returns.entry(b_ts).or_default().insert(canon_uid);
-                        }
-                    }
-
-                    (local_starts, local_returns)
-                })
-                .reduce(
-                    || (HashMap::new(), BTreeMap::new()),
-                    |(mut acc_starts, mut acc_returns), (loc_starts, loc_returns)| {
-                        for (uid, ts) in loc_starts {
-                            acc_starts
-                                .entry(uid)
-                                .and_modify(|e| {
-                                    if ts < *e {
-                                        *e = ts;
-                                    }
+                            if is_ret
+                                && return_tgt.extra_filter.as_ref().is_none_or(|ef| {
+                                    row_matches_predicates(chunk, r, std::slice::from_ref(ef))
                                 })
-                                .or_insert(ts);
+                            {
+                                let b_ts = align_floor_tz_cached(ts, query.unit, tz, &mut tz_cache);
+                                local_returns.entry(b_ts).or_default().insert(canon_uid);
+                            }
                         }
-                        for (b_ts, bm) in loc_returns {
-                            *acc_returns.entry(b_ts).or_default() |= bm;
-                        }
-                        (acc_starts, acc_returns)
-                    },
-                );
+
+                        (local_starts, local_returns)
+                    })
+                    .reduce(
+                        || (HashMap::new(), BTreeMap::new()),
+                        |(mut acc_starts, mut acc_returns), (loc_starts, loc_returns)| {
+                            for (uid, ts) in loc_starts {
+                                acc_starts
+                                    .entry(uid)
+                                    .and_modify(|e| {
+                                        if ts < *e {
+                                            *e = ts;
+                                        }
+                                    })
+                                    .or_insert(ts);
+                            }
+                            for (b_ts, bm) in loc_returns {
+                                *acc_returns.entry(b_ts).or_default() |= bm;
+                            }
+                            (acc_starts, acc_returns)
+                        },
+                    )
+            });
 
         // Group users into cohorts by `unit.align_floor_tz(first_start_ts, tz)` (`P2-09d`)
         let mut cohorts_map: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();

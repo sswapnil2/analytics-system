@@ -324,151 +324,169 @@ impl FunnelEngine {
         // Lock-free parallel shard execution via Rayon (`P3-05`):
         // Every shard uses a local breakdown interner + deterministic 64-bit hold hash (`0 == HOLD_MISSING`),
         // with zero cross-thread `Mutex` contention.
-        let shard_outputs: Vec<(ShardSummary, Vec<String>, Vec<UserEvent>)> = bucket_groups
-            .par_iter()
-            .map(|(_bucket_id, b_chunks)| {
-                let mut local_events: Vec<UserEvent> = Vec::new();
-                let mut cross_events: Vec<UserEvent> = Vec::new();
-                let mut shard_bdown_map: HashMap<String, u32> = HashMap::new();
-                let mut shard_bdown_names: Vec<String> = vec!["(none)".to_string()];
-                shard_bdown_map.insert("(none)".to_string(), 0);
-                let mut hold_scratch: Vec<u8> = Vec::new();
+        let shard_outputs: Vec<(ShardSummary, Vec<String>, Vec<UserEvent>)> =
+            crate::scanner::run_rayon_compute(|| {
+                bucket_groups
+                    .par_iter()
+                    .map(|(_bucket_id, b_chunks)| {
+                        let mut local_events: Vec<UserEvent> = Vec::new();
+                        let mut cross_events: Vec<UserEvent> = Vec::new();
+                        let mut shard_bdown_map: HashMap<String, u32> = HashMap::new();
+                        let mut shard_bdown_names: Vec<String> = vec!["(none)".to_string()];
+                        shard_bdown_map.insert("(none)".to_string(), 0);
+                        let mut hold_scratch: Vec<u8> = Vec::new();
 
-                for &(chunk_idx, chunk) in b_chunks {
-                    let ta = &chunk.tier_a;
-                    let n = ta.len();
+                        for &(chunk_idx, chunk) in b_chunks {
+                            let ta = &chunk.tier_a;
+                            let n = ta.len();
 
-                    for r in 0..n {
-                        let ts = ta.event_ts_ms[r];
-                        if ts < effective_min_ts || ts > effective_max_ts {
-                            continue;
-                        }
+                            for r in 0..n {
+                                let ts = ta.event_ts_ms[r];
+                                if ts < effective_min_ts || ts > effective_max_ts {
+                                    continue;
+                                }
 
-                        let eid = ta.event_id[r] as usize;
-                        let mut s_mask = ev_step_bits.get(eid).copied().unwrap_or(0);
-                        let mut x_mask = ev_excl_bits.get(eid).copied().unwrap_or(0);
+                                let eid = ta.event_id[r] as usize;
+                                let mut s_mask = ev_step_bits.get(eid).copied().unwrap_or(0);
+                                let mut x_mask = ev_excl_bits.get(eid).copied().unwrap_or(0);
 
-                        if !is_strict && s_mask == 0 && x_mask == 0 {
-                            continue;
-                        }
+                                if !is_strict && s_mask == 0 && x_mask == 0 {
+                                    continue;
+                                }
 
-                        let canon_uid = id_snap.resolve(ta.uid_internal[r]);
-                        if let Some(ec) = &eligible_cohort {
-                            if !ec.contains(canon_uid) {
-                                continue;
-                            }
-                        }
+                                let canon_uid = id_snap.resolve(ta.uid_internal[r]);
+                                if let Some(ec) = &eligible_cohort {
+                                    if !ec.contains(canon_uid) {
+                                        continue;
+                                    }
+                                }
 
-                        if has_global_preds
-                            && !row_matches_predicates(chunk, r, &query.global_filter.predicates)
-                        {
-                            continue;
-                        }
+                                if has_global_preds
+                                    && !row_matches_predicates(
+                                        chunk,
+                                        r,
+                                        &query.global_filter.predicates,
+                                    )
+                                {
+                                    continue;
+                                }
 
-                        if has_step_filters {
-                            if s_mask != 0 {
-                                for (s_idx, step_tgt) in step_targets.iter().enumerate().take(k) {
-                                    if (s_mask & (1u16 << s_idx)) != 0 {
-                                        let pass_extra =
-                                            step_tgt.extra_filter.as_ref().is_none_or(|ef| {
-                                                row_matches_predicates(
-                                                    chunk,
-                                                    r,
-                                                    std::slice::from_ref(ef),
-                                                )
-                                            });
-                                        let pass_step = pass_extra
-                                            && row_matches_predicates(
-                                                chunk,
-                                                r,
-                                                &query.steps[s_idx].filters,
-                                            );
-                                        if !pass_step {
-                                            s_mask &= !(1u16 << s_idx);
+                                if has_step_filters {
+                                    if s_mask != 0 {
+                                        for (s_idx, step_tgt) in
+                                            step_targets.iter().enumerate().take(k)
+                                        {
+                                            if (s_mask & (1u16 << s_idx)) != 0 {
+                                                let pass_extra = step_tgt
+                                                    .extra_filter
+                                                    .as_ref()
+                                                    .is_none_or(|ef| {
+                                                        row_matches_predicates(
+                                                            chunk,
+                                                            r,
+                                                            std::slice::from_ref(ef),
+                                                        )
+                                                    });
+                                                let pass_step = pass_extra
+                                                    && row_matches_predicates(
+                                                        chunk,
+                                                        r,
+                                                        &query.steps[s_idx].filters,
+                                                    );
+                                                if !pass_step {
+                                                    s_mask &= !(1u16 << s_idx);
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
-                            if x_mask != 0 {
-                                for (e_idx, (tgt, _)) in excl_targets.iter().enumerate() {
-                                    if (x_mask & (1u16 << e_idx)) != 0
-                                        && tgt.extra_filter.as_ref().is_some_and(|ef| {
-                                            !row_matches_predicates(
-                                                chunk,
-                                                r,
-                                                std::slice::from_ref(ef),
-                                            )
-                                        })
-                                    {
-                                        x_mask &= !(1u16 << e_idx);
+                                    if x_mask != 0 {
+                                        for (e_idx, (tgt, _)) in excl_targets.iter().enumerate() {
+                                            if (x_mask & (1u16 << e_idx)) != 0
+                                                && tgt.extra_filter.as_ref().is_some_and(|ef| {
+                                                    !row_matches_predicates(
+                                                        chunk,
+                                                        r,
+                                                        std::slice::from_ref(ef),
+                                                    )
+                                                })
+                                            {
+                                                x_mask &= !(1u16 << e_idx);
+                                            }
+                                        }
+                                    }
+                                    if !is_strict && s_mask == 0 && x_mask == 0 {
+                                        continue;
                                     }
                                 }
-                            }
-                            if !is_strict && s_mask == 0 && x_mask == 0 {
-                                continue;
+
+                                let hold_id = if has_hold {
+                                    hash_hold_tuple(
+                                        chunk,
+                                        r,
+                                        &query.hold_constant_props,
+                                        &mut hold_scratch,
+                                    )
+                                } else {
+                                    1
+                                };
+
+                                let breakdown_id = if let Some(bprop) = &query.breakdown_by {
+                                    if (s_mask & 1) != 0
+                                        || query.order_mode == FunnelOrderMode::AnyOrder
+                                    {
+                                        intern_local_prop(
+                                            chunk,
+                                            r,
+                                            bprop,
+                                            &mut shard_bdown_map,
+                                            &mut shard_bdown_names,
+                                        )
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    0
+                                };
+
+                                let has_replay_hint = ta.replay_offset_kb[r] > 0
+                                    || (!recorded_hashes.is_empty()
+                                        && recorded_hashes.contains(&ta.session_hash[r]));
+
+                                let uev = UserEvent {
+                                    canon_uid,
+                                    ts_ms: ts,
+                                    step_mask: s_mask,
+                                    excl_mask: x_mask,
+                                    hold_id,
+                                    breakdown_id,
+                                    chunk_idx,
+                                    row_idx: r as u32,
+                                    has_replay_hint,
+                                };
+
+                                if id_snap.is_cross_bucket(canon_uid) {
+                                    cross_events.push(uev);
+                                } else {
+                                    local_events.push(uev);
+                                }
                             }
                         }
 
-                        let hold_id = if has_hold {
-                            hash_hold_tuple(chunk, r, &query.hold_constant_props, &mut hold_scratch)
-                        } else {
-                            1
-                        };
-
-                        let breakdown_id = if let Some(bprop) = &query.breakdown_by {
-                            if (s_mask & 1) != 0 || query.order_mode == FunnelOrderMode::AnyOrder {
-                                intern_local_prop(
-                                    chunk,
-                                    r,
-                                    bprop,
-                                    &mut shard_bdown_map,
-                                    &mut shard_bdown_names,
-                                )
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-
-                        let has_replay_hint = ta.replay_offset_kb[r] > 0
-                            || (!recorded_hashes.is_empty()
-                                && recorded_hashes.contains(&ta.session_hash[r]));
-
-                        let uev = UserEvent {
-                            canon_uid,
-                            ts_ms: ts,
-                            step_mask: s_mask,
-                            excl_mask: x_mask,
-                            hold_id,
-                            breakdown_id,
-                            chunk_idx,
-                            row_idx: r as u32,
-                            has_replay_hint,
-                        };
-
-                        if id_snap.is_cross_bucket(canon_uid) {
-                            cross_events.push(uev);
-                        } else {
-                            local_events.push(uev);
-                        }
-                    }
-                }
-
-                let summary = evaluate_sorted_user_stream(
-                    &mut local_events,
-                    query.time_range,
-                    k,
-                    query.order_mode,
-                    window_ms,
-                    &excl_ranges,
-                    first_time_mask,
-                    has_hold,
-                    has_breakdown,
-                );
-                (summary, shard_bdown_names, cross_events)
-            })
-            .collect();
+                        let summary = evaluate_sorted_user_stream(
+                            &mut local_events,
+                            query.time_range,
+                            k,
+                            query.order_mode,
+                            window_ms,
+                            &excl_ranges,
+                            first_time_mask,
+                            has_hold,
+                            has_breakdown,
+                        );
+                        (summary, shard_bdown_names, cross_events)
+                    })
+                    .collect()
+            });
 
         // Merge shard summaries + execute coordinator Cross-Bucket Exact Stitch on `cross_bucket_users`!
         let mut final_summary = ShardSummary::new(k);

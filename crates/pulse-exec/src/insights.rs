@@ -517,153 +517,156 @@ async fn evaluate_single_series(
             interval
         };
 
-        chunks
-            .par_iter()
-            .zip(row_masks.par_iter())
-            .map(|(chunk, row_mask)| {
-                let mut local_groups: BTreeMap<String, BreakdownGroup> = BTreeMap::new();
-                let mut tz_cache: Option<(i64, i64)> = None;
+        crate::scanner::run_rayon_compute(|| {
+            chunks
+                .par_iter()
+                .zip(row_masks.par_iter())
+                .map(|(chunk, row_mask)| {
+                    let mut local_groups: BTreeMap<String, BreakdownGroup> = BTreeMap::new();
+                    let mut tz_cache: Option<(i64, i64)> = None;
 
-                for r in 0..chunk.len() {
-                    if let Some(rm) = row_mask {
-                        if !rm.contains(r as u32) {
-                            continue;
-                        }
-                    }
-                    if !tgt.matches_id(chunk.tier_a.event_id[r]) {
-                        continue;
-                    }
-                    let ts = chunk.tier_a.event_ts_ms[r];
-                    if !is_rolling && !range.contains(ts) {
-                        continue;
-                    }
-                    if is_rolling && ts > range.end_ts_ms {
-                        continue;
-                    }
-                    let canon_uid = id_snap.resolve(chunk.tier_a.uid_internal[r]);
-                    if let Some(ec) = eligible_cohort {
-                        if !ec.contains(canon_uid) {
-                            continue;
-                        }
-                    }
-                    if !row_matches_predicates(chunk, r, &all_preds) {
-                        continue;
-                    }
-
-                    let num_val = metric_prop
-                        .and_then(|mp| chunk.prop_cols.get(mp))
-                        .and_then(|c| c.get(r))
-                        .and_then(|pv| pv.as_f64());
-
-                    let entry = if breakdown_dims.is_empty() {
-                        if !local_groups.contains_key("overall") {
-                            local_groups.insert(
-                                "overall".to_string(),
-                                (BucketAccum::new(), BTreeMap::new()),
-                            );
-                        }
-                        local_groups
-                            .get_mut("overall")
-                            .expect("overall group inserted above")
-                    } else if breakdown_dims.len() == 1
-                        && !breakdown_cohorts.contains_key(&breakdown_dims[0])
-                    {
-                        let pv = chunk
-                            .prop_cols
-                            .get(&breakdown_dims[0])
-                            .and_then(|c| c.get(r))
-                            .unwrap_or(&PropValue::Null);
-                        let key_cow: std::borrow::Cow<'_, str> = if matches!(pv, PropValue::Null) {
-                            std::borrow::Cow::Borrowed("(none)")
-                        } else {
-                            pv.as_str_cow()
-                        };
-                        if !local_groups.contains_key(key_cow.as_ref()) {
-                            local_groups.insert(
-                                key_cow.into_owned(),
-                                (BucketAccum::new(), BTreeMap::new()),
-                            );
-                            // Re-lookup without cloning on repeat hits by looking up last or get_mut via pv again:
-                            let key_str = if matches!(pv, PropValue::Null) {
-                                std::borrow::Cow::Borrowed("(none)")
-                            } else {
-                                pv.as_str_cow()
-                            };
-                            local_groups
-                                .get_mut(key_str.as_ref())
-                                .expect("breakdown group inserted above")
-                        } else {
-                            local_groups
-                                .get_mut(key_cow.as_ref())
-                                .expect("breakdown group checked above")
-                        }
-                    } else {
-                        let mut parts = Vec::with_capacity(breakdown_dims.len());
-                        for dim in breakdown_dims {
-                            if let Some(cbm) = breakdown_cohorts.get(dim) {
-                                parts.push(if cbm.contains(canon_uid) {
-                                    "in_cohort".to_string()
-                                } else {
-                                    "not_in_cohort".to_string()
-                                });
-                            } else {
-                                let pv = chunk
-                                    .prop_cols
-                                    .get(dim)
-                                    .and_then(|c| c.get(r))
-                                    .unwrap_or(&PropValue::Null);
-                                parts.push(if matches!(pv, PropValue::Null) {
-                                    "(none)".to_string()
-                                } else {
-                                    pv.as_str_cow().into_owned()
-                                });
+                    for r in 0..chunk.len() {
+                        if let Some(rm) = row_mask {
+                            if !rm.contains(r as u32) {
+                                continue;
                             }
                         }
-                        let bkey = parts.join(" | ");
-                        local_groups
-                            .entry(bkey)
-                            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()))
-                    };
+                        if !tgt.matches_id(chunk.tier_a.event_id[r]) {
+                            continue;
+                        }
+                        let ts = chunk.tier_a.event_ts_ms[r];
+                        if !is_rolling && !range.contains(ts) {
+                            continue;
+                        }
+                        if is_rolling && ts > range.end_ts_ms {
+                            continue;
+                        }
+                        let canon_uid = id_snap.resolve(chunk.tier_a.uid_internal[r]);
+                        if let Some(ec) = eligible_cohort {
+                            if !ec.contains(canon_uid) {
+                                continue;
+                            }
+                        }
+                        if !row_matches_predicates(chunk, r, &all_preds) {
+                            continue;
+                        }
 
-                    if range.contains(ts) {
-                        entry.0.observe(
-                            canon_uid,
-                            chunk.tier_a.session_hash[r],
-                            num_val,
-                            metric_mask,
-                        );
-                    }
+                        let num_val = metric_prop
+                            .and_then(|mp| chunk.prop_cols.get(mp))
+                            .and_then(|c| c.get(r))
+                            .and_then(|pv| pv.as_f64());
 
-                    let b_ts = align_floor_tz_cached(ts, align_unit, tz, &mut tz_cache);
-                    entry
-                        .1
-                        .entry(b_ts)
-                        .or_insert_with(BucketAccum::new)
-                        .observe(
-                            canon_uid,
-                            chunk.tier_a.session_hash[r],
-                            num_val,
-                            metric_mask,
-                        );
-                }
+                        let entry = if breakdown_dims.is_empty() {
+                            if !local_groups.contains_key("overall") {
+                                local_groups.insert(
+                                    "overall".to_string(),
+                                    (BucketAccum::new(), BTreeMap::new()),
+                                );
+                            }
+                            local_groups
+                                .get_mut("overall")
+                                .expect("overall group inserted above")
+                        } else if breakdown_dims.len() == 1
+                            && !breakdown_cohorts.contains_key(&breakdown_dims[0])
+                        {
+                            let pv = chunk
+                                .prop_cols
+                                .get(&breakdown_dims[0])
+                                .and_then(|c| c.get(r))
+                                .unwrap_or(&PropValue::Null);
+                            let key_cow: std::borrow::Cow<'_, str> =
+                                if matches!(pv, PropValue::Null) {
+                                    std::borrow::Cow::Borrowed("(none)")
+                                } else {
+                                    pv.as_str_cow()
+                                };
+                            if !local_groups.contains_key(key_cow.as_ref()) {
+                                local_groups.insert(
+                                    key_cow.into_owned(),
+                                    (BucketAccum::new(), BTreeMap::new()),
+                                );
+                                // Re-lookup without cloning on repeat hits by looking up last or get_mut via pv again:
+                                let key_str = if matches!(pv, PropValue::Null) {
+                                    std::borrow::Cow::Borrowed("(none)")
+                                } else {
+                                    pv.as_str_cow()
+                                };
+                                local_groups
+                                    .get_mut(key_str.as_ref())
+                                    .expect("breakdown group inserted above")
+                            } else {
+                                local_groups
+                                    .get_mut(key_cow.as_ref())
+                                    .expect("breakdown group checked above")
+                            }
+                        } else {
+                            let mut parts = Vec::with_capacity(breakdown_dims.len());
+                            for dim in breakdown_dims {
+                                if let Some(cbm) = breakdown_cohorts.get(dim) {
+                                    parts.push(if cbm.contains(canon_uid) {
+                                        "in_cohort".to_string()
+                                    } else {
+                                        "not_in_cohort".to_string()
+                                    });
+                                } else {
+                                    let pv = chunk
+                                        .prop_cols
+                                        .get(dim)
+                                        .and_then(|c| c.get(r))
+                                        .unwrap_or(&PropValue::Null);
+                                    parts.push(if matches!(pv, PropValue::Null) {
+                                        "(none)".to_string()
+                                    } else {
+                                        pv.as_str_cow().into_owned()
+                                    });
+                                }
+                            }
+                            let bkey = parts.join(" | ");
+                            local_groups
+                                .entry(bkey)
+                                .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()))
+                        };
 
-                local_groups
-            })
-            .reduce(BTreeMap::new, |mut acc, map| {
-                for (bkey, (ov, pb)) in map {
-                    let dst = acc
-                        .entry(bkey)
-                        .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
-                    dst.0.merge(ov);
-                    for (bts, bucket_acc) in pb {
-                        dst.1
-                            .entry(bts)
+                        if range.contains(ts) {
+                            entry.0.observe(
+                                canon_uid,
+                                chunk.tier_a.session_hash[r],
+                                num_val,
+                                metric_mask,
+                            );
+                        }
+
+                        let b_ts = align_floor_tz_cached(ts, align_unit, tz, &mut tz_cache);
+                        entry
+                            .1
+                            .entry(b_ts)
                             .or_insert_with(BucketAccum::new)
-                            .merge(bucket_acc);
+                            .observe(
+                                canon_uid,
+                                chunk.tier_a.session_hash[r],
+                                num_val,
+                                metric_mask,
+                            );
                     }
-                }
-                acc
-            })
+
+                    local_groups
+                })
+                .reduce(BTreeMap::new, |mut acc, map| {
+                    for (bkey, (ov, pb)) in map {
+                        let dst = acc
+                            .entry(bkey)
+                            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
+                        dst.0.merge(ov);
+                        for (bts, bucket_acc) in pb {
+                            dst.1
+                                .entry(bts)
+                                .or_insert_with(BucketAccum::new)
+                                .merge(bucket_acc);
+                        }
+                    }
+                    acc
+                })
+        })
     };
 
     if breakdown_dims.is_empty() {

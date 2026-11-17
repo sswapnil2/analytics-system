@@ -289,67 +289,95 @@ impl IngestService {
             by_bucket.entry(bucket_id).or_default().push((ev, uid, fp));
         }
 
-        // 6. Flush interned u32 identities durably BEFORE writing WAL or inline L1 segments (`P1-10`)!
-        if !by_bucket.is_empty() {
+        // 6. Enforce bounded L0 high-water backpressure BEFORE flushing identities or appending WALs.
+        for &bucket_id in by_bucket.keys() {
+            ps.check_l0_backpressure(bucket_id)?;
+        }
+
+        // 7. Flush interned u32 identities durably BEFORE writing WAL or scheduling L1 flushes (`P1-10`)!
+        if !by_bucket.is_empty() && id_graph.has_pending_mutations() {
             id_graph.flush().await?;
         }
 
-        // 7. Under per-bucket append lock: re-check dedup -> durable WAL append -> L0 append -> commit dedup (`P1-01`, `P1-02`)!
+        // 8. Under per-bucket append locks in parallel across buckets: re-check dedup -> durable WAL append -> L0 append -> commit dedup (`P1-01`, `P1-02`).
+        //    L0 -> L1 segment flushes are scheduled asynchronously so ingestion never blocks on storage segment creation!
+        let bucket_results =
+            futures::future::try_join_all(by_bucket.into_iter().map(|(bucket_id, candidates)| {
+                let ps = ps.clone();
+                async move {
+                    let mut local_accepted = 0usize;
+                    let mut local_deduped = 0usize;
+                    let mut appended_events = Vec::new();
+                    let should_flush = {
+                        let append_guard = ps.lock_bucket_append(bucket_id).await;
+                        let mut to_append = Vec::with_capacity(candidates.len());
+                        let mut committed_fps = Vec::with_capacity(candidates.len());
+
+                        for (ev, uid, fp) in candidates {
+                            if self
+                                .dedup
+                                .contains(project_id, bucket_id, fp, server_now_ms)
+                            {
+                                local_deduped += 1;
+                                continue;
+                            }
+                            committed_fps.push(fp);
+                            to_append.push((ev, uid));
+                        }
+
+                        if !to_append.is_empty() {
+                            ps.append_bucket_events_locked(
+                                &append_guard,
+                                bucket_id,
+                                to_append.clone(),
+                            )
+                            .await?;
+                            self.dedup.commit_batch(
+                                project_id,
+                                bucket_id,
+                                &committed_fps,
+                                server_now_ms,
+                            );
+                            local_accepted = to_append.len();
+                            appended_events = to_append.into_iter().map(|(ev, _)| ev).collect();
+                        }
+                        ps.should_flush_bucket(bucket_id)
+                    };
+
+                    if should_flush {
+                        ps.schedule_background_flush(bucket_id);
+                    }
+
+                    Ok::<_, IngestError>((local_accepted, local_deduped, appended_events))
+                }
+            }))
+            .await?;
+
         let mut discovery_map: HashMap<String, (u64, PropTypeList)> = HashMap::new();
-        for (bucket_id, candidates) in by_bucket {
-            let should_flush = {
-                let append_guard = ps.lock_bucket_append(bucket_id).await;
-                let mut to_append = Vec::with_capacity(candidates.len());
-                let mut committed_fps = Vec::with_capacity(candidates.len());
-
-                for (ev, uid, fp) in candidates {
-                    if self
-                        .dedup
-                        .contains(project_id, bucket_id, fp, server_now_ms)
-                    {
-                        deduped += 1;
-                        continue;
-                    }
-                    committed_fps.push(fp);
-                    to_append.push((ev, uid));
-                }
-
-                if !to_append.is_empty() {
-                    ps.append_bucket_events_locked(&append_guard, bucket_id, to_append.clone())
-                        .await?;
-                    self.dedup
-                        .commit_batch(project_id, bucket_id, &committed_fps, server_now_ms);
-                    accepted += to_append.len();
-
-                    for (ev, _) in &to_append {
-                        let disc =
-                            discovery_map
-                                .entry(ev.event_name.clone())
-                                .or_insert_with(|| {
-                                    let ptypes = ev
-                                        .props
-                                        .iter()
-                                        .map(|(k, v)| {
-                                            let t = match v {
-                                                PropValue::Null => "null",
-                                                PropValue::Bool(_) => "bool",
-                                                PropValue::Int(_) => "int",
-                                                PropValue::Float(_) => "float",
-                                                PropValue::Str(_) => "string",
-                                            };
-                                            (k.clone(), t)
-                                        })
-                                        .collect();
-                                    (0, ptypes)
-                                });
-                        disc.0 += 1;
-                    }
-                }
-                ps.should_flush_bucket(bucket_id)
-            };
-
-            if should_flush {
-                ps.flush_bucket(bucket_id).await?;
+        for (local_accepted, local_deduped, appended_events) in bucket_results {
+            accepted += local_accepted;
+            deduped += local_deduped;
+            for ev in &appended_events {
+                let disc = discovery_map
+                    .entry(ev.event_name.clone())
+                    .or_insert_with(|| {
+                        let ptypes = ev
+                            .props
+                            .iter()
+                            .map(|(k, v)| {
+                                let t = match v {
+                                    PropValue::Null => "null",
+                                    PropValue::Bool(_) => "bool",
+                                    PropValue::Int(_) => "int",
+                                    PropValue::Float(_) => "float",
+                                    PropValue::Str(_) => "string",
+                                };
+                                (k.clone(), t)
+                            })
+                            .collect();
+                        (0, ptypes)
+                    });
+                disc.0 += 1;
             }
         }
 
