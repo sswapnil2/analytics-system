@@ -11,8 +11,8 @@ use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
-    UploadPart,
+    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as OsResult, UploadPart,
 };
 use parking_lot::{Mutex, RwLock};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -22,7 +22,10 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Result, StorageError};
 
-pub const ENVELOPE_MAGIC: [u8; 8] = *b"PLSEAGM1";
+/// v1 headers: the key wrap is not bound to the object path. Still readable, no longer written.
+pub const ENVELOPE_MAGIC_V1: [u8; 8] = *b"PLSEAGM1";
+/// v2 headers: the object path is part of the wrap AAD, so objects can't be swapped between paths.
+pub const ENVELOPE_MAGIC: [u8; 8] = *b"PLSEAGM2";
 pub const HEADER_LEN: usize = 100;
 pub const CHUNK_PLAIN_LEN: usize = 65_536;
 pub const GCM_TAG_LEN: usize = 16;
@@ -48,6 +51,7 @@ struct EnvelopeHeader {
     wrapped_dek: [u8; 48],
     obj_nonce_prefix: [u8; 8],
     plaintext_len: u64,
+    path_bound: bool,
 }
 
 impl EnvelopeHeader {
@@ -65,9 +69,14 @@ impl EnvelopeHeader {
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < HEADER_LEN || bytes[0..8] != ENVELOPE_MAGIC {
+        if bytes.len() < HEADER_LEN {
             return None;
         }
+        let path_bound = match &bytes[0..8] {
+            m if m == ENVELOPE_MAGIC => true,
+            m if m == ENVELOPE_MAGIC_V1 => false,
+            _ => return None,
+        };
         let raw_kid = &bytes[8..24];
         let end = raw_kid.iter().position(|&b| b == 0).unwrap_or(KEY_ID_LEN);
         let key_id = String::from_utf8(raw_kid[..end].to_vec()).ok()?;
@@ -86,16 +95,20 @@ impl EnvelopeHeader {
             wrapped_dek,
             obj_nonce_prefix,
             plaintext_len,
+            path_bound,
         })
     }
 
-    fn wrap_aad(&self) -> [u8; 32] {
-        let mut aad = [0u8; 32];
+    fn wrap_aad(&self, path: &str) -> Vec<u8> {
+        let mut aad = vec![0u8; 32];
         let kb = self.key_id.as_bytes();
         let copy_len = kb.len().min(KEY_ID_LEN);
         aad[0..copy_len].copy_from_slice(&kb[..copy_len]);
         aad[16..24].copy_from_slice(&self.obj_nonce_prefix);
         aad[24..32].copy_from_slice(&self.plaintext_len.to_le_bytes());
+        if self.path_bound {
+            aad.extend_from_slice(path.as_bytes());
+        }
         aad
     }
 }
@@ -167,6 +180,7 @@ fn seal_envelope_bytes(
     plaintext: &[u8],
     key_id: &str,
     master_key: &[u8; 32],
+    path: &str,
 ) -> OsResult<(Vec<u8>, EnvelopeHeader)> {
     if key_id.is_empty() || key_id.len() > KEY_ID_LEN {
         return Err(os_err("key_id must be 1..=16 ASCII bytes"));
@@ -182,8 +196,9 @@ fn seal_envelope_bytes(
         wrapped_dek: [0u8; 48],
         obj_nonce_prefix,
         plaintext_len,
+        path_bound: true,
     };
-    let wrap_aad = hdr.wrap_aad();
+    let wrap_aad = hdr.wrap_aad(path);
     let kek = aead_key(master_key)?;
     let mut dek_buf = dek.to_vec();
     kek.seal_in_place_append_tag(
@@ -227,7 +242,11 @@ fn seal_envelope_bytes(
     Ok((out, hdr))
 }
 
-fn unwrap_dek(hdr: &EnvelopeHeader, keyring: &DashMap<String, [u8; 32]>) -> OsResult<LessSafeKey> {
+fn unwrap_dek(
+    hdr: &EnvelopeHeader,
+    keyring: &DashMap<String, [u8; 32]>,
+    path: &str,
+) -> OsResult<LessSafeKey> {
     let master_key = keyring
         .get(&hdr.key_id)
         .map(|entry| *entry.value())
@@ -238,7 +257,7 @@ fn unwrap_dek(hdr: &EnvelopeHeader, keyring: &DashMap<String, [u8; 32]>) -> OsRe
             ))
         })?;
     let kek = aead_key(&master_key)?;
-    let wrap_aad = hdr.wrap_aad();
+    let wrap_aad = hdr.wrap_aad(path);
     let mut dek_buf = hdr.wrapped_dek.to_vec();
     let plain_dek = kek
         .open_in_place(
@@ -539,6 +558,62 @@ impl EncryptedObjectStore {
         Ok(parsed)
     }
 
+    /// With `PULSE_ENCRYPTION_STRICT=1` and a keyring loaded, plaintext objects are refused, so
+    /// someone with bucket write access can't swap in an unencrypted object. Only enable it when
+    /// the store was encrypted from the start and encryption stays on.
+    fn check_plaintext_read(&self, location: &ObjectPath) -> OsResult<()> {
+        if !self.keyring.is_empty()
+            && std::env::var("PULSE_ENCRYPTION_STRICT").as_deref() == Ok("1")
+        {
+            return Err(os_err(format!(
+                "refusing plaintext object '{location}' (PULSE_ENCRYPTION_STRICT=1)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Path-bound objects can't be byte-copied to a new path; decrypt and re-seal for `to`.
+    async fn reseal_copy(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        mode: PutMode,
+    ) -> OsResult<bool> {
+        let Some(hdr) = self.resolve_header(from).await? else {
+            return Ok(false);
+        };
+        if !hdr.path_bound {
+            return Ok(false);
+        }
+        let plain = self.get(from).await?.bytes().await?;
+        let (kid, key) = match self.active_key_pair() {
+            Some(pair) => pair,
+            None => {
+                let key = self
+                    .keyring
+                    .get(&hdr.key_id)
+                    .map(|e| *e.value())
+                    .ok_or_else(|| {
+                        os_err(format!(
+                            "decryption key '{}' not loaded in keyring",
+                            hdr.key_id
+                        ))
+                    })?;
+                (hdr.key_id.clone(), key)
+            }
+        };
+        let (sealed, new_hdr) = seal_envelope_bytes(&plain, &kid, &key, to.as_ref())?;
+        let opts = PutOptions {
+            mode,
+            ..Default::default()
+        };
+        self.inner
+            .put_opts(to, PutPayload::from_bytes(Bytes::from(sealed)), opts)
+            .await?;
+        self.headers.insert(to.as_ref().to_string(), Some(new_hdr));
+        Ok(true)
+    }
+
     async fn translate_meta(&self, mut meta: ObjectMeta) -> ObjectMeta {
         if meta.size >= HEADER_LEN as u64 {
             if let Ok(Some(hdr)) = self.resolve_header(&meta.location).await {
@@ -579,7 +654,7 @@ impl MultipartUpload for EncryptingMultipartUpload {
     async fn complete(&mut self) -> OsResult<PutResult> {
         let raw = std::mem::take(&mut *self.buffer.lock());
         if let Some((kid, key)) = &self.active_key {
-            let (sealed, hdr) = seal_envelope_bytes(&raw, kid, key)?;
+            let (sealed, hdr) = seal_envelope_bytes(&raw, kid, key, self.location.as_ref())?;
             let res = self
                 .inner
                 .put(&self.location, PutPayload::from_bytes(Bytes::from(sealed)))
@@ -616,7 +691,7 @@ impl ObjectStore for EncryptedObjectStore {
             for part in payload.as_ref() {
                 raw.extend_from_slice(part);
             }
-            let (sealed, hdr) = seal_envelope_bytes(&raw, &kid, &key)?;
+            let (sealed, hdr) = seal_envelope_bytes(&raw, &kid, &key, location.as_ref())?;
             let res = self
                 .inner
                 .put_opts(location, PutPayload::from_bytes(Bytes::from(sealed)), opts)
@@ -651,6 +726,7 @@ impl ObjectStore for EncryptedObjectStore {
         // Fast path: resolve header first so range reads only fetch needed chunks.
         if let Some(req_range) = &options.range {
             let Some(hdr) = self.resolve_header(location).await? else {
+                self.check_plaintext_read(location)?;
                 return self.inner.get_opts(location, options).await;
             };
             let plain_range = match req_range {
@@ -687,6 +763,7 @@ impl ObjectStore for EncryptedObjectStore {
 
         let raw = res.bytes().await?;
         let Some(hdr) = EnvelopeHeader::decode(&raw) else {
+            self.check_plaintext_read(location)?;
             self.headers.insert(location.as_ref().to_string(), None);
             let len = raw.len() as u64;
             let stream: BoxStream<'static, OsResult<Bytes>> =
@@ -701,7 +778,7 @@ impl ObjectStore for EncryptedObjectStore {
 
         self.headers
             .insert(location.as_ref().to_string(), Some(hdr.clone()));
-        let dek = unwrap_dek(&hdr, &self.keyring)?;
+        let dek = unwrap_dek(&hdr, &self.keyring, location.as_ref())?;
         let decrypted =
             decrypt_chunk_range(&hdr, &dek, 0, &raw[HEADER_LEN..], 0, hdr.plaintext_len)?;
         self.ops_decrypted.fetch_add(1, Ordering::Relaxed);
@@ -721,6 +798,7 @@ impl ObjectStore for EncryptedObjectStore {
 
     async fn get_range(&self, location: &ObjectPath, range: Range<u64>) -> OsResult<Bytes> {
         let Some(hdr) = self.resolve_header(location).await? else {
+            self.check_plaintext_read(location)?;
             return self.inner.get_range(location, range).await;
         };
         let req_start = range.start;
@@ -729,7 +807,7 @@ impl ObjectStore for EncryptedObjectStore {
             return Ok(Bytes::new());
         }
 
-        let dek = unwrap_dek(&hdr, &self.keyring)?;
+        let dek = unwrap_dek(&hdr, &self.keyring, location.as_ref())?;
         let first_chunk = (req_start as usize) / CHUNK_PLAIN_LEN;
         let last_chunk = ((req_end - 1) as usize) / CHUNK_PLAIN_LEN;
         let num_chunks = (hdr.plaintext_len as usize).div_ceil(CHUNK_PLAIN_LEN);
@@ -808,6 +886,9 @@ impl ObjectStore for EncryptedObjectStore {
     }
 
     async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+        if self.reseal_copy(from, to, PutMode::Overwrite).await? {
+            return Ok(());
+        }
         self.inner.copy(from, to).await?;
         if let Some(cached) = self.headers.get(from.as_ref()) {
             self.headers
@@ -817,11 +898,52 @@ impl ObjectStore for EncryptedObjectStore {
     }
 
     async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+        if self.reseal_copy(from, to, PutMode::Create).await? {
+            return Ok(());
+        }
         self.inner.copy_if_not_exists(from, to).await?;
         if let Some(cached) = self.headers.get(from.as_ref()) {
             self.headers
                 .insert(to.as_ref().to_string(), cached.value().clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn path_bound_objects_cannot_be_swapped_but_copy_reseals() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = EncryptedObjectStore::new(inner.clone());
+        store.set_master_key(Some([7u8; 32]));
+        let (a, b) = (ObjectPath::from("a"), ObjectPath::from("b"));
+        store
+            .put(&a, PutPayload::from_static(b"secret-a"))
+            .await
+            .unwrap();
+        store
+            .put(&b, PutPayload::from_static(b"secret-b"))
+            .await
+            .unwrap();
+
+        // copy re-seals for the new path and stays readable
+        let c = ObjectPath::from("c");
+        store.copy(&a, &c).await.unwrap();
+        assert_eq!(
+            store.get(&c).await.unwrap().bytes().await.unwrap(),
+            "secret-a"
+        );
+
+        // swapping raw ciphertext from `a` into `b` fails authentication (fresh store, no cache)
+        let raw_a = inner.get(&a).await.unwrap().bytes().await.unwrap();
+        inner.put(&b, PutPayload::from(raw_a)).await.unwrap();
+        let fresh = EncryptedObjectStore::new(inner.clone());
+        fresh.set_master_key(Some([7u8; 32]));
+        assert!(fresh.get(&b).await.is_err());
+        assert!(fresh.get_range(&b, 0..4).await.is_err());
     }
 }

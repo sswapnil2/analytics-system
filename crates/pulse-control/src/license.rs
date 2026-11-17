@@ -101,10 +101,16 @@ pub struct LicenseStatusResponse {
 }
 
 fn active_vendor_pubkey_bytes() -> Result<Vec<u8>, String> {
-    let raw_hex = std::env::var("PULSE_LICENSE_PUBKEY_HEX")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_VENDOR_ED25519_PUBKEY_HEX.to_string());
+    // The override exists for tests only: in a release build anyone could point it at their own
+    // key and sign their own licences.
+    let override_hex = if cfg!(debug_assertions) {
+        std::env::var("PULSE_LICENSE_PUBKEY_HEX")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        None
+    };
+    let raw_hex = override_hex.unwrap_or_else(|| DEFAULT_VENDOR_ED25519_PUBKEY_HEX.to_string());
     let decoded = hex::decode(raw_hex.trim())
         .map_err(|_| "invalid PULSE_LICENSE_PUBKEY_HEX encoding".to_string())?;
     if decoded.len() != 32 {

@@ -48,12 +48,13 @@ use crate::license::{
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
-    mask_key_prefix, seal_secret, sha256_bytes, sha256_hex, unseal_secret, AlertRule, ApiKeyRecord,
-    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
-    CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, Organization, Project, SavedReport, SystemKeyringRecord, UserProfileRecord,
-    VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
+    unseal_byok_config_json, unseal_secret, AlertRule, ApiKeyRecord, ByokCredentialRecord,
+    ByokCredentialView, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard,
+    DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord, Experiment, ExperimentMetricSpec,
+    FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project,
+    SavedReport, SystemKeyringRecord, UserProfileRecord, VariantAllocation, BYOK_CATEGORIES,
+    KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -560,6 +561,20 @@ impl ControlPlaneService {
                 encryption: enc,
             },
         }
+    }
+
+    /// Anything sealed under an ephemeral KEK is unreadable after a restart, so refuse to seal.
+    fn require_durable_kek(&self) -> Result<(), CtrlError> {
+        let allow_ephemeral = matches!(
+            std::env::var("PULSE_ALLOW_EPHEMERAL_KEK").as_deref(),
+            Ok("1" | "true")
+        );
+        if !self.has_durable_kek && !allow_ephemeral {
+            return Err(CtrlError::bad(
+                "cannot store secrets without a durable cluster KEK (set PULSE_VAULT_KEK, or use file-backed SQLite)",
+            ));
+        }
+        Ok(())
     }
 
     fn require_commercial_feature(&self, feature: CommercialFeature) -> Result<(), CtrlError> {
@@ -3646,11 +3661,33 @@ fn storage_cfg_fields(cfg: &Value) -> StorageCfg<'_> {
     }
 }
 
+fn webhook_signing_secret(cfg: &Value) -> Option<&str> {
+    cfg.get("signing_secret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| s.len() >= 16)
+}
+
+/// `sha256=<hex HMAC of "{timestamp}.{body}">`; receivers reject stale timestamps to stop replays.
+fn sign_webhook(signing_secret: &str, ts: &str, body: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(ts.as_bytes());
+    ctx.update(b".");
+    ctx.update(body);
+    format!("sha256={}", hex::encode(ctx.sign().as_ref()))
+}
+
 fn validate_byok_inputs(category: &str, secret: &str, cfg: &Value) -> Result<(), CtrlError> {
     match category {
         "webhook" => {
             validate_outbound_url_ssrf(secret)
                 .map_err(|e| CtrlError::bad(format!("webhook URL rejected by SSRF policy: {e}")))?;
+            if webhook_signing_secret(cfg).is_none() {
+                return Err(CtrlError::bad(
+                    "webhook requires config_json.signing_secret of at least 16 characters",
+                ));
+            }
         }
         "storage" => {
             let sc = storage_cfg_fields(cfg);
@@ -3745,15 +3782,7 @@ async fn handle_rotate_encryption(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| CtrlError::bad("secret or disable_new_writes=true is required"))?;
 
-    let allow_ephemeral = matches!(
-        std::env::var("PULSE_ALLOW_EPHEMERAL_KEK").as_deref(),
-        Ok("1" | "true")
-    );
-    if !ctrl.has_durable_kek && !allow_ephemeral {
-        return Err(CtrlError::bad(
-            "cannot persist encryption keyring without a durable cluster KEK (use file-backed SQLite or PULSE_VAULT_KEK)",
-        ));
-    }
+    ctrl.require_durable_kek()?;
 
     let mut salt = [0u8; 16];
     SystemRandom::new()
@@ -3960,6 +3989,7 @@ async fn handle_upsert_byok(
     }
     let config_json = req.config_json.unwrap_or_else(|| json!({}));
     validate_byok_inputs(&category, secret, &config_json)?;
+    ctrl.require_durable_kek()?;
 
     let now_ms = Utc::now().timestamp_millis();
     let rec = ByokCredentialRecord {
@@ -3973,7 +4003,7 @@ async fn handle_upsert_byok(
             .unwrap_or_else(|| format!("BYOK {provider}")),
         key_prefix_masked: mask_byok_secret(secret),
         sealed_secret_hex: seal_secret(&ctrl.vault_kek, secret),
-        config_json,
+        config_json: seal_byok_config_json(&ctrl.vault_kek, &config_json),
         status: "configured".to_string(),
         last_verified_at_ms: None,
         updated_at_ms: now_ms,
@@ -4046,10 +4076,12 @@ async fn handle_verify_byok(
         })?;
     let secret =
         unseal_secret(&ctrl.vault_kek, &rec.sealed_secret_hex).map_err(CtrlError::internal)?;
+    let cfg =
+        unseal_byok_config_json(&ctrl.vault_kek, &rec.config_json).map_err(CtrlError::internal)?;
 
     let details = match cat.as_str() {
         "storage" => {
-            let sc = storage_cfg_fields(&rec.config_json);
+            let sc = storage_cfg_fields(&cfg);
             let url = sc
                 .url
                 .ok_or_else(|| CtrlError::bad("storage credential missing config_json.url"))?;
@@ -4077,19 +4109,18 @@ async fn handle_verify_byok(
                 "timestamp_ms": Utc::now().timestamp_millis(),
             });
             let body_bytes = serde_json::to_vec(&probe_body).map_err(CtrlError::internal)?;
-            let mac_key_str = rec
-                .config_json
-                .get("signing_secret")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(secret.as_str());
-            let mac_key = hmac::Key::new(hmac::HMAC_SHA256, mac_key_str.as_bytes());
-            let tag = hmac::sign(&mac_key, &body_bytes);
-            let sig_hdr = format!("sha256={}", hex::encode(tag.as_ref()));
+            let signing_secret = webhook_signing_secret(&cfg).ok_or_else(|| {
+                CtrlError::bad(
+                    "webhook credential needs config_json.signing_secret (>= 16 chars); save it again",
+                )
+            })?;
+            let ts = Utc::now().timestamp().to_string();
+            let sig_hdr = sign_webhook(signing_secret, &ts, &body_bytes);
 
             let resp = client
                 .post(parsed.as_str())
                 .header("Content-Type", "application/json")
+                .header("X-Pulse-Timestamp", ts)
                 .header("X-Pulse-Signature-256", sig_hdr)
                 .body(body_bytes)
                 .send()
@@ -4115,8 +4146,7 @@ async fn handle_verify_byok(
                     "LLM API key appears too short (expected >= 8 characters)",
                 ));
             }
-            if let Some(ep) = rec
-                .config_json
+            if let Some(ep) = cfg
                 .get("endpoint")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
@@ -4188,7 +4218,9 @@ async fn handle_warehouse_export(
         })?;
     let secret_key = unseal_secret(&ctrl.vault_kek, &storage_rec.sealed_secret_hex)
         .map_err(CtrlError::internal)?;
-    let sc = storage_cfg_fields(&storage_rec.config_json);
+    let storage_cfg = unseal_byok_config_json(&ctrl.vault_kek, &storage_rec.config_json)
+        .map_err(CtrlError::internal)?;
+    let sc = storage_cfg_fields(&storage_cfg);
     let url = sc.url.ok_or_else(|| {
         CtrlError::bad("storage credential requires config_json.url (e.g. s3://bucket)")
     })?;
@@ -4217,7 +4249,7 @@ async fn handle_warehouse_export(
     let limit = req.limit.unwrap_or(10_000).clamp(1, 50_000);
     let rows = ctrl
         .qengine
-        .export_events(&id, time_range, None, limit, false)
+        .export_events(&id, time_range, None, limit, true)
         .await
         .map_err(CtrlError::exec)?;
 

@@ -65,7 +65,7 @@ const CATEGORIES: CategoryMeta[] = [
   {
     category: "webhook",
     title: "Alert Webhook Destination",
-    subtitle: "HMAC-SHA256 signed webhook endpoint for automated anomaly alerts.",
+    subtitle: "Webhook endpoint; requests are HMAC-SHA256 signed with your signing secret.",
     providers: [
       { value: "slack_webhook", label: "Slack / Teams Incoming Webhook" },
       { value: "custom_webhook", label: "HTTPS Webhook" },
@@ -110,6 +110,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
   const [draftStorageUrl, setDraftStorageUrl] = useState("s3://");
   const [draftStorageEndpoint, setDraftStorageEndpoint] = useState("");
   const [draftStorageRegion, setDraftStorageRegion] = useState("ap-south-1");
+  const [draftSigningSecret, setDraftSigningSecret] = useState("");
   const [draftStorageAccessKey, setDraftStorageAccessKey] = useState("");
   const [busyCategory, setBusyCategory] = useState<string | null>(null);
 
@@ -231,6 +232,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
         if (draftStorageRegion.trim()) config_json.region = draftStorageRegion.trim();
         if (draftStorageEndpoint.trim()) config_json.endpoint = draftStorageEndpoint.trim();
       }
+      if (cat.category === "webhook") config_json.signing_secret = draftSigningSecret.trim();
       await api.upsertByokCredential(projectId, {
         category: cat.category,
         provider,
@@ -612,6 +614,18 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                           className={`${field} w-full font-mono text-xs`}
                         />
                       </div>
+                    )}
+
+                    {cat.category === "webhook" && (
+                      <input
+                        type="password"
+                        value={draftSigningSecret}
+                        disabled={!isCommercial || busy}
+                        onChange={(e) => setDraftSigningSecret(e.target.value)}
+                        placeholder="Signing secret (at least 16 characters)"
+                        className={`${field} w-full font-mono text-xs`}
+                        aria-label="Webhook signing secret"
+                      />
                     )}
 
                     <div className="flex items-center gap-2">

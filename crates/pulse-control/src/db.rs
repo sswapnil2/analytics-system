@@ -1536,10 +1536,9 @@ impl MetaStore {
                         }
                     })
             }
-            MetaStore::Postgres(_) => std::env::var("PULSE_DATA_DIR")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(std::path::PathBuf::from),
+            // Postgres usually means several nodes; a per-node KEK file would differ between them,
+            // so Postgres deployments must share one PULSE_VAULT_KEK.
+            MetaStore::Postgres(_) => None,
         };
 
         let Some(dir) = dir_opt else {
@@ -1563,6 +1562,14 @@ impl MetaStore {
             return Ok(Some(key));
         }
 
+        // A missing KEK file with sealed rows means the key was lost or the file wasn't restored.
+        // Minting a new one would silently orphan every sealed secret, so stop instead.
+        if self.has_sealed_rows().await.map_err(|e| e.to_string())? {
+            return Err(format!(
+                "cluster KEK file {} is missing but sealed secrets exist; restore it or set PULSE_VAULT_KEK",
+                kek_path.display()
+            ));
+        }
         let mut new_key = [0u8; 32];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut new_key)
             .map_err(|_| "CSPRNG failure generating cluster KEK".to_string())?;
@@ -1588,6 +1595,15 @@ impl MetaStore {
         }
 
         Ok(Some(new_key))
+    }
+
+    async fn has_sealed_rows(&self) -> Result<bool, MetaError> {
+        let n = db_map_all!(
+            self,
+            "SELECT (SELECT COUNT(*) FROM byok_credentials) + (SELECT COUNT(*) FROM system_keyring) AS n",
+            |r| { r.get::<i64, _>("n") }
+        );
+        Ok(n.first().copied().unwrap_or(0) > 0)
     }
 
     pub async fn list_system_keyring(&self) -> Result<Vec<SystemKeyringRecord>, MetaError> {
