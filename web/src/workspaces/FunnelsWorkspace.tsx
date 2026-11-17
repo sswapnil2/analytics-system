@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ArrowDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
+import { typicalOrder } from "../lib/eventOrder";
+import { FunnelQueryBody, UserTimeline, WhyTheyLeft } from "./DropOffInsights";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
@@ -18,6 +20,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import {
   displayUserId,
   errorMessage,
@@ -63,6 +66,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const [excludeEvent, setExcludeEvent] = useState<string>("");
   const [holdConstant, setHoldConstant] = useState<string>("");
   const [breakdownBy, setBreakdownBy] = useState<string>("");
+  const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<FunnelResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,7 +74,17 @@ export const FunnelsWorkspace: React.FC<Props> = ({
 
   useEffect(() => {
     setSteps((prev) => (prev.length > 0 ? prev : defaultStepsFromCatalog(availableEvents)));
-  }, [availableEvents]);
+    // Reorder the automatic default into the order users actually go, unless someone changed it meanwhile.
+    const auto = defaultStepsFromCatalog(availableEvents);
+    if (new Set(auto).size < 2) return;
+    let alive = true;
+    void typicalOrder(projectId, auto).then((ordered) => {
+      if (alive) setSteps((prev) => (prev.join("\u0000") === auto.join("\u0000") ? ordered : prev));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [projectId, availableEvents]);
 
   const eventOptions = useMemo(
     () => Array.from(new Set([...availableEvents, ...steps])).filter((e) => e && !e.startsWith("$")),
@@ -92,8 +106,9 @@ export const FunnelsWorkspace: React.FC<Props> = ({
         : [],
       hold_constant_props: holdConstant ? [holdConstant] : [],
       breakdown_by: breakdownBy || null,
+      global_filter: toGlobalFilter(filter),
     }),
-    [steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy],
+    [steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy, filter],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -109,6 +124,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       setExcludeEvent(s.exclusions?.[0]?.event_name ?? "");
       setHoldConstant(s.hold_constant_props?.[0] ?? "");
       setBreakdownBy(s.breakdown_by ?? "");
+      setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
   );
@@ -136,6 +152,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   }, [runFunnel, refreshToken]);
 
   const overall = result?.overall_steps ?? [];
+  // The exact query behind the results, for the drop-off drawer's follow-up queries.
+  const drawerQuery = useMemo(() => ({ time_range: rangeFor(range), ...buildQuery() }) as FunnelQueryBody, [range, buildQuery]);
   const first = overall[0];
   const last = overall[overall.length - 1];
 
@@ -184,8 +202,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({
           `${steps.length} steps`,
           `within ${WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}`,
           breakdownBy ? `split by ${humanizeEvent(breakdownBy)}` : "no split",
-        ].join(" · ")}
-        query={
+          describeFilter(filter),
+        ].filter(Boolean).join(" · ")}
+        query={<>
+      <FilterPanel projectId={projectId} availableProps={availableProps} anchorEvent={steps[0] ?? ""} value={filter} onChange={setFilter} />
       <Panel title="Steps">
         <ol className="flex flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
           {steps.map((st, idx) => (
@@ -298,7 +318,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
           </label>
         </div>
       </Panel>
-        }
+        </>}
       >
 
       {openError && <ErrorNotice message={openError} />}
@@ -486,8 +506,12 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       {drawerStep !== null && result && (
         <DropOffDrawer
           projectId={projectId}
-          fromStep={humanizeEvent(overall[drawerStep - 1]?.event_name ?? "")}
-          toStep={humanizeEvent(overall[drawerStep]?.event_name ?? "")}
+          fromEvent={overall[drawerStep - 1]?.event_name ?? ""}
+          toEvent={overall[drawerStep]?.event_name ?? ""}
+          step={drawerStep}
+          query={drawerQuery}
+          availableProps={availableProps}
+          overallRate={(overall[drawerStep]?.entered_users ?? 0) / Math.max(1, overall[drawerStep - 1]?.entered_users ?? 0)}
           droppedCount={(overall[drawerStep - 1]?.entered_users ?? 0) - (overall[drawerStep]?.entered_users ?? 0)}
           samples={result.dropped_sample_sessions.filter((d) => d.dropped_before_step === drawerStep)}
           onClose={() => setDrawerStep(null)}
@@ -503,12 +527,18 @@ export const FunnelsWorkspace: React.FC<Props> = ({
 
 const DropOffDrawer: React.FC<{
   projectId: string;
-  fromStep: string;
-  toStep: string;
+  fromEvent: string;
+  toEvent: string;
+  step: number;
+  query: FunnelQueryBody;
+  availableProps: string[];
+  overallRate: number;
   droppedCount: number;
   samples: DroppedSessionSample[];
   onClose: () => void;
-}> = ({ projectId, fromStep, toStep, droppedCount, samples, onClose }) => {
+}> = ({ projectId, fromEvent, toEvent, step, query, availableProps, overallRate, droppedCount, samples, onClose }) => {
+  const fromStep = humanizeEvent(fromEvent);
+  const toStep = humanizeEvent(toEvent);
   const [selected, setSelected] = useState<DroppedSessionSample | null>(
     () => samples.find((d) => d.has_replay) ?? samples[0] ?? null,
   );
@@ -564,13 +594,23 @@ const DropOffDrawer: React.FC<{
               {formatCount(droppedCount)} users didn't reach {toStep}
             </h2>
             <p className="mt-0.5 text-sm text-muted">
-              They did {fromStep}, then stopped. Pick someone to see what happened on their screen.
+              They did {fromStep}, then stopped. Pick someone to see their recording or what they did.
             </p>
           </div>
           <button ref={closeRef} type="button" onClick={onClose} className={btn.ghost} aria-label="Close drop-off details">
             <X className="h-5 w-5" />
           </button>
         </div>
+
+        <WhyTheyLeft
+          projectId={projectId}
+          query={query}
+          step={step}
+          fromEvent={fromEvent}
+          toEvent={toEvent}
+          overallRate={overallRate}
+          availableProps={availableProps}
+        />
 
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
           <div className="max-h-56 shrink-0 overflow-y-auto border-b border-line md:max-h-none md:w-64 md:border-b-0 md:border-r">
@@ -619,7 +659,15 @@ const DropOffDrawer: React.FC<{
           </div>
 
           <div className="min-w-0 flex-1 overflow-y-auto p-5">
-            {selected ? (
+            {selected && !selected.has_replay ? (
+              <UserTimeline
+                key={selected.session_id}
+                projectId={projectId}
+                distinctId={selected.distinct_id}
+                dropTs={selected.drop_ts_ms}
+                fromEvent={fromEvent}
+              />
+            ) : selected ? (
               <SessionReplay
                 key={selected.session_id}
                 projectId={projectId}
@@ -627,7 +675,7 @@ const DropOffDrawer: React.FC<{
                 offsetKb={selected.replay_offset_kb}
               />
             ) : (
-              <EmptyState title="Pick a user" body="Their screen recording plays here." />
+              <EmptyState title="Pick a user" body="Their recording, or the events around when they left, shows here." />
             )}
           </div>
         </div>

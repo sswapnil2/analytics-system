@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
@@ -16,10 +17,12 @@ import {
   ReportLayout,
   ChartSkeleton,
 } from "../components/ui";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   refreshToken: number;
 }
 
@@ -31,12 +34,13 @@ const MODES: [Mode, string][] = [
   ["frequency_stickiness", "Days active per week"],
 ];
 
-export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
+export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents, availableProps, refreshToken }) => {
   const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
   const [startEvent, setStartEvent] = useState<string>(() => cleanEvents[0] ?? "");
   const [returnEvent, setReturnEvent] = useState<string>(() => cleanEvents[1] ?? cleanEvents[0] ?? "");
   const [mode, setMode] = useState<Mode>("n_day");
   const [numPeriods, setNumPeriods] = useState<number>(10);
+  const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<RetentionResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,11 +50,21 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     if (clean.length === 0) return;
     setStartEvent((prev) => prev || clean[0]);
     setReturnEvent((prev) => prev || clean[1] || clean[0]);
-  }, [availableEvents]);
+    // Default to "did the usual first action, then came back and did it again", unless someone picked events meanwhile.
+    let alive = true;
+    void typicalOrder(projectId, clean.slice(0, 4)).then(([first]) => {
+      if (!alive || !first) return;
+      setStartEvent((prev) => (prev === clean[0] ? first : prev));
+      setReturnEvent((prev) => (prev === (clean[1] || clean[0]) ? first : prev));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [projectId, availableEvents]);
 
   const buildQuery = useCallback(
-    () => ({ start_event: startEvent, return_event: returnEvent, mode, unit: "day", num_periods: numPeriods }),
-    [startEvent, returnEvent, mode, numPeriods],
+    () => ({ start_event: startEvent, return_event: returnEvent, mode, unit: "day", num_periods: numPeriods, global_filter: toGlobalFilter(filter) }),
+    [startEvent, returnEvent, mode, numPeriods, filter],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -63,6 +77,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       if (s.return_event) setReturnEvent(s.return_event);
       if (s.mode) setMode(s.mode);
       if (s.num_periods) setNumPeriods(s.num_periods);
+      setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
   );
@@ -124,8 +139,9 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       <ReportLayout
         summary={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)} · ${
           MODES.find(([k]) => k === mode)?.[1].toLowerCase() ?? ""
-        }`}
-        query={
+        }${describeFilter(filter) ? ` · ${describeFilter(filter)}` : ""}`}
+        query={<>
+      <FilterPanel projectId={projectId} availableProps={availableProps} anchorEvent={startEvent} value={filter} onChange={setFilter} />
       <Panel title="Query">
         <div className="flex flex-col gap-4">
           <label className="flex min-w-0 flex-col gap-1">
@@ -175,7 +191,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
           </label>
         </div>
       </Panel>
-        }
+        </>}
       >
 
       {openError && <ErrorNotice message={openError} />}
