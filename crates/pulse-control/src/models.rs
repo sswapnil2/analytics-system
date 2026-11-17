@@ -401,7 +401,7 @@ fn items_from_val(val: &Value) -> Vec<Value> {
     }
 }
 
-/// Applies Mixpanel People and Amplitude Identify profile operators in deterministic arrival order (`Gap 1`).
+/// Applies user profile operators in deterministic arrival order (`Gap 1`).
 pub fn apply_profile_ops(
     props: &mut BTreeMap<String, Value>,
     total_revenue: &mut f64,

@@ -503,7 +503,7 @@ export const App: React.FC = () => {
               }
             >
               <p className="mb-3 text-sm text-ink-2">
-                Accepts Segment, Mixpanel arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
+                Accepts Segment, top-level arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
               </p>
               <div className="relative rounded-lg border border-line bg-sunken p-3.5">
                 <button

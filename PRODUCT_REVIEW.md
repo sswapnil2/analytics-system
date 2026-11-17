@@ -34,7 +34,7 @@ Today Pulse is a strong engineering demo of a fast analytics engine, wrapped in 
   | Sankey flows | 136 ms |
 
   Breakdowns, the experiment readout and the flag rollout all work.
-- **The India fintech focus is a real wedge.** PAN, UPI Autopay, NSDL and Video KYC are concepts that Mixpanel and Amplitude don't model.
+- **The India fintech focus is a real wedge.** PAN, UPI Autopay, NSDL and Video KYC are concepts that mainstream product-analytics tools don't model.
 
 ### What loses a buyer in the first 10 minutes
 
@@ -47,14 +47,14 @@ Today Pulse is a strong engineering demo of a fast analytics engine, wrapped in 
 | PR-5 | **The experiment screen tells a contradictory story.** | The flag is at 100% rollout while the experiment is still "running" with a control group. It shows "P(beat control) 100.0%"; it should show ">99.9%". |
 | PR-6 | **"Ask Pulse" doesn't ask anything.** | It's a raw JSON-RPC console with preset buttons. Either add natural language or rename it to what it is (the MCP endpoint for AI tools). |
 | PR-7 | **There's no onboarding.** | There's no README. First boot shows a blank page for about 26 s while seeding. Login is a password box asking for an `sk_root_…` token that is only printed in the server logs. A failed login gives no feedback. Before login the app polls `/v1/status` → 401 repeatedly, and its first query goes to `proj_default` → 404 (an uncaught promise in the console). |
-| PR-8 | **The ingest payload is unintuitive.** | A Segment/Mixpanel-style `{"event","properties"}` payload is rejected with `data did not match any variant of untagged enum JsonBatchEnvelope`. |
+| PR-8 | **The ingest payload is unintuitive.** | A Segment-style `{"event","properties"}` payload is rejected with `data did not match any variant of untagged enum JsonBatchEnvelope`. |
 | PR-9 | **Responsive gaps.** | The replay player disappears below about 1,000 px wide. |
 | PR-10 | **System events pollute Flows.** | `$experiment_started` dominates step 2 of the Sankey diagram. |
 
 ### The positioning question to answer first
 
 Which of these is Pulse?
-1. "Self-hosted Mixpanel for Indian fintech."
+1. "Self-hosted product analytics for Indian fintech."
 2. "Session-replay-led debugging of KYC and onboarding drop-off."
 
 The second is sharper and more defensible, and it's where the product is strongest today. Eight equally weighted workspaces suggest the choice hasn't been made yet.

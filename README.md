@@ -51,9 +51,9 @@ By default, `pulse-node` runs in single-binary `--role all` mode. For horizontal
 ./target/release/pulse-node --role compactor --port 8082 --data-dir /shared/pulse_data --no-quic
 ```
 
-## Ingest Events (Pulse, Segment, or Mixpanel JSON)
+## Ingest Events (Pulse or Segment JSON)
 
-`/v1/ingest` accepts single event objects, Segment `{"batch": [...]}` payloads, Mixpanel top-level arrays `[...]`, or Pulse `{"events": [...]}` batches authenticated with `x-pulse-key`:
+`/v1/ingest` accepts single event objects, Segment `{"batch": [...]}` payloads, top-level arrays `[...]`, or Pulse `{"events": [...]}` batches authenticated with `x-pulse-key`:
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/v1/ingest" \

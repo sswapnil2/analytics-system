@@ -134,7 +134,7 @@ impl WireBatch {
     }
 
     /// Deserializes a JSON payload accepting `{"events":[...]}`, `{"batch":[...]}`, `[...]`,
-    /// or a single event object `{...}` (Pulse, Segment, or Mixpanel schema) (`PR-8`, `EN-4`).
+    /// or a single event object `{...}` (Pulse or Segment schema) (`PR-8`, `EN-4`).
     pub fn decode_json(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_DECOMPRESSED_BYTES {
             return Err(WireError::ResourceLimitExceeded(

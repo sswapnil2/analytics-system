@@ -262,7 +262,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   );
 };
 
-/** Mixpanel-style retention curve: average % back on each day, weighted by users. */
+/** Retention curve: average % back on each day, weighted by users. */
 const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods: number }> = ({ cohorts, numPeriods }) => {
   const [hover, setHover] = useState<number | null>(null);
   const pts: (number | null)[] = Array.from({ length: numPeriods + 1 }, (_, d) => {

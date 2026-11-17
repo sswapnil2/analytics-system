@@ -466,7 +466,7 @@ impl IngestService {
         })
     }
 
-    /// Processes Mixpanel `/engage` or Amplitude Identify user profile mutations (`Gap 1`).
+    /// Processes `/engage` or Identify user profile mutations (`Gap 1`).
     pub async fn engage(&self, api_key: &str, body: &[u8]) -> Result<serde_json::Value> {
         let project_id = self
             .governance
