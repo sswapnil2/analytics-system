@@ -36,7 +36,7 @@ export interface WireNode {
 }
 
 export type WireframeOp =
-  | { op: "full_snapshot"; width: number; height: number; nodes: WireNode[] }
+  | { op: "full_snapshot"; ts_offset_ms: number; width: number; height: number; nodes: WireNode[] }
   | ({ op: "node_upsert" } & WireNode)
   | { op: "node_remove"; node_id: number }
   | {
@@ -1071,6 +1071,7 @@ export class PulseWebClient {
     if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
     this.replayOps.push({
       op: "full_snapshot",
+      ts_offset_ms: Math.max(0, now - this.chunkStartTsMs),
       width: vpW,
       height: vpH,
       nodes,

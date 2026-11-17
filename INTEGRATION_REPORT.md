@@ -40,6 +40,9 @@ this machine.
 - The in-app "Send your first event" panel shows only a curl snippet with a placeholder
   `YOUR_INGEST_KEY` (`web/src/App.tsx:296`). It doesn't show the real key, and has no web or mobile
   SDK snippet.
+- The generated `sk_root_` admin token is **re-minted on every node restart** and the old one stops
+  working, which also signs you out of the Studio, unless `PULSE_ADMIN_TOKEN` is set. Nothing tells
+  you this until the API returns `invalid admin bearer token`.
 - `--seed` put my events in `proj_fintech_in` even though I didn't set `PULSE_DEFAULT_PROJECT`
   (the code default is `proj_default`). The Studio labels that project "Default Project". This is
   confusing when you call the REST API by project id.
@@ -137,11 +140,17 @@ SDK uses reqwest/rustls instead of URLSession.
   21.5 s "Pick a plan" → 29.4 s "PromoService unavailable" banner at the real position →
   29.6 s "Rage tap ×3" → 37.2 s "You're all set". ✅ All screens, taps, the rage tap, masking and the
   error played correctly.
-- Gap: `FullSnapshot` ops carry **no timestamp**. The player pins every snapshot to its chunk's start
-  (`WireframePlayer.tsx:126`), so several screens captured inside one flush interval all jump to the
-  same instant, and the last one wins. In my run the four error re-snapshots all landed at 29.36 s, a
-  few ms before the taps that caused them. It's harmless here, but fast flows would show the wrong
-  screen.
+- **[Fixed on this branch]** `FullSnapshot` ops carried **no timestamp**, so the player pinned every
+  snapshot to its chunk's start: several screens captured inside one flush interval all jumped to the
+  same instant and the last one won. Snapshots now carry `ts_offset_ms` (wire format, Rust and web
+  SDKs, player). The binary format writes a new op tag (6) only for non-zero offsets, and JSON
+  defaults a missing field to 0, so old recordings and old clients keep working. Upgrade the server
+  before the SDKs: an old server rejects the new tag. Re-verified with a fast run where three screens
+  landed in one batch: iOS "Your details" at +195 ms and "Pick a plan" at +676 ms; web details at +0,
+  plan at +1011 ms and done at +3058 ms. Both play in order in Studio.
+- Still open: `node_upsert` (used for the web error banner) has no timestamp either. The player
+  places it at the last timed op, so the web banner appears when the plan screen loads (11.3 s)
+  rather than at the first failing tap (12.3 s).
 - Node `bg_rgba` colours are drawn literally on the dark Studio theme. My light-grey text boxes from
   iOS came out as near-white blocks, which are hard to read. The player should style by `kind` and
   ignore `bg` for text.
@@ -200,8 +209,8 @@ which reaches the host at `10.0.2.2:18190`.
 3. **Automatic web snapshots**: snapshot on load, on `MutationObserver` changes (throttled) and on
    history `pushState`/`popstate`. Hook `window.onerror`/`unhandledrejection` and fetch/XHR for errors
    and breadcrumbs.
-4. **Give `full_snapshot` a `ts_offset_ms`** (wire format + SDKs + player) so screens play at the
-   right moment instead of snapping to chunk start.
+4. **Timestamp `node_upsert` too.** `full_snapshot` now has `ts_offset_ms` (fixed here), but upserts
+   still borrow the previous op's time, so error banners appear early.
 5. **Ingest keys in the Studio**: a Project settings page to view and create `pk_live_` keys, and put
    the real key into the "Send your first event" panel with web/iOS/Android snippets.
 6. **Fix the stale bindings and the bindings-gen docs**: regenerate in CI, or stop committing them, and

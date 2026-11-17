@@ -132,8 +132,11 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
       let runningOffset = chunkDelta;
       for (const op of chunk.ops) {
         if (op.op === "full_snapshot") {
+          // Older chunks have no ts_offset_ms: those snapshots start at the chunk start.
+          const t = chunkDelta + (op.ts_offset_ms ?? 0);
+          runningOffset = Math.max(runningOffset, t);
           vp = { w: op.width || 390, h: op.height || 844 };
-          items.push({ absOffsetMs: chunkDelta, op });
+          items.push({ absOffsetMs: t, op });
         } else if (op.op === "node_upsert" || op.op === "node_remove") {
           items.push({ absOffsetMs: runningOffset, op });
         } else if (op.op === "pointer_interaction") {

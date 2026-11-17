@@ -934,6 +934,7 @@ async fn pr1_funnel_drop_off_prioritizes_recorded_sessions() {
             chunk_start_ts_ms: ts,
             ops: vec![
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms: 0,
                     width: 390,
                     height: 844,
                     nodes: vec![WireNode {

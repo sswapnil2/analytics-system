@@ -168,6 +168,10 @@ pub enum InteractionKind {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum WireframeOp {
     FullSnapshot {
+        /// Offset from `chunk_start_ts_ms` at which this screen appeared. Absent in older
+        /// chunks (defaults to 0, i.e. the chunk start).
+        #[serde(default)]
+        ts_offset_ms: u32,
         width: u16,
         height: u16,
         nodes: Vec<WireNode>,
@@ -197,15 +201,24 @@ impl WireframeOp {
     const OP_NODE_REMOVE: u8 = 3;
     const OP_POINTER: u8 = 4;
     const OP_NETWORK: u8 = 5;
+    /// `OP_FULL_SNAPSHOT` preceded by a `u32` `ts_offset_ms`. Written only when the offset is
+    /// non-zero, so zero-offset snapshots stay readable by older decoders.
+    const OP_FULL_SNAPSHOT_TS: u8 = 6;
 
     fn write_to(&self, out: &mut Vec<u8>) {
         match self {
             WireframeOp::FullSnapshot {
+                ts_offset_ms,
                 width,
                 height,
                 nodes,
             } => {
-                out.push(Self::OP_FULL_SNAPSHOT);
+                if *ts_offset_ms == 0 {
+                    out.push(Self::OP_FULL_SNAPSHOT);
+                } else {
+                    out.push(Self::OP_FULL_SNAPSHOT_TS);
+                    out.extend_from_slice(&ts_offset_ms.to_le_bytes());
+                }
                 out.extend_from_slice(&width.to_le_bytes());
                 out.extend_from_slice(&height.to_le_bytes());
                 out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
@@ -261,7 +274,12 @@ impl WireframeOp {
     fn read_from(cursor: &mut ByteCursor<'_>) -> Result<Self> {
         let op = cursor.read_u8("wireframe op")?;
         match op {
-            Self::OP_FULL_SNAPSHOT => {
+            Self::OP_FULL_SNAPSHOT | Self::OP_FULL_SNAPSHOT_TS => {
+                let ts_offset_ms = if op == Self::OP_FULL_SNAPSHOT_TS {
+                    cursor.read_u32("snapshot.ts")?
+                } else {
+                    0
+                };
                 let width = cursor.read_u16("snapshot.width")?;
                 let height = cursor.read_u16("snapshot.height")?;
                 let count = cursor.read_u32("snapshot.nodes.len")? as usize;
@@ -276,6 +294,7 @@ impl WireframeOp {
                     nodes.push(WireNode::read_from(cursor)?);
                 }
                 Ok(WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes,
@@ -408,10 +427,12 @@ impl ReplayChunk {
             .into_iter()
             .map(|op| match op {
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes,
                 } => WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes: nodes.into_iter().map(WireNode::sanitized).collect(),
@@ -475,10 +496,12 @@ impl ReplayChunk {
                 .into_iter()
                 .map(|op| match op {
                     WireframeOp::FullSnapshot {
+                        ts_offset_ms,
                         width,
                         height,
                         nodes,
                     } => WireframeOp::FullSnapshot {
+                        ts_offset_ms,
                         width,
                         height,
                         nodes: nodes.into_iter().map(WireNode::sanitized).collect(),
@@ -531,4 +554,37 @@ impl ReplayChunk {
 fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_snapshot_ts_offset_roundtrips_and_stays_backward_compatible() {
+        let snap = |ts_offset_ms| WireframeOp::FullSnapshot {
+            ts_offset_ms,
+            width: 390,
+            height: 844,
+            nodes: vec![],
+        };
+        let chunk = ReplayChunk {
+            project_id: "p".into(),
+            session_id: "s".into(),
+            chunk_start_ts_ms: 1_000,
+            ops: vec![snap(0), snap(4_200)],
+        };
+        let decoded = ReplayChunk::decode_binary(&chunk.encode_binary(3).unwrap()).unwrap();
+        assert_eq!(decoded.ops, chunk.ops);
+
+        // Zero offset keeps the legacy tag, so older decoders can still read it.
+        let mut raw = Vec::new();
+        snap(0).write_to(&mut raw);
+        assert_eq!(raw[0], 1);
+
+        // JSON from older SDKs has no ts_offset_ms and lands at the chunk start.
+        let legacy = br#"{"project_id":"","session_id":"s","chunk_start_ts_ms":1,"ops":[{"op":"full_snapshot","width":390,"height":844,"nodes":[]}]}"#;
+        let c = ReplayChunk::decode_auto(legacy, Some("application/json")).unwrap();
+        assert_eq!(c.ops, vec![snap(0)]);
+    }
 }

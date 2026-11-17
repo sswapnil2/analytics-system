@@ -148,6 +148,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   assert.equal(receivedReplays.length, 1);
   // Title "John Smith Account Statement" MUST be masked to FIXED_MASK (`P3-01`)
   assert.equal(receivedReplays[0].ops[0].nodes[0].masked_label, FIXED_MASK);
+  assert.equal(receivedReplays[0].ops[0].ts_offset_ms, 0, "first snapshot starts its chunk");
 
   // 4. 4 rapid clicks -> only ONE `$rage_tap` emitted (`P3-05`)
   const clickFn = Array.from(listeners.get("click"))[0];

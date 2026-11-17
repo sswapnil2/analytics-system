@@ -167,6 +167,7 @@ mod tests {
             chunk_start_ts_ms: 1_760_000_100_000,
             ops: vec![
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms: 0,
                     width: 390,
                     height: 844,
                     nodes: vec![

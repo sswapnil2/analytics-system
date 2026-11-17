@@ -751,13 +751,12 @@ impl PulseClient {
             .collect();
 
         let mut ring = self.replay_ops_ring.lock();
-        if ring.0.is_none() {
-            ring.0 = Some(now_ms);
-        }
+        let base = *ring.0.get_or_insert(now_ms);
         if ring.1.is_none() {
             ring.1 = Some(cur_session);
         }
         ring.2.push(WireframeOp::FullSnapshot {
+            ts_offset_ms: now_ms.saturating_sub(base).max(0) as u32,
             width,
             height,
             nodes: wire_nodes,
@@ -1410,6 +1409,38 @@ mod tests {
         // Restart SDK from same directory -> disk WAL survives restart!
         let recovered = PulseClient::new(cfg).unwrap();
         assert_eq!(recovered.queued_packet_count(), queued);
+    }
+
+    #[test]
+    fn full_snapshots_carry_their_offset_within_the_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(SdkConfig {
+            endpoint_url: "http://127.0.0.1:9".into(),
+            api_key: "pk_test".into(),
+            storage_dir: dir.path().to_string_lossy().into_owned(),
+            flush_batch_size: 20,
+            flush_interval_ms: 0,
+        })
+        .unwrap();
+        client.record_wireframe_snapshot(390, 844, vec![]).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        client.record_wireframe_snapshot(390, 844, vec![]).unwrap();
+
+        let ring = client.replay_ops_ring.lock();
+        let offsets: Vec<u32> = ring
+            .2
+            .iter()
+            .filter_map(|op| match op {
+                WireframeOp::FullSnapshot { ts_offset_ms, .. } => Some(*ts_offset_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets[0], 0);
+        assert!(
+            offsets[1] >= 30,
+            "second screen must play after the first: {offsets:?}"
+        );
     }
 
     #[tokio::test]

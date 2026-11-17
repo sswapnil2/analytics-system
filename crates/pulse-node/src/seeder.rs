@@ -234,6 +234,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             chunk_start_ts_ms: base_t,
             ops: vec![
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms: 0,
                     width: 390,
                     height: 844,
                     nodes: vec![
@@ -463,6 +464,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             chunk_start_ts_ms: base_t,
             ops: vec![
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms: 0,
                     width: 390,
                     height: 844,
                     nodes: vec![
