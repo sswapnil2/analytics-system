@@ -189,14 +189,20 @@ export const App: React.FC = () => {
   }, []);
 
   const handleSignedIn = useCallback(() => {
+    // An invite can sign a different account in over an existing one: drop the old account's state.
+    setUser(null);
+    setStatus(null);
+    setProjectId("");
     setSignInReason(undefined);
     setSignedIn(true);
     setRefreshToken((n) => n + 1);
     const seg = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
     if (!ALL_IDS.includes(seg)) {
       window.history.replaceState(null, "", `#/${DEFAULT_TAB}`);
-      setActiveTab(DEFAULT_TAB);
     }
+    // replaceState fires no hashchange, so re-read the route (leaves invite/reset screens).
+    setActiveTab(tabFromHash());
+    setAuthRoute(parseAuthHash());
   }, []);
 
   const loadStatus = useCallback(async () => {
@@ -261,7 +267,7 @@ export const App: React.FC = () => {
       .catch((err) => {
         if (!isNotFound(err)) setUser(null);
       });
-  }, [signedIn]);
+  }, [signedIn, refreshToken]);
 
   const go = (id: WorkspaceId) => {
     window.location.hash = `/${id}`;
@@ -541,7 +547,8 @@ export const App: React.FC = () => {
           )}
         </div>
 
-        <div className="hidden items-center gap-2.5 border-t border-line px-1.5 pt-3 md:flex">
+        <div className="hidden flex-col gap-2 border-t border-line px-1.5 pt-3 md:flex">
+          <div className="flex items-center gap-2.5">
           <span
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-[0.8125rem] font-semibold text-ink-2"
             aria-hidden="true"
@@ -563,6 +570,7 @@ export const App: React.FC = () => {
             </span>
             {user?.name && <span className="truncate text-xs text-muted">{user.email}</span>}
           </a>
+          </div>
           {accountControls}
         </div>
       </aside>

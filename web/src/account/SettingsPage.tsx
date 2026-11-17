@@ -28,7 +28,7 @@ export const RoleBadge: React.FC<{ role: Role }> = ({ role }) => (
   <span
     title={ROLE_HELP[role]}
     className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-      role === "owner" || role === "admin" ? "bg-brand-soft text-brand" : "bg-sunken text-ink-2"
+      role === "owner" || role === "admin" ? "bg-brand-soft text-brand" : "border border-line-strong text-ink-2"
     }`}
   >
     {label(role)}
@@ -213,7 +213,7 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
           <ListSkeleton rows={3} />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[560px] text-left text-sm">
+            <table className="w-full min-w-[520px] text-left text-sm">
               <thead>
                 <tr className="border-b border-line text-xs text-muted">
                   <th className="py-2 pr-3 font-medium">Name</th>
