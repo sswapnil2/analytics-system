@@ -480,6 +480,18 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     })
 }
 
+fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use pulse_sdk_core::{PulseClient, SdkConfig, SdkWireNode};
@@ -1027,16 +1039,4 @@ mod tests {
         query_node.shutdown().await;
         ingest_node.shutdown().await;
     }
-}
-
-fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(path)?;
-    f.write_all(contents.as_bytes())?;
-    f.write_all(b"\n")?;
-    Ok(())
 }

@@ -691,6 +691,11 @@ async fn existing_user_accepts_invite_and_moves_org() {
     )
     .await;
     assert_eq!(s, StatusCode::GONE);
+    // Links go to the owner-only outbox; none may reach the log.
+    assert!(
+        !log.text().contains("/#/"),
+        "an account link leaked into the log"
+    );
 }
 
 #[tokio::test]
@@ -769,6 +774,11 @@ async fn unverified_squatter_cannot_block_an_invite() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (_, members, _) = send(&app, "GET", "/v1/org/members", Some(&owner), None).await;
     assert_eq!(members.as_array().unwrap().len(), 2);
+    // Links go to the owner-only outbox; none may reach the log.
+    assert!(
+        !log.text().contains("/#/"),
+        "an account link leaked into the log"
+    );
 }
 
 #[tokio::test]
@@ -819,6 +829,11 @@ async fn no_orphan_org_when_the_email_is_taken() {
     .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(meta.count_orgs().await.unwrap(), orgs + 1);
+    // Links go to the owner-only outbox; none may reach the log.
+    assert!(
+        !log.text().contains("/#/"),
+        "an account link leaked into the log"
+    );
 }
 
 #[tokio::test]
