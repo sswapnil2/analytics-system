@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, CtrlError};
-use crate::models::{sha256_bytes, sha256_hex, User};
+use crate::models::{sha256_bytes, sha256_hex, Role, User};
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const GOOGLE_STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -150,10 +150,16 @@ impl ControlPlaneService {
         })
     }
 
-    /// Resolves `SignupOrg` to an org id, creating the org and its first project when it's new.
-    async fn org_for_signup(&self, org: SignupOrg) -> Result<String, CtrlError> {
+    /// Resolves `SignupOrg` to an org id and the new account's role, creating the org and its
+    /// first project when it's new. Whoever creates an org owns it; the first account on the node
+    /// owns the default org; later accounts joining it by email domain are members.
+    async fn org_for_signup(&self, org: SignupOrg) -> Result<(String, Role), CtrlError> {
         match org {
-            SignupOrg::Default => Ok("org_default".to_string()),
+            SignupOrg::Default => {
+                let first = self.meta.count_users().await.map_err(CtrlError::meta)? == 0;
+                let role = if first { Role::Owner } else { Role::Member };
+                Ok(("org_default".to_string(), role))
+            }
             SignupOrg::New(name) => {
                 let id = format!("org_{}", &Uuid::new_v4().simple().to_string()[..12]);
                 self.meta
@@ -161,23 +167,29 @@ impl ControlPlaneService {
                     .await
                     .map_err(CtrlError::meta)?;
                 self.create_project_in_org(&id, &name, None).await?;
-                Ok(id)
+                Ok((id, Role::Owner))
             }
         }
     }
 
-    async fn create_session(&self, user_id: &str) -> Result<String, CtrlError> {
+    async fn create_session(&self, user_id: &str, headers: &HeaderMap) -> Result<String, CtrlError> {
         let token = format!("ps_{}", random_hex());
         let now = now_ms();
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.chars().take(256).collect::<String>());
         self.meta
-            .insert_session(&sha256_hex(&token), user_id, now, now + SESSION_TTL_MS)
+            .insert_session(&sha256_hex(&token), user_id, now, now + SESSION_TTL_MS, ua.as_deref())
             .await
             .map_err(CtrlError::meta)?;
         Ok(token)
     }
 
-    async fn session_response(&self, user: &User) -> ApiRes<Value> {
-        let token = self.create_session(&user.id).await?;
+    pub(super) async fn session_response(&self, user: &User, headers: &HeaderMap) -> ApiRes<Value> {
+        let token = self.create_session(&user.id, headers).await?;
+        self.record_enterprise_audit(&format!("user:{}", user.id), "auth.login", &format!("org:{}", user.org_id), json!({ "email": user.email }))
+            .await;
         Ok(Json(json!({ "token": token, "user": user_json(user) })))
     }
 }
@@ -198,17 +210,17 @@ pub(super) fn public_auth_router() -> Router<Arc<ControlPlaneService>> {
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-fn random_hex() -> String {
+pub(super) fn random_hex() -> String {
     let mut raw = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     hex::encode(raw)
 }
 
-fn user_json(u: &User) -> Value {
+pub(super) fn user_json(u: &User) -> Value {
     json!({
         "id": u.id,
         "org_id": u.org_id,
@@ -216,11 +228,12 @@ fn user_json(u: &User) -> Value {
         "name": u.name,
         "has_password": u.password_hash.is_some(),
         "has_google": u.google_sub.is_some(),
+        "role": u.role.as_str(),
     })
 }
 
 /// Lowercases and checks a basic `local@domain.tld` shape.
-fn normalize_email(raw: &str) -> Option<String> {
+pub(super) fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
     let (local, domain) = email.split_once('@')?;
     let ok = !local.is_empty()
@@ -260,7 +273,7 @@ fn take_pending(map: &DashMap<String, (String, i64)>, key: &str) -> Option<Strin
         .map(|(_, (v, _))| v)
 }
 
-fn hash_password(password: &str) -> Result<String, String> {
+pub(super) fn hash_password(password: &str) -> Result<String, String> {
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
@@ -270,7 +283,7 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn verify_password(password: &str, phc: &str) -> bool {
+pub(super) fn verify_password(password: &str, phc: &str) -> bool {
     PasswordHash::new(phc)
         .map(|h| {
             Argon2::default()
@@ -331,6 +344,7 @@ struct SignupReq {
 
 async fn handle_signup(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<SignupReq>,
 ) -> ApiRes<Value> {
     let email =
@@ -370,7 +384,7 @@ async fn handle_signup(
         .await
         .map_err(CtrlError::internal)?
         .map_err(CtrlError::internal)?;
-    let org_id = ctrl.org_for_signup(org).await?;
+    let (org_id, role) = ctrl.org_for_signup(org).await?;
     let user = User {
         id: format!("user_{}", Uuid::new_v4().simple()),
         email,
@@ -382,12 +396,13 @@ async fn handle_signup(
         google_sub: None,
         created_at_ms: now_ms(),
         org_id,
+        role,
     };
     ctrl.meta
         .insert_user(&user)
         .await
         .map_err(CtrlError::meta)?;
-    ctrl.session_response(&user).await
+    ctrl.session_response(&user, &headers).await
 }
 
 #[derive(Deserialize)]
@@ -398,6 +413,7 @@ struct LoginReq {
 
 async fn handle_login(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> ApiRes<Value> {
     let email = req.email.trim().to_lowercase();
@@ -435,13 +451,15 @@ async fn handle_login(
     match user {
         Some(user) if matched && has_password => {
             failures.remove(&email);
-            ctrl.session_response(&user).await
+            ctrl.session_response(&user, &headers).await
         }
         _ => {
             if failures.len() >= MAX_PENDING_ENTRIES {
                 failures.retain(|_, ts| ts.iter().any(|t| *t > now - LOGIN_FAILURE_WINDOW_MS));
             }
-            failures.entry(email).or_default().push(now);
+            failures.entry(email.clone()).or_default().push(now);
+            ctrl.record_enterprise_audit("anonymous", "auth.login_failed", "auth", json!({ "email": email }))
+                .await;
             Err(CtrlError::unauthorized(BAD_LOGIN))
         }
     }
@@ -454,6 +472,7 @@ struct ExchangeReq {
 
 async fn handle_exchange(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<ExchangeReq>,
 ) -> ApiRes<Value> {
     let invalid = || CtrlError::unauthorized("Sign-in code is invalid or expired");
@@ -464,7 +483,7 @@ async fn handle_exchange(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invalid)?;
-    ctrl.session_response(&user).await
+    ctrl.session_response(&user, &headers).await
 }
 
 pub(super) async fn handle_me(
@@ -630,7 +649,7 @@ async fn google_callback(
         else {
             return Err("signup_closed");
         };
-        let org_id = ctrl.org_for_signup(org).await.map_err(|_| "google_token")?;
+        let (org_id, role) = ctrl.org_for_signup(org).await.map_err(|_| "google_token")?;
         let user = User {
             id: format!("user_{}", Uuid::new_v4().simple()),
             email,
@@ -642,6 +661,7 @@ async fn google_callback(
             google_sub: Some(sub.to_string()),
             created_at_ms: now_ms(),
             org_id,
+            role,
         };
         meta.insert_user(&user).await.map_err(|_| "google_token")?;
         user.id

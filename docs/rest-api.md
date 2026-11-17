@@ -16,7 +16,7 @@ Source of truth: `crates/pulse-ingest/src/http.rs` (ingest), `build_admin_contro
 | Sign-in (`/v1/auth/config`, `signup`, `login`, `exchange`, `google/*`) | none | |
 
 Ingest keys are rejected on admin routes (`403`). A project admin key is bound to its project: asking
-for another project returns `403`. Root tokens and Studio sessions can address any project.
+for another project returns `403`. Root tokens can address any project; a Studio session can address its organisation's projects, as its role allows (see below).
 
 **Choosing the project.** Routes with `:id` in the path use that project. Routes without one
 use, in order: the requested project (`?project_id=` on `/v1/status`, `GET /v1/sessions` and
@@ -25,6 +25,39 @@ use, in order: the requested project (`?project_id=` on `/v1/status`, `GET /v1/s
 the node's default project.
 
 Browser calls to admin routes are limited to `PULSE_CORS_ORIGINS`; ingest and flag routes allow any origin.
+
+### Users, organisations and roles
+
+Every Studio account belongs to one organisation and has a role in it. Each role can do everything
+the roles before it can:
+
+| Role | Can |
+|---|---|
+| `viewer` | Read everything in the organisation's projects and run queries (`GET`, `query/*`, `/v1/query`, sessions, MCP) |
+| `member` | Create, edit and delete reports, dashboards, cohorts, alerts, flags, experiments and lexicon entries |
+| `admin` | Manage API keys, members, invites, BYOK, import/export, user-profile deletion and new projects |
+| `owner` | Rename the organisation, and grant, change or remove the owner role |
+
+The check runs once for every route, before the handler, and is deny-by-default. Writes a viewer
+attempts get `403` with the role they would need. An admin can grant, change, remove or issue reset
+links only for roles below their own; owners can do this for anyone. Nobody can change their own
+role, and an organisation always keeps at least one owner.
+
+**How the root token relates to accounts.** The root token (`PULSE_ADMIN_TOKEN`, or
+`root_admin_token` in the data directory) is the node operator's key. It is not an account. It acts
+as an owner of every organisation, and it has the only access to cluster settings (encryption keys,
+licence, audit log). Organisation-level routes (`/v1/org/*`) called with it act on the default
+organisation. The first account on a node needs the root token as its setup code, and becomes the
+owner of the default organisation and its existing data. After that the root token can stay in a
+vault. A project admin key (`sk_live_…`) acts as an admin of its own project. Ingest keys (`pk_…`)
+are unchanged.
+
+Accounts that existed before roles became `admin`, except the earliest one in each organisation,
+which became `owner`. Someone who signs up and creates a new organisation owns it. Someone who joins
+the default organisation through an allowed email domain becomes a `member`.
+
+Pulse has no mailer. Invite and password-reset links are returned to the admin who created them and
+also written to the node log.
 
 ## Health
 
@@ -155,3 +188,29 @@ take simpler arguments.
 | POST | `/v1/auth/signup`, `/v1/auth/login` | Email/password; returns a `ps_` session |
 | POST | `/v1/auth/exchange` | Exchange a sign-in code for a session |
 | GET | `/v1/auth/google/start`, `/v1/auth/google/callback` | Google sign-in, when configured |
+| GET | `/v1/auth/invites/:token` | Email, role and organisation of a pending invite |
+| POST | `/v1/auth/invites/accept` | `{token, password, name?}`: creates the account with the invite's role and returns a session |
+| POST | `/v1/auth/password-reset/request` | `{email}`: always `204`. If the account exists, the link goes to the node log |
+| POST | `/v1/auth/password-reset` | `{token, new_password}`: one use; signs out every session of the account |
+
+## Account and organisation (Studio session)
+
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| GET, PATCH | `/v1/auth/me` | any | Profile (`role` included); PATCH `{name}` |
+| POST | `/v1/auth/password` | any | `{current_password, new_password}`: signs out your other sessions |
+| GET | `/v1/auth/sessions` | any | Your live sessions (`id` is a hash prefix, `current` marks this one) |
+| DELETE | `/v1/auth/sessions/:sid` | any | Sign out one session |
+| POST | `/v1/auth/sessions/revoke-others` | any | Sign out every other session |
+| GET | `/v1/org` | viewer | Organisation name and your role |
+| PATCH | `/v1/org` | owner | `{name}` |
+| GET | `/v1/org/members` | viewer | Members and roles |
+| PATCH, DELETE | `/v1/org/members/:user_id` | admin | `{role}`, or remove (deletes the account) |
+| POST | `/v1/org/members/:user_id/password-reset` | admin | Returns a one-hour `reset_url` |
+| GET, POST | `/v1/org/invites` | admin | `{email, role}`: returns `invite_url` once (7 days, one use) |
+| DELETE | `/v1/org/invites/:invite_id` | admin | Revoke a pending invite |
+| DELETE | `/v1/projects/:id/api-keys/:key_id` | admin | Revoke an API key |
+
+These events are written to the audit log: sign-ins and failed sign-ins, password changes and resets,
+role changes, member removals, invites created, accepted and revoked, organisation renames, and API
+keys created and revoked.

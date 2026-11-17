@@ -282,7 +282,7 @@ async fn session_token_authorizes_admin_routes_until_logout_or_expiry() {
     // Expired session row is rejected.
     let expired = "ps_expired_session_token_for_test";
     let now = chrono::Utc::now().timestamp_millis();
-    meta.insert_session(&sha256_hex(expired), &user_id, now - 10_000, now - 1)
+    meta.insert_session(&sha256_hex(expired), &user_id, now - 10_000, now - 1, None)
         .await
         .unwrap();
     let (s, _, _) = send(&app, "GET", "/v1/projects", Some(expired), None).await;

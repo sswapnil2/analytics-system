@@ -13,9 +13,11 @@ import {
   Monitor,
   Moon,
   PlayCircle,
+  Settings,
   ShieldCheck,
   Sun,
   Terminal,
+  UserRound,
   Users,
   X,
 } from "lucide-react";
@@ -25,9 +27,21 @@ import {
   AuthUser,
   getStoredAdminToken,
   NodeStatus,
+  roleAtLeast,
   setStoredAdminToken,
 } from "./api/client";
-import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
+import {
+  AcceptInviteScreen,
+  AuthCallback,
+  ForgotPasswordScreen,
+  Logo,
+  parseAuthHash,
+  ResetPasswordScreen,
+  SignInScreen,
+  SignUpScreen,
+} from "./auth/AuthScreens";
+import { ProfilePage } from "./account/ProfilePage";
+import { SettingsPage } from "./account/SettingsPage";
 import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
 import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
@@ -51,7 +65,9 @@ type WorkspaceId =
   | "cohorts"
   | "experiments"
   | "events"
-  | "security";
+  | "security"
+  | "profile"
+  | "settings";
 
 interface NavItem {
   id: WorkspaceId;
@@ -88,7 +104,9 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   },
 ];
 
-const ALL_IDS = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id));
+// Profile and Settings open from the account area, not the workspace nav.
+const ACCOUNT_IDS: WorkspaceId[] = ["profile", "settings"];
+const ALL_IDS = [...NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id)), ...ACCOUNT_IDS];
 // Report builders that default to the project's own events.
 const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
 const DEFAULT_TAB: WorkspaceId = "funnels";
@@ -187,7 +205,7 @@ export const App: React.FC = () => {
       setStatus(s);
       if (!projectId && s.active_project_id) setProjectId(s.active_project_id);
     } catch (err) {
-      if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
+      if (err instanceof ApiAuthError && err.status === 401) signOut("Your session ended. Sign in again to continue.");
     }
   }, [projectId, signOut]);
 
@@ -215,7 +233,7 @@ export const App: React.FC = () => {
       setAvailableProps(Array.from(propNames).sort());
       setCatalogLoaded(true);
     } catch (err) {
-      if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
+      if (err instanceof ApiAuthError && err.status === 401) signOut("Your session ended. Sign in again to continue.");
       else setCatalogError(errorMessage(err));
     }
   }, [projectId, signOut]);
@@ -276,6 +294,14 @@ export const App: React.FC = () => {
     }
   };
 
+  // Invite and reset links work whether or not someone is signed in on this browser.
+  if (authRoute.view === "invite") {
+    return <AcceptInviteScreen token={authRoute.token} onSignedIn={handleSignedIn} />;
+  }
+  if (authRoute.view === "reset") {
+    return <ResetPasswordScreen token={authRoute.token} />;
+  }
+
   if (authRoute.view === "callback") {
     return <AuthCallback code={authRoute.params.get("code")} onSignedIn={handleSignedIn} />;
   }
@@ -283,6 +309,8 @@ export const App: React.FC = () => {
   if (!signedIn) {
     return authRoute.view === "signup" ? (
       <SignUpScreen onSignedIn={handleSignedIn} />
+    ) : authRoute.view === "forgot" ? (
+      <ForgotPasswordScreen />
     ) : (
       <SignInScreen
         onSignedIn={handleSignedIn}
@@ -306,6 +334,8 @@ export const App: React.FC = () => {
       .map((w) => w[0]?.toUpperCase())
       .join("") || "A";
 
+  // Admin tokens have no user and act as admins; signed-in users by their role.
+  const canManageKeys = !user || roleAtLeast(user.role, "admin");
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
   const sampleEvent = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
@@ -356,6 +386,31 @@ export const App: React.FC = () => {
       >
         <Terminal className="h-4 w-4" />
       </button>
+      <a
+        href="#/profile"
+        onClick={(e) => {
+          e.preventDefault();
+          go("profile");
+        }}
+        className={`${btn.ghost} h-8 w-8 px-0 md:hidden`}
+        aria-label="Profile"
+        title="Profile"
+      >
+        <UserRound className="h-4 w-4" />
+      </a>
+      <a
+        href="#/settings"
+        onClick={(e) => {
+          e.preventDefault();
+          go("settings");
+        }}
+        aria-current={activeTab === "settings" ? "page" : undefined}
+        className={`${btn.ghost} h-8 w-8 px-0 ${activeTab === "settings" ? "text-brand" : ""}`}
+        aria-label="Settings"
+        title="Settings: members, invites and API keys"
+      >
+        <Settings className="h-4 w-4" />
+      </a>
       <button
         type="button"
         onClick={() => setTheme(nextTheme[theme])}
@@ -493,10 +548,21 @@ export const App: React.FC = () => {
           >
             {initials}
           </span>
-          <span className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate text-sm font-semibold">{displayName}</span>
+          <a
+            href="#/profile"
+            onClick={(e) => {
+              e.preventDefault();
+              go("profile");
+            }}
+            aria-current={activeTab === "profile" ? "page" : undefined}
+            title="Your profile"
+            className="-mx-1 flex min-w-0 flex-1 flex-col rounded-md px-1 hover:bg-hover"
+          >
+            <span className={`truncate text-sm font-semibold ${activeTab === "profile" ? "text-brand" : ""}`}>
+              {displayName}
+            </span>
             {user?.name && <span className="truncate text-xs text-muted">{user.email}</span>}
-          </span>
+          </a>
           {accountControls}
         </div>
       </aside>
@@ -509,6 +575,7 @@ export const App: React.FC = () => {
               meta={activePid || undefined}
               actions={
                 <div className="flex items-center gap-2">
+                  {canManageKeys && (<>
                   <button
                     type="button"
                     disabled={mintingKey || !activePid}
@@ -520,13 +587,14 @@ export const App: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => {
-                      go("events");
+                      go("settings");
                       setQuickstartOpen(false);
                     }}
                     className={btn.ghost}
                   >
                     Manage keys
                   </button>
+                  </>)}
                   <button
                     type="button"
                     onClick={() => {
@@ -560,7 +628,15 @@ export const App: React.FC = () => {
               </div>
             </Panel>
           )}
-            {catalogError && NEEDS_EVENTS.includes(activeTab) ? (
+            {activeTab === "profile" ? (
+              <ProfilePage user={user} onUserChanged={setUser} />
+            ) : activeTab === "settings" ? (
+              <SettingsPage
+                user={user}
+                projectId={activePid}
+                projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
+              />
+            ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
               <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
             ) : !activePid || (!catalogLoaded && NEEDS_EVENTS.includes(activeTab)) ? (
               <p className="text-sm text-muted" role="status">
