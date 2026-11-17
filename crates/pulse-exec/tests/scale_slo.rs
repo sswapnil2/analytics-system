@@ -1,0 +1,658 @@
+use std::env;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
+use pulse_exec::{
+    FlowDirection, FlowsQuery, FunnelOrderMode, FunnelQuery, FunnelStepSpec, GlobalFilter,
+    InsightsMetric, InsightsQuery, InsightsSeriesSpec, QueryEngine, RetentionMode, RetentionQuery,
+    TimeInterval, TimeRange,
+};
+use pulse_identity::IdentityRouter;
+use pulse_ingest::{InMemoryGovernance, IngestService};
+use pulse_storage::{route_bucket, StorageConfig, StorageEngine};
+use pulse_wire::{PropValue, WireBatch, WireEvent};
+
+struct ScaleConfig {
+    label: String,
+    total_events: usize,
+    num_users: usize,
+    batch_size: usize,
+    cold_iters: usize,
+    warm_iters: usize,
+    flows_iters: usize,
+    concurrent_waves: usize,
+}
+
+impl ScaleConfig {
+    fn from_env() -> Self {
+        if let Ok(raw_n) = env::var("PULSE_BENCH_EVENTS") {
+            if let Ok(n) = raw_n.trim().parse::<usize>() {
+                let n = n.max(10_000);
+                let batch_size = (n / 20).clamp(5_000, 50_000);
+                let num_users = (n / 40).clamp(1_000, 250_000);
+                return Self {
+                    label: format!("{n}_events"),
+                    total_events: n,
+                    num_users,
+                    batch_size,
+                    cold_iters: if n >= 5_000_000 { 3 } else { 5 },
+                    warm_iters: if n >= 5_000_000 { 10 } else { 20 },
+                    flows_iters: if n >= 5_000_000 { 8 } else { 15 },
+                    concurrent_waves: 2,
+                };
+            }
+        }
+
+        let profile = env::var("PULSE_BENCH_SCALE")
+            .unwrap_or_else(|_| "100k".to_string())
+            .to_ascii_lowercase();
+        match profile.as_str() {
+            "10m" => Self {
+                label: "10M".to_string(),
+                total_events: 10_000_000,
+                num_users: 200_000,
+                batch_size: 50_000,
+                cold_iters: 3,
+                warm_iters: 10,
+                flows_iters: 8,
+                concurrent_waves: 2,
+            },
+            "5m" => Self {
+                label: "5M".to_string(),
+                total_events: 5_000_000,
+                num_users: 100_000,
+                batch_size: 50_000,
+                cold_iters: 3,
+                warm_iters: 12,
+                flows_iters: 10,
+                concurrent_waves: 2,
+            },
+            "1m" => Self {
+                label: "1M".to_string(),
+                total_events: 1_000_000,
+                num_users: 25_000,
+                batch_size: 50_000,
+                cold_iters: 5,
+                warm_iters: 20,
+                flows_iters: 15,
+                concurrent_waves: 2,
+            },
+            _ => Self {
+                label: "100K".to_string(),
+                total_events: 100_000,
+                num_users: 5_000,
+                batch_size: 10_000,
+                cold_iters: 5,
+                warm_iters: 25,
+                flows_iters: 15,
+                concurrent_waves: 2,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatencyStats {
+    samples: usize,
+    min_ms: f64,
+    p50_ms: f64,
+    p75_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SloBudget {
+    p50_ms: f64,
+    p75_ms: f64,
+    p99_ms: f64,
+}
+
+fn compute_stats(samples_us: &[u64]) -> LatencyStats {
+    assert!(!samples_us.is_empty(), "need at least 1 latency sample");
+    let mut sorted = samples_us.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let pick = |pct: f64| -> f64 {
+        let idx = ((pct * ((n - 1) as f64)).ceil() as usize).min(n - 1);
+        sorted[idx] as f64 / 1000.0
+    };
+    LatencyStats {
+        samples: n,
+        min_ms: sorted[0] as f64 / 1000.0,
+        p50_ms: pick(0.50),
+        p75_ms: pick(0.75),
+        p95_ms: pick(0.95),
+        p99_ms: pick(0.99),
+        max_ms: sorted[n - 1] as f64 / 1000.0,
+    }
+}
+
+fn record_row(
+    rows: &mut Vec<(&'static str, LatencyStats, SloBudget, bool)>,
+    failures: &mut Vec<String>,
+    name: &'static str,
+    samples_us: &[u64],
+    slo: SloBudget,
+) {
+    let stats = compute_stats(samples_us);
+    let pass =
+        stats.p50_ms <= slo.p50_ms && stats.p75_ms <= slo.p75_ms && stats.p99_ms <= slo.p99_ms;
+    if !pass {
+        failures.push(format!(
+            "{name}: p50={:.2}ms (<= {:.2}ms), p75={:.2}ms (<= {:.2}ms), p99={:.2}ms (<= {:.2}ms)",
+            stats.p50_ms, slo.p50_ms, stats.p75_ms, slo.p75_ms, stats.p99_ms, slo.p99_ms
+        ));
+    }
+    rows.push((name, stats, slo, pass));
+}
+
+#[tokio::test]
+async fn scale_latency_percentiles_and_slo_harness() {
+    let cfg = ScaleConfig::from_env();
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).expect("local fs"));
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+
+    let storage_cfg = StorageConfig {
+        num_buckets: 16,
+        l0_flush_row_threshold: 250_000,
+        l0_flush_max_age: Duration::from_secs(600),
+        compaction_min_segments: 8,
+    };
+    let storage = StorageEngine::new(storage_cfg, store, id_router.clone());
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = pulse_exec::CatalogRegistry::new();
+
+    let project_id = "proj_scale_bench";
+    let base_ts = TimeInterval::Day.align_floor(1_763_000_000_000);
+    let span_days = 14i64;
+    let server_now = base_ts + span_days * 86_400_000 + 60_000;
+
+    let plans = ["basic", "upi_plus", "credit_pro"];
+    let cities = ["Bengaluru", "Mumbai", "Delhi_NCR", "Hyderabad", "Pune"];
+    let pay_methods = ["upi_autopay", "upi_intent", "card", "netbanking"];
+    let merchants = ["m_swiggy", "m_zepto", "m_zomato", "m_cred"];
+
+    let mut ingest_samples_us = Vec::new();
+    let seed_t0 = Instant::now();
+    let num_batches = cfg.total_events.div_ceil(cfg.batch_size);
+
+    for b_idx in 0..num_batches {
+        let offset_base = b_idx * cfg.batch_size;
+        let len = (cfg.total_events - offset_base).min(cfg.batch_size);
+        let mut batch_events = Vec::with_capacity(len);
+
+        for j in 0..len {
+            let i = offset_base + j;
+            let uid = i % cfg.num_users;
+            let visit_idx = i / cfg.num_users;
+            let stage = visit_idx % 6;
+            let day_idx = ((visit_idx + uid) % (span_days as usize)) as i64;
+            let ts = base_ts
+                + day_idx * 86_400_000
+                + ((visit_idx as i64) * 37_000)
+                + ((uid as i64) % 1000);
+
+            let ev_name = if i % 20 == 0 {
+                "$session_start"
+            } else {
+                match stage {
+                    0 => "App_Open",
+                    1 if uid % 10 < 7 => "KYC_PAN_Submitted",
+                    1 => "Quick_Grocery_Browse",
+                    2 if uid % 10 < 5 => "UPI_Autopay_Mandate_Approved",
+                    2 => "Quick_Grocery_Browse",
+                    3 if uid % 10 < 3 => "First_Disbursal_Success",
+                    3 => "Cart_Checkout",
+                    4 => "Quick_Grocery_Browse",
+                    _ => "Cart_Checkout",
+                }
+            };
+
+            let is_cross_anon = uid % 10 == 0 && stage == 0;
+            let distinct_id = if is_cross_anon {
+                format!("anon_ios_{uid:06}")
+            } else {
+                format!("u_{uid:06}")
+            };
+            let routing_seed = if is_cross_anon {
+                format!("seed_ios_{uid:06}")
+            } else {
+                format!("seed_web_{uid:06}")
+            };
+
+            let amount = 500 + (((uid * 131 + visit_idx * 17) % 9500) as i64);
+            let uuid = [
+                (i & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 24) & 0xff) as u8,
+                (b_idx & 0xff) as u8,
+                ((b_idx >> 8) & 0xff) as u8,
+                7,
+                9,
+                11,
+                13,
+                17,
+                19,
+                23,
+                29,
+                31,
+                37,
+            ];
+
+            batch_events.push(WireEvent {
+                event_uuid: uuid,
+                routing_seed,
+                distinct_id,
+                session_id: format!("s_{uid:06}_{day_idx}"),
+                event_name: ev_name.to_string(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: 0,
+                props: vec![
+                    (
+                        "plan".to_string(),
+                        PropValue::Str(plans[uid % plans.len()].into()),
+                    ),
+                    (
+                        "city".to_string(),
+                        PropValue::Str(cities[(uid / 3) % cities.len()].into()),
+                    ),
+                    (
+                        "payment_method".to_string(),
+                        PropValue::Str(pay_methods[(uid / 5) % pay_methods.len()].into()),
+                    ),
+                    (
+                        "merchant_id".to_string(),
+                        PropValue::Str(merchants[(uid + visit_idx) % merchants.len()].into()),
+                    ),
+                    ("amount".to_string(), PropValue::Int(amount)),
+                ],
+                replay_offset_kb: 0,
+            });
+        }
+
+        let b_t0 = Instant::now();
+        ingest
+            .ingest_for_project(project_id, WireBatch::new(batch_events), server_now)
+            .await
+            .expect("ingest batch");
+        ingest_samples_us.push(b_t0.elapsed().as_micros() as u64);
+    }
+
+    // Batch-alias 10% of users across mobile & web seeds (`uid % 10 == 0`) with 1 durable flush.
+    let id_graph = id_router.get_or_open(project_id).await.expect("id_graph");
+    for uid in (0..cfg.num_users).step_by(10) {
+        let anon = format!("anon_ios_{uid:06}");
+        let user = format!("u_{uid:06}");
+        let anon_seed = format!("seed_ios_{uid:06}");
+        let user_seed = format!("seed_web_{uid:06}");
+        id_graph
+            .alias(
+                &anon,
+                &user,
+                route_bucket(&anon_seed, 16),
+                route_bucket(&user_seed, 16),
+            )
+            .expect("alias cross-bucket user");
+    }
+    id_graph.flush().await.expect("flush identity graph");
+
+    let flush_t0 = Instant::now();
+    storage.flush_all_projects().await.expect("flush storage");
+    let flush_elapsed = flush_t0.elapsed();
+    let total_ingest_elapsed = seed_t0.elapsed();
+
+    let ps = storage
+        .get_or_open_project(project_id)
+        .await
+        .expect("project");
+    let stored_l1_rows = ps.snapshot().manifest.total_l1_rows();
+    assert_eq!(stored_l1_rows as usize, cfg.total_events);
+    let ingest_eps = cfg.total_events as f64 / total_ingest_elapsed.as_secs_f64();
+
+    let full_range = TimeRange {
+        start_ts_ms: base_ts,
+        end_ts_ms: base_ts + span_days * 86_400_000 - 1,
+    };
+    let flows_days = ((1_500_000usize * span_days as usize) / cfg.total_events)
+        .clamp(1, span_days as usize) as i64;
+    let flows_range = TimeRange {
+        start_ts_ms: base_ts,
+        end_ts_ms: base_ts + flows_days * 86_400_000 - 1,
+    };
+
+    let funnel_query = FunnelQuery {
+        time_range: full_range,
+        steps: [
+            "App_Open",
+            "KYC_PAN_Submitted",
+            "UPI_Autopay_Mandate_Approved",
+            "First_Disbursal_Success",
+            "Cart_Checkout",
+        ]
+        .into_iter()
+        .map(|s| FunnelStepSpec {
+            event_name: s.to_string(),
+            filters: Vec::new(),
+            first_time_ever: false,
+        })
+        .collect(),
+        order_mode: FunnelOrderMode::LooseOrder,
+        conversion_window_ms: 14 * 86_400_000,
+        exclusions: Vec::new(),
+        hold_constant_props: vec!["city".to_string()],
+        breakdown_by: Some("payment_method".to_string()),
+        global_filter: GlobalFilter::default(),
+    };
+
+    let insights_query = InsightsQuery {
+        time_range: full_range,
+        interval: TimeInterval::Day,
+        series: vec![
+            InsightsSeriesSpec {
+                label: "A".to_string(),
+                event_name: "App_Open".to_string(),
+                metric: InsightsMetric::Uniques,
+                filters: Vec::new(),
+            },
+            InsightsSeriesSpec {
+                label: "B".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric: InsightsMetric::PropPercentile {
+                    prop: "amount".to_string(),
+                    quantile: 0.95,
+                },
+                filters: Vec::new(),
+            },
+        ],
+        breakdown_by: vec!["plan".to_string()],
+        global_filter: GlobalFilter::default(),
+        compare_previous_period: false,
+        formula: Some("(B / A) * 100".to_string()),
+    };
+
+    let retention_query = RetentionQuery {
+        time_range: full_range,
+        start_event: "App_Open".to_string(),
+        return_event: "First_Disbursal_Success".to_string(),
+        mode: RetentionMode::NDay,
+        unit: TimeInterval::Day,
+        num_periods: 14,
+        global_filter: GlobalFilter::default(),
+    };
+
+    let flows_query = FlowsQuery {
+        time_range: flows_range,
+        anchor_event: "App_Open".to_string(),
+        direction: FlowDirection::Forward,
+        steps: 5,
+        top_n_per_step: Some(10),
+        global_filter: GlobalFilter::default(),
+    };
+
+    // 1. Cold 5-step Funnel (fresh QueryEngine with empty cache per iteration)
+    let mut funnel_cold_us = Vec::with_capacity(cfg.cold_iters);
+    for _ in 0..cfg.cold_iters {
+        let cold_engine = QueryEngine::new(
+            storage.clone(),
+            256 * 1024 * 1024,
+            None,
+            64 * 1024 * 1024,
+            catalogs.clone(),
+        )
+        .await
+        .expect("cold QueryEngine");
+        let t0 = Instant::now();
+        let res = cold_engine
+            .query_funnel(project_id, &funnel_query)
+            .await
+            .expect("cold funnel");
+        funnel_cold_us.push(t0.elapsed().as_micros() as u64);
+        assert_eq!(res.overall_steps.len(), 5);
+        assert!(res.overall_steps[0].entered_users > 0);
+    }
+
+    // 2. Warm QueryEngine across all analytics modes
+    let qengine = QueryEngine::new(
+        storage.clone(),
+        256 * 1024 * 1024,
+        None,
+        64 * 1024 * 1024,
+        catalogs.clone(),
+    )
+    .await
+    .expect("warm QueryEngine");
+    // Prime L1 decoded columns & inverted indexes before measuring warm percentiles
+    let _ = qengine
+        .query_funnel(project_id, &funnel_query)
+        .await
+        .unwrap();
+    let _ = qengine
+        .query_insights(project_id, &insights_query)
+        .await
+        .unwrap();
+    let _ = qengine
+        .query_retention(project_id, &retention_query)
+        .await
+        .unwrap();
+    let _ = qengine.query_flows(project_id, &flows_query).await.unwrap();
+
+    let mut funnel_warm_us = Vec::with_capacity(cfg.warm_iters);
+    for _ in 0..cfg.warm_iters {
+        let t0 = Instant::now();
+        let res = qengine
+            .query_funnel(project_id, &funnel_query)
+            .await
+            .expect("warm funnel");
+        funnel_warm_us.push(t0.elapsed().as_micros() as u64);
+        assert!(!res.breakdowns.is_empty());
+    }
+
+    let mut insights_warm_us = Vec::with_capacity(cfg.warm_iters);
+    for _ in 0..cfg.warm_iters {
+        let t0 = Instant::now();
+        let res = qengine
+            .query_insights(project_id, &insights_query)
+            .await
+            .expect("warm insights");
+        insights_warm_us.push(t0.elapsed().as_micros() as u64);
+        assert!(!res.series.is_empty());
+        assert!(!res.formula_series.is_empty());
+    }
+
+    let mut retention_warm_us = Vec::with_capacity(cfg.warm_iters);
+    for _ in 0..cfg.warm_iters {
+        let t0 = Instant::now();
+        let res = qengine
+            .query_retention(project_id, &retention_query)
+            .await
+            .expect("warm retention");
+        retention_warm_us.push(t0.elapsed().as_micros() as u64);
+        assert!(!res.cohorts.is_empty());
+    }
+
+    let mut flows_warm_us = Vec::with_capacity(cfg.flows_iters);
+    for _ in 0..cfg.flows_iters {
+        let t0 = Instant::now();
+        let res = qengine
+            .query_flows(project_id, &flows_query)
+            .await
+            .expect("warm flows");
+        flows_warm_us.push(t0.elapsed().as_micros() as u64);
+        assert!(!res.nodes.is_empty());
+    }
+
+    // 3. 16x concurrent mixed queries
+    let mut concurrent_us = Vec::with_capacity(cfg.concurrent_waves * 16);
+    for _wave in 0..cfg.concurrent_waves {
+        let mut handles = Vec::with_capacity(16);
+        for worker in 0..16 {
+            let qe = qengine.clone();
+            let fq = funnel_query.clone();
+            let iq = insights_query.clone();
+            let rq = retention_query.clone();
+            let flq = flows_query.clone();
+            handles.push(tokio::spawn(async move {
+                let t0 = Instant::now();
+                match worker % 4 {
+                    0 => {
+                        qe.query_funnel(project_id, &fq).await.unwrap();
+                    }
+                    1 => {
+                        qe.query_insights(project_id, &iq).await.unwrap();
+                    }
+                    2 => {
+                        qe.query_retention(project_id, &rq).await.unwrap();
+                    }
+                    _ => {
+                        qe.query_flows(project_id, &flq).await.unwrap();
+                    }
+                }
+                t0.elapsed().as_micros() as u64
+            }));
+        }
+        for h in handles {
+            concurrent_us.push(h.await.expect("concurrent worker join"));
+        }
+    }
+
+    let sf = (cfg.total_events as f64 / 1_000_000.0).max(0.5);
+    let flows_sf = (sf * (flows_days as f64 / span_days as f64)).max(0.5);
+
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+
+    record_row(
+        &mut rows,
+        &mut failures,
+        "ingest_batch",
+        &ingest_samples_us,
+        SloBudget {
+            p50_ms: 450.0,
+            p75_ms: 600.0,
+            p99_ms: 1200.0,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "funnel_5step_cold",
+        &funnel_cold_us,
+        SloBudget {
+            p50_ms: 300.0 * sf,
+            p75_ms: 380.0 * sf,
+            p99_ms: 600.0 * sf,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "funnel_5step_warm",
+        &funnel_warm_us,
+        SloBudget {
+            p50_ms: 35.0 * sf,
+            p75_ms: 50.0 * sf,
+            p99_ms: 100.0 * sf,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "insights_multi_warm",
+        &insights_warm_us,
+        SloBudget {
+            p50_ms: 45.0 * sf,
+            p75_ms: 65.0 * sf,
+            p99_ms: 120.0 * sf,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "retention_14d_warm",
+        &retention_warm_us,
+        SloBudget {
+            p50_ms: 40.0 * sf,
+            p75_ms: 55.0 * sf,
+            p99_ms: 110.0 * sf,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "flows_5step_warm",
+        &flows_warm_us,
+        SloBudget {
+            p50_ms: 160.0 * flows_sf,
+            p75_ms: 220.0 * flows_sf,
+            p99_ms: 350.0 * flows_sf,
+        },
+    );
+    record_row(
+        &mut rows,
+        &mut failures,
+        "concurrent_16x_mixed",
+        &concurrent_us,
+        SloBudget {
+            p50_ms: 240.0 * sf,
+            p75_ms: 360.0 * sf,
+            p99_ms: 650.0 * sf,
+        },
+    );
+
+    println!();
+    println!(
+        "=== Pulse Analytics Scale & Latency SLO Report [scale={}, events={}, users={}, batch={}, ingest_throughput={:.0} ev/s, l1_flush={:.1}ms, flows_window={}d] ===",
+        cfg.label,
+        cfg.total_events,
+        cfg.num_users,
+        cfg.batch_size,
+        ingest_eps,
+        flush_elapsed.as_secs_f64() * 1000.0,
+        flows_days
+    );
+    println!(
+        "| Workload             |  N |  min(ms) |  p50(ms) |  p75(ms) |  p95(ms) |  p99(ms) |  max(ms) | SLO p50/p75/p99 (ms)      | Status |"
+    );
+    println!(
+        "|----------------------|---:|---------:|---------:|---------:|---------:|---------:|---------:|---------------------------|--------|"
+    );
+    for (name, st, slo, pass) in &rows {
+        println!(
+            "| {:<20} | {:>2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>6.0} / {:>6.0} / {:>6.0}    | {:<6} |",
+            name,
+            st.samples,
+            st.min_ms,
+            st.p50_ms,
+            st.p75_ms,
+            st.p95_ms,
+            st.p99_ms,
+            st.max_ms,
+            slo.p50_ms,
+            slo.p75_ms,
+            slo.p99_ms,
+            if *pass { "PASS" } else { "BREACH" }
+        );
+    }
+    println!();
+
+    id_router.close_all().await.unwrap();
+
+    #[cfg(not(debug_assertions))]
+    {
+        if env::var("PULSE_BENCH_REPORT_ONLY").as_deref() != Ok("1") {
+            assert!(
+                failures.is_empty(),
+                "SLO latency budget exceeded:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+}

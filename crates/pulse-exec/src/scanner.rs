@@ -8,10 +8,13 @@ use pulse_storage::{
     ProjectDictionary, ProjectStorage, SegmentMeta, StorageError, StorageSnapshot, StoredRow,
 };
 use pulse_wire::PropValue;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use thiserror::Error;
 
-use crate::ast::{BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, TimeRange};
+use crate::ast::{
+    BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, TimeInterval, TimeRange,
+};
 use crate::cache::{SegmentBlockCache, TierAColumns};
 use crate::catalog::{evaluate_custom_property, VirtualCatalog};
 
@@ -549,6 +552,25 @@ pub async fn precompute_segment_row_mask(
 
 pub const MAX_COHORT_DEPTH: usize = 32;
 
+/// Cached fast path for aligning millisecond timestamps to timezone-aware `TimeInterval` boundaries.
+#[inline]
+pub(crate) fn align_floor_tz_cached(
+    ts: i64,
+    unit: TimeInterval,
+    tz: chrono_tz::Tz,
+    cache: &mut Option<(i64, i64)>,
+) -> i64 {
+    if let Some((b_start, b_next)) = *cache {
+        if ts >= b_start && ts < b_next {
+            return b_start;
+        }
+    }
+    let b_start = unit.align_floor_tz(ts, tz);
+    let b_next = unit.next_bucket_tz(b_start, tz).unwrap_or(i64::MAX);
+    *cache = Some((b_start, b_next));
+    b_start
+}
+
 /// Validates synchronously at save/preview time that a `BehavioralCohortDef` contains no reference cycles
 /// and does not exceed `MAX_COHORT_DEPTH` (`P0-09`).
 pub fn validate_cohort_acyclic(
@@ -670,42 +692,55 @@ fn evaluate_cohort_bounded<'a>(
                 )
                 .await?;
 
-                let mut counts: HashMap<u32, u32> = HashMap::new();
-                for chunk in &chunks {
-                    let row_mask = precompute_segment_row_mask(
+                let row_masks = try_join_all(chunks.iter().map(|chunk| {
+                    precompute_segment_row_mask(
                         chunk,
                         where_clauses,
                         ps.dictionary(),
                         catalog,
                         cache,
                     )
-                    .await?;
-                    for i in 0..chunk.len() {
-                        if let Some(rm) = &row_mask {
-                            if !rm.contains(i as u32) {
+                }))
+                .await?;
+
+                let counts: HashMap<u32, u32> = chunks
+                    .par_iter()
+                    .zip(row_masks.par_iter())
+                    .map(|(chunk, row_mask)| {
+                        let mut local: HashMap<u32, u32> = HashMap::new();
+                        for i in 0..chunk.len() {
+                            if let Some(rm) = row_mask {
+                                if !rm.contains(i as u32) {
+                                    continue;
+                                }
+                            }
+                            if let Some(tr) = eff_range {
+                                if !tr.contains(chunk.tier_a.event_ts_ms[i]) {
+                                    continue;
+                                }
+                            }
+                            if !target.matches_id(chunk.tier_a.event_id[i]) {
                                 continue;
                             }
-                        }
-                        if let Some(tr) = eff_range {
-                            if !tr.contains(chunk.tier_a.event_ts_ms[i]) {
+                            if let Some(ef) = &target.extra_filter {
+                                if !row_matches_predicates(chunk, i, std::slice::from_ref(ef)) {
+                                    continue;
+                                }
+                            }
+                            if !row_matches_predicates(chunk, i, where_clauses) {
                                 continue;
                             }
+                            let canon = id_snap.resolve(chunk.tier_a.uid_internal[i]);
+                            *local.entry(canon).or_insert(0) += 1;
                         }
-                        if !target.matches_id(chunk.tier_a.event_id[i]) {
-                            continue;
+                        local
+                    })
+                    .reduce(HashMap::new, |mut acc, map| {
+                        for (uid, cnt) in map {
+                            *acc.entry(uid).or_insert(0) += cnt;
                         }
-                        if let Some(ef) = &target.extra_filter {
-                            if !row_matches_predicates(chunk, i, std::slice::from_ref(ef)) {
-                                continue;
-                            }
-                        }
-                        if !row_matches_predicates(chunk, i, where_clauses) {
-                            continue;
-                        }
-                        let canon = id_snap.resolve(chunk.tier_a.uid_internal[i]);
-                        *counts.entry(canon).or_insert(0) += 1;
-                    }
-                }
+                        acc
+                    });
 
                 let needed = (*min_count).max(1);
                 let mut out = RoaringBitmap::new();
@@ -733,14 +768,21 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let mut universe = RoaringBitmap::new();
-                for chunk in &all_chunks {
-                    for i in 0..chunk.len() {
-                        if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i])) {
-                            universe.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                let mut universe = all_chunks
+                    .par_iter()
+                    .map(|chunk| {
+                        let mut local = RoaringBitmap::new();
+                        for i in 0..chunk.len() {
+                            if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i])) {
+                                local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                            }
                         }
-                    }
-                }
+                        local
+                    })
+                    .reduce(RoaringBitmap::new, |mut a, b| {
+                        a |= b;
+                        a
+                    });
                 let performed = evaluate_cohort_bounded(
                     &BehavioralCohortDef::PerformedEvent {
                         event_name: event_name.clone(),
@@ -777,16 +819,23 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let mut out = RoaringBitmap::new();
-                for chunk in &chunks {
-                    for i in 0..chunk.len() {
-                        if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
-                            && row_matches_predicates(chunk, i, std::slice::from_ref(predicate))
-                        {
-                            out.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                let out = chunks
+                    .par_iter()
+                    .map(|chunk| {
+                        let mut local = RoaringBitmap::new();
+                        for i in 0..chunk.len() {
+                            if eff_range.is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
+                                && row_matches_predicates(chunk, i, std::slice::from_ref(predicate))
+                            {
+                                local.insert(id_snap.resolve(chunk.tier_a.uid_internal[i]));
+                            }
                         }
-                    }
-                }
+                        local
+                    })
+                    .reduce(RoaringBitmap::new, |mut a, b| {
+                        a |= b;
+                        a
+                    });
                 Ok(out)
             }
             BehavioralCohortDef::CohortRef { cohort_id } => {
