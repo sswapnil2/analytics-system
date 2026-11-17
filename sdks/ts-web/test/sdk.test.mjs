@@ -305,6 +305,11 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
     .map((op) => op.node_id);
   assert.equal(bannerIds.length, 2);
   assert.equal(new Set(bannerIds).size, 1);
+  const banners = calls
+    .filter((c) => c.url.endsWith("/v1/replay/chunk"))
+    .flatMap((c) => c.body.ops)
+    .filter((op) => op.kind === "error_banner");
+  assert.ok(banners.every((op) => typeof op.ts_offset_ms === "number"), "banner upserts carry a timestamp");
   const exposureEvents = calls
     .filter((c) => c.url.endsWith("/v1/ingest"))
     .flatMap((c) => c.body.events)

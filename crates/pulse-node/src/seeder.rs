@@ -339,18 +339,22 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             session_id: sess_id.clone(),
             chunk_start_ts_ms: base_t + 7_500,
             ops: vec![
-                WireframeOp::NodeUpsert(WireNode {
-                    node_id: 7,
-                    parent_id: 1,
-                    kind: NodeKind::ErrorBanner,
-                    x: 24,
-                    y: 434,
-                    w: 342,
-                    h: 56,
-                    bg_rgba: 0xDC26_26FF,
-                    masked_label: "NSDL_Gateway_504_Timeout: Upstream KYC verification timed out"
-                        .to_string(),
-                }),
+                WireframeOp::NodeUpsert {
+                    ts_offset_ms: 0,
+                    node: WireNode {
+                        node_id: 7,
+                        parent_id: 1,
+                        kind: NodeKind::ErrorBanner,
+                        x: 24,
+                        y: 434,
+                        w: 342,
+                        h: 56,
+                        bg_rgba: 0xDC26_26FF,
+                        masked_label:
+                            "NSDL_Gateway_504_Timeout: Upstream KYC verification timed out"
+                                .to_string(),
+                    },
+                },
                 WireframeOp::PointerInteraction {
                     ts_offset_ms: 600,
                     x: 198,

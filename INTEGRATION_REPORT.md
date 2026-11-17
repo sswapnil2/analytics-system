@@ -148,9 +148,10 @@ SDK uses reqwest/rustls instead of URLSession.
   before the SDKs: an old server rejects the new tag. Re-verified with a fast run where three screens
   landed in one batch: iOS "Your details" at +195 ms and "Pick a plan" at +676 ms; web details at +0,
   plan at +1011 ms and done at +3058 ms. Both play in order in Studio.
-- Still open: `node_upsert` (used for the web error banner) has no timestamp either. The player
-  places it at the last timed op, so the web banner appears when the plan screen loads (11.3 s)
-  rather than at the first failing tap (12.3 s).
+- **[Fixed on this branch]** `node_upsert` (used for the web error banner) had no timestamp either,
+  so the banner appeared when the plan screen loaded, not at the first failing tap. Upserts now carry
+  `ts_offset_ms`, with the same back-compat scheme (op tag 7, JSON default 0; the player falls back to
+  the previous timed op). Re-verified: plan at 68.8 s, banner at 70.8 s, the first promo tap.
 - Node `bg_rgba` colours are drawn literally on the dark Studio theme. My light-grey text boxes from
   iOS came out as near-white blocks, which are hard to read. The player should style by `kind` and
   ignore `bg` for text.
@@ -209,17 +210,15 @@ which reaches the host at `10.0.2.2:18190`.
 3. **Automatic web snapshots**: snapshot on load, on `MutationObserver` changes (throttled) and on
    history `pushState`/`popstate`. Hook `window.onerror`/`unhandledrejection` and fetch/XHR for errors
    and breadcrumbs.
-4. **Timestamp `node_upsert` too.** `full_snapshot` now has `ts_offset_ms` (fixed here), but upserts
-   still borrow the previous op's time, so error banners appear early.
-5. **Ingest keys in the Studio**: a Project settings page to view and create `pk_live_` keys, and put
+4. **Ingest keys in the Studio**: a Project settings page to view and create `pk_live_` keys, and put
    the real key into the "Send your first event" panel with web/iOS/Android snippets.
-6. **Fix the stale bindings and the bindings-gen docs**: regenerate in CI, or stop committing them, and
+5. **Fix the stale bindings and the bindings-gen docs**: regenerate in CI, or stop committing them, and
    fix the output path in `sdks/bindings-gen/src/main.rs`.
-7. **Replay page defaults and deep link**: default to "Any event" with no toggles, and honour
+6. **Replay page defaults and deep link**: default to "Any event" with no toggles, and honour
    `?session=` so `getSessionReplayUrl()` works.
-8. **Web replay polish**: re-snapshot after errors and layout changes, and don't cap elements
+7. **Web replay polish**: re-snapshot after errors and layout changes, and don't cap elements
    before filtering for visibility. (Banner stacking and player clipping are already fixed here.)
-9. **Publish `@pulse-analytics/ts-web`** (npm + a UMD/CDN build) and strip query strings from
+8. **Publish `@pulse-analytics/ts-web`** (npm + a UMD/CDN build) and strip query strings from
    `$current_url` by default, or make that configurable.
-10. **Docs**: one "Integrate Pulse" page per platform covering keys, CORS, the masking/unmask model,
+9. **Docs**: one "Integrate Pulse" page per platform covering keys, CORS, the masking/unmask model,
     replay calls and offline queueing. Today the README covers only curl and the node.

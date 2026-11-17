@@ -137,7 +137,12 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
           runningOffset = Math.max(runningOffset, t);
           vp = { w: op.width || 390, h: op.height || 844 };
           items.push({ absOffsetMs: t, op });
+        } else if (op.op === "node_upsert" && op.ts_offset_ms) {
+          const t = chunkDelta + op.ts_offset_ms;
+          runningOffset = Math.max(runningOffset, t);
+          items.push({ absOffsetMs: t, op });
         } else if (op.op === "node_upsert" || op.op === "node_remove") {
+          // Older chunks: no timestamp, so show it with the previous timed op.
           items.push({ absOffsetMs: runningOffset, op });
         } else if (op.op === "pointer_interaction") {
           const t = chunkDelta + op.ts_offset_ms;

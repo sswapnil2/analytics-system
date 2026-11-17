@@ -37,7 +37,7 @@ export interface WireNode {
 
 export type WireframeOp =
   | { op: "full_snapshot"; ts_offset_ms: number; width: number; height: number; nodes: WireNode[] }
-  | ({ op: "node_upsert" } & WireNode)
+  | ({ op: "node_upsert"; ts_offset_ms: number } & WireNode)
   | { op: "node_remove"; node_id: number }
   | {
       op: "pointer_interaction";
@@ -968,6 +968,7 @@ export class PulseWebClient {
       const box = visibleAlertBox(message) ?? { x: 16, y: 16, w: 340, h: 44 };
       this.replayOps.push({
         op: "node_upsert",
+        ts_offset_ms: Math.max(0, now - this.chunkStartTsMs),
         node_id: ERROR_BANNER_NODE_ID,
         parent_id: 1,
         kind: "error_banner",
