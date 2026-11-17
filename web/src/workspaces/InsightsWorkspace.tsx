@@ -52,7 +52,6 @@ const METRIC_OPTIONS: [string, string][] = [
 ];
 const PROP_METRICS = ["sum", "avg", "p50", "p90", "p99"];
 
-
 /** Inverse of buildMetricSpec, for opening a saved report. */
 function metricKindOf(m: { type?: string; quantile?: number } | undefined): string {
   if (!m?.type) return "uniques";
@@ -91,11 +90,11 @@ function buildMetricSpec(kind: string, prop: string) {
 
 function formatValue(v: number | null | undefined, digits = 2): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "–";
-  return v.toLocaleString("en-IN", { maximumFractionDigits: digits });
+  return v.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
 function formatDay(ts: number): string {
-  return new Date(ts).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+  return new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 /** 1, 2, 5 x 10^n ceiling so axis ticks land on round numbers. */
@@ -120,16 +119,22 @@ const PLOT = { left: 56, right: 885, top: 16, bottom: 200 };
 const PLOT_W = PLOT.right - PLOT.left;
 const PLOT_H = PLOT.bottom - PLOT.top;
 
+function defaultSeriesFromCatalog(events: string[], props: string[]): SeriesDraft[] {
+  const clean = events.filter((e) => !e.startsWith("$"));
+  if (clean.length === 0) return [];
+  const defaultProp = props[0] ?? "";
+  return [{ label: "A", eventName: clean[0], metricKind: "uniques", propName: defaultProp }];
+}
+
 export const InsightsWorkspace: React.FC<Props> = ({
   projectId,
   availableEvents,
   availableProps,
   refreshToken,
 }) => {
-  // Starts on the project's busiest event; the catalog is loaded before this mounts.
-  const [series, setSeries] = useState<SeriesDraft[]>(() => [
-    { label: "A", eventName: availableEvents[0] ?? "", metricKind: "uniques", propName: availableProps[0] ?? "" },
-  ]);
+  const [series, setSeries] = useState<SeriesDraft[]>(() =>
+    defaultSeriesFromCatalog(availableEvents, availableProps),
+  );
   const [formula, setFormula] = useState<string>("");
   const [breakdown, setBreakdown] = useState<string>("");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
@@ -139,6 +144,12 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [result, setResult] = useState<InsightsResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSeries((prev) =>
+      prev.length > 0 ? prev : defaultSeriesFromCatalog(availableEvents, availableProps),
+    );
+  }, [availableEvents, availableProps]);
 
   const buildQuery = useCallback(
     () => ({
@@ -164,7 +175,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
         breakdown_by?: string[]; compare_previous_period?: boolean; formula?: string | null };
       if (s.series?.length)
-        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? "" })));
+        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? availableProps[0] ?? "" })));
       setBreakdown(s.breakdown_by?.[0] ?? "");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
@@ -173,6 +184,10 @@ export const InsightsWorkspace: React.FC<Props> = ({
   );
 
   const runQuery = useCallback(async () => {
+    if (series.length === 0 || series.some((s) => !s.eventName)) {
+      setResult(null);
+      return;
+    }
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -184,7 +199,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, range]);
+  }, [projectId, buildQuery, range, series]);
 
   useEffect(() => {
     void runQuery();
@@ -239,20 +254,23 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const tableRows = result ? [...result.formula_series, ...result.series].slice(0, 18) : [];
   const tableBuckets = buckets.slice(-7);
 
-  // Saved reports may use names the catalog no longer lists; keep them selectable.
-  const breakdownOptions = Array.from(new Set([breakdown, ...availableProps])).filter(Boolean);
-  const eventOptions = Array.from(new Set([...series.map((s) => s.eventName), ...availableEvents])).filter(Boolean);
-  const propOptions = Array.from(new Set([...series.map((s) => s.propName), ...availableProps])).filter(Boolean);
+  const breakdownOptions = Array.from(new Set([...availableProps, breakdown].filter(Boolean)));
+  const eventOptions = Array.from(
+    new Set([...availableEvents.filter((e) => !e.startsWith("$")), ...series.map((s) => s.eventName)].filter(Boolean)),
+  );
 
-  const reportTitle = formula.trim()
-    ? formula
-        .trim()
-        .replace(/\b([A-Z])\b/g, (m) => {
-          const d = series.find((x) => x.label === m);
-          return d ? humanizeEvent(d.eventName) : m;
-        })
-        .replace(/\*/g, "×")
-    : series.map((s) => humanizeEvent(s.eventName)).join(" and ");
+  const reportTitle =
+    series.length === 0
+      ? "Trends"
+      : formula.trim()
+        ? formula
+            .trim()
+            .replace(/\b([A-Z])\b/g, (m) => {
+              const d = series.find((x) => x.label === m);
+              return d ? humanizeEvent(d.eventName) : m;
+            })
+            .replace(/\*/g, "×")
+        : series.map((s) => humanizeEvent(s.eventName)).join(" and ");
 
   return (
     <div className="space-y-5">
@@ -289,6 +307,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         actions={
           <button
             type="button"
+            disabled={eventOptions.length === 0}
             onClick={() =>
               setSeries([
                 ...series,
@@ -296,7 +315,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   label: String.fromCharCode(65 + series.length),
                   eventName: eventOptions[0] ?? "",
                   metricKind: "uniques",
-                  propName: propOptions[0] ?? "",
+                  propName: availableProps[0] ?? "",
                 },
               ])
             }
@@ -355,7 +374,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     onChange={(e) => updateSeries(idx, { propName: e.target.value })}
                     className={field}
                   >
-                    {propOptions.map((p) => (
+                    {Array.from(new Set([s.propName, ...availableProps].filter(Boolean))).map((p) => (
                       <option key={p} value={p}>
                         {p}
                       </option>

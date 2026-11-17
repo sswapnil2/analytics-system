@@ -1,12 +1,14 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { Bot, Play } from "lucide-react";
-import { api, LexiconEvent, LexiconProperty } from "../api/client";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Bot, Check, Copy, KeyRound, Play, Plus } from "lucide-react";
+import { api, ApiKeyRecord, LexiconEvent, LexiconProperty } from "../api/client";
 import { BatchImportExportPanel } from "../components/BatchImportExportPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
-import { displayUserId, errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { displayUserId, errorMessage, formatCount, formatTimestamp, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
+  availableEvents: string[];
+  availableProps: string[];
   onLexiconChanged: () => void;
 }
 
@@ -15,26 +17,6 @@ const EVENT_STATUS_OPTIONS = [
   { value: "hidden", label: "Hide from reports" },
   { value: "dropped", label: "Drop at ingest" },
 ];
-
-/** Example tool calls built from the project's own busiest events. */
-function mcpPresets(top: string[]) {
-  const [a, b] = [top[0], top[1] ?? top[0]];
-  return [
-    { title: "Sessions with rage taps", tool: "inspect_frustrated_sessions", args: { only_rage_tap: true, limit: 5 } },
-    ...(a
-      ? [
-          { title: `Funnel: ${humanizeEvent(a)} to ${humanizeEvent(b)}`, tool: "query_funnel", args: { steps: [a, b], days: 14 } },
-          { title: `${humanizeEvent(a)} over 14 days`, tool: "query_insights", args: { event_name: a, metric: "uniques", days: 14 } },
-          {
-            title: `7-day retention on ${humanizeEvent(a)}`,
-            tool: "query_retention",
-            args: { start_event: a, return_event: a, mode: "n_day", num_periods: 7 },
-          },
-        ]
-      : []),
-    { title: "Event and property list", tool: "get_lexicon_schema", args: {} },
-  ];
-}
 
 const USER_ID_KEYS = new Set(["distinct_id", "user_id", "canonical_uid"]);
 
@@ -63,34 +45,115 @@ function maskUserIds(value: unknown, key?: string): unknown {
   return value;
 }
 
-export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChanged }) => {
+export const LexiconMcpWorkspace: React.FC<Props> = ({
+  projectId,
+  availableEvents,
+  availableProps,
+  onLexiconChanged,
+}) => {
   const [events, setEvents] = useState<LexiconEvent[]>([]);
   const [props, setProps] = useState<LexiconProperty[]>([]);
+  const [apiKeys, setApiKeys] = useState<ApiKeyRecord[]>([]);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [newKeyRole, setNewKeyRole] = useState("ingest_and_flags");
+  const [mintedKey, setMintedKey] = useState<string | null>(null);
+  const [copiedMinted, setCopiedMinted] = useState(false);
+  const [creatingKey, setCreatingKey] = useState(false);
   const [lexLoading, setLexLoading] = useState(true);
   const [lexError, setLexError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const [selectedTool, setSelectedTool] = useState<string>("inspect_frustrated_sessions");
-  const [argsJson, setArgsJson] = useState<string>(
-    JSON.stringify({ only_rage_tap: true, limit: 5 }, null, 2),
-  );
+  const [selectedTool, setSelectedTool] = useState<string>("get_lexicon_schema");
+  const [argsJson, setArgsJson] = useState<string>(JSON.stringify({}, null, 2));
   const [mcpOutput, setMcpOutput] = useState<string>("");
   const [mcpError, setMcpError] = useState<string | null>(null);
   const [mcpLoading, setMcpLoading] = useState<boolean>(false);
+
+  const mcpPresets = useMemo(() => {
+    const clean = availableEvents.filter((e) => !e.startsWith("$"));
+    const presets: Array<{ title: string; tool: string; args: Record<string, unknown> }> = [
+      {
+        title: "Event and property list",
+        tool: "get_lexicon_schema",
+        args: {},
+      },
+      {
+        title: "Sessions with rage taps",
+        tool: "inspect_frustrated_sessions",
+        args: { only_rage_tap: true, limit: 5 },
+      },
+    ];
+    if (clean.length >= 2) {
+      presets.push({
+        title: "Conversion funnel",
+        tool: "query_funnel",
+        args: {
+          steps: clean.slice(0, Math.min(4, clean.length)),
+          days: 14,
+        },
+      });
+    }
+    if (clean.length >= 1) {
+      presets.push({
+        title: `${humanizeEvent(clean[0])} trend`,
+        tool: "query_insights",
+        args: {
+          event_name: clean[0],
+          metric: "uniques",
+          ...(availableProps[0] ? { breakdown_by: availableProps[0] } : {}),
+          days: 14,
+        },
+      });
+      presets.push({
+        title: "7-day retention",
+        tool: "query_retention",
+        args: {
+          start_event: clean[0],
+          return_event: clean[1] ?? clean[0],
+          mode: "n_day",
+          num_periods: 7,
+        },
+      });
+    }
+    return presets;
+  }, [availableEvents, availableProps]);
 
   const loadLexicon = useCallback(async () => {
     setLexLoading(true);
     setLexError(null);
     try {
-      const res = await api.getLexicon(projectId);
+      const [res, keys] = await Promise.all([
+        api.getLexicon(projectId),
+        api.listApiKeys(projectId).catch(() => []),
+      ]);
       setEvents(res.events);
       setProps(res.properties);
+      setApiKeys(keys);
     } catch (err) {
       setLexError(errorMessage(err));
     } finally {
       setLexLoading(false);
     }
   }, [projectId]);
+
+  const handleCreateApiKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setCreatingKey(true);
+    setSaveError(null);
+    try {
+      const created = await api.createApiKey(projectId, {
+        label: newKeyLabel.trim() || "Project Key",
+        role: newKeyRole,
+      });
+      setMintedKey(created.plaintext_key);
+      setNewKeyLabel("");
+      setApiKeys((prev) => [created.record, ...prev]);
+    } catch (err) {
+      setSaveError(errorMessage(err));
+    } finally {
+      setCreatingKey(false);
+    }
+  };
 
   useEffect(() => {
     void loadLexicon();
@@ -150,7 +213,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
   };
 
   useEffect(() => {
-    void runMcpTool("inspect_frustrated_sessions", JSON.stringify({ only_rage_tap: true, limit: 4 }));
+    void runMcpTool("get_lexicon_schema", JSON.stringify({}, null, 2));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
@@ -253,7 +316,90 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
             )}
           </Panel>
 
-          <BatchImportExportPanel projectId={projectId} />
+          <BatchImportExportPanel
+            projectId={projectId}
+            availableEvents={availableEvents}
+            availableProps={availableProps}
+          />
+
+          <Panel title="API keys" meta={apiKeys.length > 0 ? `${formatCount(apiKeys.length)} keys` : undefined}>
+            <div className="space-y-4">
+              <form onSubmit={(e) => void handleCreateApiKey(e)} className="flex flex-wrap items-end gap-2">
+                <label className="flex min-w-[12rem] flex-1 flex-col gap-1">
+                  <span className={fieldLabel}>Key label</span>
+                  <input
+                    value={newKeyLabel}
+                    onChange={(e) => setNewKeyLabel(e.target.value)}
+                    placeholder="Web SDK production"
+                    className={field}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className={fieldLabel}>Role</span>
+                  <select value={newKeyRole} onChange={(e) => setNewKeyRole(e.target.value)} className={field}>
+                    <option value="ingest_and_flags">Ingest & flags (pk_)</option>
+                    <option value="admin">Project admin (sk_)</option>
+                  </select>
+                </label>
+                <button type="submit" disabled={creatingKey} className={btn.primary}>
+                  <Plus className="h-3.5 w-3.5" />
+                  {creatingKey ? "Creating…" : "Create key"}
+                </button>
+              </form>
+
+              {mintedKey && (
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ink" role="status">
+                  <div className="min-w-0">
+                    <div className="font-semibold text-ok">Copy your new key now — it is shown only once:</div>
+                    <code className="block truncate font-mono text-ink">{mintedKey}</code>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(mintedKey);
+                        setCopiedMinted(true);
+                        window.setTimeout(() => setCopiedMinted(false), 2000);
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                    className={btn.secondary}
+                  >
+                    {copiedMinted ? <Check className="h-3.5 w-3.5 text-ok" /> : <Copy className="h-3.5 w-3.5" />}
+                    {copiedMinted ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              )}
+
+              {apiKeys.length === 0 ? (
+                <EmptyState icon={KeyRound} title="No API keys yet" body="Create an ingest key above to send events from your app." />
+              ) : (
+                <div className="max-h-56 overflow-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-line text-muted">
+                        <th className="py-2 pr-3 font-medium">Prefix</th>
+                        <th className="py-2 pr-3 font-medium">Label</th>
+                        <th className="py-2 pr-3 font-medium">Role</th>
+                        <th className="py-2 text-right font-medium">Created</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-line">
+                      {apiKeys.map((k) => (
+                        <tr key={k.id}>
+                          <td className="py-2 pr-3 font-mono text-ink">{k.key_prefix}</td>
+                          <td className="py-2 pr-3 text-ink-2">{k.label}</td>
+                          <td className="py-2 pr-3 font-mono text-muted">{k.role}</td>
+                          <td className="py-2 text-right text-muted">{formatTimestamp(k.created_at_ms)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </Panel>
         </div>
 
         <Panel title="AI tools" className="xl:col-span-5">
@@ -264,12 +410,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
             </p>
 
             <div className="flex flex-wrap gap-1.5">
-              {mcpPresets(
-                [...events]
-                  .filter((e) => e.status !== "dropped" && !e.name.startsWith("$"))
-                  .sort((x, y) => y.volume_24h - x.volume_24h)
-                  .map((e) => e.name),
-              ).map((preset) => (
+              {mcpPresets.map((preset) => (
                 <button
                   key={preset.title}
                   type="button"

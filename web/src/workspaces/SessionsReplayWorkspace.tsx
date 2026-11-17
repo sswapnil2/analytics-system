@@ -50,8 +50,10 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
 
   const eventOptions = useMemo(
     () =>
-      Array.from(new Set([eventFilter, ...availableEvents])).filter(Boolean),
-    [eventFilter, availableEvents],
+      Array.from(new Set([...availableEvents, eventFilter])).filter(
+        (e) => e && !e.startsWith("$"),
+      ),
+    [availableEvents, eventFilter],
   );
 
   const runSearch = useCallback(async () => {

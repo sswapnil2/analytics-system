@@ -13,18 +13,23 @@ import { downloadTextFile, errorMessage, formatCount } from "../lib/format";
 
 type ImportContentType = "application/x-ndjson" | "application/json" | "text/csv";
 
-const PLACEHOLDERS: Record<ImportContentType, string> = {
-  "application/x-ndjson":
-    '{"event":"Subscription_Renewed","distinct_id":"usr_demo_01","properties":{"plan":"pro","amount":999}}\n{"event":"Signed_Up","distinct_id":"usr_demo_02","properties":{"plan":"free"}}',
-  "application/json":
-    '[{"event":"Subscription_Renewed","distinct_id":"usr_demo_01","properties":{"plan":"pro","amount":999}}]',
-  "text/csv":
-    "event_name,distinct_id,session_id,event_ts_ms,plan,amount\nSubscription_Renewed,usr_demo_01,sess_01,1731715200000,pro,999",
-};
-
-export const BatchImportExportPanel: React.FC<{ projectId: string }> = ({
+export const BatchImportExportPanel: React.FC<{
+  projectId: string;
+  availableEvents?: string[];
+  availableProps?: string[];
+}> = ({
   projectId,
+  availableEvents = [],
+  availableProps = [],
 }) => {
+  const sampleEv = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
+  const sampleProp = availableProps[0] ?? "plan";
+  const nowTs = Date.now();
+  const placeholders: Record<ImportContentType, string> = {
+    "application/x-ndjson": `{"event":"${sampleEv}","distinct_id":"user_1","properties":{"${sampleProp}":"pro"}}`,
+    "application/json": `[{"event":"${sampleEv}","distinct_id":"user_1","properties":{"${sampleProp}":"pro"}}]`,
+    "text/csv": `event_name,distinct_id,session_id,event_ts_ms,${sampleProp}\n${sampleEv},user_1,sess_1,${nowTs},pro`,
+  };
   const [contentType, setContentType] =
     useState<ImportContentType>("application/x-ndjson");
   const [payload, setPayload] = useState("");
@@ -155,7 +160,7 @@ export const BatchImportExportPanel: React.FC<{ projectId: string }> = ({
             value={payload}
             onChange={(e) => setPayload(e.target.value)}
             rows={5}
-            placeholder={PLACEHOLDERS[contentType]}
+            placeholder={placeholders[contentType]}
             className={`${field} w-full font-mono text-xs`}
             aria-label="Batch import events payload"
           />

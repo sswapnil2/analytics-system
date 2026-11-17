@@ -31,11 +31,13 @@ function formatPropValue(v: unknown): string {
 }
 
 function formatRevenue(amount: number, props?: Record<string, unknown>): string {
-  const formatted = amount.toLocaleString("en-IN", { maximumFractionDigits: 2 });
-  const currency = typeof props?.currency === "string" ? props.currency : null;
-  if (currency === "INR") return `₹${formatted}`;
-  if (currency) return `${currency} ${formatted}`;
-  return amount > 0 ? `₹${formatted}` : "0";
+  const formatted = amount.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const currency =
+    typeof props?.currency === "string" && props.currency.trim()
+      ? props.currency.trim().toUpperCase()
+      : "USD";
+  if (currency === "USD") return `$${formatted}`;
+  return `${currency} ${formatted}`;
 }
 
 export const UserProfilesDpdpPanel: React.FC<{ projectId: string }> = ({

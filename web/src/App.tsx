@@ -145,6 +145,8 @@ export const App: React.FC = () => {
   const [quickstartOpen, setQuickstartOpen] = useState(false);
   const [quickstartDismissed, setQuickstartDismissed] = useState(false);
   const [copiedQuickstart, setCopiedQuickstart] = useState(false);
+  const [mintedIngestKey, setMintedIngestKey] = useState<string>("");
+  const [mintingKey, setMintingKey] = useState(false);
 
   useEffect(() => applyTheme(theme), [theme]);
 
@@ -198,10 +200,11 @@ export const App: React.FC = () => {
         api.getSchemaExtensions(projectId),
       ]);
       // Busiest events first: reports default to them and pickers list them on top.
+      const sortedLex = [...lex.events]
+        .filter((ev) => ev.status !== "dropped" && ev.status !== "hidden" && !ev.name.startsWith("$"))
+        .sort((a, b) => b.volume_24h - a.volume_24h || a.name.localeCompare(b.name));
       const evNames = new Set<string>();
-      const live = lex.events.filter((ev) => ev.status !== "dropped" && !ev.name.startsWith("$"));
-      live.sort((a, b) => b.volume_24h - a.volume_24h || a.name.localeCompare(b.name));
-      for (const ev of live) evNames.add(ev.name);
+      for (const ev of sortedLex) evNames.add(ev.name);
       for (const ce of ext.custom_events) evNames.add(ce.name);
       const propNames = new Set<string>();
       for (const p of lex.properties) propNames.add(p.name);
@@ -303,16 +306,31 @@ export const App: React.FC = () => {
       .map((w) => w[0]?.toUpperCase())
       .join("") || "A";
 
-  const origin = typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8080";
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
   const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
+  const sampleEvent = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
+  const sampleProp = availableProps[0] ?? "plan";
   const curlSnippet = `curl -X POST "${origin}/v1/ingest" \\
   -H "Content-Type: application/json" \\
-  -H "x-pulse-key: YOUR_INGEST_KEY" \\
+  -H "x-pulse-key: ${mintedIngestKey || "<PASTE_OR_GENERATE_INGEST_KEY>"}" \\
   -d '{
-    "event": "Signed_Up",
-    "userId": "user_123",
-    "properties": { "plan": "free" }
+    "event": "${sampleEvent}",
+    "userId": "user_1",
+    "properties": { "${sampleProp}": "pro" }
   }'`;
+
+  const mintQuickstartKey = async () => {
+    if (!activePid) return;
+    setMintingKey(true);
+    try {
+      const created = await api.createApiKey(activePid, { label: "Quickstart Ingest Key" });
+      setMintedIngestKey(created.plaintext_key);
+    } catch (err) {
+      setNotice(`Couldn't create API key: ${errorMessage(err)}`);
+    } finally {
+      setMintingKey(false);
+    }
+  };
 
   const copyQuickstart = async () => {
     try {
@@ -493,13 +511,21 @@ export const App: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={mintingKey || !activePid}
+                    onClick={() => void mintQuickstartKey()}
+                    className={btn.secondary}
+                  >
+                    {mintingKey ? "Generating…" : mintedIngestKey ? "Generate another key" : "Generate ingest key"}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => {
                       go("events");
                       setQuickstartOpen(false);
                     }}
                     className={btn.ghost}
                   >
-                    Create API key
+                    Manage keys
                   </button>
                   <button
                     type="button"
@@ -603,6 +629,7 @@ export const App: React.FC = () => {
                   <CohortsLookupsWorkspace
                     projectId={activePid}
                     availableEvents={availableEvents}
+                    availableProps={availableProps}
                     onCatalogChanged={() => {
                       void loadCatalog();
                       setRefreshToken((n) => n + 1);
@@ -619,6 +646,8 @@ export const App: React.FC = () => {
                 {activeTab === "events" && (
                   <LexiconMcpWorkspace
                     projectId={activePid}
+                    availableEvents={availableEvents}
+                    availableProps={availableProps}
                     onLexiconChanged={() => {
                       void loadCatalog();
                       setRefreshToken((n) => n + 1);

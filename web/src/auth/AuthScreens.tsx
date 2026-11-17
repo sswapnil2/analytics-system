@@ -50,35 +50,27 @@ const GoogleMark: React.FC = () => (
   </svg>
 );
 
-/** Illustrative funnel on the sign-in page; labelled as a sample, not live data. */
-const SampleFunnel: React.FC = () => {
-  const rows: { label: string; kept: number; lost: number; count: string; strong?: boolean }[] = [
-    { label: "Opened app", kept: 100, lost: 0, count: "12,480" },
-    { label: "Submitted PAN", kept: 72, lost: 28, count: "8,930" },
-    { label: "Verified OTP", kept: 42, lost: 30, count: "5,210", strong: true },
-    { label: "Approved mandate", kept: 38, lost: 4, count: "4,770" },
-  ];
-  return (
-    <figure className="max-w-[520px] space-y-3.5 rounded-xl border border-line-strong/70 bg-panel p-6">
-      <figcaption className="text-[0.8125rem] text-muted">Sample funnel, last 14 days</figcaption>
-      <div className="space-y-2.5">
-        {rows.map((r) => (
-          <div key={r.label} className="grid grid-cols-[8.5rem_minmax(0,1fr)_4rem] items-center gap-3 text-sm">
-            <span className={r.strong ? "font-semibold" : undefined}>{r.label}</span>
-            <span className="flex h-[22px] overflow-hidden rounded">
-              <span className="bg-brand" style={{ width: `${r.kept}%` }} />
-              <span className={r.strong ? "hatch-drop-strong" : "hatch-drop"} style={{ width: `${r.lost}%` }} />
-            </span>
-            <span className="tabular text-right">{r.count}</span>
-          </div>
-        ))}
-      </div>
-      <p className="text-sm font-medium text-danger">
-        3,720 users dropped before verifying OTP. 31% of them hit a PAN gateway timeout first.
-      </p>
-    </figure>
-  );
-};
+const WORKSPACE_HIGHLIGHTS = [
+  ["Funnels & journeys", "Trace conversion step by step and inspect where users drop off."],
+  ["Trends & retention", "Break down active users, event volume, and cohort return rates."],
+  ["Wireframe session replay", "Watch privacy-masked session recordings linked directly to drop-offs."],
+] as const;
+
+const WorkspaceHighlights: React.FC = () => (
+  <ol className="max-w-[460px] space-y-[18px]">
+    {WORKSPACE_HIGHLIGHTS.map(([title, sub], i) => (
+      <li key={title} className="grid grid-cols-[2rem_minmax(0,1fr)] items-start gap-3.5">
+        <span className="flex h-7 w-7 items-center justify-center rounded-full border-[1.5px] border-faint text-sm font-semibold text-ink-2">
+          {i + 1}
+        </span>
+        <span className="flex flex-col gap-0.5">
+          <span className="font-semibold">{title}</span>
+          <span className="text-sm text-muted">{sub}</span>
+        </span>
+      </li>
+    ))}
+  </ol>
+);
 
 const AuthLayout: React.FC<{ heading: string; body: string; aside: React.ReactNode; children: React.ReactNode }> = ({
   heading,
@@ -204,7 +196,7 @@ export const SignInScreen: React.FC<{ onSignedIn: () => void; reason?: string; g
     <AuthLayout
       heading="Find where users drop off. Then watch why."
       body="Funnels, journeys and retention for your product, with the session replay one click away from every drop."
-      aside={<SampleFunnel />}
+      aside={<WorkspaceHighlights />}
     >
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">

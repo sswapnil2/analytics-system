@@ -69,19 +69,28 @@ pub fn tier_c_key_bit(prop_key_id: u16) -> u64 {
     1u64 << (xxh3_64(&prop_key_id.to_le_bytes()) & 63)
 }
 
+/// Every manifest epoch repeats this per segment, so `false` flags are omitted to keep manifests small.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TierBColumnEntry {
     pub prop_key_id: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub has_i64: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub has_f64: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub has_bool: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub has_str: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub has_null: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub bool_indexed: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub str_indexed_complete: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl TierBColumnEntry {

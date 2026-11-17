@@ -32,14 +32,21 @@ const MODES: [Mode, string][] = [
 ];
 
 export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  // Busiest event as both start and return: "came back and did it again".
-  const [startEvent, setStartEvent] = useState<string>(() => availableEvents[0] ?? "");
-  const [returnEvent, setReturnEvent] = useState<string>(() => availableEvents[0] ?? "");
+  const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
+  const [startEvent, setStartEvent] = useState<string>(() => cleanEvents[0] ?? "");
+  const [returnEvent, setReturnEvent] = useState<string>(() => cleanEvents[1] ?? cleanEvents[0] ?? "");
   const [mode, setMode] = useState<Mode>("n_day");
   const [numPeriods, setNumPeriods] = useState<number>(10);
   const [result, setResult] = useState<RetentionResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const clean = availableEvents.filter((e) => !e.startsWith("$"));
+    if (clean.length === 0) return;
+    setStartEvent((prev) => prev || clean[0]);
+    setReturnEvent((prev) => prev || clean[1] || clean[0]);
+  }, [availableEvents]);
 
   const buildQuery = useCallback(
     () => ({ start_event: startEvent, return_event: returnEvent, mode, unit: "day", num_periods: numPeriods }),
@@ -61,6 +68,10 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   );
 
   const runRetention = useCallback(async () => {
+    if (!startEvent || !returnEvent) {
+      setResult(null);
+      return;
+    }
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -72,21 +83,27 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, range]);
+  }, [projectId, buildQuery, range, startEvent, returnEvent]);
 
   useEffect(() => {
     void runRetention();
   }, [runRetention, refreshToken]);
 
-  const eventOptions = Array.from(new Set([startEvent, returnEvent, ...availableEvents])).filter(Boolean);
+  const eventOptions = Array.from(
+    new Set([...availableEvents.filter((e) => !e.startsWith("$")), startEvent, returnEvent].filter(Boolean)),
+  );
 
   const stickiness = mode === "frequency_stickiness";
   const cohorts = result?.cohorts ?? [];
+  const reportTitle =
+    startEvent && returnEvent
+      ? `${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`
+      : "Retention";
 
   return (
     <div className="space-y-5">
       <PageHeader
-        title={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`}
+        title={reportTitle}
         description="Retention: how many users come back after their first action."
         actions={
           <>
@@ -94,7 +111,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
             <SaveToDashboard
               projectId={projectId}
               kind="retention"
-              defaultName={`${humanizeEvent(startEvent)}, then ${humanizeEvent(returnEvent)}`}
+              defaultName={reportTitle}
               query={buildQuery}
             />
             <button type="button" onClick={() => void runRetention()} disabled={loading} className={btn.ghost} aria-label="Refresh results">

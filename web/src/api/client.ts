@@ -6,6 +6,21 @@ export interface ProjectInfo {
   created_at_ms: number;
 }
 
+export interface ApiKeyRecord {
+  id: string;
+  key_prefix: string;
+  project_id: string;
+  label: string;
+  role: string;
+  created_at_ms: number;
+  revoked: boolean;
+}
+
+export interface CreatedApiKeyResponse {
+  record: ApiKeyRecord;
+  plaintext_key: string;
+}
+
 export interface NodeStatus {
   status: string;
   default_project_id: string;
@@ -637,6 +652,15 @@ export const api = {
     fetchJson<NodeStatus>(
       projectId ? `/v1/status?project_id=${encodeURIComponent(projectId)}` : "/v1/status",
     ),
+
+  listApiKeys: (projectId: string) =>
+    fetchJson<ApiKeyRecord[]>(`/v1/projects/${encodeURIComponent(projectId)}/api-keys`),
+
+  createApiKey: (projectId: string, body: { label: string; role?: string }) =>
+    fetchJson<CreatedApiKeyResponse>(`/v1/projects/${encodeURIComponent(projectId)}/api-keys`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   flushStorage: () =>
     fetchJson<{

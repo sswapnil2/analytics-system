@@ -22,7 +22,7 @@ export function displayUserId(id: string): string {
 
 export function formatCount(n: number | null | undefined): string {
   if (n === null || n === undefined || Number.isNaN(n)) return "–";
-  return Math.round(n).toLocaleString("en-IN");
+  return Math.round(n).toLocaleString();
 }
 
 /** 0.2814 -> "28.1%"; accepts fractions (0..1). */

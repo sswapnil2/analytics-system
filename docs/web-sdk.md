@@ -45,11 +45,11 @@ Ingest routes allow any origin (permissive CORS), so the app can live on a diffe
 ## Track and identify
 
 ```ts
-pulse.track("Checkout_Started", { cart_value: 1299, currency: "INR" });
+pulse.track("Checkout_Started", { cart_value: 99, currency: "USD" });
 await pulse.identify("usr_1042", { plan: "pro" });  // merges the anonymous id into the user
 pulse.register({ app_version: "2.3.0" });           // super property, sent with every event
 pulse.timeEvent("Video_Watched");                   // next track() of this event gets $duration / $duration_ms
-await pulse.trackRevenue({ amount: 499, currency: "INR", productId: "pro_monthly" });
+await pulse.trackRevenue({ amount: 49, currency: "USD", productId: "pro_monthly" });
 pulse.reset();                                      // on logout: new anonymous id and session
 ```
 
