@@ -76,7 +76,7 @@ const CATEGORIES: CategoryMeta[] = [
 
 const COPILOT_PRESETS = [
   "Diagnose our biggest onboarding funnel drop-off and cite replay sessions",
-  "Summarize payment & KYC errors affecting revenue conversion",
+  "Summarize the errors that hurt conversion most this week",
 ];
 
 export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({

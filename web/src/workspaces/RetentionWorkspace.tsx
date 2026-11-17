@@ -32,8 +32,9 @@ const MODES: [Mode, string][] = [
 ];
 
 export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [startEvent, setStartEvent] = useState<string>("App_Open");
-  const [returnEvent, setReturnEvent] = useState<string>("Quick_Grocery_Browse");
+  // Busiest event as both start and return: "came back and did it again".
+  const [startEvent, setStartEvent] = useState<string>(() => availableEvents[0] ?? "");
+  const [returnEvent, setReturnEvent] = useState<string>(() => availableEvents[0] ?? "");
   const [mode, setMode] = useState<Mode>("n_day");
   const [numPeriods, setNumPeriods] = useState<number>(10);
   const [result, setResult] = useState<RetentionResult | null>(null);
@@ -77,14 +78,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     void runRetention();
   }, [runRetention, refreshToken]);
 
-  const eventOptions = [
-    "App_Open",
-    "Quick_Grocery_Browse",
-    "Quick_Commerce_Order_Paid",
-    "OTP_Verified",
-    "UPI_Autopay_Mandate_Approved",
-    ...availableEvents,
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const eventOptions = Array.from(new Set([startEvent, returnEvent, ...availableEvents])).filter(Boolean);
 
   const stickiness = mode === "frequency_stickiness";
   const cohorts = result?.cohorts ?? [];

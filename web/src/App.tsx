@@ -28,7 +28,7 @@ import {
   setStoredAdminToken,
 } from "./api/client";
 import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
-import { btn, Panel } from "./components/ui";
+import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
 import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
@@ -89,6 +89,8 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
 ];
 
 const ALL_IDS = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id));
+// Report builders that default to the project's own events.
+const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
 const DEFAULT_TAB: WorkspaceId = "funnels";
 
 function tabFromHash(): WorkspaceId {
@@ -134,6 +136,8 @@ export const App: React.FC = () => {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState<number>(0);
   const [theme, setTheme] = useState<ThemePref>(readTheme);
   const [flushing, setFlushing] = useState(false);
@@ -187,23 +191,29 @@ export const App: React.FC = () => {
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
+    setCatalogError(null);
     try {
       const [lex, ext] = await Promise.all([
         api.getLexicon(projectId),
         api.getSchemaExtensions(projectId),
       ]);
+      // Busiest events first: reports default to them and pickers list them on top.
       const evNames = new Set<string>();
-      for (const ev of lex.events) if (ev.status !== "dropped") evNames.add(ev.name);
+      const live = lex.events.filter((ev) => ev.status !== "dropped" && !ev.name.startsWith("$"));
+      live.sort((a, b) => b.volume_24h - a.volume_24h || a.name.localeCompare(b.name));
+      for (const ev of live) evNames.add(ev.name);
       for (const ce of ext.custom_events) evNames.add(ce.name);
       const propNames = new Set<string>();
       for (const p of lex.properties) propNames.add(p.name);
       for (const cp of ext.custom_properties) propNames.add(cp.name);
       for (const lt of ext.lookup_tables)
         for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
-      setAvailableEvents(Array.from(evNames).sort());
+      setAvailableEvents(Array.from(evNames));
       setAvailableProps(Array.from(propNames).sort());
+      setCatalogLoaded(true);
     } catch (err) {
       if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
+      else setCatalogError(errorMessage(err));
     }
   }, [projectId, signOut]);
 
@@ -299,9 +309,9 @@ export const App: React.FC = () => {
   -H "Content-Type: application/json" \\
   -H "x-pulse-key: YOUR_INGEST_KEY" \\
   -d '{
-    "event": "KYC_PAN_Submitted",
-    "userId": "usr_1042",
-    "properties": { "city": "Bengaluru", "plan": "pro" }
+    "event": "Signed_Up",
+    "userId": "user_123",
+    "properties": { "plan": "free" }
   }'`;
 
   const copyQuickstart = async () => {
@@ -374,6 +384,10 @@ export const App: React.FC = () => {
             value={activePid}
             onChange={(e) => {
               setProjectId(e.target.value);
+              // Reports pick their defaults from the catalog, so wait for the new project's.
+              setCatalogLoaded(false);
+              setAvailableEvents([]);
+              setAvailableProps([]);
               setRefreshToken((n) => n + 1);
             }}
             className="w-full truncate bg-transparent text-sm font-semibold text-ink focus:outline-none"
@@ -520,12 +534,31 @@ export const App: React.FC = () => {
               </div>
             </Panel>
           )}
-            {!activePid ? (
+            {catalogError && NEEDS_EVENTS.includes(activeTab) ? (
+              <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
+            ) : !activePid || (!catalogLoaded && NEEDS_EVENTS.includes(activeTab)) ? (
               <p className="text-sm text-muted" role="status">
                 Loading your workspace…
               </p>
+            ) : availableEvents.length === 0 && NEEDS_EVENTS.includes(activeTab) ? (
+              <EmptyState
+                title="No events in this project yet"
+                body="Reports fill in once your app sends its first event."
+                action={
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQuickstartDismissed(false);
+                      setQuickstartOpen(true);
+                    }}
+                    className={btn.primary}
+                  >
+                    Show how to send events
+                  </button>
+                }
+              />
             ) : (
-              <>
+              <React.Fragment key={activePid}>
                 {activeTab === "dashboards" && (
                   <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
                 )}
@@ -541,6 +574,7 @@ export const App: React.FC = () => {
                   <FunnelsWorkspace
                     projectId={activePid}
                     availableEvents={availableEvents}
+                    availableProps={availableProps}
                     refreshToken={refreshToken}
                   />
                 )}
@@ -590,7 +624,7 @@ export const App: React.FC = () => {
                 {activeTab === "security" && (
                   <ByokCommercialPanel projectId={activePid} />
                 )}
-              </>
+              </React.Fragment>
             )}
         </div>
       </main>

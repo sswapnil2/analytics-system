@@ -15,7 +15,7 @@ type ImportContentType = "application/x-ndjson" | "application/json" | "text/csv
 
 const PLACEHOLDERS: Record<ImportContentType, string> = {
   "application/x-ndjson":
-    '{"event":"Subscription_Renewed","distinct_id":"usr_demo_01","properties":{"plan":"pro","amount":999}}\n{"event":"UPI_Autopay_Enabled","distinct_id":"usr_demo_02","properties":{"bank":"HDFC"}}',
+    '{"event":"Subscription_Renewed","distinct_id":"usr_demo_01","properties":{"plan":"pro","amount":999}}\n{"event":"Signed_Up","distinct_id":"usr_demo_02","properties":{"plan":"free"}}',
   "application/json":
     '[{"event":"Subscription_Renewed","distinct_id":"usr_demo_01","properties":{"plan":"pro","amount":999}}]',
   "text/csv":
@@ -160,14 +160,7 @@ export const BatchImportExportPanel: React.FC<{ projectId: string }> = ({
             aria-label="Batch import events payload"
           />
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <button
-              type="button"
-              onClick={() => setPayload(PLACEHOLDERS[contentType])}
-              className={btn.ghost}
-            >
-              Fill sample
-            </button>
+          <div className="flex flex-wrap items-center justify-end gap-3">
             <button
               type="submit"
               disabled={importing || !payload.trim()}

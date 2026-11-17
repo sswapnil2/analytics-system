@@ -29,20 +29,11 @@ import {
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   refreshToken: number;
 }
 
 type OrderMode = "loose_order" | "strict_order" | "any_order";
-
-const DEFAULT_STEPS = [
-  "App_Open",
-  "KYC_PAN_Submitted",
-  "Video_KYC_Completed",
-  "UPI_Autopay_Mandate_Approved",
-  "First_Disbursal_Success",
-];
-
-const SEGMENT_PROPS = ["platform", "city", "payment_method", "network"];
 
 const WINDOWS: { hours: number; label: string }[] = [
   { hours: 1, label: "1 hour" },
@@ -53,21 +44,27 @@ const WINDOWS: { hours: number; label: string }[] = [
 
 const pct = (v: number) => `${v.toFixed(1)}%`;
 
-export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [steps, setSteps] = useState<string[]>(DEFAULT_STEPS);
+export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, availableProps, refreshToken }) => {
+  // Starts from the project's two busiest events; the catalog is loaded before this mounts.
+  const [steps, setSteps] = useState<string[]>(() => [availableEvents[0], availableEvents[1] ?? availableEvents[0]]);
   const [orderMode, setOrderMode] = useState<OrderMode>("loose_order");
   const [windowHours, setWindowHours] = useState<number>(168);
   const [excludeEvent, setExcludeEvent] = useState<string>("");
   const [holdConstant, setHoldConstant] = useState<string>("");
-  const [breakdownBy, setBreakdownBy] = useState<string>("platform");
+  const [breakdownBy, setBreakdownBy] = useState<string>("");
   const [result, setResult] = useState<FunnelResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [drawerStep, setDrawerStep] = useState<number | null>(null);
 
   const eventOptions = useMemo(
-    () => Array.from(new Set([...DEFAULT_STEPS, ...availableEvents])).filter((e) => !e.startsWith("$")),
-    [availableEvents],
+    () => Array.from(new Set([...steps, ...availableEvents])),
+    [steps, availableEvents],
+  );
+  // A saved report may use a property the catalog no longer lists; keep it selectable.
+  const propOptions = useMemo(
+    () => Array.from(new Set([holdConstant, breakdownBy, ...availableProps])).filter(Boolean),
+    [holdConstant, breakdownBy, availableProps],
   );
 
   const buildQuery = useCallback(
@@ -242,8 +239,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             <span className={fieldLabel}>Exclude users who did (between steps 2 and 3)</span>
             <select value={excludeEvent} onChange={(e) => setExcludeEvent(e.target.value)} className={field}>
               <option value="">Nothing excluded</option>
-              {Array.from(new Set(["NSDL_Gateway_504_Timeout", ...availableEvents]))
-                .filter((e) => !e.startsWith("$"))
+              {Array.from(new Set([excludeEvent, ...availableEvents]))
+                .filter(Boolean)
                 .map((ev) => (
                   <option key={ev} value={ev}>
                     {humanizeEvent(ev)}
@@ -255,7 +252,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             <span className={fieldLabel}>Same value on every step</span>
             <select value={holdConstant} onChange={(e) => setHoldConstant(e.target.value)} className={field}>
               <option value="">Not required</option>
-              {SEGMENT_PROPS.map((p) => (
+              {propOptions.map((p) => (
                 <option key={p} value={p}>
                   {humanizeEvent(p)}
                 </option>
@@ -266,7 +263,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             <span className={fieldLabel}>Split by</span>
             <select value={breakdownBy} onChange={(e) => setBreakdownBy(e.target.value)} className={field}>
               <option value="">No split</option>
-              {SEGMENT_PROPS.map((p) => (
+              {propOptions.map((p) => (
                 <option key={p} value={p}>
                   {humanizeEvent(p)}
                 </option>

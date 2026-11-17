@@ -45,7 +45,7 @@ function truncate(text: string, maxChars: number): string {
 }
 
 export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [anchorEvent, setAnchorEvent] = useState<string>("KYC_PAN_Submitted");
+  const [anchorEvent, setAnchorEvent] = useState<string>(() => availableEvents[0] ?? "");
   const [direction, setDirection] = useState<"forward" | "reverse">("forward");
   const [steps, setSteps] = useState<number>(3);
   const [hideSystem, setHideSystem] = useState<boolean>(true);
@@ -184,15 +184,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
     return { svgH: svgH + 4, nodeRects: Array.from(nodeRects.entries()), ribbons };
   }, [result, hideSystem]);
 
-  const eventOptions = [
-    "App_Open",
-    "OTP_Verified",
-    "KYC_PAN_Submitted",
-    "Video_KYC_Completed",
-    "UPI_Autopay_Mandate_Approved",
-    "First_Disbursal_Success",
-    ...availableEvents,
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const eventOptions = Array.from(new Set([anchorEvent, ...availableEvents])).filter(Boolean);
 
   const ribbonStyle = {
     main: { stroke: "rgb(var(--brand))", opacity: 0.45 },

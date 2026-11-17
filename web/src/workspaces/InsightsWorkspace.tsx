@@ -52,18 +52,6 @@ const METRIC_OPTIONS: [string, string][] = [
 ];
 const PROP_METRICS = ["sum", "avg", "p50", "p90", "p99"];
 
-const FALLBACK_EVENTS = [
-  "App_Open",
-  "OTP_Verified",
-  "KYC_PAN_Submitted",
-  "Video_KYC_Completed",
-  "UPI_Autopay_Mandate_Approved",
-  "First_Disbursal_Success",
-  "Quick_Commerce_Order_Paid",
-  "Checkout_Any",
-];
-
-const BREAKDOWN_DEFAULTS = ["city", "platform", "payment_method", "network", "ticket_band", "category"];
 
 /** Inverse of buildMetricSpec, for opening a saved report. */
 function metricKindOf(m: { type?: string; quantile?: number } | undefined): string {
@@ -138,17 +126,12 @@ export const InsightsWorkspace: React.FC<Props> = ({
   availableProps,
   refreshToken,
 }) => {
-  const [series, setSeries] = useState<SeriesDraft[]>([
-    { label: "A", eventName: "App_Open", metricKind: "uniques", propName: "amount" },
-    {
-      label: "B",
-      eventName: "First_Disbursal_Success",
-      metricKind: "uniques",
-      propName: "amount",
-    },
+  // Starts on the project's busiest event; the catalog is loaded before this mounts.
+  const [series, setSeries] = useState<SeriesDraft[]>(() => [
+    { label: "A", eventName: availableEvents[0] ?? "", metricKind: "uniques", propName: availableProps[0] ?? "" },
   ]);
-  const [formula, setFormula] = useState<string>("(B / A) * 100");
-  const [breakdown, setBreakdown] = useState<string>("city");
+  const [formula, setFormula] = useState<string>("");
+  const [breakdown, setBreakdown] = useState<string>("");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -181,7 +164,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
         breakdown_by?: string[]; compare_previous_period?: boolean; formula?: string | null };
       if (s.series?.length)
-        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? "amount" })));
+        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? "" })));
       setBreakdown(s.breakdown_by?.[0] ?? "");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
@@ -256,10 +239,10 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const tableRows = result ? [...result.formula_series, ...result.series].slice(0, 18) : [];
   const tableBuckets = buckets.slice(-7);
 
-  const breakdownOptions = [...BREAKDOWN_DEFAULTS, ...availableProps].filter(
-    (v, i, a) => a.indexOf(v) === i,
-  );
-  const eventOptions = availableEvents.length > 0 ? availableEvents : FALLBACK_EVENTS;
+  // Saved reports may use names the catalog no longer lists; keep them selectable.
+  const breakdownOptions = Array.from(new Set([breakdown, ...availableProps])).filter(Boolean);
+  const eventOptions = Array.from(new Set([...series.map((s) => s.eventName), ...availableEvents])).filter(Boolean);
+  const propOptions = Array.from(new Set([...series.map((s) => s.propName), ...availableProps])).filter(Boolean);
 
   const reportTitle = formula.trim()
     ? formula
@@ -311,9 +294,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 ...series,
                 {
                   label: String.fromCharCode(65 + series.length),
-                  eventName: eventOptions[0] || "App_Open",
+                  eventName: eventOptions[0] ?? "",
                   metricKind: "uniques",
-                  propName: "amount",
+                  propName: propOptions[0] ?? "",
                 },
               ])
             }
@@ -372,7 +355,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     onChange={(e) => updateSeries(idx, { propName: e.target.value })}
                     className={field}
                   >
-                    {["amount", ...availableProps.filter((p) => p !== "amount")].map((p) => (
+                    {propOptions.map((p) => (
                       <option key={p} value={p}>
                         {p}
                       </option>

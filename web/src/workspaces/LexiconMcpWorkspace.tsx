@@ -16,47 +16,25 @@ const EVENT_STATUS_OPTIONS = [
   { value: "dropped", label: "Drop at ingest" },
 ];
 
-const MCP_PRESETS = [
-  {
-    title: "Sessions with rage taps in KYC",
-    tool: "inspect_frustrated_sessions",
-    args: { only_rage_tap: true, limit: 5 },
-  },
-  {
-    title: "Onboarding to disbursal funnel",
-    tool: "query_funnel",
-    args: {
-      steps: [
-        "App_Open",
-        "OTP_Verified",
-        "KYC_PAN_Submitted",
-        "UPI_Autopay_Mandate_Approved",
-        "First_Disbursal_Success",
-      ],
-      days: 14,
-    },
-  },
-  {
-    title: "App opens by city",
-    tool: "query_insights",
-    args: { event_name: "App_Open", metric: "uniques", breakdown_by: "city", days: 14 },
-  },
-  {
-    title: "Grocery 7-day retention",
-    tool: "query_retention",
-    args: {
-      start_event: "App_Open",
-      return_event: "Quick_Grocery_Browse",
-      mode: "n_day",
-      num_periods: 7,
-    },
-  },
-  {
-    title: "Event and property list",
-    tool: "get_lexicon_schema",
-    args: {},
-  },
-];
+/** Example tool calls built from the project's own busiest events. */
+function mcpPresets(top: string[]) {
+  const [a, b] = [top[0], top[1] ?? top[0]];
+  return [
+    { title: "Sessions with rage taps", tool: "inspect_frustrated_sessions", args: { only_rage_tap: true, limit: 5 } },
+    ...(a
+      ? [
+          { title: `Funnel: ${humanizeEvent(a)} to ${humanizeEvent(b)}`, tool: "query_funnel", args: { steps: [a, b], days: 14 } },
+          { title: `${humanizeEvent(a)} over 14 days`, tool: "query_insights", args: { event_name: a, metric: "uniques", days: 14 } },
+          {
+            title: `7-day retention on ${humanizeEvent(a)}`,
+            tool: "query_retention",
+            args: { start_event: a, return_event: a, mode: "n_day", num_periods: 7 },
+          },
+        ]
+      : []),
+    { title: "Event and property list", tool: "get_lexicon_schema", args: {} },
+  ];
+}
 
 const USER_ID_KEYS = new Set(["distinct_id", "user_id", "canonical_uid"]);
 
@@ -286,7 +264,12 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({ projectId, onLexiconChang
             </p>
 
             <div className="flex flex-wrap gap-1.5">
-              {MCP_PRESETS.map((preset) => (
+              {mcpPresets(
+                [...events]
+                  .filter((e) => e.status !== "dropped" && !e.name.startsWith("$"))
+                  .sort((x, y) => y.volume_24h - x.volume_24h)
+                  .map((e) => e.name),
+              ).map((preset) => (
                 <button
                   key={preset.title}
                   type="button"

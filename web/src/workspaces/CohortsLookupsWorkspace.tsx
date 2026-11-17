@@ -48,8 +48,8 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   availableEvents,
   onCatalogChanged,
 }) => {
-  const [cohortName, setCohortName] = useState<string>("Power quick-commerce buyers");
-  const [cohortEvent, setCohortEvent] = useState<string>("Quick_Commerce_Order_Paid");
+  const [cohortName, setCohortName] = useState<string>("");
+  const [cohortEvent, setCohortEvent] = useState<string>(() => availableEvents[0] ?? "");
   const [minCount, setMinCount] = useState<number>(2);
   const [preview, setPreview] = useState<{ count: number; us: number } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -58,14 +58,12 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
     Array<{ id: string; name: string; description: string; created_at_ms: number }>
   >([]);
 
-  const [lookupName, setLookupName] = useState<string>("sku_margin_catalog");
-  const [joinProp, setJoinProp] = useState<string>("merchant_id");
-  const [csvText, setCsvText] = useState<string>(
-    "merchant_id,vertical,commission_pct\nm_zepto,Grocery_10m,19.0\nm_swiggy,Food_Instant,23.5\nm_croma,Electronics,11.0",
-  );
+  const [lookupName, setLookupName] = useState<string>("");
+  const [joinProp, setJoinProp] = useState<string>("");
+  const [csvText, setCsvText] = useState<string>("");
 
-  const [customPropName, setCustomPropName] = useState<string>("gst_18_pct");
-  const [customSql, setCustomSql] = useState<string>("amount * 0.18");
+  const [customPropName, setCustomPropName] = useState<string>("");
+  const [customSql, setCustomSql] = useState<string>("");
 
   const [extensions, setExtensions] = useState<{
     custom_events: Array<{ name: string; source_events: string[] }>;
@@ -188,13 +186,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
       onCatalogChanged();
     });
 
-  const eventOptions = [
-    "Quick_Commerce_Order_Paid",
-    "UPI_Autopay_Mandate_Approved",
-    "First_Disbursal_Success",
-    "NSDL_Gateway_504_Timeout",
-    ...availableEvents,
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const eventOptions = Array.from(new Set([cohortEvent, ...availableEvents])).filter(Boolean);
 
   return (
     <div>
@@ -219,6 +211,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               <input
                 id="cohort-name"
                 value={cohortName}
+                placeholder="e.g. Repeat buyers"
                 onChange={(e) => setCohortName(e.target.value)}
                 className={`${field} w-full`}
               />
@@ -340,6 +333,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   <input
                     id="lookup-name"
                     value={lookupName}
+                    placeholder="e.g. plan_catalog"
                     onChange={(e) => setLookupName(e.target.value)}
                     className={`${field} w-full font-mono`}
                   />
@@ -352,7 +346,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     id="lookup-key"
                     value={joinProp}
                     onChange={(e) => setJoinProp(e.target.value)}
-                    placeholder="merchant_id"
+                    placeholder="e.g. plan_id"
                     className={`${field} w-full font-mono`}
                   />
                 </div>
@@ -365,6 +359,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   id="lookup-csv"
                   rows={4}
                   value={csvText}
+                  placeholder={"plan_id,tier,price\npro,paid,999\nfree,free,0"}
                   onChange={(e) => setCsvText(e.target.value)}
                   className={`${field} w-full font-mono text-xs`}
                 />
@@ -404,6 +399,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                 <input
                   id="prop-name"
                   value={customPropName}
+                  placeholder="e.g. order_size"
                   onChange={(e) => setCustomPropName(e.target.value)}
                   className={`${field} w-full font-mono`}
                 />
@@ -416,7 +412,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   id="prop-formula"
                   value={customSql}
                   onChange={(e) => setCustomSql(e.target.value)}
-                  placeholder="CASE WHEN amount > 5000 THEN 'Prime' ELSE 'Standard' END"
+                  placeholder="e.g. CASE WHEN amount > 5000 THEN 'Large' ELSE 'Small' END"
                   className={`${field} w-full font-mono`}
                 />
               </div>
