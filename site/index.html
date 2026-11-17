@@ -72,6 +72,7 @@ summary::-webkit-details-marker{display:none}summary{list-style:none}
 <div class="pl-navlinks" style="display: flex; flex-wrap: wrap; align-items: center; gap: 2px 26px; font-size: 14px">
 <a href="#product" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Product</a>
 <a href="#privacy" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Privacy</a>
+<a href="#demo" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Demo</a>
 <a href="#selfhost" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Self-host</a>
 <a href="#agent" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Agent setup</a>
 <a href="#editions" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Editions</a>
@@ -205,6 +206,17 @@ Apache-2.0 · Rust · one binary
 </section>
 
 <!-- TECH STRIP -->
+<!-- DEMO VIDEO -->
+<section id="demo" aria-labelledby="demo-h" style="max-width: 1240px; margin: 0 auto; padding: 120px 24px 0; display: flex; flex-direction: column; gap: 28px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
+<h2 id="demo-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">See it in action.<br><span style="color: #71717A">40 seconds, real Studio.</span></h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 420px">From a funnel drop-off to the session replays of the users who left, then journeys, retention and trends. Recorded on the seeded demo dataset.</p>
+</div>
+<div style="border: 1px solid #26262C; border-radius: 16px; overflow: hidden; background: #0E0E11; box-shadow: 0 30px 120px -40px rgba(200,240,74,0.18)">
+<video id="pl-demo" src="demo.mp4" poster="demo-poster.jpg" muted loop playsinline controls preload="metadata" width="1440" height="900" style="display: block; width: 100%; height: auto; aspect-ratio: 1440 / 900" aria-label="Pulse Studio walkthrough: funnel, session replay, journeys, retention and trends"></video>
+</div>
+</section>
+
 <section aria-label="Built with" style="border-top: 1px solid #1C1C21; border-bottom: 1px solid #1C1C21">
 <div style="max-width: 1240px; margin: 0 auto; padding: 22px 24px; display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 44px; font-family: 'Geist Mono', monospace; font-size: 13px; color: #8A8A93">
 <span>Rust core</span><span>Columnar storage</span><span>QUIC + HTTP ingest</span><span>Edge flag evaluation</span><span>MCP server</span><span>S3-compatible</span>
@@ -553,6 +565,14 @@ pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
 </footer>
 
 </div>
+<script>
+// Autoplay the demo only while it is on screen, and never under reduced motion.
+(function(){
+  var v=document.getElementById('pl-demo');
+  if(!v||!('IntersectionObserver' in window)||matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){var p=v.play();if(p)p.catch(function(){});}else v.pause();});},{threshold:0.4}).observe(v);
+})();
+</script>
 <script>
 document.getElementById('pl-copy').addEventListener('click',function(){
   var b=this,t=document.getElementById('pl-prompt').textContent;
