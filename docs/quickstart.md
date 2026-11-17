@@ -52,10 +52,12 @@ Recompute it, compare in constant time, and reject timestamps more than a few mi
 ## 3. Get the admin token
 
 - If you set `PULSE_ADMIN_TOKEN`, that is the root token.
-- If you did not, the node mints a new `sk_root_…` token **on every start** and prints it once:
+- If you did not, the node mints a new `sk_root_…` token **on every start** and writes it to
+  `root_admin_token` in the data directory, readable only by your user. The log says where. It is
+  never printed, so it doesn't end up in shipped or shared logs:
 
-  ```
-  Generated one-time Root Admin Bearer Token (save now, never stored in plaintext): sk_root_…
+  ```bash
+  cat pulse_data/root_admin_token
   ```
 
   The previous token stops working after a restart (and Studio sessions signed in with it end), so
@@ -72,7 +74,7 @@ curl -s http://127.0.0.1:8080/v1/status -H "Authorization: Bearer $PULSE_ADMIN_T
 On first boot of a data directory the node creates an ingest key for the default project and prints it once:
 
 ```
-Generated one-time Public Ingest Key (save now, never stored in plaintext): pk_live_…
+Generated the public ingest key for client SDKs: pk_live_…
 ```
 
 Keys are stored hashed, so a missed log line cannot be recovered, and the Studio has no screen for

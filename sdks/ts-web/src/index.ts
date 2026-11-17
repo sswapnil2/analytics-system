@@ -751,8 +751,11 @@ export class PulseWebClient {
     return this.engage({ $remove: { [prop]: value } });
   }
 
+  /**
+   * Forgets this user on this device. It does not erase server-side data: the ingest key is
+   * public, so erasure needs an admin call to DELETE /v1/projects/:id/users/:distinct_id.
+   */
   public async deleteUser(): Promise<void> {
-    await this.engage({ $delete_user: true });
     this.reset();
   }
 

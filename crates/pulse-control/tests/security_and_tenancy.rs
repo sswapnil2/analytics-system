@@ -360,3 +360,40 @@ async fn p0_04_cross_project_idor_reads_and_mcp_project_override_blocked() {
         "MCP allowed cross-project override to leak proj_alpha lexicon: {raw_mcp}"
     );
 }
+
+#[tokio::test]
+async fn revoked_api_key_stops_working_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
+    let root = Some("sk_root_test_admin_secret_0123456789");
+    let base = "/v1/projects/proj_alpha/api-keys";
+
+    let (_, created) = send_json(
+        &app,
+        "POST",
+        base,
+        root,
+        Some(json!({"label": "CI", "role": "admin"})),
+    )
+    .await;
+    let key = created["plaintext_key"].as_str().unwrap().to_string();
+    let key_id = created["record"]["id"].as_str().unwrap().to_string();
+    let (s, _) = send_json(&app, "GET", base, Some(&key), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_json(&app, "DELETE", &format!("{base}/{key_id}"), root, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send_json(&app, "GET", base, Some(&key), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (_, listed) = send_json(&app, "GET", base, root, None).await;
+    let rec = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == key_id.as_str())
+        .unwrap();
+    assert_eq!(rec["revoked"], true);
+
+    let (s, _) = send_json(&app, "DELETE", &format!("{base}/key_missing"), root, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}

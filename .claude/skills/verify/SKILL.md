@@ -28,7 +28,7 @@ Use the release binary from the tree you changed (`target/release/pulse-node`), 
 - **Fresh:** no `--seed`, empty `PULSE_DATA_DIR`, for example port 18091. This is what a new customer sees.
 - **Demo:** `--seed --no-quic`, port 18090.
 
-Each node prints a one-time root admin token and a public ingest key (`pk_live_…`) in its startup log. To sign the Studio in, set `localStorage.pulse_admin_bearer_token` to the root admin token and reload. Never paste these tokens into chat, commits or PRs.
+Each node writes its root admin token to `root_admin_token` in its data directory and prints its public ingest key (`pk_live_…`) in the startup log. The first account created at `/#/signup` needs the root token as its setup code. To sign the Studio in, set `localStorage.pulse_admin_bearer_token` to the root admin token and reload. Never paste these tokens into chat, commits or PRs.
 
 ## 3. Check the Studio with data that isn't the demo
 

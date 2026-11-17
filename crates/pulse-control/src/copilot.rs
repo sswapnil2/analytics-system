@@ -404,24 +404,9 @@ pub async fn run_byok_copilot(
         );
     }
 
-    let model = llm_cred
-        .config_json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(match llm_cred.provider.as_str() {
-            "anthropic" => "claude-sonnet-4-5",
-            "gemini" => "gemini-2.5-flash",
-            _ => "gpt-4o-mini",
-        })
-        .to_string();
-
-    let custom_endpoint = llm_cred
-        .config_json
-        .get("endpoint")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
+    let (model, custom_endpoint) =
+        llm_model_and_endpoint(&llm_cred.provider, &llm_cred.config_json);
+    let custom_endpoint = custom_endpoint.as_deref();
 
     let metrics_summary = Value::Object(metrics_map);
 
@@ -449,7 +434,28 @@ pub async fn run_byok_copilot(
     })
 }
 
-async fn call_external_llm(
+/// The model and optional custom endpoint from an LLM credential's config.
+pub(crate) fn llm_model_and_endpoint(provider: &str, cfg: &Value) -> (String, Option<String>) {
+    let model = cfg
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(match provider {
+            "anthropic" => "claude-sonnet-4-5",
+            "gemini" => "gemini-2.5-flash",
+            _ => "gpt-4o-mini",
+        })
+        .to_string();
+    let endpoint = cfg
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (model, endpoint)
+}
+
+pub(crate) async fn call_external_llm(
     provider: &str,
     model: &str,
     api_key: &str,

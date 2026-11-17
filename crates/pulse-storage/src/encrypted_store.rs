@@ -419,14 +419,16 @@ impl EncryptedObjectStore {
         if let Ok(raw) = std::env::var("PULSE_BYOK_MASTER_KEY") {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
-                if let Ok(key) = parse_byok_master_key(trimmed) {
-                    let kid = make_key_id(&key);
-                    keyring.insert(kid.clone(), key);
-                    active_key_id = Some(kid);
-                }
+                // A typo here must stop the node, not quietly write unencrypted data.
+                let key = parse_byok_master_key(trimmed).unwrap_or_else(|e| {
+                    panic!("PULSE_BYOK_MASTER_KEY is set but invalid ({e}); fix it or unset it")
+                });
+                let kid = make_key_id(&key);
+                keyring.insert(kid.clone(), key);
+                active_key_id = Some(kid);
             }
         }
-        let ephemeral_cache_key = csprng_bytes().unwrap_or([0xA5; 32]);
+        let ephemeral_cache_key = csprng_bytes().expect("OS random number generator unavailable");
 
         Self {
             inner,

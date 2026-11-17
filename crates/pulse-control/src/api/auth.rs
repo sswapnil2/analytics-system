@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, CtrlError};
-use crate::models::{sha256_hex, User};
+use crate::models::{sha256_bytes, sha256_hex, User};
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const GOOGLE_STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -33,6 +33,7 @@ const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 const SIGNUP_CLOSED: &str =
     "Sign-ups are closed for this workspace. Ask an admin to add your email domain.";
+const SETUP_CODE_NEEDED: &str = "Enter the setup code to create the first account. It's the root admin token: the PULSE_ADMIN_TOKEN you set, or the one saved in the data directory on first start.";
 const BAD_LOGIN: &str = "Email or password is incorrect";
 
 /// Sign-in configuration, read once from the environment; tests replace it via
@@ -44,8 +45,10 @@ pub struct AuthConfig {
     /// Origin the browser uses to reach this node, without a trailing slash.
     pub public_url: String,
     pub google_token_url: String,
-    /// Lowercased domains whose addresses may self-register.
+    /// Lowercased domains whose addresses join the default organisation (the node owner's).
     pub allowed_email_domains: Vec<String>,
+    /// Whether anyone may sign up and create a new, separate organisation (`PULSE_ALLOW_NEW_ORGS`, default on).
+    pub allow_new_orgs: bool,
 }
 
 impl AuthConfig {
@@ -71,6 +74,10 @@ impl AuthConfig {
                 .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
                 .filter(|d| !d.is_empty())
                 .collect(),
+            allow_new_orgs: !matches!(
+                var("PULSE_ALLOW_NEW_ORGS").as_deref(),
+                Some("0" | "false" | "no" | "off")
+            ),
         }
     }
 
@@ -102,15 +109,61 @@ impl ControlPlaneService {
         *self.auth_cfg.write() = cfg;
     }
 
-    async fn signup_allowed(&self, email: &str) -> Result<bool, CtrlError> {
+    /// Allowed when the email's domain is on the allowlist, or for the very first account when the
+    /// caller proves they run the node by giving the root admin token as the setup code.
+    /// Without that, whoever reached a fresh public node first would own every project.
+    /// Which organisation a new account lands in, or `None` when it may not sign up.
+    /// - The first account on a node needs the root admin token as a setup code (or an allowed
+    ///   domain) and owns the default organisation and its existing data.
+    /// - Later accounts with an organisation name get a new, separate organisation.
+    /// - Later accounts in an allowed domain without one join the default organisation.
+    async fn signup_org(
+        &self,
+        email: &str,
+        setup_code: Option<&str>,
+        org_name: Option<&str>,
+    ) -> Result<Option<SignupOrg>, CtrlError> {
         let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
-        let domain_ok = self
-            .auth_cfg
-            .read()
-            .allowed_email_domains
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(domain));
-        Ok(domain_ok || self.meta.count_users().await.map_err(CtrlError::meta)? == 0)
+        let (domain_ok, allow_new_orgs) = {
+            let cfg = self.auth_cfg.read();
+            (
+                cfg.allowed_email_domains
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(domain)),
+                cfg.allow_new_orgs,
+            )
+        };
+        if self.meta.count_users().await.map_err(CtrlError::meta)? == 0 {
+            let code_ok = setup_code
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .is_some_and(|c| {
+                    constant_time_eq::constant_time_eq(&sha256_bytes(c), &self.root_admin_hash)
+                });
+            return Ok((domain_ok || code_ok).then_some(SignupOrg::Default));
+        }
+        let org_name = org_name.map(str::trim).filter(|n| !n.is_empty());
+        Ok(match org_name {
+            Some(name) if allow_new_orgs => Some(SignupOrg::New(name.chars().take(80).collect())),
+            _ if domain_ok => Some(SignupOrg::Default),
+            _ => None,
+        })
+    }
+
+    /// Resolves `SignupOrg` to an org id, creating the org and its first project when it's new.
+    async fn org_for_signup(&self, org: SignupOrg) -> Result<String, CtrlError> {
+        match org {
+            SignupOrg::Default => Ok("org_default".to_string()),
+            SignupOrg::New(name) => {
+                let id = format!("org_{}", &Uuid::new_v4().simple().to_string()[..12]);
+                self.meta
+                    .insert_org(&id, &name, now_ms())
+                    .await
+                    .map_err(CtrlError::meta)?;
+                self.create_project_in_org(&id, &name, None).await?;
+                Ok(id)
+            }
+        }
     }
 
     async fn create_session(&self, user_id: &str) -> Result<String, CtrlError> {
@@ -127,6 +180,11 @@ impl ControlPlaneService {
         let token = self.create_session(&user.id).await?;
         Ok(Json(json!({ "token": token, "user": user_json(user) })))
     }
+}
+
+enum SignupOrg {
+    Default,
+    New(String),
 }
 
 pub(super) fn public_auth_router() -> Router<Arc<ControlPlaneService>> {
@@ -153,6 +211,7 @@ fn random_hex() -> String {
 fn user_json(u: &User) -> Value {
     json!({
         "id": u.id,
+        "org_id": u.org_id,
         "email": u.email,
         "name": u.name,
         "has_password": u.password_hash.is_some(),
@@ -246,11 +305,16 @@ async fn handle_config(State(ctrl): State<Arc<ControlPlaneService>>) -> ApiRes<V
             !cfg.allowed_email_domains.is_empty(),
         )
     };
+    let allow_new_orgs = ctrl.auth_cfg.read().allow_new_orgs;
     let no_users = ctrl.meta.count_users().await.map_err(CtrlError::meta)? == 0;
     Ok(Json(json!({
         "password": true,
         "google": google,
-        "signup_open": no_users || domains_configured,
+        "signup_open": no_users || domains_configured || allow_new_orgs,
+        // The first account needs the root admin token as a setup code unless its domain is allowlisted.
+        "setup_code_required": no_users,
+        // After that, a new account names its organisation (blank joins the default org for allowed domains).
+        "org_name_required": !no_users && allow_new_orgs,
     })))
 }
 
@@ -259,6 +323,10 @@ struct SignupReq {
     email: String,
     password: String,
     name: Option<String>,
+    #[serde(default)]
+    setup_code: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
 }
 
 async fn handle_signup(
@@ -273,9 +341,18 @@ async fn handle_signup(
             "password must be between 10 and 256 characters",
         ));
     }
-    if !ctrl.signup_allowed(&email).await? {
+    let Some(org) = ctrl
+        .signup_org(&email, req.setup_code.as_deref(), req.org_name.as_deref())
+        .await?
+    else {
+        if ctrl.meta.count_users().await.map_err(CtrlError::meta)? == 0 {
+            return Err(CtrlError::forbidden(SETUP_CODE_NEEDED));
+        }
+        if ctrl.auth_cfg.read().allow_new_orgs {
+            return Err(CtrlError::bad("Enter your organisation's name."));
+        }
         return Err(CtrlError::forbidden(SIGNUP_CLOSED));
-    }
+    };
     if ctrl
         .meta
         .get_user_by_email(&email)
@@ -293,6 +370,7 @@ async fn handle_signup(
         .await
         .map_err(CtrlError::internal)?
         .map_err(CtrlError::internal)?;
+    let org_id = ctrl.org_for_signup(org).await?;
     let user = User {
         id: format!("user_{}", Uuid::new_v4().simple()),
         email,
@@ -303,6 +381,7 @@ async fn handle_signup(
         password_hash: Some(password_hash),
         google_sub: None,
         created_at_ms: now_ms(),
+        org_id,
     };
     ctrl.meta
         .insert_user(&user)
@@ -392,7 +471,7 @@ pub(super) async fn handle_me(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiRes<Value> {
-    let AuthPrincipal::User { user_id } = principal else {
+    let AuthPrincipal::User { user_id, .. } = principal else {
         return Err(CtrlError::not_found(
             "this credential is not a user session",
         ));
@@ -538,13 +617,20 @@ async fn google_callback(
             .map_err(|_| "google_token")?;
         u.id
     } else {
-        if !ctrl
-            .signup_allowed(&email)
+        // Google can't carry an org name, so a new Google account gets a workspace named after its owner.
+        let display = claims["name"]
+            .as_str()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| email.split('@').next().unwrap_or("My"));
+        let org_name = format!("{display}'s workspace");
+        let Some(org) = ctrl
+            .signup_org(&email, None, Some(&org_name))
             .await
             .map_err(|_| "google_token")?
-        {
+        else {
             return Err("signup_closed");
-        }
+        };
+        let org_id = ctrl.org_for_signup(org).await.map_err(|_| "google_token")?;
         let user = User {
             id: format!("user_{}", Uuid::new_v4().simple()),
             email,
@@ -555,6 +641,7 @@ async fn google_callback(
             password_hash: None,
             google_sub: Some(sub.to_string()),
             created_at_ms: now_ms(),
+            org_id,
         };
         meta.insert_user(&user).await.map_err(|_| "google_token")?;
         user.id

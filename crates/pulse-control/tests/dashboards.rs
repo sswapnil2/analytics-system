@@ -173,7 +173,7 @@ async fn dashboard_crud_with_report_and_text_cards() {
         .uri("/v1/auth/signup")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"email": "ada@example.com", "password": "correct horse battery"}).to_string(),
+            json!({"email": "ada@example.com", "password": "correct horse battery", "setup_code": ROOT}).to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
