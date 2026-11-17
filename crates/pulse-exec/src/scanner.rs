@@ -128,11 +128,32 @@ impl ResolvedEventTarget {
     }
 }
 
+/// Event name that matches every event the app sends (not Pulse's own `$` events).
+/// Lets retention ask "came back and did anything".
+pub const ANY_EVENT: &str = "$any_event";
+
 pub fn resolve_event_target(
     name: &str,
     dict: &ProjectDictionary,
     catalog: &VirtualCatalog,
 ) -> ResolvedEventTarget {
+    if name == ANY_EVENT {
+        // ponytail: `matches_id` is a linear scan; a bitset if projects reach thousands of event names.
+        let event_ids: Vec<u16> = dict
+            .all_events()
+            .into_iter()
+            .filter(|(_, n)| !n.starts_with('$'))
+            .map(|(id, _)| id)
+            .collect();
+        let bloom_mask_64 = event_ids.iter().fold(0u64, |m, id| {
+            m | pulse_storage::SessionHeader::event_bit(*id)
+        });
+        return ResolvedEventTarget {
+            event_ids,
+            bloom_mask_64,
+            extra_filter: None,
+        };
+    }
     if let Some(ce) = catalog.custom_events.get(name) {
         let mut ids = Vec::new();
         let mut mask = 0u64;

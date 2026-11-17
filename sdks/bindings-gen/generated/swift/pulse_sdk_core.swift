@@ -463,6 +463,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -547,9 +563,21 @@ public protocol PulseClientProtocol : AnyObject {
     func flush() async throws  -> UInt32
     
     /**
+     * Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
+     * (`flag_key`, `variant`) once, which is what experiment results count.
+     */
+    func getVariant(flagKey: String, trackExposure: Bool) async throws  -> String?
+    
+    /**
      * Identifies a logged-in user, preserving `routing_seed` (`device_install_id`) and queueing retroactive `alias`.
      */
     func identify(userId: String) throws 
+    
+    func isOptedOut()  -> Bool
+    
+    func optIn() throws 
+    
+    func optOut() throws 
     
     func queuedPacketCount()  -> UInt32
     
@@ -565,6 +593,8 @@ public protocol PulseClientProtocol : AnyObject {
     
     func refreshFlags() async throws 
     
+    func registerSuperProps(propsJson: String) throws 
+    
     /**
      * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
@@ -573,12 +603,18 @@ public protocol PulseClientProtocol : AnyObject {
     
     func sessionId()  -> String
     
+    func setUserProperties(propsJson: String) throws 
+    
     func shutdown() async throws 
+    
+    func timeEvent(eventName: String) throws 
     
     /**
      * Tracks an analytical event with a JSON object of properties.
      */
     func track(eventName: String, propsJson: String) throws 
+    
+    func trackRevenue(amount: Double, currency: String, productId: String?) throws 
     
 }
 
@@ -692,11 +728,51 @@ open func flush()async throws  -> UInt32 {
 }
     
     /**
+     * Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
+     * (`flag_key`, `variant`) once, which is what experiment results count.
+     */
+open func getVariant(flagKey: String, trackExposure: Bool)async throws  -> String? {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_pulse_sdk_core_fn_method_pulseclient_get_variant(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(flagKey),FfiConverterBool.lower(trackExposure)
+                )
+            },
+            pollFunc: ffi_pulse_sdk_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_pulse_sdk_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_pulse_sdk_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: FfiConverterTypeSdkError.lift
+        )
+}
+    
+    /**
      * Identifies a logged-in user, preserving `routing_seed` (`device_install_id`) and queueing retroactive `alias`.
      */
 open func identify(userId: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
     uniffi_pulse_sdk_core_fn_method_pulseclient_identify(self.uniffiClonePointer(),
         FfiConverterString.lower(userId),$0
+    )
+}
+}
+    
+open func isOptedOut() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_is_opted_out(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func optIn()throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_opt_in(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func optOut()throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_opt_out(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -751,6 +827,13 @@ open func refreshFlags()async throws  {
         )
 }
     
+open func registerSuperProps(propsJson: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_register_super_props(self.uniffiClonePointer(),
+        FfiConverterString.lower(propsJson),$0
+    )
+}
+}
+    
     /**
      * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
@@ -766,6 +849,13 @@ open func sessionId() -> String {
     uniffi_pulse_sdk_core_fn_method_pulseclient_session_id(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func setUserProperties(propsJson: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_set_user_properties(self.uniffiClonePointer(),
+        FfiConverterString.lower(propsJson),$0
+    )
+}
 }
     
 open func shutdown()async throws  {
@@ -785,6 +875,13 @@ open func shutdown()async throws  {
         )
 }
     
+open func timeEvent(eventName: String)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_time_event(self.uniffiClonePointer(),
+        FfiConverterString.lower(eventName),$0
+    )
+}
+}
+    
     /**
      * Tracks an analytical event with a JSON object of properties.
      */
@@ -792,6 +889,15 @@ open func track(eventName: String, propsJson: String)throws  {try rustCallWithEr
     uniffi_pulse_sdk_core_fn_method_pulseclient_track(self.uniffiClonePointer(),
         FfiConverterString.lower(eventName),
         FfiConverterString.lower(propsJson),$0
+    )
+}
+}
+    
+open func trackRevenue(amount: Double, currency: String, productId: String?)throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
+    uniffi_pulse_sdk_core_fn_method_pulseclient_track_revenue(self.uniffiClonePointer(),
+        FfiConverterDouble.lower(amount),
+        FfiConverterString.lower(currency),
+        FfiConverterOptionString.lower(productId),$0
     )
 }
 }
@@ -1278,7 +1384,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 13927) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_get_variant() != 25430) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_identify() != 25556) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_is_opted_out() != 21728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_in() != 13246) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_out() != 37774) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_queued_packet_count() != 36553) {
@@ -1293,16 +1411,28 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props() != 56505) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_set_user_properties() != 36905) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_shutdown() != 37508) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_time_event() != 4717) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_track() != 33488) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_track_revenue() != 3198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_constructor_pulseclient_new() != 53018) {

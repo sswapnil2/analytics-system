@@ -20,7 +20,7 @@ pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;
 pub use insights::{eval_math_expr, InsightsEngine};
 pub use retention::RetentionEngine;
-pub use scanner::{validate_cohort_acyclic, ExecError, Result, MAX_COHORT_DEPTH};
+pub use scanner::{validate_cohort_acyclic, ExecError, Result, ANY_EVENT, MAX_COHORT_DEPTH};
 
 #[cfg(test)]
 mod tests {

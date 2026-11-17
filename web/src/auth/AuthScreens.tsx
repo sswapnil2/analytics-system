@@ -313,6 +313,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
   const [password, setPassword] = useState("");
   const [setupCode, setSetupCode] = useState("");
   const [orgName, setOrgName] = useState("");
+  const [projectName, setProjectName] = useState("");
   const [touchedPw, setTouchedPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -333,7 +334,8 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
         password,
         name: name.trim() || undefined,
         setup_code: cfg?.setup_code_required ? setupCode.trim() || undefined : undefined,
-        org_name: cfg?.org_name_required ? orgName.trim() || undefined : undefined,
+        org_name: cfg?.org_name_required || cfg?.setup_code_required ? orgName.trim() || undefined : undefined,
+        project_name: cfg?.setup_code_required ? projectName.trim() || undefined : undefined,
       });
       if ("verification_required" in res) {
         setPendingEmail(res.email);
@@ -416,6 +418,28 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
             Your name
             <input type="text" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} className={inputCls} autoFocus />
           </label>
+          {cfg?.setup_code_required && (
+            <>
+              <label className={labelCls}>
+                Company name
+                <input type="text" autoComplete="organization" value={orgName} onChange={(e) => setOrgName(e.target.value)} placeholder="e.g. ShopNest" className={inputCls} />
+              </label>
+              <label className={labelCls}>
+                First project
+                <input
+                  type="text"
+                  value={projectName}
+                  onChange={(e) => setProjectName(e.target.value)}
+                  placeholder="e.g. ShopNest app"
+                  aria-describedby="project-hint"
+                  className={inputCls}
+                />
+                <span id="project-hint" className="text-[0.8125rem] font-normal text-muted">
+                  One project per app or site. You can add more later.
+                </span>
+              </label>
+            </>
+          )}
           {cfg?.org_name_required && (
             <label className={labelCls}>
               Organisation
@@ -465,7 +489,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
           </label>
           {cfg?.setup_code_required && (
             <label className={labelCls}>
-              Setup code
+              Server owner code
               <input
                 type="password"
                 autoComplete="off"
@@ -475,8 +499,8 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
                 className={inputCls}
               />
               <span id="setup-hint" className="text-[0.8125rem] font-normal text-muted">
-                The first account owns this node. Paste the root admin token: the PULSE_ADMIN_TOKEN you set, or the one in
-                root_admin_token in the data directory.
+                Proves you run this Pulse server, so the first account becomes its owner. It's in the file{" "}
+                <code className="font-mono">root_admin_token</code> in Pulse's data folder (or the PULSE_ADMIN_TOKEN you set).
               </span>
             </label>
           )}

@@ -253,6 +253,14 @@ export interface FeatureFlag {
   updated_at_ms: number;
 }
 
+export interface FlagPatch {
+  enabled?: boolean;
+  rollout_pct?: number;
+  /** A cohort id, or "" for everyone. */
+  targeting_cohort_id?: string;
+  variants?: { key: string; weight_bps: number }[];
+}
+
 export interface Experiment {
   id: string;
   project_id: string;
@@ -652,7 +660,7 @@ export function default14DayRange(): TimeRange {
 
 export const api = {
   getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
-  signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string }) =>
+  signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string; project_name?: string }) =>
     // A session, or `verification_required` when the address must be proven first.
     fetchJson<AuthSession | { verification_required: true; email: string }>("/v1/auth/signup", {
       method: "POST",
@@ -888,7 +896,7 @@ export const api = {
   patchFlag: (
     projectId: string,
     flagId: string,
-    body: { enabled?: boolean; rollout_pct?: number },
+    body: FlagPatch,
   ) =>
     fetchJson<FeatureFlag>(
       `/v1/projects/${encodeURIComponent(projectId)}/flags/${encodeURIComponent(flagId)}`,
@@ -896,6 +904,13 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(body),
       },
+    ),
+
+  /** Stop (`concluded`), pause or resume an experiment. */
+  patchExperiment: (projectId: string, expId: string, body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number }) =>
+    fetchJson<Experiment>(
+      `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}`,
+      { method: "PATCH", body: JSON.stringify(body) },
     ),
 
   createExperiment: (
