@@ -300,6 +300,8 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [setupCode, setSetupCode] = useState("");
+  const [orgName, setOrgName] = useState("");
   const [touchedPw, setTouchedPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -311,10 +313,17 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
     setTouchedPw(true);
     setError(null);
     if (!email.trim()) return setError("Enter your work email.");
+    if (cfg?.org_name_required && !orgName.trim()) return setError("Enter your organisation's name.");
     if (password.length < 10) return;
     setBusy(true);
     try {
-      const session = await api.signUp({ email: email.trim(), password, name: name.trim() || undefined });
+      const session = await api.signUp({
+        email: email.trim(),
+        password,
+        name: name.trim() || undefined,
+        setup_code: cfg?.setup_code_required ? setupCode.trim() || undefined : undefined,
+        org_name: cfg?.org_name_required ? orgName.trim() || undefined : undefined,
+      });
       setStoredAdminToken(session.token);
       onSignedIn();
     } catch (err) {
@@ -374,6 +383,22 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
             Your name
             <input type="text" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} className={inputCls} autoFocus />
           </label>
+          {cfg?.org_name_required && (
+            <label className={labelCls}>
+              Organisation
+              <input
+                type="text"
+                autoComplete="organization"
+                value={orgName}
+                onChange={(e) => setOrgName(e.target.value)}
+                aria-describedby="org-hint"
+                className={inputCls}
+              />
+              <span id="org-hint" className="text-[0.8125rem] font-normal text-muted">
+                You get a private workspace with its own project. Other accounts on this server can't see it.
+              </span>
+            </label>
+          )}
           <label className={labelCls}>
             Work email
             <input
@@ -404,6 +429,23 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
               Use at least 10 characters.
             </span>
           </label>
+          {cfg?.setup_code_required && (
+            <label className={labelCls}>
+              Setup code
+              <input
+                type="password"
+                autoComplete="off"
+                value={setupCode}
+                onChange={(e) => setSetupCode(e.target.value)}
+                aria-describedby="setup-hint"
+                className={inputCls}
+              />
+              <span id="setup-hint" className="text-[0.8125rem] font-normal text-muted">
+                The first account owns this node. Paste the root admin token: the PULSE_ADMIN_TOKEN you set, or the one in
+                root_admin_token in the data directory.
+              </span>
+            </label>
+          )}
         </div>
 
         <button type="submit" disabled={busy || cfg === null} className={`${btn.primary} h-11 text-[0.9375rem]`}>

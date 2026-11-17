@@ -36,6 +36,8 @@ pub struct User {
     pub password_hash: Option<String>,
     pub google_sub: Option<String>,
     pub created_at_ms: i64,
+    /// The organisation whose projects this account can see.
+    pub org_id: String,
 }
 
 pub const KEY_ROLE_INGEST_AND_FLAGS: &str = "ingest_and_flags";

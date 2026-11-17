@@ -400,6 +400,10 @@ export interface AuthConfig {
   password: boolean;
   google: boolean;
   signup_open: boolean;
+  /** No accounts yet: the first sign-up must present the root admin token. */
+  setup_code_required?: boolean;
+  /** Accounts exist: a new one names its organisation and gets its own projects. */
+  org_name_required?: boolean;
 }
 
 export interface AuthSession {
@@ -605,7 +609,7 @@ export function default14DayRange(): TimeRange {
 
 export const api = {
   getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
-  signUp: (body: { email: string; password: string; name?: string }) =>
+  signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string }) =>
     fetchJson<AuthSession>("/v1/auth/signup", { method: "POST", body: JSON.stringify(body) }),
   logIn: (body: { email: string; password: string }) =>
     fetchJson<AuthSession>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) }),

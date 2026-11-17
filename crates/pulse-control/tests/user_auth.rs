@@ -24,6 +24,7 @@ fn auth_cfg(domains: &[&str], token_url: &str) -> AuthConfig {
         public_url: PUBLIC_URL.to_string(),
         google_token_url: token_url.to_string(),
         allowed_email_domains: domains.iter().map(|d| d.to_string()).collect(),
+        allow_new_orgs: false,
     }
 }
 
@@ -91,7 +92,8 @@ async fn signup(app: &Router, email: &str) -> (StatusCode, Value) {
         "POST",
         "/v1/auth/signup",
         None,
-        Some(json!({"email": email, "password": "correct horse battery", "name": "Ada"})),
+        // The setup code only matters for the first account; later sign-ups ignore it.
+        Some(json!({"email": email, "password": "correct horse battery", "name": "Ada", "setup_code": ROOT})),
     )
     .await;
     (s, v)
@@ -109,12 +111,34 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 async fn signup_policy_first_user_then_domain_allowlist() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, ctrl, _meta) = setup_app(tmp.path()).await;
+    // Closed node: no new organisations, only allowed domains after the first account.
+    ctrl.set_auth_config(auth_cfg(&[], "http://127.0.0.1:1/unused"));
 
     let (_, cfg, _) = send(&app, "GET", "/v1/auth/config", None, None).await;
     assert_eq!(
         cfg,
-        json!({"password": true, "google": true, "signup_open": true})
+        json!({"password": true, "google": true, "signup_open": true, "setup_code_required": true, "org_name_required": false})
     );
+
+    // A fresh node must not hand its first (owner) account to whoever reaches it first.
+    let (s, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/signup",
+        None,
+        Some(json!({"email": "mallory@evil.test", "password": "correct horse battery"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/signup",
+        None,
+        Some(json!({"email": "mallory@evil.test", "password": "correct horse battery", "setup_code": "wrong"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 
     let (s, v) = signup(&app, "  Ada@Example.com ").await;
     assert_eq!(s, StatusCode::OK, "{v}");
@@ -227,7 +251,7 @@ async fn session_token_authorizes_admin_routes_until_logout_or_expiry() {
         .iter()
         .any(|p| p["id"] == "proj_alpha"));
 
-    // Users may use root-only routes in a single-org deployment.
+    // Users can create projects; they land in their own organisation.
     let (s, _, _) = send(
         &app,
         "POST",
@@ -356,7 +380,8 @@ async fn google_full_callback_against_stub_token_endpoint() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
-    ctrl.set_auth_config(auth_cfg(&[], &format!("http://{addr}/token")));
+    // Google sign-in can't carry a setup code, so on a fresh node it needs an allowed domain.
+    ctrl.set_auth_config(auth_cfg(&["example.com"], &format!("http://{addr}/token")));
 
     let (s, _, loc) = send(
         &app,
@@ -414,4 +439,78 @@ async fn google_full_callback_against_stub_token_endpoint() {
 
     let (s, _, _) = send(&app, "GET", "/v1/projects", Some(token), None).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn each_signup_gets_its_own_org_and_cannot_see_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, ctrl, _meta) = setup_app(tmp.path()).await;
+    let mut cfg = auth_cfg(&[], "http://127.0.0.1:1/unused");
+    cfg.allow_new_orgs = true;
+    ctrl.set_auth_config(cfg);
+
+    // The owner (setup code) gets the default org and its existing project.
+    let (_, owner) = signup(&app, "ada@example.com").await;
+    let owner_tok = owner["token"].as_str().unwrap().to_string();
+
+    let (_, cfg, _) = send(&app, "GET", "/v1/auth/config", None, None).await;
+    assert_eq!(cfg["org_name_required"], true);
+
+    // A stranger without an org name is told to give one; with one, they get a separate org.
+    let body = |org: Option<&str>| {
+        let mut b = json!({"email": "eve@other.com", "password": "correct horse battery"});
+        if let Some(o) = org {
+            b["org_name"] = json!(o);
+        }
+        Some(b)
+    };
+    let (s, _, _) = send(&app, "POST", "/v1/auth/signup", None, body(None)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, eve, _) = send(&app, "POST", "/v1/auth/signup", None, body(Some("Acme"))).await;
+    assert_eq!(s, StatusCode::OK, "{eve}");
+    let eve_tok = eve["token"].as_str().unwrap().to_string();
+    assert_ne!(eve["user"]["org_id"], "org_default");
+
+    let (_, eve_projects, _) = send(&app, "GET", "/v1/projects", Some(&eve_tok), None).await;
+    let eve_projects = eve_projects.as_array().unwrap().clone();
+    assert_eq!(eve_projects.len(), 1);
+    assert_eq!(eve_projects[0]["name"], "Acme");
+    let acme = eve_projects[0]["id"].as_str().unwrap().to_string();
+
+    // Status without a project id lands Eve in her own project, never the default one.
+    let (s, st, _) = send(&app, "GET", "/v1/status", Some(&eve_tok), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(st["active_project_id"], acme.as_str());
+
+    // Eve can't read the owner's project, and the owner can't read Eve's.
+    for uri in [
+        "/v1/projects/proj_alpha/api-keys",
+        "/v1/status?project_id=proj_alpha",
+    ] {
+        let (s, _, _) = send(&app, "GET", uri, Some(&eve_tok), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (s, _, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{acme}/api-keys"),
+        Some(&owner_tok),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, owner_projects, _) = send(&app, "GET", "/v1/projects", Some(&owner_tok), None).await;
+    assert!(owner_projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["id"] != acme.as_str()));
+
+    // The root admin token still sees every org's projects.
+    let (_, all, _) = send(&app, "GET", "/v1/projects", Some(ROOT), None).await;
+    assert!(all
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == acme.as_str()));
 }

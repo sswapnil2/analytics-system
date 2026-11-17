@@ -12,7 +12,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 use parking_lot::Mutex;
 use pulse_exec::{
@@ -63,9 +63,10 @@ pub enum AuthPrincipal {
     ProjectAdmin {
         project_id: String,
     },
-    /// Dashboard user signed in with a `ps_` session token; single-org deployment, so authorized like `RootAdmin`.
+    /// Dashboard user signed in with a `ps_` session token. Sees only its organisation's projects.
     User {
         user_id: String,
+        org_id: String,
     },
 }
 
@@ -111,7 +112,7 @@ impl AuthPrincipal {
     fn actor_label(&self) -> String {
         match self {
             AuthPrincipal::RootAdmin => "root_admin".to_string(),
-            AuthPrincipal::User { user_id } => format!("user:{user_id}"),
+            AuthPrincipal::User { user_id, .. } => format!("user:{user_id}"),
             AuthPrincipal::ProjectAdmin { project_id } => format!("project_admin:{project_id}"),
         }
     }
@@ -151,7 +152,8 @@ pub struct ControlPlaneService {
     bootstrap_creds: Mutex<BootstrapCredentials>,
     /// Keyed by lowercase SHA-256 hex digest (`P0-02`).
     api_key_cache: DashMap<String, CachedApiKey>,
-    known_projects: DashSet<String>,
+    /// Project id → owning org id.
+    known_projects: DashMap<String, String>,
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     license_state: parking_lot::RwLock<Option<LicenseClaims>>,
     max_seen_ts_ms: AtomicI64,
@@ -219,7 +221,7 @@ impl ControlPlaneService {
                 generated_ingest_key: None,
             }),
             api_key_cache: DashMap::new(),
-            known_projects: DashSet::new(),
+            known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
             license_state: parking_lot::RwLock::new(None),
             max_seen_ts_ms: AtomicI64::new(0),
@@ -372,16 +374,18 @@ impl ControlPlaneService {
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
         self.known_projects.clear();
         for proj in projects {
-            self.known_projects.insert(proj.id.clone());
+            self.known_projects
+                .insert(proj.id.clone(), proj.org_id.clone());
             self.refresh_project_lexicon_cache(&proj.id).await?;
             self.refresh_project_virtual_catalog(&proj.id).await?;
         }
         Ok(())
     }
 
-    async fn ensure_known_project(&self, project_id: &str) -> Result<(), CtrlError> {
-        if self.known_projects.contains(project_id) {
-            return Ok(());
+    /// The project's org id; 404 when the project doesn't exist.
+    async fn project_org(&self, project_id: &str) -> Result<String, CtrlError> {
+        if let Some(org) = self.known_projects.get(project_id) {
+            return Ok(org.clone());
         }
         match self
             .meta
@@ -390,13 +394,51 @@ impl ControlPlaneService {
             .map_err(CtrlError::internal)?
         {
             Some(p) => {
-                self.known_projects.insert(p.id);
-                Ok(())
+                self.known_projects.insert(p.id, p.org_id.clone());
+                Ok(p.org_id)
             }
             None => Err(CtrlError::not_found(format!(
                 "project '{project_id}' not found"
             ))),
         }
+    }
+
+    /// The project a request targets: the one it names, or else the caller's own default (for a
+    /// user, the first project in their org). Then checks the caller may use it.
+    async fn resolve_and_check(
+        &self,
+        principal: &AuthPrincipal,
+        requested: Option<&str>,
+    ) -> Result<String, CtrlError> {
+        let requested = requested.filter(|s| !s.is_empty());
+        let pid = match (principal, requested) {
+            (AuthPrincipal::User { org_id, .. }, None) => self
+                .meta
+                .list_projects()
+                .await
+                .map_err(CtrlError::meta)?
+                .into_iter()
+                .find(|p| &p.org_id == org_id)
+                .map(|p| p.id)
+                .ok_or_else(|| CtrlError::not_found("your organisation has no projects yet"))?,
+            _ => principal.resolve_project(requested, &self.default_project_id)?,
+        };
+        self.authorize_and_check(principal, &pid).await?;
+        Ok(pid)
+    }
+
+    /// Projects the caller can see.
+    async fn visible_projects(&self, principal: &AuthPrincipal) -> Result<Vec<Project>, CtrlError> {
+        let all = self.meta.list_projects().await.map_err(CtrlError::meta)?;
+        Ok(match principal {
+            AuthPrincipal::RootAdmin => all,
+            AuthPrincipal::User { org_id, .. } => {
+                all.into_iter().filter(|p| &p.org_id == org_id).collect()
+            }
+            AuthPrincipal::ProjectAdmin { project_id } => {
+                all.into_iter().filter(|p| &p.id == project_id).collect()
+            }
+        })
     }
 
     async fn authorize_and_check(
@@ -405,7 +447,16 @@ impl ControlPlaneService {
         project_id: &str,
     ) -> Result<(), CtrlError> {
         principal.authorize_project(project_id)?;
-        self.ensure_known_project(project_id).await
+        let org = self.project_org(project_id).await?;
+        if let AuthPrincipal::User { org_id, .. } = principal {
+            if &org != org_id {
+                // Same answer as a missing project, so other orgs' project ids don't leak.
+                return Err(CtrlError::not_found(format!(
+                    "project '{project_id}' not found"
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn restore_license_and_byok(&self) -> Result<(), String> {
@@ -940,9 +991,13 @@ impl GovernanceProvider for ControlPlaneService {
 
         let out = apply_profile_ops(&mut props, &mut total_revenue, ops);
         if out.delete_requested {
-            let _ = self
-                .erase_user_dpdp(project_id, distinct_id, "sdk:$delete_user")
-                .await;
+            // This path is authenticated only by the public ingest key that ships in client code,
+            // so it must never erase data. Erasure goes through the admin-authenticated
+            // DELETE /v1/projects/:id/users/:distinct_id.
+            tracing::warn!(
+                project_id,
+                "ignored $delete_user from ingest; erase users with DELETE /v1/projects/:id/users/:distinct_id"
+            );
             return;
         }
         if !out.modified && existing.is_some() {
@@ -1040,14 +1095,14 @@ async fn require_admin_auth(
     };
     let session_user = if token.starts_with("ps_") {
         ctrl.meta
-            .get_session_user_id(&sha256_hex(token), Utc::now().timestamp_millis())
+            .get_session_user(&sha256_hex(token), Utc::now().timestamp_millis())
             .await
             .map_err(CtrlError::meta)?
     } else {
         None
     };
     let principal = match session_user {
-        Some(user_id) => AuthPrincipal::User { user_id },
+        Some((user_id, org_id)) => AuthPrincipal::User { user_id, org_id },
         None => ctrl.verify_admin_token(token)?,
     };
     req.extensions_mut().insert(principal);
@@ -1073,6 +1128,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/api-keys",
             get(handle_list_keys).post(handle_create_key),
+        )
+        .route(
+            "/v1/projects/:id/api-keys/:key_id",
+            delete(handle_revoke_key),
         )
         // Unified & per-project Query endpoints
         .route("/v1/query", post(handle_unified_query))
@@ -1307,11 +1366,9 @@ async fn handle_status(
     Extension(principal): Extension<AuthPrincipal>,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiRes<Value> {
-    let pid = principal.resolve_project(
-        q.get("project_id").map(|s| s.as_str()),
-        &ctrl.default_project_id,
-    )?;
-    ctrl.ensure_known_project(&pid).await?;
+    let pid = ctrl
+        .resolve_and_check(&principal, q.get("project_id").map(|s| s.as_str()))
+        .await?;
 
     let ps = ctrl
         .qengine
@@ -1341,14 +1398,7 @@ async fn handle_status(
             (0, 0, 0, 0)
         };
 
-    let all_projects = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
-    let projects: Vec<Project> = match &principal {
-        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => all_projects,
-        AuthPrincipal::ProjectAdmin { project_id } => all_projects
-            .into_iter()
-            .filter(|p| &p.id == project_id)
-            .collect(),
-    };
+    let projects = ctrl.visible_projects(&principal).await?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -1404,14 +1454,7 @@ async fn handle_list_projects(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiRes<Vec<Project>> {
-    let list = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
-    let scoped = match principal {
-        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => list,
-        AuthPrincipal::ProjectAdmin { project_id } => {
-            list.into_iter().filter(|p| p.id == project_id).collect()
-        }
-    };
-    Ok(Json(scoped))
+    Ok(Json(ctrl.visible_projects(&principal).await?))
 }
 
 #[derive(Deserialize)]
@@ -1426,77 +1469,91 @@ async fn handle_create_project(
     Extension(principal): Extension<AuthPrincipal>,
     Json(req): Json<CreateProjectReq>,
 ) -> ApiRes<Value> {
-    if !matches!(
-        principal,
-        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. }
-    ) {
-        return Err(CtrlError::forbidden(
-            "creating projects requires root admin token",
-        ));
-    }
+    let org_id = match &principal {
+        AuthPrincipal::RootAdmin => "org_default".to_string(),
+        AuthPrincipal::User { org_id, .. } => org_id.clone(),
+        AuthPrincipal::ProjectAdmin { .. } => {
+            return Err(CtrlError::forbidden(
+                "creating projects requires root admin token",
+            ))
+        }
+    };
     if req.id.is_some() {
         return Err(CtrlError::bad(
             "project id is generated by the server and must not be client-supplied",
         ));
     }
-    let name = req.name.trim();
-    if name.is_empty() {
-        return Err(CtrlError::bad("project name must not be empty"));
-    }
+    let (proj, api_key) = ctrl
+        .create_project_in_org(&org_id, &req.name, req.timezone)
+        .await?;
+    Ok(Json(json!({ "project": proj, "api_key": api_key })))
+}
 
-    let now = Utc::now().timestamp_millis();
-    let id = format!("proj_{}", &Uuid::new_v4().simple().to_string()[..12]);
-    let proj = Project {
-        id: id.clone(),
-        org_id: "org_default".to_string(),
-        name: name.to_string(),
-        timezone: req.timezone.unwrap_or_else(|| "UTC".to_string()),
-        created_at_ms: now,
-    };
-    ctrl.meta
-        .insert_project(&proj)
-        .await
-        .map_err(CtrlError::meta)?;
-
-    let (plaintext_key, key_hash, key_prefix) = generate_random_api_key(KEY_ROLE_INGEST_AND_FLAGS);
-    let key = ApiKeyRecord {
-        id: format!("key_{}", &Uuid::new_v4().simple().to_string()[..12]),
-        key_hash: key_hash.clone(),
-        key_prefix,
-        project_id: id.clone(),
-        label: "Primary Ingest Key".to_string(),
-        role: KEY_ROLE_INGEST_AND_FLAGS.to_string(),
-        created_at_ms: now,
-        revoked: false,
-    };
-    ctrl.meta
-        .insert_api_key(&key)
-        .await
-        .map_err(CtrlError::meta)?;
-
-    // Incremental single-project cache registration (Section 6)
-    ctrl.known_projects.insert(id.clone());
-    ctrl.api_key_cache.insert(
-        key_hash,
-        CachedApiKey {
-            project_id: id.clone(),
-            role: key.role.clone(),
-        },
-    );
-    ctrl.refresh_project_lexicon_cache(&id)
-        .await
-        .map_err(CtrlError::internal)?;
-    ctrl.refresh_project_virtual_catalog(&id)
-        .await
-        .map_err(CtrlError::internal)?;
-
-    Ok(Json(json!({
-        "project": proj,
-        "api_key": CreatedApiKeyResponse {
-            record: key,
-            plaintext_key,
+impl ControlPlaneService {
+    /// Creates a project in `org_id` with its first ingest key (plaintext returned once).
+    async fn create_project_in_org(
+        &self,
+        org_id: &str,
+        name: &str,
+        timezone: Option<String>,
+    ) -> Result<(Project, CreatedApiKeyResponse), CtrlError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CtrlError::bad("project name must not be empty"));
         }
-    })))
+        let now = Utc::now().timestamp_millis();
+        let id = format!("proj_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let proj = Project {
+            id: id.clone(),
+            org_id: org_id.to_string(),
+            name: name.to_string(),
+            timezone: timezone.unwrap_or_else(|| "UTC".to_string()),
+            created_at_ms: now,
+        };
+        self.meta
+            .insert_project(&proj)
+            .await
+            .map_err(CtrlError::meta)?;
+
+        let (plaintext_key, key_hash, key_prefix) =
+            generate_random_api_key(KEY_ROLE_INGEST_AND_FLAGS);
+        let key = ApiKeyRecord {
+            id: format!("key_{}", &Uuid::new_v4().simple().to_string()[..12]),
+            key_hash: key_hash.clone(),
+            key_prefix,
+            project_id: id.clone(),
+            label: "Primary Ingest Key".to_string(),
+            role: KEY_ROLE_INGEST_AND_FLAGS.to_string(),
+            created_at_ms: now,
+            revoked: false,
+        };
+        self.meta
+            .insert_api_key(&key)
+            .await
+            .map_err(CtrlError::meta)?;
+
+        self.known_projects.insert(id.clone(), proj.org_id.clone());
+        self.api_key_cache.insert(
+            key_hash,
+            CachedApiKey {
+                project_id: id.clone(),
+                role: key.role.clone(),
+            },
+        );
+        self.refresh_project_lexicon_cache(&id)
+            .await
+            .map_err(CtrlError::internal)?;
+        self.refresh_project_virtual_catalog(&id)
+            .await
+            .map_err(CtrlError::internal)?;
+        Ok((
+            proj,
+            CreatedApiKeyResponse {
+                record: key,
+                plaintext_key,
+            },
+        ))
+    }
 }
 
 async fn handle_list_keys(
@@ -1511,6 +1568,29 @@ async fn handle_list_keys(
         .await
         .map_err(CtrlError::meta)?;
     Ok(Json(keys))
+}
+
+async fn handle_revoke_key(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, key_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let key = ctrl
+        .meta
+        .list_api_keys(Some(&id))
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|k| k.id == key_id)
+        .ok_or_else(|| CtrlError::not_found("api key not found"))?;
+    ctrl.meta
+        .revoke_api_key(&id, &key_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    // Other nodes drop it on their next cache reload.
+    ctrl.api_key_cache.remove(&key.key_hash);
+    Ok(Json(json!({"id": key_id, "revoked": true})))
 }
 
 #[derive(Deserialize)]
@@ -1600,8 +1680,7 @@ async fn handle_unified_query(
 ) -> ApiRes<Value> {
     let payload: Value = parse_json_body("query", &body)?;
     let req_pid = payload.get("project_id").and_then(|v| v.as_str());
-    let pid = principal.resolve_project(req_pid, &ctrl.default_project_id)?;
-    ctrl.ensure_known_project(&pid).await?;
+    let pid = ctrl.resolve_and_check(&principal, req_pid).await?;
 
     let kind = payload
         .get("kind")
@@ -1756,11 +1835,9 @@ async fn handle_get_sessions_default(
     Extension(principal): Extension<AuthPrincipal>,
     Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
-    let pid = principal.resolve_project(
-        params.get("project_id").map(|s| s.as_str()),
-        &ctrl.default_project_id,
-    )?;
-    ctrl.ensure_known_project(&pid).await?;
+    let pid = ctrl
+        .resolve_and_check(&principal, params.get("project_id").map(|s| s.as_str()))
+        .await?;
     let sq = session_query_from_params(&params);
     let res = ctrl
         .qengine
@@ -1775,8 +1852,7 @@ async fn handle_post_sessions_default(
     Extension(principal): Extension<AuthPrincipal>,
     Json(sq): Json<SessionSearchQuery>,
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
-    let pid = principal.resolve_project(None, &ctrl.default_project_id)?;
-    ctrl.ensure_known_project(&pid).await?;
+    let pid = ctrl.resolve_and_check(&principal, None).await?;
     let res = ctrl
         .qengine
         .search_sessions(&pid, &sq)
@@ -1823,11 +1899,9 @@ async fn handle_get_replay_default(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> std::result::Result<Response, CtrlError> {
-    let pid = principal.resolve_project(
-        params.get("project_id").map(|s| s.as_str()),
-        &ctrl.default_project_id,
-    )?;
-    ctrl.ensure_known_project(&pid).await?;
+    let pid = ctrl
+        .resolve_and_check(&principal, params.get("project_id").map(|s| s.as_str()))
+        .await?;
     serve_replay(&ctrl, &pid, &session_id, &headers, &params).await
 }
 
@@ -2316,7 +2390,7 @@ fn new_card_id() -> String {
 impl ControlPlaneService {
     /// Who to record as `created_by`: the user's email for sessions, otherwise `"admin token"`.
     async fn principal_label(&self, principal: &AuthPrincipal) -> Result<String, CtrlError> {
-        if let AuthPrincipal::User { user_id } = principal {
+        if let AuthPrincipal::User { user_id, .. } = principal {
             if let Some(u) = self
                 .meta
                 .get_user_by_id(user_id)
@@ -2953,8 +3027,7 @@ async fn handle_mcp(
     Json(req): Json<JsonRpcRequest>,
 ) -> std::result::Result<Response, CtrlError> {
     let header_pid = headers.get("x-pulse-project").and_then(|v| v.to_str().ok());
-    let bound_pid = principal.resolve_project(header_pid, &ctrl.default_project_id)?;
-    ctrl.ensure_known_project(&bound_pid).await?;
+    let bound_pid = ctrl.resolve_and_check(&principal, header_pid).await?;
     // JSON-RPC notifications (no `id`, e.g. `notifications/initialized`) get no response body;
     // MCP Streamable HTTP requires `202 Accepted`.
     if req.id.is_null() {
@@ -3118,7 +3191,7 @@ async fn handle_delete_user_profile(
     let who = match &principal {
         AuthPrincipal::RootAdmin => "root_admin",
         AuthPrincipal::ProjectAdmin { .. } => "project_admin",
-        AuthPrincipal::User { user_id } => user_id.as_str(),
+        AuthPrincipal::User { user_id, .. } => user_id.as_str(),
     };
     let rec = ctrl.erase_user_dpdp(&id, &distinct_id, who).await?;
     Ok(Json(rec))
@@ -3491,6 +3564,166 @@ async fn handle_get_revenue_summary(
     })))
 }
 
+const ALERT_OPERATORS: [&str; 4] = ["gt", "gte", "lt", "lte"];
+/// An alert looks at the last 24 hours and, while its condition holds, fires at most once per window.
+const ALERT_WINDOW_MS: i64 = 86_400_000;
+
+fn alert_condition_met(operator: &str, value: f64, threshold: f64) -> bool {
+    match operator {
+        "gt" => value > threshold,
+        "gte" => value >= threshold,
+        "lt" => value < threshold,
+        "lte" => value <= threshold,
+        _ => false,
+    }
+}
+
+impl ControlPlaneService {
+    /// Count of the alert's event over the last 24 hours.
+    async fn alert_value(&self, a: &AlertRule, now_ms: i64) -> f64 {
+        let iq = InsightsQuery {
+            time_range: TimeRange {
+                start_ts_ms: now_ms - ALERT_WINDOW_MS,
+                end_ts_ms: now_ms,
+            },
+            interval: pulse_exec::TimeInterval::Day,
+            series: vec![pulse_exec::InsightsSeriesSpec {
+                label: a.name.clone(),
+                event_name: a.event_name.clone(),
+                metric: pulse_exec::InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: Default::default(),
+            compare_previous_period: false,
+            formula: None,
+        };
+        self.qengine
+            .query_insights(&a.project_id, &iq)
+            .await
+            .ok()
+            .and_then(|r| r.series.first().and_then(|s| s.overall_value))
+            .unwrap_or(0.0)
+    }
+
+    /// Checks every alert rule, records when one fires, and posts a signed webhook for it.
+    /// `pulse-node` calls this on a timer.
+    // ponytail: every query-serving node runs this, so several query nodes each deliver; add a
+    // leader lease if you run more than one.
+    pub async fn evaluate_alerts(&self) {
+        let now_ms = Utc::now().timestamp_millis();
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(rules) = self.meta.list_alert_rules(&proj.id).await else {
+                continue;
+            };
+            for mut a in rules {
+                if a.last_triggered_ms
+                    .is_some_and(|t| now_ms - t < ALERT_WINDOW_MS)
+                {
+                    continue;
+                }
+                let value = self.alert_value(&a, now_ms).await;
+                if !alert_condition_met(&a.operator, value, a.threshold) {
+                    continue;
+                }
+                a.last_triggered_ms = Some(now_ms);
+                if let Err(e) = self.meta.upsert_alert_rule(&a).await {
+                    tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
+                    continue;
+                }
+                match self.deliver_alert(&a, value, now_ms).await {
+                    Ok(Some(status)) => {
+                        tracing::info!(alert_id = %a.id, %status, "alert fired, webhook delivered")
+                    }
+                    Ok(None) => {
+                        tracing::info!(alert_id = %a.id, "alert fired; no webhook configured")
+                    }
+                    Err(e) => tracing::warn!(alert_id = %a.id, "alert fired, webhook failed: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Posts the alert to its `webhook_url`, or to the project's webhook credential URL, signed with
+    /// that credential's secret. Needs the `webhook_alerts` licence feature and a webhook credential;
+    /// returns `Ok(None)` when either is missing.
+    async fn deliver_alert(
+        &self,
+        a: &AlertRule,
+        value: f64,
+        now_ms: i64,
+    ) -> Result<Option<reqwest::StatusCode>, String> {
+        if self
+            .require_commercial_feature(CommercialFeature::WebhookAlerts)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let Some(rec) = self
+            .meta
+            .get_byok_credential(&a.project_id, "webhook")
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
+        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
+        let signing_secret = webhook_signing_secret(&cfg)
+            .ok_or("webhook credential has no signing_secret")?
+            .to_string();
+        let url = a.webhook_url.clone().unwrap_or(cred_url);
+        let body = json!({
+            "event": "pulse.alert.triggered",
+            "project_id": a.project_id,
+            "alert": {
+                "id": a.id,
+                "name": a.name,
+                "event_name": a.event_name,
+                "operator": a.operator,
+                "threshold": a.threshold,
+            },
+            "value": value,
+            "window_ms": ALERT_WINDOW_MS,
+            "timestamp_ms": now_ms,
+        });
+        post_signed_webhook(&url, &signing_secret, &body)
+            .await
+            .map(Some)
+    }
+}
+
+/// POSTs `body` with `X-Pulse-Timestamp` and `X-Pulse-Signature-256` through the SSRF-pinned client.
+async fn post_signed_webhook(
+    url: &str,
+    signing_secret: &str,
+    body: &Value,
+) -> Result<reqwest::StatusCode, String> {
+    let (parsed, client) =
+        crate::copilot::pinned_outbound_client(url, std::time::Duration::from_secs(10))
+            .await
+            .map_err(|e| format!("webhook URL blocked by SSRF policy: {e}"))?;
+    let body_bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let ts = Utc::now().timestamp().to_string();
+    let sig_hdr = sign_webhook(signing_secret, &ts, &body_bytes);
+    let resp = client
+        .post(parsed.as_str())
+        .header("Content-Type", "application/json")
+        .header("X-Pulse-Timestamp", ts)
+        .header("X-Pulse-Signature-256", sig_hdr)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("webhook delivery failed: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("webhook endpoint returned HTTP {}", resp.status()));
+    }
+    Ok(resp.status())
+}
+
 async fn handle_list_alerts(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -3504,41 +3737,10 @@ async fn handle_list_alerts(
         .map_err(CtrlError::meta)?;
 
     let now_ms = Utc::now().timestamp_millis();
-    let range = TimeRange {
-        start_ts_ms: now_ms - 86_400_000,
-        end_ts_ms: now_ms,
-    };
     let mut out = Vec::with_capacity(alerts.len());
-    for mut a in alerts {
-        let iq = InsightsQuery {
-            time_range: range,
-            interval: pulse_exec::TimeInterval::Day,
-            series: vec![pulse_exec::InsightsSeriesSpec {
-                label: a.name.clone(),
-                event_name: a.event_name.clone(),
-                metric: pulse_exec::InsightsMetric::Totals,
-                filters: Vec::new(),
-            }],
-            breakdown_by: Vec::new(),
-            global_filter: Default::default(),
-            compare_previous_period: false,
-            formula: None,
-        };
-        let current_value = ctrl
-            .qengine
-            .query_insights(&id, &iq)
-            .await
-            .ok()
-            .and_then(|r| r.series.first().and_then(|s| s.overall_value))
-            .unwrap_or(0.0);
-        let triggered = match a.operator.as_str() {
-            "lt" => current_value < a.threshold,
-            "lte" => current_value <= a.threshold,
-            _ => current_value >= a.threshold,
-        };
-        if triggered {
-            a.last_triggered_ms = Some(now_ms);
-        }
+    for a in alerts {
+        let current_value = ctrl.alert_value(&a, now_ms).await;
+        let triggered = alert_condition_met(&a.operator, current_value, a.threshold);
         out.push(json!({
             "id": a.id,
             "project_id": a.project_id,
@@ -3581,6 +3783,17 @@ async fn handle_create_alert(
     if req.name.trim().is_empty() || req.event_name.trim().is_empty() {
         return Err(CtrlError::bad("alert name and event_name are required"));
     }
+    if !ALERT_OPERATORS.contains(&req.operator.as_str()) {
+        return Err(CtrlError::bad("operator must be one of: gt, gte, lt, lte"));
+    }
+    let webhook_url = req
+        .webhook_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(u) = &webhook_url {
+        validate_outbound_url_ssrf(u)
+            .map_err(|e| CtrlError::bad(format!("webhook_url rejected by SSRF policy: {e}")))?;
+    }
     let rec = AlertRule {
         id: format!("alr_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id,
@@ -3588,7 +3801,7 @@ async fn handle_create_alert(
         event_name: req.event_name.trim().to_string(),
         operator: req.operator,
         threshold: req.threshold,
-        webhook_url: req.webhook_url.filter(|s| !s.trim().is_empty()),
+        webhook_url,
         last_triggered_ms: None,
         created_at_ms: Utc::now().timestamp_millis(),
     };
@@ -4109,68 +4322,51 @@ async fn handle_verify_byok(
             format!("Verified connectivity to {url} ({entries} root entries visible)")
         }
         "webhook" => {
-            let (parsed, client) =
-                crate::copilot::pinned_outbound_client(&secret, std::time::Duration::from_secs(10))
-                    .await
-                    .map_err(|e| {
-                        CtrlError::bad(format!("webhook URL blocked by SSRF policy: {e}"))
-                    })?;
             let probe_body = json!({
                 "event": "pulse.webhook.verify",
                 "project_id": id,
                 "timestamp_ms": Utc::now().timestamp_millis(),
             });
-            let body_bytes = serde_json::to_vec(&probe_body).map_err(CtrlError::internal)?;
             let signing_secret = webhook_signing_secret(&cfg).ok_or_else(|| {
                 CtrlError::bad(
                     "webhook credential needs config_json.signing_secret (>= 16 chars); save it again",
                 )
             })?;
-            let ts = Utc::now().timestamp().to_string();
-            let sig_hdr = sign_webhook(signing_secret, &ts, &body_bytes);
-
-            let resp = client
-                .post(parsed.as_str())
-                .header("Content-Type", "application/json")
-                .header("X-Pulse-Timestamp", ts)
-                .header("X-Pulse-Signature-256", sig_hdr)
-                .body(body_bytes)
-                .send()
+            let status = post_signed_webhook(&secret, signing_secret, &probe_body)
                 .await
-                .map_err(|e| {
-                    CtrlError::bad_gateway(format!("webhook delivery failed: {}", e.without_url()))
-                })?;
-            if !resp.status().is_success() {
-                return Err(CtrlError::bad_gateway(format!(
-                    "webhook endpoint returned HTTP {}",
-                    resp.status()
-                )));
-            }
+                .map_err(CtrlError::bad_gateway)?;
+            let host = reqwest::Url::parse(&secret)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "webhook".to_string());
             format!(
-                "Delivered signed probe (HTTP {}) to {}",
-                resp.status().as_u16(),
-                parsed.host_str().unwrap_or("webhook")
+                "Delivered signed probe (HTTP {}) to {host}",
+                status.as_u16()
             )
         }
         _ => {
-            if secret.len() < 8 {
-                return Err(CtrlError::bad(
-                    "LLM API key appears too short (expected >= 8 characters)",
-                ));
-            }
-            if let Some(ep) = cfg
-                .get("endpoint")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                validate_outbound_url_ssrf(ep).map_err(|e| {
-                    CtrlError::bad(format!("LLM endpoint blocked by SSRF policy: {e}"))
-                })?;
-            }
+            // A real round trip: the same request the Copilot makes, with a one-line prompt.
+            let (model, endpoint) = crate::copilot::llm_model_and_endpoint(&rec.provider, &cfg);
+            crate::copilot::call_external_llm(
+                &rec.provider,
+                &model,
+                &secret,
+                endpoint.as_deref(),
+                "Reply with the single word OK.",
+                &json!({}),
+                &[],
+            )
+            .await
+            .map_err(|e| match e {
+                crate::copilot::CopilotError::BadRequest(m) => CtrlError::bad(m),
+                crate::copilot::CopilotError::Upstream(m) => CtrlError::bad_gateway(format!(
+                    "{} rejected the key or request: {m}",
+                    rec.provider
+                )),
+            })?;
             format!(
-                "Verified BYOK '{}' credential ({}) ready for AI Copilot",
-                rec.provider, rec.key_prefix_masked
+                "{} answered a test request with model {model}",
+                rec.provider
             )
         }
     };
@@ -4368,6 +4564,7 @@ mod cluster_admin_tests {
         assert!(AuthPrincipal::RootAdmin.require_cluster_admin().is_ok());
         let user = AuthPrincipal::User {
             user_id: "u1".into(),
+            org_id: "org_default".into(),
         };
         assert!(user.require_cluster_admin().is_err());
         let proj = AuthPrincipal::ProjectAdmin {

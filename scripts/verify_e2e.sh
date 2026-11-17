@@ -58,14 +58,7 @@ if ! curl -fsS "${BASE_URL}/healthz" >/dev/null 2>&1; then
   fi
 
   if [[ -z "$ADMIN_TOKEN" ]]; then
-    ADMIN_TOKEN="$(python3 - "${TMP_DATA_DIR}/node.log" <<'PY'
-import re, sys
-text = open(sys.argv[1], "r", encoding="utf-8", errors="replace").read()
-m = re.search(r"(sk_root_[A-Za-z0-9_]+)", text)
-assert m, f"failed to find generated sk_root_ token in boot log:\n{text}"
-print(m.group(1))
-PY
-)"
+    ADMIN_TOKEN="$(tr -d '[:space:]' <"${TMP_DATA_DIR}/root_admin_token")"
   fi
   if [[ -z "$API_KEY" ]]; then
     API_KEY="$(python3 - "${TMP_DATA_DIR}/node.log" <<'PY'

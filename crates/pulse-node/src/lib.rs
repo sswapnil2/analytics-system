@@ -271,12 +271,18 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
 
     let bootstrap_credentials = control.take_bootstrap_credentials();
     if let Some(tok) = &bootstrap_credentials.generated_admin_token {
-        info!("Generated one-time Root Admin Bearer Token (save now, never stored in plaintext): {tok}");
+        // Logs get shipped and shared, so the root token goes to an owner-only file instead.
+        let path = config.data_dir.join("root_admin_token");
+        write_owner_only(&path, tok)?;
+        info!(
+            "Generated the root admin token and wrote it to {} (owner-only). Save it somewhere safe, then delete the file.",
+            path.display()
+        );
     }
     if let Some(pk) = &bootstrap_credentials.generated_ingest_key {
         info!(
             project_id = %config.default_project_id,
-            "Generated one-time Public Ingest Key (save now, never stored in plaintext): {pk}"
+            "Generated the public ingest key for client SDKs: {pk}"
         );
     }
 
@@ -294,6 +300,21 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     }
 
     let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
+    if config.role.serves_query_and_admin() {
+        let alerts_control = control.clone();
+        let mut alerts_shutdown = shutdown_bg_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => alerts_control.evaluate_alerts().await,
+                    changed = alerts_shutdown.changed() => {
+                        if changed.is_err() || *alerts_shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
     let _bg_handle = if config.role == NodeRole::All {
         storage.spawn_background_maintenance(shutdown_bg_rx)
     } else {
@@ -1005,4 +1026,16 @@ mod tests {
         query_node.shutdown().await;
         ingest_node.shutdown().await;
     }
+}
+
+fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
 }

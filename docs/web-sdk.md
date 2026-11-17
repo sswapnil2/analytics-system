@@ -57,6 +57,9 @@ User and group profiles: `setUserProperties`, `setUserPropertiesOnce`, `incremen
 `unsetUserProperties`, `appendUserProperty`, `unionUserProperty`, `removeUserProperty`, `deleteUser`,
 `setGroup(type, id)`, `setGroupProperties`.
 
+`deleteUser()` only forgets the user on this device. The ingest key is public, so it can't erase
+server-side data; erase a user with the admin API, `DELETE /v1/projects/:id/users/:distinct_id`.
+
 Consent: `optOut()`, `optIn()`, `hasOptedOut()`, `clearOptInOut()`.
 
 Delivery: `flush()` sends now; `flushBeacon()` sends with `keepalive` on page hide (wired up for you);

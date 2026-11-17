@@ -219,8 +219,7 @@ async fn mock_llm_handler(axum::Json(req): axum::Json<Value>) -> impl IntoRespon
 async fn test_full_oss_and_commercial_suite() {
     let vendor = TestVendorKeys::generate();
     let tmp = tempfile::tempdir().unwrap();
-    let (ctrl_app, ingest_app, _ctrl, storage, enc_store) =
-        setup_full(tmp.path(), ROOT, None).await;
+    let (ctrl_app, ingest_app, ctrl, storage, enc_store) = setup_full(tmp.path(), ROOT, None).await;
 
     // =========================================================================
     // 1. OPEN-SOURCE ENCRYPTION AT REST (Available in Community without license)
@@ -536,6 +535,37 @@ async fn test_full_oss_and_commercial_suite() {
         .unwrap()
         .starts_with("sha256="));
 
+    // Alerts fire on their own and deliver to the same signed webhook. App_Open happened twice in
+    // the last day: "gt 1" fires, "gt 2" must not (2 is not greater than 2).
+    for (name, threshold) in [("Opens above one", 1.0), ("Opens above two", 2.0)] {
+        let (st, _) = send_admin_json(
+            &ctrl_app,
+            "POST",
+            "/v1/projects/proj_byok/alerts",
+            Some(json!({ "name": name, "event_name": "App_Open", "operator": "gt", "threshold": threshold })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    ctrl.evaluate_alerts().await;
+    assert_eq!(webhook_state.received_count.load(Ordering::Relaxed), 2);
+    ctrl.evaluate_alerts().await;
+    assert_eq!(
+        webhook_state.received_count.load(Ordering::Relaxed),
+        2,
+        "an alert fires once per window, not on every check"
+    );
+    let (_, alerts) =
+        send_admin_json(&ctrl_app, "GET", "/v1/projects/proj_byok/alerts", None).await;
+    let fired: Vec<_> = alerts
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["last_triggered_ms"].is_i64())
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(fired, vec!["Opens above one"]);
+
     // =========================================================================
     // 6. REAL CLOUD WAREHOUSE EXPORT (NDJSON)
     // =========================================================================
@@ -578,6 +608,20 @@ async fn test_full_oss_and_commercial_suite() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+
+    // Verify makes a real call to the provider (here the mock), not a length check.
+    let (st, v) = send_admin_json(
+        &ctrl_app,
+        "POST",
+        "/v1/projects/proj_byok/byok-verify",
+        Some(json!({ "category": "llm" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["details"]
+        .as_str()
+        .unwrap()
+        .contains("answered a test request"));
 
     let (st, copilot_res) = send_admin_json(
         &ctrl_app,

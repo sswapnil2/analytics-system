@@ -293,8 +293,7 @@ impl MetaStore {
             "INSERT INTO api_keys (id, key_hash, key_prefix, project_id, label, role, created_at_ms, revoked)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(key_hash) DO UPDATE SET
-                label = excluded.label,
-                revoked = excluded.revoked
+                label = excluded.label
              WHERE api_keys.project_id = excluded.project_id",
             &rec.id,
             &rec.key_hash,
@@ -311,6 +310,18 @@ impl MetaStore {
             ));
         }
         Ok(())
+    }
+
+    /// Revokes a key for good. Re-inserting the same key later (a restart with it still
+    /// configured) does not bring it back, because the upsert above never clears `revoked`.
+    pub async fn revoke_api_key(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "UPDATE api_keys SET revoked = 1 WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
     }
 
     pub async fn list_api_keys(
@@ -1054,8 +1065,8 @@ impl MetaStore {
     pub async fn insert_user(&self, u: &User) -> Result<(), MetaError> {
         let affected = db_exec!(
             self,
-            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms, org_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
             &u.id,
             &u.email,
@@ -1063,6 +1074,7 @@ impl MetaStore {
             &u.password_hash,
             &u.google_sub,
             u.created_at_ms,
+            &u.org_id,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(
@@ -1079,7 +1091,7 @@ impl MetaStore {
         value: &str,
     ) -> Result<Option<User>, MetaError> {
         let sql = format!(
-            "SELECT id, email, name, password_hash, google_sub, created_at_ms FROM users WHERE {column} = ?"
+            "SELECT id, email, name, password_hash, google_sub, created_at_ms, org_id FROM users WHERE {column} = ?"
         );
         let user = db_map_opt!(
             self,
@@ -1092,6 +1104,7 @@ impl MetaStore {
                     password_hash: r.get("password_hash"),
                     google_sub: r.get("google_sub"),
                     created_at_ms: r.get("created_at_ms"),
+                    org_id: r.get("org_id"),
                 }
             },
             value,
@@ -1141,20 +1154,47 @@ impl MetaStore {
     }
 
     /// Returns the user id of a live (unexpired) session whose user still exists.
-    pub async fn get_session_user_id(
+    /// The signed-in user's id and organisation for a live session.
+    pub async fn get_session_user(
         &self,
         token_hash: &str,
         now_ms: i64,
-    ) -> Result<Option<String>, MetaError> {
-        let uid = db_map_opt!(
+    ) -> Result<Option<(String, String)>, MetaError> {
+        let row = db_map_opt!(
             self,
-            "SELECT s.user_id AS user_id FROM user_sessions s JOIN users u ON u.id = s.user_id
+            "SELECT s.user_id AS user_id, u.org_id AS org_id FROM user_sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = ? AND s.expires_at_ms > ?",
-            |r| { r.get::<String, _>("user_id") },
+            |r| { (r.get::<String, _>("user_id"), r.get::<String, _>("org_id")) },
             token_hash,
             now_ms,
         );
-        Ok(uid)
+        Ok(row)
+    }
+
+    pub async fn insert_org(
+        &self,
+        id: &str,
+        name: &str,
+        created_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO orgs (id, name, created_at_ms) VALUES (?, ?, ?)",
+            id,
+            name,
+            created_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn get_org_name(&self, id: &str) -> Result<Option<String>, MetaError> {
+        let name = db_map_opt!(
+            self,
+            "SELECT name FROM orgs WHERE id = ?",
+            |r| { r.get::<String, _>("name") },
+            id,
+        );
+        Ok(name)
     }
 
     pub async fn delete_session(&self, token_hash: &str) -> Result<(), MetaError> {

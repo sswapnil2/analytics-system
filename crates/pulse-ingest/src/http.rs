@@ -17,7 +17,8 @@ pub fn build_ingest_router(service: Arc<IngestService>) -> Router {
         .route("/v1/engage", post(handle_engage))
         .route("/v1/groups", post(handle_groups))
         .route("/v1/replay/chunk", post(handle_replay_chunk))
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // ponytail: one cap for every ingest route; the SDKs send batches and replay chunks far below it.
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(service)
 }
 

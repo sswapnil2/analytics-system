@@ -25,15 +25,19 @@ npm --prefix web ci && npm --prefix web run build
 cargo build --release --bin pulse-node
 ```
 
-### 2. Boot with the Pre-Seeded Indian Fintech Dataset
+### 2. Start a node
 
 ```bash
-PORT=8080 PULSE_DEFAULT_PROJECT=proj_fintech_in ./target/release/pulse-node --seed --no-quic
+PORT=8080 ./target/release/pulse-node --no-quic
 ```
 
-Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser:
-- On first launch with a seeded database, sign in with the generated `sk_root_...` admin token printed in startup logs, or create the first workspace account from `/#/signup`.
-- Empty projects display an in-app **Send your first event** quickstart panel (also accessible anytime from the terminal icon in the sidebar footer).
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080) and create the first account at `/#/signup`. It asks for a setup code: the `sk_root_…` root admin token in `pulse_data/root_admin_token` (or the `PULSE_ADMIN_TOKEN` you set), so nobody else can claim a fresh node. The Studio then walks you through sending your first event. Anyone who signs up after that gets their own organisation and can't see yours. See [accounts and organisations](docs/README.md#accounts-and-organisations).
+
+To explore with demo data instead, add `--seed`. It loads a sample fintech app (`PULSE_DEFAULT_PROJECT=proj_fintech_in` names its project).
+
+### Community and commercial features
+
+Analytics, replay, flags, cohorts, privacy tools and the MCP server are Apache-2.0 with no event or seat limits. The built-in AI Copilot, warehouse export, enterprise audit log and webhook alerts check for a commercial licence key (`POST /v1/license`) and return HTTP 402 without one.
 
 ## High-Availability & Node Roles
 
