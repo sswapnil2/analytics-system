@@ -4248,6 +4248,7 @@ dependencies = [
  "pulse-identity",
  "pulse-wire",
  "rand 0.8.8",
+ "reqwest",
  "ring",
  "roaring",
  "serde",

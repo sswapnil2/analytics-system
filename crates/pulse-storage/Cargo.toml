@@ -25,6 +25,7 @@ hex.workspace = true
 moka.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
 ring.workspace = true
 roaring.workspace = true
 serde.workspace = true
