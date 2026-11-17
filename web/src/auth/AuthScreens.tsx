@@ -208,7 +208,7 @@ export const SignInScreen: React.FC<{ onSignedIn: () => void; reason?: string; g
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Sign in</h2>
           <p className="text-[0.9375rem] text-muted">
-            {showToken ? "Use the admin token from the server log. It starts with sk_." : "Welcome back. Use your work account."}
+            {showToken ? "Use the root admin token in the root_admin_token file in the server's data directory. It starts with sk_." : "Welcome back. Use your work account."}
           </p>
         </div>
 
@@ -382,8 +382,8 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
             </p>
           </div>
           <p className="rounded-lg bg-warn-soft px-3 py-2.5 text-sm text-warn">
-            This Pulse server doesn't send email. The link is written to the server log, so ask whoever runs it to pass
-            it on.
+            This Pulse server doesn't send email. The link is written to the outbox file in the server's data directory, so ask
+            whoever runs it to pass it on.
           </p>
           <a href="#/signin" className="text-sm text-muted hover:text-ink hover:underline">
             Back to sign in
@@ -723,8 +723,8 @@ export const ForgotPasswordScreen: React.FC = () => {
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Reset your password</h2>
           <p className="text-[0.9375rem] text-muted">
-            This server doesn't send email. If the account exists, a reset link is written to the server log, and an
-            admin can also give you one from Settings.
+            This server doesn't send email. If the account exists, a reset link is written to the outbox file in the
+            server's data directory, and an admin can also give you one from Settings.
           </p>
         </div>
         {sent ? (

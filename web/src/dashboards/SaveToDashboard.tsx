@@ -4,6 +4,7 @@ import { api, Dashboard, ReportKind } from "../api/client";
 import { btn, field, fieldLabel } from "../components/ui";
 import { errorMessage } from "../lib/format";
 import type { RangeSel } from "./ReportCard";
+import { useAccess } from "../auth/access";
 
 const NEW = "__new__";
 
@@ -18,6 +19,7 @@ export const SaveToDashboard: React.FC<{
   defaultName: string;
   query: () => Record<string, unknown>;
 }> = ({ projectId, kind, defaultName, query }) => {
+  const { canEdit } = useAccess();
   const [open, setOpen] = useState(false);
   const [dashboards, setDashboards] = useState<Dashboard[] | null>(null);
   const [name, setName] = useState(defaultName);
@@ -84,6 +86,7 @@ export const SaveToDashboard: React.FC<{
     }
   };
 
+  if (!canEdit) return null;
   return (
     <div className="relative" ref={panelRef}>
       <button type="button" onClick={() => setOpen((v) => !v)} className={btn.secondary} aria-expanded={open}>

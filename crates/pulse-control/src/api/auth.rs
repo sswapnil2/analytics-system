@@ -102,11 +102,40 @@ pub(super) struct AuthState {
     login_codes: DashMap<String, (String, i64)>,
     /// Lowercased email -> recent failed login timestamps.
     login_failures: DashMap<String, Vec<i64>>,
+    /// Lowercased email -> when its last password-reset link was made.
+    pub(super) reset_requests: DashMap<String, i64>,
 }
 
 impl ControlPlaneService {
     pub fn set_auth_config(&self, cfg: AuthConfig) {
         *self.auth_cfg.write() = cfg;
+    }
+
+    /// Where sign-up verification and password-reset links are written. `pulse-node` sets
+    /// `<data dir>/outbox`; without it those links are dropped.
+    pub fn set_outbox_path(&self, path: std::path::PathBuf) {
+        *self.outbox_path.write() = Some(path);
+    }
+
+    /// Pulse has no mailer. A link that proves an email address goes to the owner-only outbox file,
+    /// never to the log: anyone who can read shipped or shared logs must not be able to use it.
+    pub(super) fn deliver_link(&self, kind: &str, email: &str, url: &str) {
+        let Some(path) = self.outbox_path.read().clone() else {
+            tracing::warn!(
+                kind,
+                "no outbox configured; a {kind} link for an account was not delivered"
+            );
+            return;
+        };
+        let line = format!("{} {kind} {email} {url}\n", Utc::now().to_rfc3339());
+        match append_owner_only(&path, &line) {
+            Ok(()) => tracing::info!(kind, "{kind} link written to {}", path.display()),
+            Err(e) => tracing::warn!(
+                kind,
+                "couldn't write {kind} link to {}: {e}",
+                path.display()
+            ),
+        }
     }
 
     /// Allowed when the email's domain is on the allowlist, or for the very first account when the
@@ -157,17 +186,20 @@ impl ControlPlaneService {
     /// A new organisation is created only now, after the account row exists, so a sign-up that
     /// loses a race on its email never leaves an empty organisation behind. Whoever creates an
     /// org owns it; the first account in the default org owns it; later ones are members.
-    pub(super) async fn assign_org(&self, user_id: &str, org: SignupOrg) -> Result<(String, Role), CtrlError> {
+    pub(super) async fn assign_org(
+        &self,
+        user_id: &str,
+        org: SignupOrg,
+    ) -> Result<(String, Role), CtrlError> {
         let (org_id, role) = match org {
             SignupOrg::Default => {
-                let empty = self
+                // One statement decides owner-or-member, so two first sign-ups can't both own it.
+                let role = self
                     .meta
-                    .list_org_users("org_default")
+                    .join_default_org(user_id)
                     .await
-                    .map_err(CtrlError::meta)?
-                    .is_empty();
-                let role = if empty { Role::Owner } else { Role::Member };
-                ("org_default".to_string(), role)
+                    .map_err(CtrlError::meta)?;
+                return Ok(("org_default".to_string(), role));
             }
             SignupOrg::New(name) => {
                 let id = format!("org_{}", &Uuid::new_v4().simple().to_string()[..12]);
@@ -203,11 +235,18 @@ impl ControlPlaneService {
         }
         user.org_id = PENDING_ORG.to_string();
         user.role = Role::Viewer;
-        self.meta.insert_user(&user).await.map_err(CtrlError::meta)?;
+        self.meta
+            .insert_user(&user)
+            .await
+            .map_err(CtrlError::meta)?;
         Ok(user)
     }
 
-    async fn create_session(&self, user_id: &str, headers: &HeaderMap) -> Result<String, CtrlError> {
+    async fn create_session(
+        &self,
+        user_id: &str,
+        headers: &HeaderMap,
+    ) -> Result<String, CtrlError> {
         let token = format!("ps_{}", random_hex());
         let now = now_ms();
         let ua = headers
@@ -215,7 +254,13 @@ impl ControlPlaneService {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.chars().take(256).collect::<String>());
         self.meta
-            .insert_session(&sha256_hex(&token), user_id, now, now + SESSION_TTL_MS, ua.as_deref())
+            .insert_session(
+                &sha256_hex(&token),
+                user_id,
+                now,
+                now + SESSION_TTL_MS,
+                ua.as_deref(),
+            )
             .await
             .map_err(CtrlError::meta)?;
         Ok(token)
@@ -223,8 +268,13 @@ impl ControlPlaneService {
 
     pub(super) async fn session_response(&self, user: &User, headers: &HeaderMap) -> ApiRes<Value> {
         let token = self.create_session(&user.id, headers).await?;
-        self.record_enterprise_audit(&format!("user:{}", user.id), "auth.login", &format!("org:{}", user.org_id), json!({ "email": user.email }))
-            .await;
+        self.record_enterprise_audit(
+            &format!("user:{}", user.id),
+            "auth.login",
+            &format!("org:{}", user.org_id),
+            json!({ "email": user.email }),
+        )
+        .await;
         Ok(Json(json!({ "token": token, "user": user_json(user) })))
     }
 }
@@ -247,6 +297,15 @@ pub(super) fn public_auth_router() -> Router<Arc<ControlPlaneService>> {
         .route("/v1/auth/google/start", get(handle_google_start))
         .route("/v1/auth/google/callback", get(handle_google_callback))
         .layer(DefaultBodyLimit::max(16 * 1024))
+}
+
+fn append_owner_only(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(line.as_bytes())
 }
 
 pub(super) fn now_ms() -> i64 {
@@ -448,13 +507,20 @@ async fn handle_signup(
         SignupOrg::Default => None,
     };
     ctrl.meta
-        .insert_email_verification(&sha256_hex(&token), &user.id, org_name, now_ms() + VERIFY_TTL_MS)
+        .insert_email_verification(
+            &sha256_hex(&token),
+            &user.id,
+            org_name,
+            now_ms() + VERIFY_TTL_MS,
+        )
         .await
         .map_err(CtrlError::meta)?;
     let url = format!("{}/#/verify/{token}", ctrl.auth_cfg.read().public_url);
-    // ponytail: the log is the mailer. Add SMTP when someone needs links delivered.
-    tracing::info!(email = %user.email, "email verification link: {url}");
-    Ok(Json(json!({ "verification_required": true, "email": user.email })))
+    // ponytail: the outbox file is the mailer. Add SMTP when someone needs links delivered.
+    ctrl.deliver_link("verify", &user.email, &url);
+    Ok(Json(
+        json!({ "verification_required": true, "email": user.email }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -514,9 +580,21 @@ async fn handle_login(
             if failures.len() >= MAX_PENDING_ENTRIES {
                 failures.retain(|_, ts| ts.iter().any(|t| *t > now - LOGIN_FAILURE_WINDOW_MS));
             }
-            failures.entry(email.clone()).or_default().push(now);
-            ctrl.record_enterprise_audit("anonymous", "auth.login_failed", "auth", json!({ "email": email }))
+            let count = {
+                let mut ts = failures.entry(email.clone()).or_default();
+                ts.push(now);
+                ts.len()
+            };
+            // One audit entry when an email gets locked out, not one per guess.
+            if count == MAX_LOGIN_FAILURES {
+                ctrl.record_enterprise_audit(
+                    "anonymous",
+                    "auth.login_throttled",
+                    "auth",
+                    json!({ "email": email, "failures": count }),
+                )
                 .await;
+            }
             Err(CtrlError::unauthorized(BAD_LOGIN))
         }
     }
@@ -723,8 +801,13 @@ async fn google_callback(
             role: Role::Viewer,
         };
         // Google has already verified the email, so the account joins its organisation at once.
-        let user = ctrl.insert_pending_user(user).await.map_err(|_| "google_token")?;
-        ctrl.assign_org(&user.id, org).await.map_err(|_| "google_token")?;
+        let user = ctrl
+            .insert_pending_user(user)
+            .await
+            .map_err(|_| "google_token")?;
+        ctrl.assign_org(&user.id, org)
+            .await
+            .map_err(|_| "google_token")?;
         user.id
     };
 

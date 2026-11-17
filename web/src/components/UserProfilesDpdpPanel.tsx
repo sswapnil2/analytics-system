@@ -6,6 +6,7 @@ import {
   UserDetailResponse,
   UserProfileItem,
 } from "../api/client";
+import { useAccess } from "../auth/access";
 import {
   EmptyState,
   ErrorNotice,
@@ -43,6 +44,7 @@ function formatRevenue(amount: number, props?: Record<string, unknown>): string 
 export const UserProfilesDpdpPanel: React.FC<{ projectId: string }> = ({
   projectId,
 }) => {
+  const { canAdmin } = useAccess();
   const [search, setSearch] = useState("");
   const [users, setUsers] = useState<UserProfileItem[]>([]);
   const [deletions, setDeletions] = useState<DeletionAuditRecord[]>([]);
@@ -271,7 +273,7 @@ export const UserProfilesDpdpPanel: React.FC<{ projectId: string }> = ({
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    {canAdmin && <div className="flex items-center gap-2">
                       {!confirmErase ? (
                         <button
                           type="button"
@@ -305,7 +307,7 @@ export const UserProfilesDpdpPanel: React.FC<{ projectId: string }> = ({
                           </button>
                         </div>
                       )}
-                    </div>
+                    </div>}
                   </div>
 
                   <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">

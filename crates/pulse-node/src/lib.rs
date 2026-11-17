@@ -269,6 +269,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
 
+    control.set_outbox_path(config.data_dir.join("outbox"));
     let bootstrap_credentials = control.take_bootstrap_credentials();
     if let Some(tok) = &bootstrap_credentials.generated_admin_token {
         // Logs get shipped and shared, so the root token goes to an owner-only file instead.

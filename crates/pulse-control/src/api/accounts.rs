@@ -23,6 +23,8 @@ use crate::models::{sha256_hex, Role, User};
 
 const INVITE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const RESET_TTL_MS: i64 = 60 * 60 * 1000;
+/// One self-service reset link per email per window.
+const RESET_REQUEST_INTERVAL_MS: i64 = 5 * 60 * 1000;
 
 /// The lowest role allowed to call `method path`, where `path` is the route pattern
 /// (`/v1/projects/:id/...`). Reads and queries need viewer, admin paths admin, renaming the org
@@ -38,6 +40,8 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         "/v1/projects/:id/import",
         "/v1/projects/:id/export",
         "/v1/projects/:id/export/warehouse",
+        // Bulk download of users and their properties, like /export.
+        "/v1/projects/:id/cohorts/:cohort_id/export",
         "/v1/projects/:id/deletions",
         "/v1/org/invites",
         "/v1/org/invites/:invite_id",
@@ -83,15 +87,24 @@ pub(super) fn account_router() -> Router<Arc<ControlPlaneService>> {
         .route("/v1/auth/password", post(handle_change_password))
         .route("/v1/auth/sessions", get(handle_list_sessions))
         .route("/v1/auth/sessions/:sid", delete(handle_revoke_session))
-        .route("/v1/auth/sessions/revoke-others", post(handle_revoke_other_sessions))
+        .route(
+            "/v1/auth/sessions/revoke-others",
+            post(handle_revoke_other_sessions),
+        )
         .route("/v1/org", get(handle_get_org).patch(handle_rename_org))
         .route("/v1/org/members", get(handle_list_members))
         .route(
             "/v1/org/members/:user_id",
             patch(handle_set_member_role).delete(handle_remove_member),
         )
-        .route("/v1/org/members/:user_id/password-reset", post(handle_admin_reset_link))
-        .route("/v1/org/invites", get(handle_list_invites).post(handle_create_invite))
+        .route(
+            "/v1/org/members/:user_id/password-reset",
+            post(handle_admin_reset_link),
+        )
+        .route(
+            "/v1/org/invites",
+            get(handle_list_invites).post(handle_create_invite),
+        )
         .route("/v1/org/invites/:invite_id", delete(handle_delete_invite))
         .route("/v1/auth/join-org", post(handle_join_org))
 }
@@ -101,7 +114,10 @@ pub(super) fn public_router() -> Router<Arc<ControlPlaneService>> {
     Router::new()
         .route("/v1/auth/invites/:token", get(handle_get_invite))
         .route("/v1/auth/invites/accept", post(handle_accept_invite))
-        .route("/v1/auth/password-reset/request", post(handle_request_reset))
+        .route(
+            "/v1/auth/password-reset/request",
+            post(handle_request_reset),
+        )
         .route("/v1/auth/password-reset", post(handle_reset_password))
         .route("/v1/auth/verify-email", post(handle_verify_email))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -111,7 +127,9 @@ fn check_password(pw: &str) -> Result<(), CtrlError> {
     if (10..=256).contains(&pw.chars().count()) {
         Ok(())
     } else {
-        Err(CtrlError::bad("password must be between 10 and 256 characters"))
+        Err(CtrlError::bad(
+            "password must be between 10 and 256 characters",
+        ))
     }
 }
 
@@ -125,7 +143,9 @@ async fn hash(pw: String) -> Result<String, CtrlError> {
 fn session_user(p: &AuthPrincipal) -> Result<&str, CtrlError> {
     match p {
         AuthPrincipal::User { user_id, .. } => Ok(user_id),
-        _ => Err(CtrlError::not_found("this credential is not a user session")),
+        _ => Err(CtrlError::not_found(
+            "this credential is not a user session",
+        )),
     }
 }
 
@@ -172,7 +192,9 @@ impl ControlPlaneService {
             .filter(|u| u.org_id == org_id)
             .ok_or_else(|| CtrlError::not_found("member not found"))?;
         if matches!(p, AuthPrincipal::User { user_id: me, .. } if me == user_id) {
-            return Err(CtrlError::forbidden("you can't change your own role or remove yourself"));
+            return Err(CtrlError::forbidden(
+                "you can't change your own role or remove yourself",
+            ));
         }
         if !p.role().outranks(target.role) {
             return Err(CtrlError::forbidden(format!(
@@ -194,9 +216,14 @@ impl ControlPlaneService {
             .count())
     }
 
-    /// Creates a one-hour reset token for `user_id` and returns the Studio link for it.
+    /// Creates a one-hour reset token for `user_id` and returns the Studio link for it. Any
+    /// earlier unused link for the account stops working, so at most one is live.
     async fn new_reset_link(&self, user_id: &str) -> Result<(String, String), CtrlError> {
         let token = random_hex();
+        self.meta
+            .delete_password_resets(user_id)
+            .await
+            .map_err(CtrlError::meta)?;
         self.meta
             .insert_password_reset(&sha256_hex(&token), user_id, now_ms() + RESET_TTL_MS)
             .await
@@ -259,16 +286,31 @@ async fn handle_change_password(
         return Err(CtrlError::forbidden("current password is incorrect"));
     }
     let phc = hash(req.new_password).await?;
-    ctrl.meta.update_user_password(uid, &phc).await.map_err(CtrlError::meta)?;
+    ctrl.meta
+        .update_user_password(uid, &phc)
+        .await
+        .map_err(CtrlError::meta)?;
+    // A reset link someone else holds must not undo this change.
+    ctrl.meta
+        .delete_password_resets(uid)
+        .await
+        .map_err(CtrlError::meta)?;
     let keep = current_hash(&headers);
     let revoked = ctrl
         .meta
         .delete_user_sessions(uid, None, keep.as_deref())
         .await
         .map_err(CtrlError::meta)?;
-    ctrl.record_enterprise_audit(&p.actor_label(), "auth.password_changed", &format!("user:{uid}"), json!({ "other_sessions_signed_out": revoked }))
-        .await;
-    Ok(Json(json!({ "status": "ok", "other_sessions_signed_out": revoked })))
+    ctrl.record_enterprise_audit(
+        &p.actor_label(),
+        "auth.password_changed",
+        &format!("user:{uid}"),
+        json!({ "other_sessions_signed_out": revoked }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "status": "ok", "other_sessions_signed_out": revoked }),
+    ))
 }
 
 async fn handle_list_sessions(
@@ -278,7 +320,11 @@ async fn handle_list_sessions(
 ) -> ApiRes<Value> {
     let uid = session_user(&p)?;
     let current = current_hash(&headers);
-    let rows = ctrl.meta.list_sessions(uid, now_ms()).await.map_err(CtrlError::meta)?;
+    let rows = ctrl
+        .meta
+        .list_sessions(uid, now_ms())
+        .await
+        .map_err(CtrlError::meta)?;
     let out: Vec<Value> = rows
         .into_iter()
         .map(|(hash, info)| {
@@ -332,8 +378,14 @@ async fn handle_get_org(
     Extension(p): Extension<AuthPrincipal>,
 ) -> ApiRes<Value> {
     let org_id = org_of(&p)?;
-    let name = ctrl.meta.get_org_name(&org_id).await.map_err(CtrlError::meta)?;
-    Ok(Json(json!({ "id": org_id, "name": name, "role": p.role().as_str() })))
+    let name = ctrl
+        .meta
+        .get_org_name(&org_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(
+        json!({ "id": org_id, "name": name, "role": p.role().as_str() }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -351,10 +403,20 @@ async fn handle_rename_org(
     if name.is_empty() {
         return Err(CtrlError::bad("enter a name"));
     }
-    ctrl.meta.rename_org(&org_id, &name).await.map_err(CtrlError::meta)?;
-    ctrl.record_enterprise_audit(&p.actor_label(), "org.renamed", &format!("org:{org_id}"), json!({ "name": name }))
-        .await;
-    Ok(Json(json!({ "id": org_id, "name": name, "role": p.role().as_str() })))
+    ctrl.meta
+        .rename_org(&org_id, &name)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &p.actor_label(),
+        "org.renamed",
+        &format!("org:{org_id}"),
+        json!({ "name": name }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "id": org_id, "name": name, "role": p.role().as_str() }),
+    ))
 }
 
 async fn handle_list_members(
@@ -362,7 +424,11 @@ async fn handle_list_members(
     Extension(p): Extension<AuthPrincipal>,
 ) -> ApiRes<Value> {
     let org_id = org_of(&p)?;
-    let users = ctrl.meta.list_org_users(&org_id).await.map_err(CtrlError::meta)?;
+    let users = ctrl
+        .meta
+        .list_org_users(&org_id)
+        .await
+        .map_err(CtrlError::meta)?;
     let out: Vec<Value> = users
         .iter()
         .map(|u| {
@@ -389,10 +455,15 @@ async fn handle_set_member_role(
     let role = parse_role(&req.role)?;
     let target = ctrl.manageable_member(&p, &org_id, &user_id).await?;
     if !p.role().outranks(role) {
-        return Err(CtrlError::forbidden(format!("only an owner can grant the {} role", role.as_str())));
+        return Err(CtrlError::forbidden(format!(
+            "only an owner can grant the {} role",
+            role.as_str()
+        )));
     }
     if target.role == Role::Owner && role != Role::Owner && ctrl.owner_count(&org_id).await? <= 1 {
-        return Err(CtrlError::conflict("an organisation needs at least one owner"));
+        return Err(CtrlError::conflict(
+            "an organisation needs at least one owner",
+        ));
     }
     ctrl.meta
         .update_user_role(&org_id, &user_id, role)
@@ -416,9 +487,14 @@ async fn handle_remove_member(
     let org_id = org_of(&p)?;
     let target = ctrl.manageable_member(&p, &org_id, &user_id).await?;
     if target.role == Role::Owner && ctrl.owner_count(&org_id).await? <= 1 {
-        return Err(CtrlError::conflict("an organisation needs at least one owner"));
+        return Err(CtrlError::conflict(
+            "an organisation needs at least one owner",
+        ));
     }
-    ctrl.meta.delete_user(&org_id, &user_id).await.map_err(CtrlError::meta)?;
+    ctrl.meta
+        .delete_user(&org_id, &user_id)
+        .await
+        .map_err(CtrlError::meta)?;
     ctrl.record_enterprise_audit(
         &p.actor_label(),
         "member.removed",
@@ -438,9 +514,16 @@ async fn handle_admin_reset_link(
     let org_id = org_of(&p)?;
     let target = ctrl.manageable_member(&p, &org_id, &user_id).await?;
     let (_, url) = ctrl.new_reset_link(&target.id).await?;
-    ctrl.record_enterprise_audit(&p.actor_label(), "auth.password_reset_link", &format!("org:{org_id}"), json!({ "user_id": user_id, "email": target.email }))
-        .await;
-    Ok(Json(json!({ "reset_url": url, "expires_in_ms": RESET_TTL_MS })))
+    ctrl.record_enterprise_audit(
+        &p.actor_label(),
+        "auth.password_reset_link",
+        &format!("org:{org_id}"),
+        json!({ "user_id": user_id, "email": target.email }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "reset_url": url, "expires_in_ms": RESET_TTL_MS }),
+    ))
 }
 
 // ------------------- Invites -------------------
@@ -450,7 +533,12 @@ async fn handle_list_invites(
     Extension(p): Extension<AuthPrincipal>,
 ) -> ApiRes<Vec<OrgInvite>> {
     let org_id = org_of(&p)?;
-    Ok(Json(ctrl.meta.list_invites(&org_id, now_ms()).await.map_err(CtrlError::meta)?))
+    Ok(Json(
+        ctrl.meta
+            .list_invites(&org_id, now_ms())
+            .await
+            .map_err(CtrlError::meta)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -459,18 +547,21 @@ struct CreateInviteReq {
     role: String,
 }
 
-/// Creates an invite and returns its link once. Pulse has no mailer: the link is also written to
-/// the node log, and the inviter passes it on.
+/// Creates an invite and returns its link once, to the inviter, who passes it on. It is never logged.
 async fn handle_create_invite(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(p): Extension<AuthPrincipal>,
     Json(req): Json<CreateInviteReq>,
 ) -> ApiRes<Value> {
     let org_id = org_of(&p)?;
-    let email = normalize_email(&req.email).ok_or_else(|| CtrlError::bad("enter a valid email address"))?;
+    let email =
+        normalize_email(&req.email).ok_or_else(|| CtrlError::bad("enter a valid email address"))?;
     let role = parse_role(&req.role)?;
     if !p.role().outranks(role) {
-        return Err(CtrlError::forbidden(format!("only an owner can invite someone as {}", role.as_str())));
+        return Err(CtrlError::forbidden(format!(
+            "only an owner can invite someone as {}",
+            role.as_str()
+        )));
     }
     // Someone with an account elsewhere can still be invited: they accept while signed in and move here.
     if ctrl
@@ -493,10 +584,11 @@ async fn handle_create_invite(
         created_at_ms: now,
         expires_at_ms: now + INVITE_TTL_MS,
     };
-    ctrl.meta.insert_invite(&inv, &sha256_hex(&token)).await.map_err(CtrlError::meta)?;
+    ctrl.meta
+        .insert_invite(&inv, &sha256_hex(&token))
+        .await
+        .map_err(CtrlError::meta)?;
     let url = format!("{}/#/invite/{token}", ctrl.auth_cfg.read().public_url);
-    // ponytail: the log is the mailer. Add SMTP when someone needs invites delivered.
-    tracing::info!(email = %inv.email, role = %inv.role, "invite link: {url}");
     ctrl.record_enterprise_audit(
         &p.actor_label(),
         "invite.created",
@@ -515,16 +607,29 @@ async fn handle_delete_invite(
     AxumPath(invite_id): AxumPath<String>,
 ) -> ApiRes<Value> {
     let org_id = org_of(&p)?;
-    if !ctrl.meta.delete_invite(&org_id, &invite_id).await.map_err(CtrlError::meta)? {
+    if !ctrl
+        .meta
+        .delete_invite(&org_id, &invite_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
         return Err(CtrlError::not_found("invite not found"));
     }
-    ctrl.record_enterprise_audit(&p.actor_label(), "invite.revoked", &format!("org:{org_id}"), json!({ "invite_id": invite_id }))
-        .await;
+    ctrl.record_enterprise_audit(
+        &p.actor_label(),
+        "invite.revoked",
+        &format!("org:{org_id}"),
+        json!({ "invite_id": invite_id }),
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
 fn invite_gone() -> CtrlError {
-    CtrlError(StatusCode::GONE, "This invite has expired or was already used. Ask for a new one.".to_string())
+    CtrlError(
+        StatusCode::GONE,
+        "This invite has expired or was already used. Ask for a new one.".to_string(),
+    )
 }
 
 async fn handle_get_invite(
@@ -537,7 +642,11 @@ async fn handle_get_invite(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invite_gone)?;
-    let org_name = ctrl.meta.get_org_name(&inv.org_id).await.map_err(CtrlError::meta)?;
+    let org_name = ctrl
+        .meta
+        .get_org_name(&inv.org_id)
+        .await
+        .map_err(CtrlError::meta)?;
     // A verified account must sign in and join; an unverified one is replaced when the invite is accepted.
     let has_account = ctrl
         .meta
@@ -545,7 +654,9 @@ async fn handle_get_invite(
         .await
         .map_err(CtrlError::meta)?
         .is_some_and(|u| u.org_id != PENDING_ORG);
-    Ok(Json(json!({ "email": inv.email, "role": inv.role, "org_name": org_name, "has_account": has_account })))
+    Ok(Json(
+        json!({ "email": inv.email, "role": inv.role, "org_name": org_name, "has_account": has_account }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -568,32 +679,51 @@ async fn handle_accept_invite(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invite_gone)?;
-    let existing = ctrl.meta.get_user_by_email(&inv.email).await.map_err(CtrlError::meta)?;
+    let existing = ctrl
+        .meta
+        .get_user_by_email(&inv.email)
+        .await
+        .map_err(CtrlError::meta)?;
     if existing.is_some_and(|u| u.org_id != PENDING_ORG) {
         return Err(CtrlError::conflict(
             "You already have an account. Sign in, then open this invite link again to join.",
         ));
     }
     let phc = hash(req.password).await?;
-    if !ctrl.meta.accept_invite(&inv.id, now).await.map_err(CtrlError::meta)? {
+    if !ctrl
+        .meta
+        .accept_invite(&inv.id, now)
+        .await
+        .map_err(CtrlError::meta)?
+    {
         return Err(invite_gone());
     }
     // The invite link proves the address, so an unverified sign-up with it is replaced.
     let user = ctrl
         .insert_pending_user(User {
-        id: format!("user_{}", Uuid::new_v4().simple()),
-        email: inv.email.clone(),
-        name: req.name.map(|n| n.trim().chars().take(120).collect::<String>()).filter(|n| !n.is_empty()),
-        password_hash: Some(phc),
-        google_sub: None,
-        created_at_ms: now,
-        org_id: String::new(),
-        role: Role::Viewer,
-    })
-    .await?;
+            id: format!("user_{}", Uuid::new_v4().simple()),
+            email: inv.email.clone(),
+            name: req
+                .name
+                .map(|n| n.trim().chars().take(120).collect::<String>())
+                .filter(|n| !n.is_empty()),
+            password_hash: Some(phc),
+            google_sub: None,
+            created_at_ms: now,
+            org_id: String::new(),
+            role: Role::Viewer,
+        })
+        .await?;
     let role = Role::parse(&inv.role).unwrap_or(Role::Viewer);
-    ctrl.meta.set_user_org(&user.id, &inv.org_id, role).await.map_err(CtrlError::meta)?;
-    let user = User { org_id: inv.org_id.clone(), role, ..user };
+    ctrl.meta
+        .set_user_org(&user.id, &inv.org_id, role)
+        .await
+        .map_err(CtrlError::meta)?;
+    let user = User {
+        org_id: inv.org_id.clone(),
+        role,
+        ..user
+    };
     ctrl.record_enterprise_audit(
         &format!("user:{}", user.id),
         "invite.accepted",
@@ -612,17 +742,32 @@ struct ResetRequestReq {
 }
 
 /// Always answers 204 so it can't be used to find out which emails have accounts. When the account
-/// exists, the reset link goes to the node log (there is no mailer).
+/// exists, the reset link goes to the outbox file (there is no mailer), at most once per 5 minutes.
 async fn handle_request_reset(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Json(req): Json<ResetRequestReq>,
 ) -> std::result::Result<StatusCode, CtrlError> {
     if let Some(email) = normalize_email(&req.email) {
-        let user = ctrl.meta.get_user_by_email(&email).await.map_err(CtrlError::meta)?;
+        let user = ctrl
+            .meta
+            .get_user_by_email(&email)
+            .await
+            .map_err(CtrlError::meta)?;
         // Unverified sign-ups verify first; a reset link would be a second way to prove the address.
-        if let Some(user) = user.filter(|u| u.org_id != PENDING_ORG) {
+        let now = now_ms();
+        let recent = ctrl
+            .auth_state
+            .reset_requests
+            .get(&email)
+            .is_some_and(|t| now - *t < RESET_REQUEST_INTERVAL_MS);
+        if let Some(user) = user.filter(|u| u.org_id != PENDING_ORG && !recent) {
+            let requests = &ctrl.auth_state.reset_requests;
+            if requests.len() >= 10_000 {
+                requests.retain(|_, t| now - *t < RESET_REQUEST_INTERVAL_MS);
+            }
+            requests.insert(email.clone(), now);
             let (_, url) = ctrl.new_reset_link(&user.id).await?;
-            tracing::info!(email = %email, "password reset link: {url}");
+            ctrl.deliver_link("reset", &email, &url);
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -646,11 +791,31 @@ async fn handle_reset_password(
         .take_password_reset(&sha256_hex(&req.token), now_ms())
         .await
         .map_err(CtrlError::meta)?
-        .ok_or_else(|| CtrlError(StatusCode::GONE, "This reset link has expired or was already used.".to_string()))?;
-    ctrl.meta.update_user_password(&uid, &phc).await.map_err(CtrlError::meta)?;
-    ctrl.meta.delete_user_sessions(&uid, None, None).await.map_err(CtrlError::meta)?;
-    ctrl.record_enterprise_audit(&format!("user:{uid}"), "auth.password_reset", &format!("user:{uid}"), json!({}))
-        .await;
+        .ok_or_else(|| {
+            CtrlError(
+                StatusCode::GONE,
+                "This reset link has expired or was already used.".to_string(),
+            )
+        })?;
+    ctrl.meta
+        .update_user_password(&uid, &phc)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.meta
+        .delete_password_resets(&uid)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.meta
+        .delete_user_sessions(&uid, None, None)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &format!("user:{uid}"),
+        "auth.password_reset",
+        &format!("user:{uid}"),
+        json!({}),
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -668,7 +833,12 @@ async fn handle_verify_email(
     headers: HeaderMap,
     Json(req): Json<TokenReq>,
 ) -> ApiRes<Value> {
-    let gone = || CtrlError(StatusCode::GONE, "This link has expired or was already used. Sign up again for a new one.".to_string());
+    let gone = || {
+        CtrlError(
+            StatusCode::GONE,
+            "This link has expired or was already used. Sign up again for a new one.".to_string(),
+        )
+    };
     let (uid, org_name) = ctrl
         .meta
         .take_email_verification(&sha256_hex(&req.token), now_ms())
@@ -681,21 +851,40 @@ async fn handle_verify_email(
     }
     let (allow_new_orgs, domain_ok) = {
         let cfg = ctrl.auth_cfg.read();
-        let domain = user.email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+        let domain = user
+            .email
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .unwrap_or_default();
         (
             cfg.allow_new_orgs,
-            cfg.allowed_email_domains.iter().any(|d| d.eq_ignore_ascii_case(domain)),
+            cfg.allowed_email_domains
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(domain)),
         )
     };
     let org = match org_name {
         Some(name) if allow_new_orgs => SignupOrg::New(name),
         None if domain_ok => SignupOrg::Default,
-        _ => return Err(CtrlError::forbidden("Sign-ups are closed for this workspace.")),
+        _ => {
+            return Err(CtrlError::forbidden(
+                "Sign-ups are closed for this workspace.",
+            ))
+        }
     };
     let (org_id, role) = ctrl.assign_org(&uid, org).await?;
-    ctrl.record_enterprise_audit(&format!("user:{uid}"), "auth.email_verified", &format!("org:{org_id}"), json!({ "email": user.email, "role": role.as_str() }))
-        .await;
-    let user = User { org_id, role, ..user };
+    ctrl.record_enterprise_audit(
+        &format!("user:{uid}"),
+        "auth.email_verified",
+        &format!("org:{org_id}"),
+        json!({ "email": user.email, "role": role.as_str() }),
+    )
+    .await;
+    let user = User {
+        org_id,
+        role,
+        ..user
+    };
     ctrl.session_response(&user, &headers).await
 }
 
@@ -723,22 +912,30 @@ async fn handle_join_org(
         )));
     }
     if user.org_id == inv.org_id {
-        return Err(CtrlError::conflict("you're already a member of this organisation"));
+        return Err(CtrlError::conflict(
+            "you're already a member of this organisation",
+        ));
     }
-    if user.role == Role::Owner {
-        let members = ctrl.meta.list_org_users(&user.org_id).await.map_err(CtrlError::meta)?;
-        let owners = members.iter().filter(|u| u.role == Role::Owner).count();
-        if owners <= 1 && members.len() > 1 {
-            return Err(CtrlError::conflict(
-                "You're the only owner of your current organisation. Make someone else an owner in Settings first.",
-            ));
-        }
+    // Leaving as the last owner would strand the organisation, its projects and live ingest keys
+    // where nobody can reach them, even when nobody else is in it.
+    if user.role == Role::Owner && ctrl.owner_count(&user.org_id).await? <= 1 {
+        return Err(CtrlError::conflict(
+            "You're the only owner of your current organisation, so leaving it would leave its projects with nobody to manage them. Invite someone as owner there first, or accept this invite from a different account.",
+        ));
     }
-    if !ctrl.meta.accept_invite(&inv.id, now).await.map_err(CtrlError::meta)? {
+    if !ctrl
+        .meta
+        .accept_invite(&inv.id, now)
+        .await
+        .map_err(CtrlError::meta)?
+    {
         return Err(invite_gone());
     }
     let role = Role::parse(&inv.role).unwrap_or(Role::Viewer);
-    ctrl.meta.set_user_org(uid, &inv.org_id, role).await.map_err(CtrlError::meta)?;
+    ctrl.meta
+        .set_user_org(uid, &inv.org_id, role)
+        .await
+        .map_err(CtrlError::meta)?;
     ctrl.record_enterprise_audit(
         &p.actor_label(),
         "invite.accepted",
@@ -746,7 +943,11 @@ async fn handle_join_org(
         json!({ "invite_id": inv.id, "email": inv.email, "role": inv.role, "left_org": user.org_id }),
     )
     .await;
-    Ok(Json(user_json(&User { org_id: inv.org_id, role, ..user })))
+    Ok(Json(user_json(&User {
+        org_id: inv.org_id,
+        role,
+        ..user
+    })))
 }
 
 #[cfg(test)]
@@ -756,13 +957,32 @@ mod tests {
     #[test]
     fn route_guard_table() {
         let r = |m: Method, p: &str| required_role(&m, p);
-        assert_eq!(r(Method::GET, "/v1/projects/:id/saved-reports"), Role::Viewer);
-        assert_eq!(r(Method::POST, "/v1/projects/:id/query/funnel"), Role::Viewer);
-        assert_eq!(r(Method::PUT, "/v1/projects/:id/saved-reports/:rep_id"), Role::Member);
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/saved-reports"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/query/funnel"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::PUT, "/v1/projects/:id/saved-reports/:rep_id"),
+            Role::Member
+        );
         assert_eq!(r(Method::POST, "/v1/projects/:id/dashboards"), Role::Member);
-        assert_eq!(r(Method::POST, "/v1/projects/:id/some-new-write"), Role::Member);
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/some-new-write"),
+            Role::Member
+        );
         assert_eq!(r(Method::GET, "/v1/projects/:id/api-keys"), Role::Admin);
-        assert_eq!(r(Method::DELETE, "/v1/projects/:id/users/:distinct_id"), Role::Admin);
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/cohorts/:cohort_id/export"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/users/:distinct_id"),
+            Role::Admin
+        );
         assert_eq!(r(Method::POST, "/v1/projects"), Role::Admin);
         assert_eq!(r(Method::GET, "/v1/org/members"), Role::Viewer);
         assert_eq!(r(Method::PATCH, "/v1/org/members/:user_id"), Role::Admin);

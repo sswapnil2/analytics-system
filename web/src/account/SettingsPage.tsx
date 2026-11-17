@@ -317,8 +317,7 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
               </button>
             </form>
             <p className="text-xs text-muted">
-              {ROLE_HELP[inviteRole]}. Pulse doesn't send email: you get a link to pass on, and it's also written to the
-              server log.
+              {ROLE_HELP[inviteRole]}. Pulse doesn't send email: you get a link to pass on.
             </p>
             {invites.length > 0 && (
               <ul className="divide-y divide-line border-t border-line">

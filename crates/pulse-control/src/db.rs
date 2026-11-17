@@ -14,8 +14,8 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard, DeletionAuditRecord,
     EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, LookupTableSummary, Organization, Project, SavedReport, SystemKeyringRecord,
-    Role, User, UserProfileRecord,
+    LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
+    SystemKeyringRecord, User, UserProfileRecord,
 };
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
@@ -1108,7 +1108,35 @@ impl MetaStore {
     }
 
     /// Moves an account into an organisation with a role (verifying, or accepting an invite).
-    pub async fn set_user_org(&self, user_id: &str, org_id: &str, role: Role) -> Result<(), MetaError> {
+    /// Moves a user into the default org: owner if it has nobody yet, else member. Decided in one
+    /// statement so concurrent first sign-ups don't both become owner.
+    // ponytail: atomic on SQLite (one writer); on Postgres two transactions committing in the same
+    // instant can still both see an empty org. Add a unique partial index on owners if that matters.
+    pub async fn join_default_org(&self, user_id: &str) -> Result<Role, MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET org_id = 'org_default',
+                role = CASE WHEN EXISTS (SELECT 1 FROM users u2 WHERE u2.org_id = 'org_default' AND u2.id <> ?)
+                            THEN 'member' ELSE 'owner' END
+             WHERE id = ?",
+            user_id,
+            user_id,
+        );
+        let role = db_map_opt!(
+            self,
+            "SELECT role FROM users WHERE id = ?",
+            |r| { role_of(&r.get::<String, _>("role")) },
+            user_id,
+        );
+        Ok(role.unwrap_or(Role::Member))
+    }
+
+    pub async fn set_user_org(
+        &self,
+        user_id: &str,
+        org_id: &str,
+        role: Role,
+    ) -> Result<(), MetaError> {
         let _ = db_exec!(
             self,
             "UPDATE users SET org_id = ?, role = ? WHERE id = ?",
@@ -1147,7 +1175,12 @@ impl MetaStore {
             self,
             "SELECT user_id, org_name FROM email_verifications
              WHERE token_hash = ? AND used_at_ms IS NULL AND expires_at_ms > ?",
-            |r| { (r.get::<String, _>("user_id"), r.get::<Option<String>, _>("org_name")) },
+            |r| {
+                (
+                    r.get::<String, _>("user_id"),
+                    r.get::<Option<String>, _>("org_name"),
+                )
+            },
             token_hash,
             now_ms,
         );
@@ -1344,8 +1377,17 @@ impl MetaStore {
         Ok(n)
     }
 
-    pub async fn update_user_name(&self, user_id: &str, name: Option<&str>) -> Result<(), MetaError> {
-        let _ = db_exec!(self, "UPDATE users SET name = ? WHERE id = ?", name, user_id);
+    pub async fn update_user_name(
+        &self,
+        user_id: &str,
+        name: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET name = ? WHERE id = ?",
+            name,
+            user_id
+        );
         Ok(())
     }
 
@@ -1359,7 +1401,12 @@ impl MetaStore {
         Ok(())
     }
 
-    pub async fn update_user_role(&self, org_id: &str, user_id: &str, role: Role) -> Result<bool, MetaError> {
+    pub async fn update_user_role(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        role: Role,
+    ) -> Result<bool, MetaError> {
         let n = db_exec!(
             self,
             "UPDATE users SET role = ? WHERE id = ? AND org_id = ?",
@@ -1381,8 +1428,16 @@ impl MetaStore {
         );
         if n > 0 {
             let _ = db_exec!(self, "DELETE FROM user_sessions WHERE user_id = ?", user_id);
-            let _ = db_exec!(self, "DELETE FROM password_resets WHERE user_id = ?", user_id);
-            let _ = db_exec!(self, "DELETE FROM email_verifications WHERE user_id = ?", user_id);
+            let _ = db_exec!(
+                self,
+                "DELETE FROM password_resets WHERE user_id = ?",
+                user_id
+            );
+            let _ = db_exec!(
+                self,
+                "DELETE FROM email_verifications WHERE user_id = ?",
+                user_id
+            );
         }
         Ok(n > 0)
     }
@@ -1439,7 +1494,11 @@ impl MetaStore {
     }
 
     /// Pending (unaccepted, unexpired) invites of an organisation, newest first.
-    pub async fn list_invites(&self, org_id: &str, now_ms: i64) -> Result<Vec<OrgInvite>, MetaError> {
+    pub async fn list_invites(
+        &self,
+        org_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<OrgInvite>, MetaError> {
         let rows = db_map_all!(
             self,
             "SELECT id, org_id, email, role, invited_by, created_at_ms, expires_at_ms FROM org_invites
@@ -1462,7 +1521,11 @@ impl MetaStore {
     }
 
     /// A pending invite by its token hash.
-    pub async fn get_invite(&self, token_hash: &str, now_ms: i64) -> Result<Option<OrgInvite>, MetaError> {
+    pub async fn get_invite(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<OrgInvite>, MetaError> {
         let row = db_map_opt!(
             self,
             "SELECT id, org_id, email, role, invited_by, created_at_ms, expires_at_ms FROM org_invites
@@ -1522,7 +1585,20 @@ impl MetaStore {
     }
 
     /// Uses a reset token once; returns its user id when it was live.
-    pub async fn take_password_reset(&self, token_hash: &str, now_ms: i64) -> Result<Option<String>, MetaError> {
+    pub async fn delete_password_resets(&self, user_id: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "DELETE FROM password_resets WHERE user_id = ?",
+            user_id
+        );
+        Ok(())
+    }
+
+    pub async fn take_password_reset(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, MetaError> {
         let uid = db_map_opt!(
             self,
             "SELECT user_id FROM password_resets WHERE token_hash = ? AND used_at_ms IS NULL AND expires_at_ms > ?",

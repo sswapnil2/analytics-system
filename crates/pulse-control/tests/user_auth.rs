@@ -51,6 +51,7 @@ async fn setup_app(tmp: &std::path::Path) -> (Router, Arc<ControlPlaneService>, 
     let ctrl = ControlPlaneService::new(meta.clone(), qengine, "proj_alpha", "pk_alpha_key")
         .await
         .unwrap();
+    ctrl.set_outbox_path(tmp.join("outbox"));
     ctrl.set_auth_config(auth_cfg(&[], "http://127.0.0.1:1/unused"));
     (build_control_router(ctrl.clone()), ctrl, meta)
 }
@@ -111,8 +112,9 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 
 #[tokio::test]
 async fn signup_policy_first_user_then_domain_allowlist() {
-    let (logs, _guard) = common::capture_logs();
+    let (log, _guard) = common::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
+    let logs = common::Outbox::at(tmp.path());
     let (app, ctrl, _meta) = setup_app(tmp.path()).await;
     // Closed node: no new organisations, only allowed domains after the first account.
     ctrl.set_auth_config(auth_cfg(&[], "http://127.0.0.1:1/unused"));
@@ -166,23 +168,58 @@ async fn signup_policy_first_user_then_domain_allowlist() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["verification_required"], true);
     assert!(v.get("token").is_none());
-    let (s, _, _) = send(&app, "POST", "/v1/auth/login", None, Some(json!({"email": "bob@example.com", "password": "correct horse battery"}))).await;
+    let (s, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/login",
+        None,
+        Some(json!({"email": "bob@example.com", "password": "correct horse battery"})),
+    )
+    .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     // A second, unverified sign-up for the same address replaces the first (no squatting); the first link dies.
     let first = logs.last_token("verify");
     let (s, _) = signup(&app, "bob@example.com").await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": first}))).await;
+    let (s, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/verify-email",
+        None,
+        Some(json!({"token": first})),
+    )
+    .await;
     assert_eq!(s, StatusCode::GONE);
     let token = logs.last_token("verify");
-    let (s, v, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    let (s, v, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/verify-email",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["user"]["org_id"], "org_default");
     assert_eq!(v["user"]["role"], "member");
     let bob = v["token"].as_str().unwrap();
-    let (s, _, _) = send(&app, "GET", "/v1/projects/proj_alpha/saved-reports", Some(bob), None).await;
+    let (s, _, _) = send(
+        &app,
+        "GET",
+        "/v1/projects/proj_alpha/saved-reports",
+        Some(bob),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    let (s, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/verify-email",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
     assert_eq!(s, StatusCode::GONE);
     let (s, _) = signup(&app, "bob@example.com").await;
     assert_eq!(s, StatusCode::CONFLICT);
@@ -467,8 +504,9 @@ async fn google_full_callback_against_stub_token_endpoint() {
 
 #[tokio::test]
 async fn each_signup_gets_its_own_org_and_cannot_see_others() {
-    let (logs, _guard) = common::capture_logs();
+    let (log, _guard) = common::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
+    let logs = common::Outbox::at(tmp.path());
     let (app, ctrl, meta) = setup_app(tmp.path()).await;
     let mut cfg = auth_cfg(&[], "http://127.0.0.1:1/unused");
     cfg.allow_new_orgs = true;
@@ -498,7 +536,14 @@ async fn each_signup_gets_its_own_org_and_cannot_see_others() {
     // The org is created when the address is proven, not at sign-up.
     assert_eq!(meta.count_orgs().await.unwrap(), orgs_before);
     let token = logs.last_token("verify");
-    let (s, eve, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    let (s, eve, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/verify-email",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{eve}");
     assert_eq!(eve["user"]["role"], "owner");
     assert_eq!(meta.count_orgs().await.unwrap(), orgs_before + 1);
