@@ -353,10 +353,10 @@ Apache-2.0 · Rust · one binary
 <div style="flex: 1 1 440px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
 <span style="font-family: 'Geist Mono', monospace; font-size: 12.5px; letter-spacing: 0.06em; text-transform: uppercase; color: #6E7BFF">Privacy by architecture</span>
 <h2 id="privacy-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">See what users did.<br>Never what they typed.</h2>
-<p style="margin: 0; font-size: 16.5px; line-height: 1.6; color: #A1A1AA; max-width: 520px">Sensitive text is masked on the device before it is sent. Card numbers, PAN and passwords never reach your servers — let alone ours.</p>
+<p style="margin: 0; font-size: 16.5px; line-height: 1.6; color: #A1A1AA; max-width: 520px">Replays record a wireframe of the screen, and its text is masked on the device before it is sent. Card numbers, PAN and passwords typed into your app never show up in a replay.</p>
 </div>
 <div style="flex: 1 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 1px; border-radius: 14px; overflow: hidden; border: 1px solid #1F1F25; background: #1F1F25">
-<div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">01</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Masked on the device</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Not scrubbed later on a server.</span></div></div>
+<div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">01</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Replay text masked on the device</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Not scrubbed later on a server. Event properties are sent as you pass them, so keep secrets out of them.</span></div></div>
 <div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">02</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Built for the DPDP Act</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Opt-out and per-user erasure APIs, with an audit record of every deletion.</span></div></div>
 <div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">03</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Data stays in your infrastructure</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Local disk or any S3-compatible bucket you control.</span></div></div>
 </div>
@@ -375,12 +375,14 @@ Apache-2.0 · Rust · one binary
 <span style="padding: 6px 12px; border-radius: 6px; background: #1A1A1F; color: #FFFFFF">terminal</span>
 <span style="padding: 6px 12px; color: #8A8A93">app.ts</span>
 </div>
-<pre style="margin: 0; padding: 22px 24px 26px; overflow-x: auto; font-family: 'Geist Mono', monospace; font-size: 13.5px; line-height: 1.8; color: #D4D4D8; white-space: pre"><span style="color: #8A8A93">$</span> cargo build --release -p pulse-node
+<pre style="margin: 0; padding: 22px 24px 26px; overflow-x: auto; font-family: 'Geist Mono', monospace; font-size: 13.5px; line-height: 1.8; color: #D4D4D8; white-space: pre"><span style="color: #8A8A93">$</span> npm --prefix web ci &amp;&amp; npm --prefix web run build
+<span style="color: #8A8A93">$</span> cargo build --release -p pulse-node
 <span style="color: #8A8A93">$</span> ./target/release/pulse-node --seed
-<span style="color: #C8F04A">✓</span> Studio      <span style="color: #8A8A93">http://localhost:8090</span>
-<span style="color: #C8F04A">✓</span> Ingest key  <span style="color: #8A8A93">pk_live_••••••••</span>
+<span style="color: #8A8A93"># Studio: http://localhost:8080  (set PORT to change)
+# The admin token and ingest key are printed in the startup log.</span>
 
-<span style="color: #C792EA">import</span> { PulseWebClient } <span style="color: #C792EA">from</span> <span style="color: #F4C38B">"@pulse/web"</span>;
+<span style="color: #8A8A93">// npm install ./sdks/ts-web</span>
+<span style="color: #C792EA">import</span> { PulseWebClient } <span style="color: #C792EA">from</span> <span style="color: #F4C38B">"@pulse-analytics/ts-web"</span>;
 <span style="color: #C792EA">const</span> pulse = <span style="color: #C792EA">new</span> PulseWebClient({ endpointUrl, apiKey,
   enableWireframeReplay: <span style="color: #C792EA">true</span> });
 pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
