@@ -244,9 +244,10 @@ fn default_range_days(args: &Value) -> TimeRange {
         .unwrap_or(14)
         .clamp(1, 365);
     let now = Utc::now().timestamp_millis();
+    let today_floor = TimeInterval::Day.align_floor(now);
     TimeRange {
-        start_ts_ms: now - days * 86_400_000,
-        end_ts_ms: now + 3_600_000,
+        start_ts_ms: today_floor - (days - 1) * 86_400_000,
+        end_ts_ms: today_floor + 86_400_000,
     }
 }
 

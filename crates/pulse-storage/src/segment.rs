@@ -342,6 +342,59 @@ pub async fn write_vortex_segment(
     segment_id: &str,
     rows: Vec<StoredRow>,
 ) -> Result<Option<SegmentMeta>> {
+    let Some(built) = tokio::task::spawn_blocking(move || build_segment_payload_sync(rows))
+        .await
+        .map_err(|e| StorageError::Corrupted(format!("segment build join error: {e}")))??
+    else {
+        return Ok(None);
+    };
+
+    let vortex_array = VortexArrayRef::from_arrow(built.record_batch, false);
+    let vortex_buf = VortexWriteOptions::default()
+        .write(ByteBufferMut::empty(), vortex_array.to_array_stream())
+        .await?
+        .freeze();
+
+    let vortex_bytes = vortex_buf.as_slice();
+    let vortex_len = vortex_bytes.len() as u64;
+    let inverted_idx_offset = vortex_len;
+    let session_idx_offset = inverted_idx_offset + built.inverted_bytes.len() as u64;
+    let total_size = session_idx_offset + built.session_idx_bytes.len() as u64;
+
+    let mut container = Vec::with_capacity(total_size as usize);
+    container.extend_from_slice(vortex_bytes);
+    container.extend_from_slice(&built.inverted_bytes);
+    container.extend_from_slice(&built.session_idx_bytes);
+
+    let yyyymmdd = date.format("%Y%m%d").to_string();
+    let rel_path =
+        format!("segments/{project_id}/{yyyymmdd}/bucket_{bucket_id:03}/{segment_id}.pvtx");
+    let obj_path = ObjectPath::from(rel_path.as_str());
+    object_store
+        .put(&obj_path, PutPayload::from_bytes(Bytes::from(container)))
+        .await?;
+
+    Ok(Some(SegmentMeta {
+        segment_id: segment_id.to_string(),
+        object_path: rel_path,
+        date,
+        bucket_id,
+        file_size: total_size,
+        vortex_len,
+        inverted_idx_offset,
+        session_idx_offset,
+        footer: built.footer_meta,
+    }))
+}
+
+struct BuiltSegmentPayload {
+    record_batch: RecordBatch,
+    inverted_bytes: Vec<u8>,
+    session_idx_bytes: Vec<u8>,
+    footer_meta: SegmentFooterMeta,
+}
+
+fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmentPayload>> {
     let entries = prepare_and_sort_rows(rows);
     if entries.is_empty() {
         return Ok(None);
@@ -665,13 +718,6 @@ pub async fn write_vortex_segment(
 
     let schema = Arc::new(Schema::new(fields));
     let record_batch = RecordBatch::try_new(schema, columns)?;
-    let vortex_array = VortexArrayRef::from_arrow(record_batch, false);
-    let vortex_buf = VortexWriteOptions::default()
-        .write(ByteBufferMut::empty(), vortex_array.to_array_stream())
-        .await?
-        .freeze();
-
-    let vortex_bytes = vortex_buf.as_slice();
     let inverted_bytes = inverted_idx.encode()?;
     let session_idx_bytes = encode_session_index(&session_headers, &session_ids)?;
 
@@ -686,34 +732,11 @@ pub async fn write_vortex_segment(
         tier_b_columns: tier_b_catalog,
     };
 
-    let vortex_len = vortex_bytes.len() as u64;
-    let inverted_idx_offset = vortex_len;
-    let session_idx_offset = inverted_idx_offset + inverted_bytes.len() as u64;
-    let total_size = session_idx_offset + session_idx_bytes.len() as u64;
-
-    let mut container = Vec::with_capacity(total_size as usize);
-    container.extend_from_slice(vortex_bytes);
-    container.extend_from_slice(&inverted_bytes);
-    container.extend_from_slice(&session_idx_bytes);
-
-    let yyyymmdd = date.format("%Y%m%d").to_string();
-    let rel_path =
-        format!("segments/{project_id}/{yyyymmdd}/bucket_{bucket_id:03}/{segment_id}.pvtx");
-    let obj_path = ObjectPath::from(rel_path.as_str());
-    object_store
-        .put(&obj_path, PutPayload::from_bytes(Bytes::from(container)))
-        .await?;
-
-    Ok(Some(SegmentMeta {
-        segment_id: segment_id.to_string(),
-        object_path: rel_path,
-        date,
-        bucket_id,
-        file_size: total_size,
-        vortex_len,
-        inverted_idx_offset,
-        session_idx_offset,
-        footer: footer_meta,
+    Ok(Some(BuiltSegmentPayload {
+        record_batch,
+        inverted_bytes,
+        session_idx_bytes,
+        footer_meta,
     }))
 }
 

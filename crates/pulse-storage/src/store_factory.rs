@@ -1,10 +1,12 @@
 use std::fmt::{Debug, Display, Formatter};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::stream::BoxStream;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
@@ -182,4 +184,168 @@ pub fn build_from_url(raw_url: &str) -> Result<Arc<dyn ObjectStore>> {
             "unsupported object store scheme: {other}"
         ))),
     }
+}
+
+fn named_memory_stores() -> &'static DashMap<String, Arc<InMemory>> {
+    static STORES: OnceLock<DashMap<String, Arc<InMemory>>> = OnceLock::new();
+    STORES.get_or_init(DashMap::new)
+}
+
+#[inline]
+pub fn allow_private_endpoints() -> bool {
+    std::env::var("PULSE_ALLOW_PRIVATE_ENDPOINTS").as_deref() == Ok("1")
+}
+
+#[inline]
+fn is_forbidden_ssrf_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Validates an outbound customer-supplied HTTP(S) URL against SSRF (`M1`), rejecting private,
+/// loopback, and link-local cloud metadata targets unless `PULSE_ALLOW_PRIVATE_ENDPOINTS=1` is set.
+pub fn validate_outbound_url_ssrf(raw_url: &str) -> Result<Url> {
+    let trimmed = raw_url.trim();
+    let parsed = Url::parse(trimmed)
+        .map_err(|e| StorageError::Corrupted(format!("invalid outbound URL: {e}")))?;
+    let allow_priv = allow_private_endpoints();
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_priv => {}
+        "http" => {
+            return Err(StorageError::Corrupted(
+                "plaintext http:// endpoints are blocked by SSRF policy (https:// required)".into(),
+            ))
+        }
+        other => {
+            return Err(StorageError::Corrupted(format!(
+                "unsupported URL scheme '{other}' (expected https://)"
+            )))
+        }
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| StorageError::Corrupted("URL is missing host".to_string()))?;
+    let host_lower = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if !allow_priv
+        && (host_lower == "localhost"
+            || host_lower.ends_with(".localhost")
+            || host_lower == "metadata.google.internal")
+    {
+        return Err(StorageError::Corrupted(format!(
+            "outbound host '{host}' is blocked by SSRF policy"
+        )));
+    }
+    if let Ok(ip) = host_lower.parse::<IpAddr>() {
+        if !allow_priv && is_forbidden_ssrf_ip(ip) {
+            return Err(StorageError::Corrupted(format!(
+                "outbound IP '{ip}' is blocked by SSRF policy"
+            )));
+        }
+        return Ok(parsed);
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    if !allow_priv {
+        if let Ok(addrs) = (host, port).to_socket_addrs() {
+            for addr in addrs {
+                if is_forbidden_ssrf_ip(addr.ip()) {
+                    return Err(StorageError::Corrupted(format!(
+                        "outbound host '{host}' resolved to private/metadata IP {}",
+                        addr.ip()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// Builds a customer BYOC object store (S3-compatible, or named `memory://` in private test mode).
+/// Explicitly refuses `file://` URLs and enforces SSRF validation on custom endpoints (`M1`).
+pub fn build_customer_object_store(
+    raw_url: &str,
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<Arc<dyn ObjectStore>> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::Corrupted(
+            "storage URL cannot be empty".to_string(),
+        ));
+    }
+    let parsed = Url::parse(trimmed)
+        .map_err(|e| StorageError::Corrupted(format!("invalid storage URL: {e}")))?;
+
+    match parsed.scheme() {
+        "s3" => {
+            let bucket = parsed.host_str().ok_or_else(|| {
+                StorageError::Corrupted("s3:// URL missing bucket host".to_string())
+            })?;
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .with_region(region.unwrap_or("ap-south-1"));
+            if let Some(ak) = access_key.filter(|s| !s.trim().is_empty()) {
+                builder = builder.with_access_key_id(ak);
+            }
+            if let Some(sk) = secret_key.filter(|s| !s.trim().is_empty()) {
+                builder = builder.with_secret_access_key(sk);
+            }
+            if let Some(ep) = endpoint.filter(|s| !s.trim().is_empty()) {
+                let checked = validate_outbound_url_ssrf(ep)?;
+                builder = builder
+                    .with_endpoint(checked.as_str())
+                    .with_virtual_hosted_style_request(false);
+                if allow_private_endpoints() && checked.scheme() == "http" {
+                    builder = builder.with_allow_http(true);
+                }
+            }
+            Ok(Arc::new(builder.build()?))
+        }
+        "memory" if allow_private_endpoints() => {
+            let key = trimmed.to_string();
+            let store = named_memory_stores()
+                .entry(key)
+                .or_insert_with(|| Arc::new(InMemory::new()))
+                .clone();
+            Ok(store as Arc<dyn ObjectStore>)
+        }
+        "file" => Err(StorageError::Corrupted(
+            "file:// storage URLs are disallowed by SSRF / local file probe guard".to_string(),
+        )),
+        other => Err(StorageError::Corrupted(format!(
+            "unsupported customer BYOC storage scheme '{other}' (expected s3://)"
+        ))),
+    }
+}
+
+/// Validates a customer-supplied BYOC S3 object store URL using non-destructive `list_with_delimiter`.
+pub async fn validate_object_store_connection(
+    raw_url: &str,
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<usize> {
+    let store = build_customer_object_store(raw_url, access_key, secret_key, region, endpoint)?;
+    let listed = store.list_with_delimiter(None).await?;
+    Ok(listed.objects.len() + listed.common_prefixes.len())
 }

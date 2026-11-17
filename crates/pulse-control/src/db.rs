@@ -9,11 +9,13 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use sqlx::Row;
 use thiserror::Error;
 
+use crate::license::SystemLicenseRecord;
 use crate::models::DashboardCard;
 use crate::models::{
-    AlertRule, ApiKeyRecord, CohortRecord, Dashboard, DeletionAuditRecord, Experiment, FeatureFlag,
-    GroupProfileRecord, LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project,
-    SavedReport, User, UserProfileRecord,
+    AlertRule, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard, DeletionAuditRecord,
+    EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord, LexiconEvent,
+    LexiconProperty, LookupTableSummary, Organization, Project, SavedReport, SystemKeyringRecord,
+    User, UserProfileRecord,
 };
 
 #[derive(Debug, Error)]
@@ -1436,6 +1438,378 @@ impl MetaStore {
             "DELETE FROM alert_rules WHERE project_id = ? AND id = ?",
             project_id,
             alert_id,
+        );
+        Ok(affected)
+    }
+
+    // ------------------- Open-Core License & Commercial BYOK Vault -------------------
+
+    pub async fn get_system_license(&self) -> Result<Option<SystemLicenseRecord>, MetaError> {
+        let rec = db_map_opt!(
+            self,
+            "SELECT license_key, customer_org, edition, features_json, expires_at_ms, activated_at_ms, max_seen_ts_ms
+             FROM system_license WHERE id = 1",
+            |r| {
+                let fstr: String = r.get("features_json");
+                let features: Vec<String> = serde_json::from_str(&fstr).unwrap_or_default();
+                SystemLicenseRecord {
+                    license_key: r.get("license_key"),
+                    customer_org: r.get("customer_org"),
+                    edition: r.get("edition"),
+                    features,
+                    expires_at_ms: r.get("expires_at_ms"),
+                    activated_at_ms: r.get("activated_at_ms"),
+                    max_seen_ts_ms: r.get("max_seen_ts_ms"),
+                }
+            },
+        );
+        Ok(rec)
+    }
+
+    pub async fn upsert_system_license(&self, rec: &SystemLicenseRecord) -> Result<(), MetaError> {
+        let fjson = serde_json::to_string(&rec.features).unwrap_or_else(|_| "[]".into());
+        let _ = db_exec!(
+            self,
+            "INSERT INTO system_license (id, license_key, customer_org, edition, features_json, expires_at_ms, activated_at_ms, max_seen_ts_ms)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                license_key = excluded.license_key,
+                customer_org = excluded.customer_org,
+                edition = excluded.edition,
+                features_json = excluded.features_json,
+                expires_at_ms = excluded.expires_at_ms,
+                activated_at_ms = excluded.activated_at_ms,
+                max_seen_ts_ms = excluded.max_seen_ts_ms",
+            &rec.license_key,
+            &rec.customer_org,
+            &rec.edition,
+            fjson,
+            rec.expires_at_ms,
+            rec.activated_at_ms,
+            rec.max_seen_ts_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn update_license_max_seen_ts(&self, now_ms: i64) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE system_license SET max_seen_ts_ms = ? WHERE id = 1 AND max_seen_ts_ms < ?",
+            now_ms,
+            now_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn delete_system_license(&self) -> Result<(), MetaError> {
+        let _ = db_exec!(self, "DELETE FROM system_license WHERE id = 1");
+        Ok(())
+    }
+
+    /// Resolves a persistent cluster KEK from `PULSE_VAULT_KEK` or `<db_dir>/.pulse_cluster.kek` (`C3`),
+    /// completely independent of `PULSE_ADMIN_TOKEN`. Returns `Ok(None)` only for pure in-memory stores.
+    pub async fn resolve_or_create_cluster_kek(&self) -> Result<Option<[u8; 32]>, String> {
+        if let Ok(raw) = std::env::var("PULSE_VAULT_KEK") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let k = pulse_storage::parse_byok_master_key(trimmed).map_err(|e| e.to_string())?;
+                return Ok(Some(k));
+            }
+        }
+
+        let dir_opt: Option<std::path::PathBuf> = match self {
+            MetaStore::Sqlite(pool) => {
+                let rows = sqlx::query("PRAGMA database_list")
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                rows.into_iter()
+                    .find(|r| r.get::<String, _>("name") == "main")
+                    .and_then(|r| {
+                        let file: String = r.get("file");
+                        if file.is_empty() || file == ":memory:" {
+                            None
+                        } else {
+                            std::path::Path::new(&file)
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                        }
+                    })
+            }
+            MetaStore::Postgres(_) => std::env::var("PULSE_DATA_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(std::path::PathBuf::from),
+        };
+
+        let Some(dir) = dir_opt else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let kek_path = dir.join(".pulse_cluster.kek");
+        if kek_path.exists() {
+            let content = std::fs::read_to_string(&kek_path)
+                .map_err(|e| format!("failed to read {}: {e}", kek_path.display()))?;
+            let bytes = hex::decode(content.trim())
+                .map_err(|e| format!("corrupted cluster KEK file {}: {e}", kek_path.display()))?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "cluster KEK file {} must contain 32 hex bytes",
+                    kek_path.display()
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(Some(key));
+        }
+
+        let mut new_key = [0u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut new_key)
+            .map_err(|_| "CSPRNG failure generating cluster KEK".to_string())?;
+        let hex_str = hex::encode(new_key);
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&kek_path)
+                .map_err(|e| format!("failed creating {}: {e}", kek_path.display()))?;
+            f.write_all(hex_str.as_bytes())
+                .map_err(|e| format!("failed writing {}: {e}", kek_path.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&kek_path, hex_str.as_bytes())
+                .map_err(|e| format!("failed writing {}: {e}", kek_path.display()))?;
+        }
+
+        Ok(Some(new_key))
+    }
+
+    pub async fn list_system_keyring(&self) -> Result<Vec<SystemKeyringRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT key_id, salt_hex, sealed_key_hex, is_active, created_at_ms
+             FROM system_keyring ORDER BY created_at_ms ASC",
+            |r| {
+                let active_i: i64 = r.get("is_active");
+                SystemKeyringRecord {
+                    key_id: r.get("key_id"),
+                    salt_hex: r.get("salt_hex"),
+                    sealed_key_hex: r.get("sealed_key_hex"),
+                    is_active: active_i != 0,
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+        );
+        Ok(rows)
+    }
+
+    pub async fn upsert_system_keyring_key(
+        &self,
+        rec: &SystemKeyringRecord,
+    ) -> Result<(), MetaError> {
+        if rec.is_active {
+            let _ = db_exec!(self, "UPDATE system_keyring SET is_active = 0");
+        }
+        let active_val: i64 = if rec.is_active { 1 } else { 0 };
+        let _ = db_exec!(
+            self,
+            "INSERT INTO system_keyring (key_id, salt_hex, sealed_key_hex, is_active, created_at_ms)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(key_id) DO UPDATE SET
+                salt_hex = excluded.salt_hex,
+                sealed_key_hex = excluded.sealed_key_hex,
+                is_active = excluded.is_active",
+            &rec.key_id,
+            &rec.salt_hex,
+            &rec.sealed_key_hex,
+            active_val,
+            rec.created_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn deactivate_all_keyring_writes(&self) -> Result<(), MetaError> {
+        let _ = db_exec!(self, "UPDATE system_keyring SET is_active = 0");
+        Ok(())
+    }
+
+    pub async fn insert_enterprise_audit(
+        &self,
+        rec: &EnterpriseAuditRecord,
+    ) -> Result<(), MetaError> {
+        let djson = serde_json::to_string(&rec.details_json).unwrap_or_else(|_| "{}".into());
+        let _ = db_exec!(
+            self,
+            "INSERT INTO enterprise_audit_log (id, actor, action, resource, details_json, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            &rec.id,
+            &rec.actor,
+            &rec.action,
+            &rec.resource,
+            djson,
+            rec.created_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn list_enterprise_audit(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<EnterpriseAuditRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, actor, action, resource, details_json, created_at_ms
+             FROM enterprise_audit_log ORDER BY created_at_ms DESC LIMIT ?",
+            |r| {
+                let dstr: String = r.get("details_json");
+                let details_json =
+                    serde_json::from_str(&dstr).unwrap_or_else(|_| serde_json::json!({}));
+                EnterpriseAuditRecord {
+                    id: r.get("id"),
+                    actor: r.get("actor"),
+                    action: r.get("action"),
+                    resource: r.get("resource"),
+                    details_json,
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            limit.clamp(1, 500),
+        );
+        Ok(rows)
+    }
+
+    pub async fn list_byok_credentials(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ByokCredentialRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, category, provider, label, key_prefix_masked, sealed_secret_hex, config_json, status, last_verified_at_ms, updated_at_ms
+             FROM byok_credentials WHERE project_id = ? ORDER BY category ASC",
+            |r| {
+                let cstr: String = r.get("config_json");
+                let config_json = serde_json::from_str(&cstr).unwrap_or_else(|_| serde_json::json!({}));
+                ByokCredentialRecord {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    category: r.get("category"),
+                    provider: r.get("provider"),
+                    label: r.get("label"),
+                    key_prefix_masked: r.get("key_prefix_masked"),
+                    sealed_secret_hex: r.get("sealed_secret_hex"),
+                    config_json,
+                    status: r.get("status"),
+                    last_verified_at_ms: r.get("last_verified_at_ms"),
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            project_id,
+        );
+        Ok(rows)
+    }
+
+    pub async fn get_byok_credential(
+        &self,
+        project_id: &str,
+        category: &str,
+    ) -> Result<Option<ByokCredentialRecord>, MetaError> {
+        let rec = db_map_opt!(
+            self,
+            "SELECT id, project_id, category, provider, label, key_prefix_masked, sealed_secret_hex, config_json, status, last_verified_at_ms, updated_at_ms
+             FROM byok_credentials WHERE project_id = ? AND category = ?",
+            |r| {
+                let cstr: String = r.get("config_json");
+                let config_json = serde_json::from_str(&cstr).unwrap_or_else(|_| serde_json::json!({}));
+                ByokCredentialRecord {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    category: r.get("category"),
+                    provider: r.get("provider"),
+                    label: r.get("label"),
+                    key_prefix_masked: r.get("key_prefix_masked"),
+                    sealed_secret_hex: r.get("sealed_secret_hex"),
+                    config_json,
+                    status: r.get("status"),
+                    last_verified_at_ms: r.get("last_verified_at_ms"),
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            project_id,
+            category,
+        );
+        Ok(rec)
+    }
+
+    pub async fn upsert_byok_credential(
+        &self,
+        rec: &ByokCredentialRecord,
+    ) -> Result<(), MetaError> {
+        let cstr = serde_json::to_string(&rec.config_json).unwrap_or_else(|_| "{}".into());
+        let _ = db_exec!(
+            self,
+            "INSERT INTO byok_credentials (id, project_id, category, provider, label, key_prefix_masked, sealed_secret_hex, config_json, status, last_verified_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(project_id, category) DO UPDATE SET
+                id = excluded.id,
+                provider = excluded.provider,
+                label = excluded.label,
+                key_prefix_masked = excluded.key_prefix_masked,
+                sealed_secret_hex = excluded.sealed_secret_hex,
+                config_json = excluded.config_json,
+                status = excluded.status,
+                last_verified_at_ms = excluded.last_verified_at_ms,
+                updated_at_ms = excluded.updated_at_ms",
+            &rec.id,
+            &rec.project_id,
+            &rec.category,
+            &rec.provider,
+            &rec.label,
+            &rec.key_prefix_masked,
+            &rec.sealed_secret_hex,
+            cstr,
+            &rec.status,
+            rec.last_verified_at_ms,
+            rec.updated_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn touch_byok_verified(
+        &self,
+        project_id: &str,
+        category: &str,
+        status: &str,
+        ts_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE byok_credentials SET status = ?, last_verified_at_ms = ?, updated_at_ms = ?
+             WHERE project_id = ? AND category = ?",
+            status,
+            ts_ms,
+            ts_ms,
+            project_id,
+            category,
+        );
+        Ok(())
+    }
+
+    pub async fn delete_byok_credential(
+        &self,
+        project_id: &str,
+        category: &str,
+    ) -> Result<u64, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM byok_credentials WHERE project_id = ? AND category = ?",
+            project_id,
+            category,
         );
         Ok(affected)
     }

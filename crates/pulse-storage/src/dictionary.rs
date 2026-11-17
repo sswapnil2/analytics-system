@@ -157,4 +157,38 @@ impl ProjectDictionary {
             prop_keys: self.prop_keys.read().clone(),
         }
     }
+
+    /// Merges newly committed event/property IDs from a newer `ProjectDictSnapshot` into this dictionary.
+    pub fn merge_snapshot(&self, snap: &ProjectDictSnapshot) {
+        {
+            let mut ev_guard = self.events.write();
+            if snap.events.len() > ev_guard.len() {
+                for name in snap
+                    .events
+                    .iter()
+                    .skip(ev_guard.len())
+                    .take(MAX_DICTIONARY_ENTRIES.saturating_sub(ev_guard.len()))
+                {
+                    let id = ev_guard.len() as u16;
+                    self.event_to_id.insert(name.clone(), id);
+                    ev_guard.push(name.clone());
+                }
+            }
+        }
+        {
+            let mut pk_guard = self.prop_keys.write();
+            if snap.prop_keys.len() > pk_guard.len() {
+                for name in snap
+                    .prop_keys
+                    .iter()
+                    .skip(pk_guard.len())
+                    .take(MAX_DICTIONARY_ENTRIES.saturating_sub(pk_guard.len()))
+                {
+                    let id = pk_guard.len() as u16;
+                    self.prop_to_id.insert(name.clone(), id);
+                    pk_guard.push(name.clone());
+                }
+            }
+        }
+    }
 }
