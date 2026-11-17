@@ -1,0 +1,32 @@
+# /etc/systemd/system/pulse.service
+[Unit]
+Description=Pulse analytics node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pulse
+Group=pulse
+WorkingDirectory=/opt/pulse
+# Secrets live here, outside the data dir and outside git (mode 0600, owned by root).
+EnvironmentFile=/etc/pulse/pulse.env
+ExecStart=/opt/pulse/pulse-node --host 127.0.0.1 --port 8080 --data-dir /var/lib/pulse --web-dir /opt/pulse/web/dist --no-quic
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=60
+LimitNOFILE=65536
+
+# Hardening: only /var/lib/pulse is writable.
+StateDirectory=pulse
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
