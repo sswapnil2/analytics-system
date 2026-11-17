@@ -270,10 +270,17 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
   await sdk.setUserProperties({ plan: "credit_pro" });
   await sdk.incrementUserProperty("logins", 2);
   await sdk.setGroupProperties("merchant", "m_zepto", { tier: "enterprise" });
-  await sdk.trackRevenue({ amount: 499, currency: "INR", productId: "pro_plan" });
+  await sdk.trackRevenue({ amount: 499, productId: "pro_plan" });
   assert.ok(calls.some((c) => c.url.endsWith("/v1/engage") && c.body.$set?.plan === "credit_pro"));
   assert.ok(calls.some((c) => c.url.endsWith("/v1/groups") && c.body.group_id === "m_zepto"));
-  assert.ok(calls.some((c) => c.url.endsWith("/v1/engage") && c.body.$track_charge?.$amount === 499));
+  assert.ok(
+    calls.some(
+      (c) =>
+        c.url.endsWith("/v1/engage") &&
+        c.body.$track_charge?.$amount === 499 &&
+        c.body.$track_charge?.currency === "USD",
+    ),
+  );
 
   // Replay trigger + pause/resume + console/network breadcrumbs
   assert.equal(sdk.isRecordingSession(), false, "paused until Error_Hit trigger fires");

@@ -36,8 +36,8 @@ const Toggle: React.FC<{
 );
 
 export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [eventFilter, setEventFilter] = useState<string>("NSDL_Gateway_504_Timeout");
-  const [onlyRage, setOnlyRage] = useState<boolean>(true);
+  const [eventFilter, setEventFilter] = useState<string>("");
+  const [onlyRage, setOnlyRage] = useState<boolean>(false);
   const [onlyErrors, setOnlyErrors] = useState<boolean>(false);
   const [searchRes, setSearchRes] = useState<SessionSearchResult | null>(null);
   const [selected, setSelected] = useState<SessionSummaryItem | null>(null);
@@ -46,10 +46,10 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
 
   const eventOptions = useMemo(
     () =>
-      Array.from(new Set(["NSDL_Gateway_504_Timeout", "KYC_PAN_Submitted", ...availableEvents])).filter(
-        (e) => !e.startsWith("$"),
+      Array.from(new Set([...availableEvents, eventFilter])).filter(
+        (e) => e && !e.startsWith("$"),
       ),
-    [availableEvents],
+    [availableEvents, eventFilter],
   );
 
   const runSearch = useCallback(async () => {

@@ -8,6 +8,7 @@ import { downloadTextFile, errorMessage, formatCount, humanizeEvent } from "../l
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   onCatalogChanged: () => void;
 }
 
@@ -46,10 +47,12 @@ async function withFeedback(
 export const CohortsLookupsWorkspace: React.FC<Props> = ({
   projectId,
   availableEvents,
+  availableProps,
   onCatalogChanged,
 }) => {
-  const [cohortName, setCohortName] = useState<string>("Power quick-commerce buyers");
-  const [cohortEvent, setCohortEvent] = useState<string>("Quick_Commerce_Order_Paid");
+  const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
+  const [cohortName, setCohortName] = useState<string>("");
+  const [cohortEvent, setCohortEvent] = useState<string>(() => cleanEvents[0] ?? "");
   const [minCount, setMinCount] = useState<number>(2);
   const [preview, setPreview] = useState<{ count: number; us: number } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -58,14 +61,21 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
     Array<{ id: string; name: string; description: string; created_at_ms: number }>
   >([]);
 
-  const [lookupName, setLookupName] = useState<string>("sku_margin_catalog");
-  const [joinProp, setJoinProp] = useState<string>("merchant_id");
-  const [csvText, setCsvText] = useState<string>(
-    "merchant_id,vertical,commission_pct\nm_zepto,Grocery_10m,19.0\nm_swiggy,Food_Instant,23.5\nm_croma,Electronics,11.0",
-  );
+  const [lookupName, setLookupName] = useState<string>("");
+  const [joinProp, setJoinProp] = useState<string>(() => availableProps[0] ?? "");
+  const [csvText, setCsvText] = useState<string>("");
 
-  const [customPropName, setCustomPropName] = useState<string>("gst_18_pct");
-  const [customSql, setCustomSql] = useState<string>("amount * 0.18");
+  const [customPropName, setCustomPropName] = useState<string>("");
+  const [customSql, setCustomSql] = useState<string>("");
+
+  useEffect(() => {
+    const clean = availableEvents.filter((e) => !e.startsWith("$"));
+    if (clean.length > 0) setCohortEvent((prev) => prev || clean[0]);
+  }, [availableEvents]);
+
+  useEffect(() => {
+    if (availableProps.length > 0) setJoinProp((prev) => prev || availableProps[0]);
+  }, [availableProps]);
 
   const [extensions, setExtensions] = useState<{
     custom_events: Array<{ name: string; source_events: string[] }>;
@@ -126,6 +136,10 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   }, [loadAll]);
 
   const runPreview = useCallback(async () => {
+    if (!cohortEvent) {
+      setPreview(null);
+      return;
+    }
     const def = {
       kind: "performed_event",
       event_name: cohortEvent,
@@ -188,13 +202,9 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
       onCatalogChanged();
     });
 
-  const eventOptions = [
-    "Quick_Commerce_Order_Paid",
-    "UPI_Autopay_Mandate_Approved",
-    "First_Disbursal_Success",
-    "NSDL_Gateway_504_Timeout",
-    ...availableEvents,
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const eventOptions = Array.from(
+    new Set([...availableEvents.filter((e) => !e.startsWith("$")), cohortEvent].filter(Boolean)),
+  );
 
   return (
     <div>
@@ -220,6 +230,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                 id="cohort-name"
                 value={cohortName}
                 onChange={(e) => setCohortName(e.target.value)}
+                placeholder="Repeat active users"
                 className={`${field} w-full`}
               />
             </div>
@@ -341,6 +352,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     id="lookup-name"
                     value={lookupName}
                     onChange={(e) => setLookupName(e.target.value)}
+                    placeholder="catalog_lookup"
                     className={`${field} w-full font-mono`}
                   />
                 </div>
@@ -352,7 +364,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     id="lookup-key"
                     value={joinProp}
                     onChange={(e) => setJoinProp(e.target.value)}
-                    placeholder="merchant_id"
+                    placeholder={availableProps[0] ?? "item_id"}
                     className={`${field} w-full font-mono`}
                   />
                 </div>
@@ -366,6 +378,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   rows={4}
                   value={csvText}
                   onChange={(e) => setCsvText(e.target.value)}
+                  placeholder={`${joinProp || "item_id"},category\nitem_1,tier_a`}
                   className={`${field} w-full font-mono text-xs`}
                 />
               </div>
@@ -405,6 +418,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   id="prop-name"
                   value={customPropName}
                   onChange={(e) => setCustomPropName(e.target.value)}
+                  placeholder="derived_value"
                   className={`${field} w-full font-mono`}
                 />
               </div>

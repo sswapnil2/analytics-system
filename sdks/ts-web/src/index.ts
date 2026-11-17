@@ -786,7 +786,7 @@ export class PulseWebClient {
 
   public async trackRevenue(params: RevenueParams): Promise<void> {
     if (this.optedOut) return;
-    const currency = params.currency ?? "INR";
+    const currency = params.currency ?? "USD";
     const quantity = params.quantity ?? 1;
     const totalAmount = params.amount * quantity;
     const evProps: EventProperties = {

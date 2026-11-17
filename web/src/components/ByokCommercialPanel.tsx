@@ -75,8 +75,8 @@ const CATEGORIES: CategoryMeta[] = [
 ];
 
 const COPILOT_PRESETS = [
-  "Diagnose our biggest onboarding funnel drop-off and cite replay sessions",
-  "Summarize payment & KYC errors affecting revenue conversion",
+  "Diagnose our biggest funnel drop-off and cite replay sessions",
+  "Summarize errors and rage taps affecting conversion",
 ];
 
 export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
@@ -107,14 +107,14 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
     webhook: "slack_webhook",
   });
   const [draftSecret, setDraftSecret] = useState<Record<string, string>>({});
-  const [draftStorageUrl, setDraftStorageUrl] = useState("s3://");
+  const [draftStorageUrl, setDraftStorageUrl] = useState("");
   const [draftStorageEndpoint, setDraftStorageEndpoint] = useState("");
-  const [draftStorageRegion, setDraftStorageRegion] = useState("ap-south-1");
+  const [draftStorageRegion, setDraftStorageRegion] = useState("");
   const [draftSigningSecret, setDraftSigningSecret] = useState("");
   const [draftStorageAccessKey, setDraftStorageAccessKey] = useState("");
   const [busyCategory, setBusyCategory] = useState<string | null>(null);
 
-  const [copilotPrompt, setCopilotPrompt] = useState(COPILOT_PRESETS[0]);
+  const [copilotPrompt, setCopilotPrompt] = useState("");
   const [copilotLoading, setCopilotLoading] = useState(false);
   const [copilotRes, setCopilotRes] = useState<CopilotResponse | null>(null);
 

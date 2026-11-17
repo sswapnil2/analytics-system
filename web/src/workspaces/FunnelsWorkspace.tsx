@@ -29,20 +29,11 @@ import {
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   refreshToken: number;
 }
 
 type OrderMode = "loose_order" | "strict_order" | "any_order";
-
-const DEFAULT_STEPS = [
-  "App_Open",
-  "KYC_PAN_Submitted",
-  "Video_KYC_Completed",
-  "UPI_Autopay_Mandate_Approved",
-  "First_Disbursal_Success",
-];
-
-const SEGMENT_PROPS = ["platform", "city", "payment_method", "network"];
 
 const WINDOWS: { hours: number; label: string }[] = [
   { hours: 1, label: "1 hour" },
@@ -53,21 +44,42 @@ const WINDOWS: { hours: number; label: string }[] = [
 
 const pct = (v: number) => `${v.toFixed(1)}%`;
 
-export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [steps, setSteps] = useState<string[]>(DEFAULT_STEPS);
+function defaultStepsFromCatalog(events: string[]): string[] {
+  const clean = events.filter((e) => !e.startsWith("$"));
+  if (clean.length >= 2) return clean.slice(0, Math.min(4, clean.length));
+  if (clean.length === 1) return [clean[0], clean[0]];
+  return [];
+}
+
+export const FunnelsWorkspace: React.FC<Props> = ({
+  projectId,
+  availableEvents,
+  availableProps,
+  refreshToken,
+}) => {
+  const [steps, setSteps] = useState<string[]>(() => defaultStepsFromCatalog(availableEvents));
   const [orderMode, setOrderMode] = useState<OrderMode>("loose_order");
   const [windowHours, setWindowHours] = useState<number>(168);
   const [excludeEvent, setExcludeEvent] = useState<string>("");
   const [holdConstant, setHoldConstant] = useState<string>("");
-  const [breakdownBy, setBreakdownBy] = useState<string>("platform");
+  const [breakdownBy, setBreakdownBy] = useState<string>("");
   const [result, setResult] = useState<FunnelResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [drawerStep, setDrawerStep] = useState<number | null>(null);
 
+  useEffect(() => {
+    setSteps((prev) => (prev.length > 0 ? prev : defaultStepsFromCatalog(availableEvents)));
+  }, [availableEvents]);
+
   const eventOptions = useMemo(
-    () => Array.from(new Set([...DEFAULT_STEPS, ...availableEvents])).filter((e) => !e.startsWith("$")),
-    [availableEvents],
+    () => Array.from(new Set([...availableEvents, ...steps])).filter((e) => e && !e.startsWith("$")),
+    [availableEvents, steps],
+  );
+
+  const propOptions = useMemo(
+    () => Array.from(new Set([...availableProps, holdConstant, breakdownBy].filter(Boolean))),
+    [availableProps, holdConstant, breakdownBy],
   );
 
   const buildQuery = useCallback(
@@ -102,6 +114,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
   );
 
   const runFunnel = useCallback(async () => {
+    if (steps.length < 2) {
+      setResult(null);
+      return;
+    }
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -113,7 +129,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, range]);
+  }, [projectId, buildQuery, range, steps.length]);
 
   useEffect(() => {
     void runFunnel();
@@ -137,7 +153,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
     return best;
   }, [overall]);
 
-  const reportTitle = `${humanizeEvent(steps[0] ?? "")} → ${humanizeEvent(steps[steps.length - 1] ?? "")}`;
+  const reportTitle =
+    steps.length >= 2
+      ? `${humanizeEvent(steps[0] ?? "")} → ${humanizeEvent(steps[steps.length - 1] ?? "")}`
+      : "Funnels";
 
   return (
     <div className="space-y-5">
@@ -211,7 +230,13 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
           <li>
             <button
               type="button"
-              onClick={() => setSteps([...steps, eventOptions.find((e) => !steps.includes(e)) ?? eventOptions[0]])}
+              disabled={eventOptions.length === 0}
+              onClick={() =>
+                setSteps([
+                  ...steps,
+                  eventOptions.find((e) => !steps.includes(e)) ?? eventOptions[0] ?? "",
+                ])
+              }
               className={btn.ghost}
             >
               <Plus className="h-4 w-4" /> Add step
@@ -242,20 +267,18 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             <span className={fieldLabel}>Exclude users who did (between steps 2 and 3)</span>
             <select value={excludeEvent} onChange={(e) => setExcludeEvent(e.target.value)} className={field}>
               <option value="">Nothing excluded</option>
-              {Array.from(new Set(["NSDL_Gateway_504_Timeout", ...availableEvents]))
-                .filter((e) => !e.startsWith("$"))
-                .map((ev) => (
-                  <option key={ev} value={ev}>
-                    {humanizeEvent(ev)}
-                  </option>
-                ))}
+              {eventOptions.map((ev) => (
+                <option key={ev} value={ev}>
+                  {humanizeEvent(ev)}
+                </option>
+              ))}
             </select>
           </label>
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Same value on every step</span>
             <select value={holdConstant} onChange={(e) => setHoldConstant(e.target.value)} className={field}>
               <option value="">Not required</option>
-              {SEGMENT_PROPS.map((p) => (
+              {propOptions.map((p) => (
                 <option key={p} value={p}>
                   {humanizeEvent(p)}
                 </option>
@@ -266,7 +289,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
             <span className={fieldLabel}>Split by</span>
             <select value={breakdownBy} onChange={(e) => setBreakdownBy(e.target.value)} className={field}>
               <option value="">No split</option>
-              {SEGMENT_PROPS.map((p) => (
+              {propOptions.map((p) => (
                 <option key={p} value={p}>
                   {humanizeEvent(p)}
                 </option>
@@ -280,6 +303,15 @@ export const FunnelsWorkspace: React.FC<Props> = ({ projectId, availableEvents, 
 
       {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={`The funnel didn't run: ${error}`} onRetry={() => void runFunnel()} />}
+
+      {steps.length < 2 && !loading && (
+        <Panel>
+          <EmptyState
+            title="No events in this project yet"
+            body="Send events to your project via the SDK or /v1/ingest to build a conversion funnel."
+          />
+        </Panel>
+      )}
 
       {!result && loading && (
         <Panel>

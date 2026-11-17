@@ -45,7 +45,8 @@ function truncate(text: string, maxChars: number): string {
 }
 
 export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
-  const [anchorEvent, setAnchorEvent] = useState<string>("KYC_PAN_Submitted");
+  const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
+  const [anchorEvent, setAnchorEvent] = useState<string>(() => cleanEvents[0] ?? "");
   const [direction, setDirection] = useState<"forward" | "reverse">("forward");
   const [steps, setSteps] = useState<number>(3);
   const [hideSystem, setHideSystem] = useState<boolean>(true);
@@ -53,10 +54,20 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const clean = availableEvents.filter((e) => !e.startsWith("$"));
+    if (clean.length === 0) return;
+    setAnchorEvent((prev) => prev || clean[0]);
+  }, [availableEvents]);
+
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
 
   const runFlows = useCallback(async () => {
+    if (!anchorEvent) {
+      setResult(null);
+      return;
+    }
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -184,15 +195,9 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
     return { svgH: svgH + 4, nodeRects: Array.from(nodeRects.entries()), ribbons };
   }, [result, hideSystem]);
 
-  const eventOptions = [
-    "App_Open",
-    "OTP_Verified",
-    "KYC_PAN_Submitted",
-    "Video_KYC_Completed",
-    "UPI_Autopay_Mandate_Approved",
-    "First_Disbursal_Success",
-    ...availableEvents,
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const eventOptions = Array.from(
+    new Set([...availableEvents.filter((e) => !e.startsWith("$")), anchorEvent].filter(Boolean)),
+  );
 
   const ribbonStyle = {
     main: { stroke: "rgb(var(--brand))", opacity: 0.45 },
@@ -200,10 +205,14 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, re
     other: { stroke: "rgb(var(--line-strong))", opacity: 0.8 },
   } as const;
 
+  const pageTitle = anchorEvent
+    ? `${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)}`
+    : "Journeys";
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title={`${direction === "forward" ? "After" : "Before"} ${humanizeEvent(anchorEvent)}`}
+        title={pageTitle}
         description="Journey: what users do before or after a key event."
         actions={
           <>
