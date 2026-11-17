@@ -27,3 +27,14 @@ CREATE TABLE IF NOT EXISTS password_resets (
     expires_at_ms BIGINT NOT NULL,
     used_at_ms BIGINT
 );
+
+-- A password sign-up proves its email before it joins or creates an organisation. Until then the
+-- account sits in the placeholder organisation `org_pending`, which has no projects, and gets no session.
+CREATE TABLE IF NOT EXISTS email_verifications (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    -- Set when verifying creates a new organisation with this name; NULL joins the default one.
+    org_name TEXT,
+    expires_at_ms BIGINT NOT NULL,
+    used_at_ms BIGINT
+);

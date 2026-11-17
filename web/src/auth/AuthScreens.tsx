@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { api, ApiAuthError, AuthConfig, setStoredAdminToken } from "../api/client";
+import { api, ApiAuthError, AuthConfig, getStoredAdminToken, setStoredAdminToken } from "../api/client";
 import { btn, field } from "../components/ui";
 import { errorMessage } from "../lib/format";
 
-export type AuthView = "signin" | "signup" | "callback" | "invite" | "reset" | "forgot";
+export type AuthView = "signin" | "signup" | "callback" | "invite" | "reset" | "forgot" | "verify";
 
 /** Reads `#/signin`, `#/signup`, `#/forgot`, `#/invite/<token>`, `#/reset/<token>` or
  * `#/auth/callback?code=…` from the URL hash. */
@@ -17,6 +17,7 @@ export function parseAuthHash(): { view: AuthView; params: URLSearchParams; toke
   if (path === "auth/callback") return { view: "callback", params, token };
   if (head === "invite" && token) return { view: "invite", params, token };
   if (head === "reset" && token) return { view: "reset", params, token };
+  if (head === "verify" && token) return { view: "verify", params, token };
   return { view: "signin", params, token: "" };
 }
 
@@ -315,6 +316,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
   const [touchedPw, setTouchedPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
   const pwTooShort = password.length > 0 && password.length < 10;
 
@@ -323,18 +325,21 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
     setTouchedPw(true);
     setError(null);
     if (!email.trim()) return setError("Enter your work email.");
-    if (cfg?.org_name_required && !orgName.trim()) return setError("Enter your organisation's name.");
     if (password.length < 10) return;
     setBusy(true);
     try {
-      const session = await api.signUp({
+      const res = await api.signUp({
         email: email.trim(),
         password,
         name: name.trim() || undefined,
         setup_code: cfg?.setup_code_required ? setupCode.trim() || undefined : undefined,
         org_name: cfg?.org_name_required ? orgName.trim() || undefined : undefined,
       });
-      setStoredAdminToken(session.token);
+      if ("verification_required" in res) {
+        setPendingEmail(res.email);
+        return;
+      }
+      setStoredAdminToken(res.token);
       onSignedIn();
     } catch (err) {
       setError(errorMessage(err));
@@ -367,6 +372,24 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
         </ol>
       }
     >
+      {pendingEmail ? (
+        <div className="flex flex-col gap-6" role="status">
+          <div className="space-y-1.5">
+            <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Verify your email</h2>
+            <p className="text-[0.9375rem] text-muted">
+              Your account for <span className="font-medium text-ink">{pendingEmail}</span> is waiting. Open the
+              verification link to finish: it works once and expires in 24 hours.
+            </p>
+          </div>
+          <p className="rounded-lg bg-warn-soft px-3 py-2.5 text-sm text-warn">
+            This Pulse server doesn't send email. The link is written to the server log, so ask whoever runs it to pass
+            it on.
+          </p>
+          <a href="#/signin" className="text-sm text-muted hover:text-ink hover:underline">
+            Back to sign in
+          </a>
+        </div>
+      ) : (
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Create your account</h2>
@@ -405,7 +428,8 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
                 className={inputCls}
               />
               <span id="org-hint" className="text-[0.8125rem] font-normal text-muted">
-                You get a private workspace with its own project. Other accounts on this server can't see it.
+                You get a private workspace with its own project. Leave it blank to join your company's workspace, if
+                your email domain is allowed on this server.
               </span>
             </label>
           )}
@@ -468,6 +492,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
           </a>
         </span>
       </form>
+      )}
     </AuthLayout>
   );
 };
@@ -537,8 +562,12 @@ const SimpleAuthLayout: React.FC<{ children: React.ReactNode }> = ({ children })
 );
 
 export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => void }> = ({ token, onSignedIn }) => {
-  const [info, setInfo] = useState<{ email: string; role: string; org_name: string | null } | null>(null);
+  const [info, setInfo] = useState<{ email: string; role: string; org_name: string | null; has_account: boolean } | null>(
+    null,
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Who is signed in on this browser, if anyone: an existing account accepts by joining.
+  const [me, setMe] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -546,7 +575,26 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
 
   useEffect(() => {
     api.getInvite(token).then(setInfo).catch((err) => setLoadError(errorMessage(err)));
+    if (getStoredAdminToken())
+      api
+        .getMe()
+        .then((u) => setMe(u.email))
+        .catch(() => setMe(null));
   }, [token]);
+
+  const join = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await api.joinOrg(token);
+      window.history.replaceState(null, "", "#/dashboards");
+      onSignedIn();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -574,6 +622,33 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
           <a href="#/signin" className={`${btn.secondary} h-11`}>
             Go to sign in
           </a>
+        </div>
+      ) : info?.has_account ? (
+        <div className="flex flex-col gap-6">
+          <div className="space-y-1.5">
+            <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Join {info.org_name ?? "your team"}</h2>
+            <p className="text-[0.9375rem] text-muted">
+              You're invited as {info.role}: you can {ROLE_WORDS[info.role] ?? "use Pulse"}. You already have an account,
+              and an account belongs to one organisation, so joining moves it here.
+            </p>
+          </div>
+          <FormError id="invite-error" message={error} />
+          {me === info.email ? (
+            <button type="button" onClick={() => void join()} disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+              {busy ? "Joining…" : `Join as ${info.email}`}
+            </button>
+          ) : (
+            <>
+              {me && (
+                <p className="text-sm text-ink-2">
+                  You're signed in as {me}. This invite is for {info.email}.
+                </p>
+              )}
+              <a href={`#/signin?next=invite/${token}`} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+                Sign in as {info.email}
+              </a>
+            </>
+          )}
         </div>
       ) : (
         <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
@@ -734,6 +809,45 @@ export const ResetPasswordScreen: React.FC<{ token: string }> = ({ token }) => {
           </>
         )}
       </form>
+    </SimpleAuthLayout>
+  );
+};
+
+export const VerifyEmailScreen: React.FC<{ token: string; onSignedIn: () => void }> = ({ token, onSignedIn }) => {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // A button, not an automatic call: link previewers that open the URL must not use up the token.
+  const verify = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const session = await api.verifyEmail(token);
+      setStoredAdminToken(session.token);
+      window.history.replaceState(null, "", "#/dashboards");
+      onSignedIn();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SimpleAuthLayout>
+      <div className="flex flex-col gap-6">
+        <div className="space-y-1.5">
+          <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Verify your email</h2>
+          <p className="text-[0.9375rem] text-muted">Confirm this is your address to finish creating your account.</p>
+        </div>
+        <FormError id="verify-error" message={error} />
+        <button type="button" onClick={() => void verify()} disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+          {busy ? "Verifying…" : "Verify and sign in"}
+        </button>
+        <a href="#/signin" className="text-sm text-muted hover:text-ink hover:underline">
+          Back to sign in
+        </a>
+      </div>
     </SimpleAuthLayout>
   );
 };

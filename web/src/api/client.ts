@@ -653,7 +653,15 @@ export function default14DayRange(): TimeRange {
 export const api = {
   getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
   signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string }) =>
-    fetchJson<AuthSession>("/v1/auth/signup", { method: "POST", body: JSON.stringify(body) }),
+    // A session, or `verification_required` when the address must be proven first.
+    fetchJson<AuthSession | { verification_required: true; email: string }>("/v1/auth/signup", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  verifyEmail: (token: string) =>
+    fetchJson<AuthSession>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) }),
+  joinOrg: (token: string) =>
+    fetchJson<AuthUser>("/v1/auth/join-org", { method: "POST", body: JSON.stringify({ token }) }),
   logIn: (body: { email: string; password: string }) =>
     fetchJson<AuthSession>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) }),
   exchangeLoginCode: (code: string) =>
@@ -681,7 +689,9 @@ export const api = {
     fetchJson<OrgInvite>("/v1/org/invites", { method: "POST", body: JSON.stringify(body) }),
   deleteInvite: (id: string) => fetchJson<unknown>(`/v1/org/invites/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getInvite: (token: string) =>
-    fetchJson<{ email: string; role: Role; org_name: string | null }>(`/v1/auth/invites/${encodeURIComponent(token)}`),
+    fetchJson<{ email: string; role: Role; org_name: string | null; has_account: boolean }>(
+      `/v1/auth/invites/${encodeURIComponent(token)}`,
+    ),
   acceptInvite: (body: { token: string; password: string; name?: string }) =>
     fetchJson<AuthSession>("/v1/auth/invites/accept", { method: "POST", body: JSON.stringify(body) }),
   requestPasswordReset: (email: string) =>

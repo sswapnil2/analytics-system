@@ -13,7 +13,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::auth::{hash_password, normalize_email, now_ms, random_hex, user_json, verify_password};
+use super::auth::{
+    hash_password, normalize_email, now_ms, random_hex, user_json, verify_password, SignupOrg,
+    PENDING_ORG,
+};
 use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, CtrlError};
 use crate::db::OrgInvite;
 use crate::models::{sha256_hex, Role, User};
@@ -57,6 +60,7 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         "/v1/auth/password",
         "/v1/auth/sessions/:sid",
         "/v1/auth/sessions/revoke-others",
+        "/v1/auth/join-org",
     ];
     let m = method;
     if path == "/v1/org" && m == Method::PATCH {
@@ -89,6 +93,7 @@ pub(super) fn account_router() -> Router<Arc<ControlPlaneService>> {
         .route("/v1/org/members/:user_id/password-reset", post(handle_admin_reset_link))
         .route("/v1/org/invites", get(handle_list_invites).post(handle_create_invite))
         .route("/v1/org/invites/:invite_id", delete(handle_delete_invite))
+        .route("/v1/auth/join-org", post(handle_join_org))
 }
 
 /// Routes that work without a session: looking up and accepting an invite, and password reset.
@@ -98,6 +103,7 @@ pub(super) fn public_router() -> Router<Arc<ControlPlaneService>> {
         .route("/v1/auth/invites/accept", post(handle_accept_invite))
         .route("/v1/auth/password-reset/request", post(handle_request_reset))
         .route("/v1/auth/password-reset", post(handle_reset_password))
+        .route("/v1/auth/verify-email", post(handle_verify_email))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
@@ -466,8 +472,15 @@ async fn handle_create_invite(
     if !p.role().outranks(role) {
         return Err(CtrlError::forbidden(format!("only an owner can invite someone as {}", role.as_str())));
     }
-    if ctrl.meta.get_user_by_email(&email).await.map_err(CtrlError::meta)?.is_some() {
-        return Err(CtrlError::conflict("an account with this email already exists"));
+    // Someone with an account elsewhere can still be invited: they accept while signed in and move here.
+    if ctrl
+        .meta
+        .get_user_by_email(&email)
+        .await
+        .map_err(CtrlError::meta)?
+        .is_some_and(|u| u.org_id == org_id)
+    {
+        return Err(CtrlError::conflict("this person is already a member"));
     }
     let token = random_hex();
     let now = now_ms();
@@ -525,7 +538,14 @@ async fn handle_get_invite(
         .map_err(CtrlError::meta)?
         .ok_or_else(invite_gone)?;
     let org_name = ctrl.meta.get_org_name(&inv.org_id).await.map_err(CtrlError::meta)?;
-    Ok(Json(json!({ "email": inv.email, "role": inv.role, "org_name": org_name })))
+    // A verified account must sign in and join; an unverified one is replaced when the invite is accepted.
+    let has_account = ctrl
+        .meta
+        .get_user_by_email(&inv.email)
+        .await
+        .map_err(CtrlError::meta)?
+        .is_some_and(|u| u.org_id != PENDING_ORG);
+    Ok(Json(json!({ "email": inv.email, "role": inv.role, "org_name": org_name, "has_account": has_account })))
 }
 
 #[derive(Deserialize)]
@@ -548,24 +568,32 @@ async fn handle_accept_invite(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invite_gone)?;
-    if ctrl.meta.get_user_by_email(&inv.email).await.map_err(CtrlError::meta)?.is_some() {
-        return Err(CtrlError::conflict("an account with this email already exists; sign in instead"));
+    let existing = ctrl.meta.get_user_by_email(&inv.email).await.map_err(CtrlError::meta)?;
+    if existing.is_some_and(|u| u.org_id != PENDING_ORG) {
+        return Err(CtrlError::conflict(
+            "You already have an account. Sign in, then open this invite link again to join.",
+        ));
     }
     let phc = hash(req.password).await?;
     if !ctrl.meta.accept_invite(&inv.id, now).await.map_err(CtrlError::meta)? {
         return Err(invite_gone());
     }
-    let user = User {
+    // The invite link proves the address, so an unverified sign-up with it is replaced.
+    let user = ctrl
+        .insert_pending_user(User {
         id: format!("user_{}", Uuid::new_v4().simple()),
         email: inv.email.clone(),
         name: req.name.map(|n| n.trim().chars().take(120).collect::<String>()).filter(|n| !n.is_empty()),
         password_hash: Some(phc),
         google_sub: None,
         created_at_ms: now,
-        org_id: inv.org_id.clone(),
-        role: Role::parse(&inv.role).unwrap_or(Role::Viewer),
-    };
-    ctrl.meta.insert_user(&user).await.map_err(CtrlError::meta)?;
+        org_id: String::new(),
+        role: Role::Viewer,
+    })
+    .await?;
+    let role = Role::parse(&inv.role).unwrap_or(Role::Viewer);
+    ctrl.meta.set_user_org(&user.id, &inv.org_id, role).await.map_err(CtrlError::meta)?;
+    let user = User { org_id: inv.org_id.clone(), role, ..user };
     ctrl.record_enterprise_audit(
         &format!("user:{}", user.id),
         "invite.accepted",
@@ -590,7 +618,9 @@ async fn handle_request_reset(
     Json(req): Json<ResetRequestReq>,
 ) -> std::result::Result<StatusCode, CtrlError> {
     if let Some(email) = normalize_email(&req.email) {
-        if let Some(user) = ctrl.meta.get_user_by_email(&email).await.map_err(CtrlError::meta)? {
+        let user = ctrl.meta.get_user_by_email(&email).await.map_err(CtrlError::meta)?;
+        // Unverified sign-ups verify first; a reset link would be a second way to prove the address.
+        if let Some(user) = user.filter(|u| u.org_id != PENDING_ORG) {
             let (_, url) = ctrl.new_reset_link(&user.id).await?;
             tracing::info!(email = %email, "password reset link: {url}");
         }
@@ -622,6 +652,101 @@ async fn handle_reset_password(
     ctrl.record_enterprise_audit(&format!("user:{uid}"), "auth.password_reset", &format!("user:{uid}"), json!({}))
         .await;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+// ------------------- Email verification and joining -------------------
+
+#[derive(Deserialize)]
+struct TokenReq {
+    token: String,
+}
+
+/// Finishes a password sign-up: the account joins (or creates) its organisation and is signed in.
+/// The sign-up policy is checked again here, in case it changed while the link was waiting.
+async fn handle_verify_email(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
+    Json(req): Json<TokenReq>,
+) -> ApiRes<Value> {
+    let gone = || CtrlError(StatusCode::GONE, "This link has expired or was already used. Sign up again for a new one.".to_string());
+    let (uid, org_name) = ctrl
+        .meta
+        .take_email_verification(&sha256_hex(&req.token), now_ms())
+        .await
+        .map_err(CtrlError::meta)?
+        .ok_or_else(gone)?;
+    let user = ctrl.get_user(&uid).await.map_err(|_| gone())?;
+    if user.org_id != PENDING_ORG {
+        return Err(gone());
+    }
+    let (allow_new_orgs, domain_ok) = {
+        let cfg = ctrl.auth_cfg.read();
+        let domain = user.email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+        (
+            cfg.allow_new_orgs,
+            cfg.allowed_email_domains.iter().any(|d| d.eq_ignore_ascii_case(domain)),
+        )
+    };
+    let org = match org_name {
+        Some(name) if allow_new_orgs => SignupOrg::New(name),
+        None if domain_ok => SignupOrg::Default,
+        _ => return Err(CtrlError::forbidden("Sign-ups are closed for this workspace.")),
+    };
+    let (org_id, role) = ctrl.assign_org(&uid, org).await?;
+    ctrl.record_enterprise_audit(&format!("user:{uid}"), "auth.email_verified", &format!("org:{org_id}"), json!({ "email": user.email, "role": role.as_str() }))
+        .await;
+    let user = User { org_id, role, ..user };
+    ctrl.session_response(&user, &headers).await
+}
+
+/// A signed-in account accepts an invite addressed to its email and moves to that organisation.
+/// A user belongs to one organisation, so this leaves the current one; the last owner of an
+/// organisation that still has other members must hand over ownership first.
+async fn handle_join_org(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(p): Extension<AuthPrincipal>,
+    Json(req): Json<TokenReq>,
+) -> ApiRes<Value> {
+    let uid = session_user(&p)?;
+    let now = now_ms();
+    let inv = ctrl
+        .meta
+        .get_invite(&sha256_hex(&req.token), now)
+        .await
+        .map_err(CtrlError::meta)?
+        .ok_or_else(invite_gone)?;
+    let user = ctrl.get_user(uid).await?;
+    if user.email != inv.email {
+        return Err(CtrlError::forbidden(format!(
+            "This invite is for {}. Sign in with that account to accept it.",
+            inv.email
+        )));
+    }
+    if user.org_id == inv.org_id {
+        return Err(CtrlError::conflict("you're already a member of this organisation"));
+    }
+    if user.role == Role::Owner {
+        let members = ctrl.meta.list_org_users(&user.org_id).await.map_err(CtrlError::meta)?;
+        let owners = members.iter().filter(|u| u.role == Role::Owner).count();
+        if owners <= 1 && members.len() > 1 {
+            return Err(CtrlError::conflict(
+                "You're the only owner of your current organisation. Make someone else an owner in Settings first.",
+            ));
+        }
+    }
+    if !ctrl.meta.accept_invite(&inv.id, now).await.map_err(CtrlError::meta)? {
+        return Err(invite_gone());
+    }
+    let role = Role::parse(&inv.role).unwrap_or(Role::Viewer);
+    ctrl.meta.set_user_org(uid, &inv.org_id, role).await.map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &p.actor_label(),
+        "invite.accepted",
+        &format!("org:{}", inv.org_id),
+        json!({ "invite_id": inv.id, "email": inv.email, "role": inv.role, "left_org": user.org_id }),
+    )
+    .await;
+    Ok(Json(user_json(&User { org_id: inv.org_id, role, ..user })))
 }
 
 #[cfg(test)]

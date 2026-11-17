@@ -1090,11 +1090,75 @@ impl MetaStore {
 
     // ------------------- Users & Sessions -------------------
 
+    /// Accounts with an organisation; sign-ups still waiting to verify their email don't count.
     pub async fn count_users(&self) -> Result<i64, MetaError> {
-        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM users", |r| {
+        let n = db_map_opt!(
+            self,
+            "SELECT COUNT(*) AS n FROM users WHERE org_id <> 'org_pending'",
+            |r| { r.get::<i64, _>("n") }
+        );
+        Ok(n.unwrap_or(0))
+    }
+
+    pub async fn count_orgs(&self) -> Result<i64, MetaError> {
+        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM orgs", |r| {
             r.get::<i64, _>("n")
         });
         Ok(n.unwrap_or(0))
+    }
+
+    /// Moves an account into an organisation with a role (verifying, or accepting an invite).
+    pub async fn set_user_org(&self, user_id: &str, org_id: &str, role: Role) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET org_id = ?, role = ? WHERE id = ?",
+            org_id,
+            role.as_str(),
+            user_id,
+        );
+        Ok(())
+    }
+
+    pub async fn insert_email_verification(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        org_name: Option<&str>,
+        expires_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO email_verifications (token_hash, user_id, org_name, expires_at_ms) VALUES (?, ?, ?, ?)",
+            token_hash,
+            user_id,
+            org_name,
+            expires_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Uses a verification token once; returns its user id and the organisation name to create.
+    pub async fn take_email_verification(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<(String, Option<String>)>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT user_id, org_name FROM email_verifications
+             WHERE token_hash = ? AND used_at_ms IS NULL AND expires_at_ms > ?",
+            |r| { (r.get::<String, _>("user_id"), r.get::<Option<String>, _>("org_name")) },
+            token_hash,
+            now_ms,
+        );
+        let Some(row) = row else { return Ok(None) };
+        let n = db_exec!(
+            self,
+            "UPDATE email_verifications SET used_at_ms = ? WHERE token_hash = ? AND used_at_ms IS NULL",
+            now_ms,
+            token_hash,
+        );
+        Ok((n > 0).then_some(row))
     }
 
     /// Inserts a new user; `Conflict` when the email (or Google subject) is already taken.
@@ -1318,6 +1382,7 @@ impl MetaStore {
         if n > 0 {
             let _ = db_exec!(self, "DELETE FROM user_sessions WHERE user_id = ?", user_id);
             let _ = db_exec!(self, "DELETE FROM password_resets WHERE user_id = ?", user_id);
+            let _ = db_exec!(self, "DELETE FROM email_verifications WHERE user_id = ?", user_id);
         }
         Ok(n > 0)
     }

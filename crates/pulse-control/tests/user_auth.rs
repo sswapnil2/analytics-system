@@ -14,6 +14,8 @@ use pulse_storage::{build_from_url, StorageConfig, StorageEngine};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+mod common;
+
 const ROOT: &str = "sk_root_test_admin_secret_0123456789";
 const PUBLIC_URL: &str = "http://pulse.test";
 
@@ -109,6 +111,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 
 #[tokio::test]
 async fn signup_policy_first_user_then_domain_allowlist() {
+    let (logs, _guard) = common::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
     let (app, ctrl, _meta) = setup_app(tmp.path()).await;
     // Closed node: no new organisations, only allowed domains after the first account.
@@ -158,8 +161,29 @@ async fn signup_policy_first_user_then_domain_allowlist() {
     );
 
     ctrl.set_auth_config(auth_cfg(&["example.com"], "http://127.0.0.1:1/unused"));
-    let (s, _) = signup(&app, "bob@EXAMPLE.com").await;
+    // An allowed domain is not proof of owning the address: no session and no org until verified.
+    let (s, v) = signup(&app, "bob@EXAMPLE.com").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["verification_required"], true);
+    assert!(v.get("token").is_none());
+    let (s, _, _) = send(&app, "POST", "/v1/auth/login", None, Some(json!({"email": "bob@example.com", "password": "correct horse battery"}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // A second, unverified sign-up for the same address replaces the first (no squatting); the first link dies.
+    let first = logs.last_token("verify");
+    let (s, _) = signup(&app, "bob@example.com").await;
     assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": first}))).await;
+    assert_eq!(s, StatusCode::GONE);
+    let token = logs.last_token("verify");
+    let (s, v, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["user"]["org_id"], "org_default");
+    assert_eq!(v["user"]["role"], "member");
+    let bob = v["token"].as_str().unwrap();
+    let (s, _, _) = send(&app, "GET", "/v1/projects/proj_alpha/saved-reports", Some(bob), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::GONE);
     let (s, _) = signup(&app, "bob@example.com").await;
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = signup(&app, "eve@other.com").await;
@@ -443,8 +467,9 @@ async fn google_full_callback_against_stub_token_endpoint() {
 
 #[tokio::test]
 async fn each_signup_gets_its_own_org_and_cannot_see_others() {
+    let (logs, _guard) = common::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
-    let (app, ctrl, _meta) = setup_app(tmp.path()).await;
+    let (app, ctrl, meta) = setup_app(tmp.path()).await;
     let mut cfg = auth_cfg(&[], "http://127.0.0.1:1/unused");
     cfg.allow_new_orgs = true;
     ctrl.set_auth_config(cfg);
@@ -466,8 +491,17 @@ async fn each_signup_gets_its_own_org_and_cannot_see_others() {
     };
     let (s, _, _) = send(&app, "POST", "/v1/auth/signup", None, body(None)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    let orgs_before = meta.count_orgs().await.unwrap();
     let (s, eve, _) = send(&app, "POST", "/v1/auth/signup", None, body(Some("Acme"))).await;
     assert_eq!(s, StatusCode::OK, "{eve}");
+    assert_eq!(eve["verification_required"], true);
+    // The org is created when the address is proven, not at sign-up.
+    assert_eq!(meta.count_orgs().await.unwrap(), orgs_before);
+    let token = logs.last_token("verify");
+    let (s, eve, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::OK, "{eve}");
+    assert_eq!(eve["user"]["role"], "owner");
+    assert_eq!(meta.count_orgs().await.unwrap(), orgs_before + 1);
     let eve_tok = eve["token"].as_str().unwrap().to_string();
     assert_ne!(eve["user"]["org_id"], "org_default");
 

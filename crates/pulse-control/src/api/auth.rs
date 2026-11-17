@@ -122,7 +122,7 @@ impl ControlPlaneService {
         email: &str,
         setup_code: Option<&str>,
         org_name: Option<&str>,
-    ) -> Result<Option<SignupOrg>, CtrlError> {
+    ) -> Result<Option<(SignupOrg, bool)>, CtrlError> {
         let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
         let (domain_ok, allow_new_orgs) = {
             let cfg = self.auth_cfg.read();
@@ -140,25 +140,34 @@ impl ControlPlaneService {
                 .is_some_and(|c| {
                     constant_time_eq::constant_time_eq(&sha256_bytes(c), &self.root_admin_hash)
                 });
-            return Ok((domain_ok || code_ok).then_some(SignupOrg::Default));
+            // The setup code proves the caller runs the node, so that account needs no email check.
+            return Ok((domain_ok || code_ok).then_some((SignupOrg::Default, code_ok)));
         }
         let org_name = org_name.map(str::trim).filter(|n| !n.is_empty());
         Ok(match org_name {
-            Some(name) if allow_new_orgs => Some(SignupOrg::New(name.chars().take(80).collect())),
-            _ if domain_ok => Some(SignupOrg::Default),
+            Some(name) if allow_new_orgs => {
+                Some((SignupOrg::New(name.chars().take(80).collect()), false))
+            }
+            _ if domain_ok => Some((SignupOrg::Default, false)),
             _ => None,
         })
     }
 
-    /// Resolves `SignupOrg` to an org id and the new account's role, creating the org and its
-    /// first project when it's new. Whoever creates an org owns it; the first account on the node
-    /// owns the default org; later accounts joining it by email domain are members.
-    async fn org_for_signup(&self, org: SignupOrg) -> Result<(String, Role), CtrlError> {
-        match org {
+    /// Puts an existing account (inserted first, in `PENDING_ORG`) into its sign-up organisation.
+    /// A new organisation is created only now, after the account row exists, so a sign-up that
+    /// loses a race on its email never leaves an empty organisation behind. Whoever creates an
+    /// org owns it; the first account in the default org owns it; later ones are members.
+    pub(super) async fn assign_org(&self, user_id: &str, org: SignupOrg) -> Result<(String, Role), CtrlError> {
+        let (org_id, role) = match org {
             SignupOrg::Default => {
-                let first = self.meta.count_users().await.map_err(CtrlError::meta)? == 0;
-                let role = if first { Role::Owner } else { Role::Member };
-                Ok(("org_default".to_string(), role))
+                let empty = self
+                    .meta
+                    .list_org_users("org_default")
+                    .await
+                    .map_err(CtrlError::meta)?
+                    .is_empty();
+                let role = if empty { Role::Owner } else { Role::Member };
+                ("org_default".to_string(), role)
             }
             SignupOrg::New(name) => {
                 let id = format!("org_{}", &Uuid::new_v4().simple().to_string()[..12]);
@@ -167,9 +176,35 @@ impl ControlPlaneService {
                     .await
                     .map_err(CtrlError::meta)?;
                 self.create_project_in_org(&id, &name, None).await?;
-                Ok((id, Role::Owner))
+                (id, Role::Owner)
             }
+        };
+        self.meta
+            .set_user_org(user_id, &org_id, role)
+            .await
+            .map_err(CtrlError::meta)?;
+        Ok((org_id, role))
+    }
+
+    /// Inserts a new account with no organisation yet. An unverified account with the same email
+    /// is replaced: it has no session and no data, and must not let a stranger squat an address.
+    pub(super) async fn insert_pending_user(&self, mut user: User) -> Result<User, CtrlError> {
+        if let Some(old) = self
+            .meta
+            .get_user_by_email(&user.email)
+            .await
+            .map_err(CtrlError::meta)?
+            .filter(|u| u.org_id == PENDING_ORG)
+        {
+            self.meta
+                .delete_user(PENDING_ORG, &old.id)
+                .await
+                .map_err(CtrlError::meta)?;
         }
+        user.org_id = PENDING_ORG.to_string();
+        user.role = Role::Viewer;
+        self.meta.insert_user(&user).await.map_err(CtrlError::meta)?;
+        Ok(user)
     }
 
     async fn create_session(&self, user_id: &str, headers: &HeaderMap) -> Result<String, CtrlError> {
@@ -194,7 +229,11 @@ impl ControlPlaneService {
     }
 }
 
-enum SignupOrg {
+/// Placeholder organisation for sign-ups that haven't verified their email. It has no projects.
+pub(super) const PENDING_ORG: &str = "org_pending";
+const VERIFY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+pub(super) enum SignupOrg {
     Default,
     New(String),
 }
@@ -355,7 +394,7 @@ async fn handle_signup(
             "password must be between 10 and 256 characters",
         ));
     }
-    let Some(org) = ctrl
+    let Some((org, verified)) = ctrl
         .signup_org(&email, req.setup_code.as_deref(), req.org_name.as_deref())
         .await?
     else {
@@ -367,42 +406,55 @@ async fn handle_signup(
         }
         return Err(CtrlError::forbidden(SIGNUP_CLOSED));
     };
-    if ctrl
-        .meta
-        .get_user_by_email(&email)
-        .await
-        .map_err(CtrlError::meta)?
-        .is_some()
-    {
-        return Err(CtrlError::conflict(
-            "an account with this email already exists",
-        ));
-    }
 
     let password = req.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(CtrlError::internal)?
         .map_err(CtrlError::internal)?;
-    let (org_id, role) = ctrl.org_for_signup(org).await?;
-    let user = User {
-        id: format!("user_{}", Uuid::new_v4().simple()),
-        email,
-        name: req
-            .name
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty()),
-        password_hash: Some(password_hash),
-        google_sub: None,
-        created_at_ms: now_ms(),
-        org_id,
-        role,
+    // The account row goes in first; the email's unique constraint settles concurrent sign-ups
+    // before any organisation is created.
+    let user = ctrl
+        .insert_pending_user(User {
+            id: format!("user_{}", Uuid::new_v4().simple()),
+            email,
+            name: req
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            password_hash: Some(password_hash),
+            google_sub: None,
+            created_at_ms: now_ms(),
+            org_id: String::new(),
+            role: Role::Viewer,
+        })
+        .await?;
+
+    if verified {
+        ctrl.assign_org(&user.id, org).await?;
+        let user = ctrl
+            .meta
+            .get_user_by_id(&user.id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::internal("account vanished"))?;
+        return ctrl.session_response(&user, &headers).await;
+    }
+
+    // Everyone else proves the address first. Pulse has no mailer: the link goes to the node log.
+    let token = random_hex();
+    let org_name = match &org {
+        SignupOrg::New(name) => Some(name.as_str()),
+        SignupOrg::Default => None,
     };
     ctrl.meta
-        .insert_user(&user)
+        .insert_email_verification(&sha256_hex(&token), &user.id, org_name, now_ms() + VERIFY_TTL_MS)
         .await
         .map_err(CtrlError::meta)?;
-    ctrl.session_response(&user, &headers).await
+    let url = format!("{}/#/verify/{token}", ctrl.auth_cfg.read().public_url);
+    // ponytail: the log is the mailer. Add SMTP when someone needs links delivered.
+    tracing::info!(email = %user.email, "email verification link: {url}");
+    Ok(Json(json!({ "verification_required": true, "email": user.email })))
 }
 
 #[derive(Deserialize)]
@@ -449,6 +501,11 @@ async fn handle_login(
         .map_err(CtrlError::internal)?;
 
     match user {
+        Some(user) if matched && has_password && user.org_id == PENDING_ORG => {
+            Err(CtrlError::forbidden(
+                "Verify your email first with the link from sign-up. To get a new link, sign up again.",
+            ))
+        }
         Some(user) if matched && has_password => {
             failures.remove(&email);
             ctrl.session_response(&user, &headers).await
@@ -626,6 +683,8 @@ async fn google_callback(
         .get_user_by_email(&email)
         .await
         .map_err(|_| "google_token")?
+        // An unverified password sign-up is not linked: the branch below replaces it.
+        .filter(|u| u.org_id != PENDING_ORG)
     {
         // Link by verified email, but never re-point an account already bound to another Google identity.
         if u.google_sub.is_some() {
@@ -649,7 +708,7 @@ async fn google_callback(
         else {
             return Err("signup_closed");
         };
-        let (org_id, role) = ctrl.org_for_signup(org).await.map_err(|_| "google_token")?;
+        let (org, _) = org;
         let user = User {
             id: format!("user_{}", Uuid::new_v4().simple()),
             email,
@@ -660,10 +719,12 @@ async fn google_callback(
             password_hash: None,
             google_sub: Some(sub.to_string()),
             created_at_ms: now_ms(),
-            org_id,
-            role,
+            org_id: String::new(),
+            role: Role::Viewer,
         };
-        meta.insert_user(&user).await.map_err(|_| "google_token")?;
+        // Google has already verified the email, so the account joins its organisation at once.
+        let user = ctrl.insert_pending_user(user).await.map_err(|_| "google_token")?;
+        ctrl.assign_org(&user.id, org).await.map_err(|_| "google_token")?;
         user.id
     };
 

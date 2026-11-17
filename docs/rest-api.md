@@ -56,8 +56,28 @@ Accounts that existed before roles became `admin`, except the earliest one in ea
 which became `owner`. Someone who signs up and creates a new organisation owns it. Someone who joins
 the default organisation through an allowed email domain becomes a `member`.
 
+**Email verification.** A password sign-up must prove its address before it gets a session. This
+applies both to joining the default organisation by email domain and to creating a new
+organisation. The domain case needs it because otherwise anyone could type `anything@yourcompany.com`
+and read the company's data. New organisations need it too, so an unproven account never owns
+anything. Until then the account sits in a placeholder organisation (`org_pending`) with no projects,
+and sign-in answers `403`. The organisation is joined or created only when the link is used, after
+the account row exists, so a sign-up that loses a race on its email never leaves an empty
+organisation behind. Some accounts need no link because they've already proven themselves:
+- the first account, which gives the setup code
+- Google sign-ins (Google has verified the email)
+- accounts created from an invite link
+
+An unverified account can't block anyone. Signing up again, accepting an invite for that address, or
+signing in with Google for it replaces the unverified account.
+
+**Invites to existing accounts.** An account belongs to one organisation. Someone who already has an
+account accepts an invite while signed in (`POST /v1/auth/join-org`), which moves the account and its
+sessions to the inviting organisation with the invited role. The last owner of an organisation that
+still has other members must make someone else an owner first.
+
 Pulse has no mailer. Invite and password-reset links are returned to the admin who created them and
-also written to the node log.
+also written to the node log. Email-verification links are written to the node log.
 
 ## Health
 
@@ -185,10 +205,11 @@ take simpler arguments.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/v1/auth/config` | Which sign-in methods are enabled |
-| POST | `/v1/auth/signup`, `/v1/auth/login` | Email/password; returns a `ps_` session |
+| POST | `/v1/auth/signup`, `/v1/auth/login` | Email/password; returns a `ps_` session, or for a sign-up that must verify its email, `{verification_required: true}` |
 | POST | `/v1/auth/exchange` | Exchange a sign-in code for a session |
 | GET | `/v1/auth/google/start`, `/v1/auth/google/callback` | Google sign-in, when configured |
-| GET | `/v1/auth/invites/:token` | Email, role and organisation of a pending invite |
+| POST | `/v1/auth/verify-email` | `{token}`: finishes a sign-up that answered `verification_required`; returns a session |
+| GET | `/v1/auth/invites/:token` | Email, role and organisation of a pending invite, and `has_account` (then sign in and use `join-org`) |
 | POST | `/v1/auth/invites/accept` | `{token, password, name?}`: creates the account with the invite's role and returns a session |
 | POST | `/v1/auth/password-reset/request` | `{email}`: always `204`. If the account exists, the link goes to the node log |
 | POST | `/v1/auth/password-reset` | `{token, new_password}`: one use; signs out every session of the account |
@@ -202,6 +223,7 @@ take simpler arguments.
 | GET | `/v1/auth/sessions` | any | Your live sessions (`id` is a hash prefix, `current` marks this one) |
 | DELETE | `/v1/auth/sessions/:sid` | any | Sign out one session |
 | POST | `/v1/auth/sessions/revoke-others` | any | Sign out every other session |
+| POST | `/v1/auth/join-org` | any | `{token}`: accept an invite for your own email and move to that organisation |
 | GET | `/v1/org` | viewer | Organisation name and your role |
 | PATCH | `/v1/org` | owner | `{name}` |
 | GET | `/v1/org/members` | viewer | Members and roles |

@@ -10,6 +10,8 @@ use pulse_storage::{build_from_url, StorageConfig, StorageEngine};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+mod common;
+
 const ROOT: &str = "sk_root_test_admin_secret_0123456789";
 const PUBLIC_URL: &str = "http://pulse.test";
 
@@ -270,4 +272,129 @@ async fn password_change_reset_and_sessions() {
     assert_eq!(s, StatusCode::GONE);
     let (s, _, _) = send(&app, "GET", "/v1/auth/me", Some(&viewer), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+/// Signs up with an org name (or by domain) and follows the verification link from the log.
+async fn signup_verified(app: &Router, logs: &common::Logs, email: &str, org: Option<&str>) -> String {
+    let mut body = json!({"email": email, "password": PW});
+    if let Some(o) = org {
+        body["org_name"] = json!(o);
+    }
+    let (s, v, _) = send(app, "POST", "/v1/auth/signup", None, Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["verification_required"], true);
+    let token = logs.last_token("verify");
+    let (s, v, _) = send(app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["token"].as_str().unwrap().to_string()
+}
+
+fn member_id(members: &Value, email: &str) -> String {
+    members.as_array().unwrap().iter().find(|m| m["email"] == email).unwrap()["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn existing_user_accepts_invite_and_moves_org() {
+    let (logs, _guard) = common::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, ctrl, _meta) = setup_app(tmp.path()).await;
+    let mut cfg = auth_cfg(&[], "http://127.0.0.1:1/unused");
+    cfg.allow_new_orgs = true;
+    ctrl.set_auth_config(cfg);
+    let owner = owner_session(&app).await;
+    let eve = signup_verified(&app, &logs, "eve@other.test", Some("Acme")).await;
+    // Eve's Acme gains a second member, so Eve is the last owner of an org with others in it.
+    let (_, v, _) = send(&app, "POST", "/v1/org/invites", Some(&eve), Some(json!({"email": "zed@other.test", "role": "member"}))).await;
+    let zed_link = v["invite_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let (s, _, _) = send(&app, "POST", "/v1/auth/invites/accept", None, Some(json!({"token": zed_link, "password": PW}))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // The default org's owner invites Eve, who already has an account.
+    let (s, v, _) = send(&app, "POST", "/v1/org/invites", Some(&owner), Some(json!({"email": "eve@other.test", "role": "member"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let token = v["invite_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let (_, info, _) = send(&app, "GET", &format!("/v1/auth/invites/{token}"), None, None).await;
+    assert_eq!(info["has_account"], true);
+    // Not by making a second account...
+    let (s, _, _) = send(&app, "POST", "/v1/auth/invites/accept", None, Some(json!({"token": token, "password": PW}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // ...and not with someone else's session.
+    let (s, _, _) = send(&app, "POST", "/v1/auth/join-org", Some(&owner), Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Eve can't leave Acme ownerless while Zed is still in it.
+    let (s, v, _) = send(&app, "POST", "/v1/auth/join-org", Some(&eve), Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let (_, acme, _) = send(&app, "GET", "/v1/org/members", Some(&eve), None).await;
+    let zed = member_id(&acme, "zed@other.test");
+    let (s, _, _) = send(&app, "PATCH", &format!("/v1/org/members/{zed}"), Some(&eve), Some(json!({"role": "owner"}))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, v, _) = send(&app, "POST", "/v1/auth/join-org", Some(&eve), Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["org_id"], "org_default");
+    assert_eq!(v["role"], "member");
+    // The same session now works in the new org and no longer in the old one.
+    let (s, _, _) = send(&app, "GET", "/v1/projects/proj_alpha/saved-reports", Some(&eve), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, projects, _) = send(&app, "GET", "/v1/projects", Some(&eve), None).await;
+    assert!(projects.as_array().unwrap().iter().all(|p| p["name"] != "Acme"));
+    let (s, _, _) = send(&app, "POST", "/v1/auth/join-org", Some(&eve), Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn unverified_squatter_cannot_block_an_invite() {
+    let (logs, _guard) = common::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, ctrl, _meta) = setup_app(tmp.path()).await;
+    ctrl.set_auth_config(auth_cfg(&["acme.test"], "http://127.0.0.1:1/unused"));
+    let owner = owner_session(&app).await;
+    let (_, v, _) = send(&app, "POST", "/v1/org/invites", Some(&owner), Some(json!({"email": "vic@acme.test", "role": "viewer"}))).await;
+    let token = v["invite_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+
+    // A stranger signs up with Vic's address first but can't prove it.
+    let (s, v, _) = send(&app, "POST", "/v1/auth/signup", None, Some(json!({"email": "vic@acme.test", "password": "stranger password"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let squat = logs.last_token("verify");
+    let (_, info, _) = send(&app, "GET", &format!("/v1/auth/invites/{token}"), None, None).await;
+    assert_eq!(info["has_account"], false);
+
+    // Vic accepts anyway; the unverified account is replaced and its link dies.
+    let (s, v, _) = send(&app, "POST", "/v1/auth/invites/accept", None, Some(json!({"token": token, "password": PW}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["user"]["role"], "viewer");
+    let (s, _, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": squat}))).await;
+    assert_eq!(s, StatusCode::GONE);
+    let (s, _, _) = send(&app, "POST", "/v1/auth/login", None, Some(json!({"email": "vic@acme.test", "password": "stranger password"}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (_, members, _) = send(&app, "GET", "/v1/org/members", Some(&owner), None).await;
+    assert_eq!(members.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn no_orphan_org_when_the_email_is_taken() {
+    let (logs, _guard) = common::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, ctrl, meta) = setup_app(tmp.path()).await;
+    let mut cfg = auth_cfg(&[], "http://127.0.0.1:1/unused");
+    cfg.allow_new_orgs = true;
+    ctrl.set_auth_config(cfg);
+    let _owner = owner_session(&app).await;
+    let orgs = meta.count_orgs().await.unwrap();
+
+    // Sign-up with an org name for an address that already has an account: refused, nothing created.
+    let (s, _, _) = send(&app, "POST", "/v1/auth/signup", None, Some(json!({"email": "owner@acme.test", "password": PW, "org_name": "Dup"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(meta.count_orgs().await.unwrap(), orgs);
+
+    // Two pending sign-ups for one address: only the last link creates an org, exactly once.
+    for name in ["One", "Two"] {
+        let (s, _, _) = send(&app, "POST", "/v1/auth/signup", None, Some(json!({"email": "new@b.test", "password": PW, "org_name": name}))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    assert_eq!(meta.count_orgs().await.unwrap(), orgs);
+    let token = logs.last_token("verify");
+    let (s, v, _) = send(&app, "POST", "/v1/auth/verify-email", None, Some(json!({"token": token}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(meta.count_orgs().await.unwrap(), orgs + 1);
 }

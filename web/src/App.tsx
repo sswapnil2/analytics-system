@@ -38,6 +38,7 @@ import {
   parseAuthHash,
   ResetPasswordScreen,
   SignInScreen,
+  VerifyEmailScreen,
   SignUpScreen,
 } from "./auth/AuthScreens";
 import { ProfilePage } from "./account/ProfilePage";
@@ -196,8 +197,12 @@ export const App: React.FC = () => {
     setSignInReason(undefined);
     setSignedIn(true);
     setRefreshToken((n) => n + 1);
+    // Signing in from an invite link ("Sign in as …") goes back to that invite.
+    const next = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("next");
+    const toInvite = !!next && /^invite\/[0-9a-f]+$/.test(next);
+    if (toInvite) window.history.replaceState(null, "", `#/${next}`);
     const seg = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
-    if (!ALL_IDS.includes(seg)) {
+    if (!toInvite && !ALL_IDS.includes(seg)) {
       window.history.replaceState(null, "", `#/${DEFAULT_TAB}`);
     }
     // replaceState fires no hashchange, so re-read the route (leaves invite/reset screens).
@@ -306,6 +311,9 @@ export const App: React.FC = () => {
   }
   if (authRoute.view === "reset") {
     return <ResetPasswordScreen token={authRoute.token} />;
+  }
+  if (authRoute.view === "verify") {
+    return <VerifyEmailScreen token={authRoute.token} onSignedIn={handleSignedIn} />;
   }
 
   if (authRoute.view === "callback") {
