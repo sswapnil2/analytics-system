@@ -2933,12 +2933,17 @@ async fn handle_mcp(
     Extension(principal): Extension<AuthPrincipal>,
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
-) -> std::result::Result<Json<crate::mcp::JsonRpcResponse>, CtrlError> {
+) -> std::result::Result<Response, CtrlError> {
     let header_pid = headers.get("x-pulse-project").and_then(|v| v.to_str().ok());
     let bound_pid = principal.resolve_project(header_pid, &ctrl.default_project_id)?;
     ctrl.ensure_known_project(&bound_pid).await?;
+    // JSON-RPC notifications (no `id`, e.g. `notifications/initialized`) get no response body;
+    // MCP Streamable HTTP requires `202 Accepted`.
+    if req.id.is_null() {
+        return Ok(StatusCode::ACCEPTED.into_response());
+    }
     let resp = handle_mcp_request(req, &bound_pid, &ctrl.meta, &ctrl.qengine).await;
-    Ok(Json(resp))
+    Ok(Json(resp).into_response())
 }
 
 // ------------------- User Profiles, DPDP Erasure, Import/Export, Revenue & Alerts -------------------
