@@ -1,31 +1,160 @@
+@import "@fontsource-variable/instrument-sans";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Design tokens. Colors are space-separated RGB so Tailwind can apply alpha
+ * (`bg-brand/15`). Light is the default; dark follows the OS unless the user
+ * picked a theme explicitly (data-theme on <html>).
+ */
 :root {
+  color-scheme: light;
+  --canvas: 243 244 240; /* stone */
+  --panel: 255 255 255;
+  --sunken: 233 236 228;
+  --field: 255 255 255;
+  --hover: 238 240 234;
+  --line: 225 228 220;
+  --line-strong: 201 206 195;
+  --ink: 20 26 23;
+  --ink-2: 58 67 62;
+  --muted: 94 104 98;
+  --faint: 98 107 101; /* AA on canvas and sunken */
+  --brand: 11 110 95; /* teal: actions, conversion */
+  --brand-hover: 8 86 74;
+  --brand-soft: 220 237 232;
+  --on-brand: 255 255 255;
+  --danger: 184 60 10; /* orange: lost users, failures. Nothing else is orange. */
+  --danger-soft: 251 231 218;
+  --destructive: 180 35 24; /* red: delete and remove actions only */
+  --destructive-soft: 253 236 234;
+  --warn: 138 84 6;
+  --warn-soft: 246 236 212;
+  --ok: 11 110 95;
+  --ok-soft: 220 237 232;
+  --info: 69 83 201; /* indigo: second series */
+  --info-soft: 230 232 248;
+}
+
+/* Dark values are repeated in the media query below; CSS cannot share them. */
+:root[data-theme="dark"] {
   color-scheme: dark;
+  --canvas: 15 21 19;
+  --panel: 22 29 26;
+  --sunken: 18 24 22;
+  --field: 26 34 31;
+  --hover: 32 42 38;
+  --line: 40 51 46;
+  --line-strong: 58 72 66;
+  --ink: 232 237 234;
+  --ink-2: 200 209 204;
+  --muted: 150 163 157;
+  --faint: 124 137 131;
+  --brand: 52 184 160;
+  --brand-hover: 84 200 178;
+  --brand-soft: 20 50 44;
+  --on-brand: 6 26 22;
+  --danger: 240 128 74;
+  --danger-soft: 60 30 18;
+  --destructive: 248 113 102;
+  --destructive-soft: 66 24 22;
+  --warn: 230 178 80;
+  --warn-soft: 52 40 16;
+  --ok: 52 184 160;
+  --ok-soft: 20 50 44;
+  --info: 150 160 240;
+  --info-soft: 32 36 70;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --canvas: 15 21 19;
+    --panel: 22 29 26;
+    --sunken: 18 24 22;
+    --field: 26 34 31;
+    --hover: 32 42 38;
+    --line: 40 51 46;
+    --line-strong: 58 72 66;
+    --ink: 232 237 234;
+    --ink-2: 200 209 204;
+    --muted: 150 163 157;
+    --faint: 124 137 131;
+    --brand: 52 184 160;
+    --brand-hover: 84 200 178;
+    --brand-soft: 20 50 44;
+    --on-brand: 6 26 22;
+    --danger: 240 128 74;
+    --danger-soft: 60 30 18;
+    --destructive: 248 113 102;
+    --destructive-soft: 66 24 22;
+    --warn: 230 178 80;
+    --warn-soft: 52 40 16;
+    --ok: 52 184 160;
+    --ok-soft: 20 50 44;
+    --info: 150 160 240;
+    --info-soft: 32 36 70;
+  }
 }
 
 body {
-  background-color: #090d16;
-  color: #e2e8f0;
-  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  background-color: rgb(var(--canvas));
+  color: rgb(var(--ink));
+  font-family: "Instrument Sans Variable", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Figures line up in tables and stat rows. */
+.tabular,
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid rgb(var(--brand));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: rgb(var(--brand) / 0.2);
 }
 
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
-
 ::-webkit-scrollbar-track {
-  background: #090d16;
+  background: transparent;
 }
-
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 3px;
+  background: rgb(var(--line-strong));
+  border-radius: 4px;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Drop-off hatch: lost users read as a gap, not a bar. */
+.hatch-drop {
+  background: repeating-linear-gradient(135deg, rgb(var(--danger) / 0.3) 0 4px, rgb(var(--danger) / 0.12) 4px 8px);
+}
+.hatch-drop-strong {
+  background: repeating-linear-gradient(135deg, rgb(var(--danger)) 0 4px, rgb(var(--danger) / 0.75) 4px 8px);
+}
+
+/* Sideways scrollers on phones (nav strip, date presets) scroll without a visible bar. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }

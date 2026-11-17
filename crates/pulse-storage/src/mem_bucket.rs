@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, NaiveDate, Utc};
 use parking_lot::RwLock;
 use pulse_wire::PropValue;
+use roaring::RoaringBitmap;
 
 pub const SESSION_FLAG_RAGE_TAP: u16 = 0b001;
 pub const SESSION_FLAG_DEAD_TAP: u16 = 0b010;
@@ -178,5 +179,33 @@ impl MemBucket {
         } else {
             guard.oldest_unflushed_at = Some(Instant::now());
         }
+    }
+
+    /// Removes all rows belonging to any UID in `uids`, returning `(purged_rows, unique_session_ids)` (`Gap 4`).
+    pub fn purge_uids(&self, uids: &RoaringBitmap) -> (u64, Vec<String>) {
+        if uids.is_empty() {
+            return (0, Vec::new());
+        }
+        let mut guard = self.inner.write();
+        let mut sessions = Vec::new();
+        let prev_len = guard.rows.len();
+        guard.rows.retain(|r| {
+            if uids.contains(r.uid_internal) {
+                sessions.push(r.session_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let purged = (prev_len - guard.rows.len()) as u64;
+        if purged > 0 {
+            guard.cached_slice = None;
+            if guard.rows.is_empty() {
+                guard.oldest_unflushed_at = None;
+            }
+        }
+        sessions.sort_unstable();
+        sessions.dedup();
+        (purged, sessions)
     }
 }

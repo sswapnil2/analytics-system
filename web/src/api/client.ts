@@ -71,6 +71,7 @@ export interface DroppedSessionSample {
   distinct_id: string;
   drop_ts_ms: number;
   replay_offset_kb: number;
+  has_replay?: boolean;
 }
 
 export interface FunnelResult {
@@ -135,6 +136,7 @@ export interface SessionSummaryItem {
   has_rage_tap: boolean;
   has_dead_tap: boolean;
   has_error: boolean;
+  has_replay?: boolean;
   events: [number, string, number][];
 }
 
@@ -292,24 +294,102 @@ export interface ExperimentResults {
 
 const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
 
-export function getStoredAdminToken(): string {
+// Signed-in user sessions (ps_ tokens) last 30 days, so they live in localStorage.
+// Pasted admin tokens stay in sessionStorage and die with the tab.
+function storages(): Storage[] {
   try {
-    return window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
+    return [window.sessionStorage, window.localStorage];
   } catch {
-    return "";
+    return [];
   }
 }
 
-export function setStoredAdminToken(token: string): void {
-  try {
-    if (token.trim()) {
-      window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token.trim());
-    } else {
-      window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+export function getStoredAdminToken(): string {
+  for (const st of storages()) {
+    try {
+      const v = st.getItem(ADMIN_TOKEN_STORAGE_KEY);
+      if (v) return v;
+    } catch {
+      // storage blocked
     }
+  }
+  return "";
+}
+
+export function setStoredAdminToken(token: string): void {
+  const value = token.trim();
+  for (const st of storages()) {
+    try {
+      st.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    } catch {
+      // storage blocked
+    }
+  }
+  if (!value) return;
+  try {
+    (value.startsWith("ps_") ? window.localStorage : window.sessionStorage).setItem(
+      ADMIN_TOKEN_STORAGE_KEY,
+      value,
+    );
   } catch {
     // Ignore storage quota / sandbox restrictions
   }
+}
+
+export type ReportKind = "funnel" | "insights" | "retention" | "flows";
+
+export interface SavedReport {
+  id: string;
+  project_id: string;
+  name: string;
+  report_kind: ReportKind;
+  query_json: Record<string, unknown>;
+  created_at_ms: number;
+  updated_at_ms?: number | null;
+}
+
+export interface DashboardCard {
+  id?: string;
+  kind: "report" | "text";
+  report_id?: string;
+  text?: string;
+  width: 1 | 2;
+}
+
+export interface Dashboard {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string | null;
+  cards: DashboardCard[];
+  created_by: string | null;
+  created_at_ms: number;
+  updated_at_ms: number | null;
+}
+
+export interface DashboardInput {
+  name: string;
+  description?: string | null;
+  cards: DashboardCard[];
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string | null;
+  has_password: boolean;
+  has_google: boolean;
+}
+
+export interface AuthConfig {
+  password: boolean;
+  google: boolean;
+  signup_open: boolean;
+}
+
+export interface AuthSession {
+  token: string;
+  user: AuthUser;
 }
 
 export class ApiAuthError extends Error {
@@ -318,6 +398,53 @@ export class ApiAuthError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+export interface UserProfileItem {
+  project_id: string;
+  distinct_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  props: Record<string, unknown>;
+  total_revenue: number;
+  updated_at_ms: number;
+}
+
+export interface UserEventItem {
+  event_ts_ms: number;
+  event_name: string;
+  distinct_id: string;
+  canonical_uid: number;
+  session_id: string;
+  props: Record<string, unknown>;
+}
+
+export interface UserDetailResponse {
+  distinct_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  profile: UserProfileItem | null;
+  events: UserEventItem[];
+  replay_sessions: string[];
+}
+
+export interface DeletionAuditRecord {
+  id: string;
+  project_id: string;
+  distinct_id_masked: string;
+  canonical_uid: number;
+  events_purged: number;
+  replays_purged: number;
+  requested_by: string;
+  deleted_at_ms: number;
+}
+
+export interface BatchImportResponse {
+  status: string;
+  accepted: number;
+  deduped: number;
+  dropped: number;
+  server_ts_ms: number;
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -340,7 +467,30 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(text || `HTTP ${res.status}`);
   }
-  return (await res.json()) as T;
+  const body = await res.text();
+  return (body ? JSON.parse(body) : null) as T;
+}
+
+async function fetchText(url: string, init?: RequestInit): Promise<string> {
+  const token = getStoredAdminToken();
+  const authHeaders: Record<string, string> = token
+    ? { Authorization: `Bearer ${token}` }
+    : {};
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      ...authHeaders,
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 401 || res.status === 403) {
+      throw new ApiAuthError(res.status, text || `HTTP ${res.status}`);
+    }
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.text();
 }
 
 export function default14DayRange(): TimeRange {
@@ -352,6 +502,50 @@ export function default14DayRange(): TimeRange {
 }
 
 export const api = {
+  getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
+  signUp: (body: { email: string; password: string; name?: string }) =>
+    fetchJson<AuthSession>("/v1/auth/signup", { method: "POST", body: JSON.stringify(body) }),
+  logIn: (body: { email: string; password: string }) =>
+    fetchJson<AuthSession>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) }),
+  exchangeLoginCode: (code: string) =>
+    fetchJson<AuthSession>("/v1/auth/exchange", { method: "POST", body: JSON.stringify({ code }) }),
+  getMe: () => fetchJson<AuthUser>("/v1/auth/me"),
+  logOut: () => fetchJson<unknown>("/v1/auth/logout", { method: "POST" }),
+  listReports: (projectId: string) =>
+    fetchJson<SavedReport[]>(`/v1/projects/${encodeURIComponent(projectId)}/saved-reports`),
+  createReport: (projectId: string, body: { name: string; report_kind: ReportKind; query_json: unknown }) =>
+    fetchJson<SavedReport>(`/v1/projects/${encodeURIComponent(projectId)}/saved-reports`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteReport: (projectId: string, reportId: string) =>
+    fetchJson<unknown>(
+      `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
+      { method: "DELETE" },
+    ),
+  listDashboards: (projectId: string) =>
+    fetchJson<Dashboard[]>(`/v1/projects/${encodeURIComponent(projectId)}/dashboards`),
+  getDashboard: (projectId: string, id: string) =>
+    fetchJson<Dashboard>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+    ),
+  createDashboard: (projectId: string, body: DashboardInput) =>
+    fetchJson<Dashboard>(`/v1/projects/${encodeURIComponent(projectId)}/dashboards`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateDashboard: (projectId: string, id: string, body: DashboardInput) =>
+    fetchJson<Dashboard>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  deleteDashboard: (projectId: string, id: string) =>
+    fetchJson<unknown>(
+      `/v1/projects/${encodeURIComponent(projectId)}/dashboards/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+
+
   getStatus: (projectId?: string) =>
     fetchJson<NodeStatus>(
       projectId ? `/v1/status?project_id=${encodeURIComponent(projectId)}` : "/v1/status",
@@ -517,6 +711,50 @@ export const api = {
   getExperimentResults: (projectId: string, expId: string) =>
     fetchJson<ExperimentResults>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results`,
+    ),
+
+  listUsers: (projectId: string, search = "", limit = 100) =>
+    fetchJson<UserProfileItem[]>(
+      `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}`,
+    ),
+
+  getUserDetail: (projectId: string, distinctId: string) =>
+    fetchJson<UserDetailResponse>(
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+    ),
+
+  deleteUserDpdp: (projectId: string, distinctId: string) =>
+    fetchJson<DeletionAuditRecord>(
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+      { method: "DELETE" },
+    ),
+
+  listDeletionAudit: (projectId: string) =>
+    fetchJson<DeletionAuditRecord[]>(`/v1/projects/${projectId}/deletions`),
+
+  exportCohortCsv: (projectId: string, cohortId: string) =>
+    fetchText(
+      `/v1/projects/${projectId}/cohorts/${encodeURIComponent(cohortId)}/export?format=csv`,
+    ),
+
+  importEvents: (
+    projectId: string,
+    body: string,
+    contentType: "application/json" | "application/x-ndjson" | "text/csv",
+  ) =>
+    fetchJson<BatchImportResponse>(`/v1/projects/${projectId}/import`, {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body,
+    }),
+
+  exportRawEvents: (
+    projectId: string,
+    format: "ndjson" | "csv" | "json" = "ndjson",
+    limit = 2000,
+  ) =>
+    fetchText(
+      `/v1/projects/${projectId}/export?format=${format}&limit=${limit}`,
     ),
 
   callMcp: (method: string, params: unknown = {}) =>

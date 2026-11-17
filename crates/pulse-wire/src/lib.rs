@@ -9,11 +9,11 @@ pub use batch::{
     FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
 pub use bucketing::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
-pub use error::{Result, WireError};
+pub use error::{sanitize_json_error_message, Result, WireError};
 pub use event::{PropValue, WireEvent};
 pub use replay::{
-    mask_input_value, InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp,
-    FIXED_MASK_PLACEHOLDER, MASK_CHAR, REPLAY_MAGIC,
+    mask_input_value, mask_user_identifier, InteractionKind, NodeKind, ReplayChunk, WireNode,
+    WireframeOp, FIXED_MASK_PLACEHOLDER, MASK_CHAR, REPLAY_MAGIC,
 };
 
 #[cfg(test)]
@@ -264,5 +264,66 @@ mod tests {
             ReplayChunk::decode_stream(&stream[offset2..]).expect("decode range slice");
         assert_eq!(tail_chunks.len(), 1);
         assert_eq!(tail_chunks[0], chunk2);
+    }
+
+    #[test]
+    fn pr3_mask_user_identifier_redacts_phones_and_emails_only() {
+        assert_eq!(mask_user_identifier("+919845106153"), "+91 •••• 153");
+        assert_eq!(mask_user_identifier("9845106153"), "•••• 153");
+        assert_eq!(mask_user_identifier("+91 98451-06153"), "+91 •••• 153");
+        assert_eq!(
+            mask_user_identifier("priya.sharma@fintech.in"),
+            "p•••@fintech.in"
+        );
+        assert_eq!(mask_user_identifier("anon_in_00123"), "anon_in_00123");
+        assert_eq!(mask_user_identifier("u_1234567890"), "u_1234567890");
+    }
+
+    #[test]
+    fn pr8_en4_segment_mixpanel_json_ingest_and_clean_errors() {
+        // 1. Segment single object
+        let seg_single = br#"{"event":"App_Open","userId":"u_seg_1","properties":{"city":"Mumbai","plan_amt":499},"timestamp":"2026-11-17T00:00:00Z"}"#;
+        let b1 = WireBatch::decode_json(seg_single).expect("segment single object");
+        assert_eq!(b1.len(), 1);
+        assert_eq!(b1.events[0].event_name, "App_Open");
+        assert_eq!(b1.events[0].distinct_id, "u_seg_1");
+        assert_eq!(
+            b1.events[0].get_prop("city"),
+            Some(&PropValue::Str("Mumbai".into()))
+        );
+        assert!(b1.events[0].client_event_ts_ms > 1_700_000_000_000);
+
+        // 2. Segment batch wrapper with missing timestamp
+        let seg_batch =
+            br#"{"batch":[{"event":"Step_1","anonymousId":"anon_9","properties":{"step":1}}]}"#;
+        let b2 = WireBatch::decode_json(seg_batch).expect("segment batch");
+        assert_eq!(b2.len(), 1);
+        assert_eq!(b2.events[0].event_name, "Step_1");
+        assert_eq!(b2.events[0].distinct_id, "anon_9");
+        assert!(b2.events[0].client_event_ts_ms > 0);
+
+        // 3. Mixpanel top-level array with distinct_id and epoch seconds nested in properties
+        let mp_arr = br#"[{"event":"SignedUp","properties":{"distinct_id":"u_mp_1","time":1760000000,"plan":"pro"}}]"#;
+        let b3 = WireBatch::decode_json(mp_arr).expect("mixpanel array");
+        assert_eq!(b3.len(), 1);
+        assert_eq!(b3.events[0].event_name, "SignedUp");
+        assert_eq!(b3.events[0].distinct_id, "u_mp_1");
+        assert_eq!(b3.events[0].client_event_ts_ms, 1_760_000_000_000);
+
+        // 4. Clean error messages without internal serde wrapper names
+        let err = WireBatch::decode_json(br#"{"distinct_id":"u_1"}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing event name"), "unexpected msg: {msg}");
+        assert!(
+            !msg.contains("WireEventJsonIn"),
+            "leaked struct name: {msg}"
+        );
+        assert!(!msg.contains("JsonBatchEnvelope"), "leaked envelope: {msg}");
+
+        let sanitized = sanitize_json_error_message(
+            "invalid type: integer 123, expected struct TimeRange at line 1 column 20",
+        );
+        assert!(!sanitized.contains("TimeRange"));
+        assert!(sanitized.contains("expected JSON object"));
     }
 }

@@ -59,6 +59,23 @@ export type WireframeOp =
       duration_ms: number;
     };
 
+export interface AutocaptureConfig {
+  pageviews?: boolean;
+  clicks?: boolean;
+  forms?: boolean;
+  allowSelectors?: string[];
+  blockSelectors?: string[];
+}
+
+export interface RevenueParams {
+  amount: number;
+  currency?: string;
+  productId?: string;
+  quantity?: number;
+  revenueType?: string;
+  props?: EventProperties;
+}
+
 export interface PulseWebConfig {
   endpointUrl: string;
   apiKey: string;
@@ -66,6 +83,15 @@ export interface PulseWebConfig {
   flushIntervalMs?: number;
   enableWireframeReplay?: boolean;
   maxQueuedEvents?: number;
+  optOutByDefault?: boolean;
+  propertyBlacklist?: string[];
+  beforeSend?: (event: Record<string, unknown>) => Record<string, unknown> | null;
+  autocapture?: boolean | AutocaptureConfig;
+  replaySampleRate?: number;
+  replayTriggerEvents?: string[];
+  maskSelectors?: string[];
+  blockSelectors?: string[];
+  unmaskSelectors?: string[];
 }
 
 export interface EdgeFlagRule {
@@ -74,7 +100,7 @@ export interface EdgeFlagRule {
   rollout_bps: number;
   targeting_cohort_id?: string;
   cohort_members?: string[];
-  variants: Array<{ key: string; weight_bps: number }>;
+  variants: Array<{ key: string; weight_bps: number; payload?: unknown }>;
 }
 
 interface PersistedWebState {
@@ -83,6 +109,13 @@ interface PersistedWebState {
   userId: string | null;
   sessionId: string;
   lastActivityMs: number;
+  optedOut?: boolean;
+  explicitOptSet?: boolean;
+  superProps?: EventProperties;
+  firstTouchUtms?: EventProperties;
+  lastTouchUtms?: EventProperties;
+  groups?: Record<string, string>;
+  exposuresSent?: string[];
 }
 
 interface SealedReplayPacket {
@@ -140,12 +173,73 @@ function randomId(prefix: string): string {
   return `${prefix}_${r2}${r1}`;
 }
 
+const ATTRIBUTION_PARAMS = [
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_content",
+  "utm_term",
+  "gclid",
+  "fbclid",
+  "ttclid",
+  "li_fat_id",
+  "msclkid",
+] as const;
+
+function detectBrowserAndOs(ua: string): { $browser: string; $os: string; $device: string } {
+  let $browser = "Unknown";
+  if (ua.includes("Edg/")) $browser = "Edge";
+  else if (ua.includes("Chrome/")) $browser = "Chrome";
+  else if (ua.includes("Firefox/")) $browser = "Firefox";
+  else if (ua.includes("Safari/")) $browser = "Safari";
+
+  let $os = "Unknown";
+  if (ua.includes("Android")) $os = "Android";
+  else if (ua.includes("iPhone") || ua.includes("iPad")) $os = "iOS";
+  else if (ua.includes("Mac OS X")) $os = "macOS";
+  else if (ua.includes("Windows")) $os = "Windows";
+  else if (ua.includes("Linux")) $os = "Linux";
+
+  const $device =
+    ua.includes("Mobi") || ua.includes("Android") || ua.includes("iPhone") ? "Mobile" : "Desktop";
+  return { $browser, $os, $device };
+}
+
+function collectDefaultContext(): EventProperties {
+  const ctx: EventProperties = {};
+  if (typeof navigator !== "undefined") {
+    if (navigator.userAgent) {
+      const parsed = detectBrowserAndOs(navigator.userAgent);
+      ctx.$browser = parsed.$browser;
+      ctx.$os = parsed.$os;
+      ctx.$device = parsed.$device;
+    }
+    if (navigator.language) ctx.$locale = navigator.language;
+  }
+  if (typeof window !== "undefined") {
+    if (window.location?.href) ctx.$current_url = window.location.href.slice(0, 512);
+    if (window.location?.pathname) ctx.$pathname = window.location.pathname;
+    if (typeof window.innerWidth === "number") ctx.$screen_width = window.innerWidth;
+    if (typeof window.innerHeight === "number") ctx.$screen_height = window.innerHeight;
+  }
+  if (typeof document !== "undefined" && typeof document.referrer === "string" && document.referrer) {
+    ctx.$referrer = document.referrer.slice(0, 512);
+    try {
+      ctx.$referring_domain = new URL(document.referrer).hostname;
+    } catch {
+      // Ignore malformed referrer URL.
+    }
+  }
+  return ctx;
+}
+
 export class PulseWebClient {
   private readonly endpoint: string;
   private readonly apiKey: string;
   private readonly storageKey: string;
   private readonly flushBatchSize: number;
   private readonly maxQueuedEvents: number;
+  private readonly cfg: PulseWebConfig;
 
   private routingSeed: string;
   private anonId: string;
@@ -155,7 +249,23 @@ export class PulseWebClient {
   private seqCounter = 0;
   private replayOffsetKb = 0;
 
+  private optedOut: boolean;
+  private explicitOptSet = false;
+  private superProps: EventProperties = {};
+  private firstTouchUtms: EventProperties = {};
+  private lastTouchUtms: EventProperties = {};
+  private groups: Record<string, string> = {};
+  private exposuresSent: Set<string> = new Set();
+  private timedEvents: Map<string, number> = new Map();
+
+  private recordingActive = false;
+  private recordingPaused = false;
+  private replayTriggered = false;
+  private readonly replayTriggerSet: Set<string>;
+  private readonly propertyBlacklist: Set<string>;
+
   private eventQueue: Array<Record<string, unknown>> = [];
+  private engageQueue: Array<Record<string, unknown>> = [];
   private replayQueue: SealedReplayPacket[] = [];
   private replayOps: WireframeOp[] = [];
   private replayOpsSessionId: string | null = null;
@@ -170,14 +280,20 @@ export class PulseWebClient {
   private backoffUntilMs = 0;
 
   private boundClickListener: ((ev: MouseEvent) => void) | null = null;
+  private boundAutocaptureClickListener: ((ev: MouseEvent) => void) | null = null;
+  private boundAutocaptureSubmitListener: ((ev: Event) => void) | null = null;
+  private boundPopstateListener: (() => void) | null = null;
   private boundVisibilityListener: (() => void) | null = null;
 
   constructor(cfg: PulseWebConfig) {
+    this.cfg = cfg;
     this.endpoint = cfg.endpointUrl.replace(/\/+$/, "");
     this.apiKey = cfg.apiKey;
     this.storageKey = `pulse_sdk_state_${xxh3_64(cfg.apiKey).toString(16)}`;
     this.flushBatchSize = cfg.flushBatchSize ?? 20;
     this.maxQueuedEvents = cfg.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS;
+    this.propertyBlacklist = new Set(cfg.propertyBlacklist ?? []);
+    this.replayTriggerSet = new Set(cfg.replayTriggerEvents ?? []);
 
     const now = Date.now();
     const loaded = this.loadPersistedState();
@@ -187,16 +303,28 @@ export class PulseWebClient {
       this.userId = loaded.userId;
       if (now - loaded.lastActivityMs > SESSION_TIMEOUT_MS) {
         this.sessionId = randomId("sess");
+        this.exposuresSent = new Set();
       } else {
         this.sessionId = loaded.sessionId;
+        this.exposuresSent = new Set(loaded.exposuresSent ?? []);
       }
       this.lastActivityMs = now;
+      this.explicitOptSet = Boolean(loaded.explicitOptSet);
+      this.optedOut = this.explicitOptSet ? Boolean(loaded.optedOut) : Boolean(cfg.optOutByDefault);
+      this.superProps = loaded.superProps ?? {};
+      this.firstTouchUtms = loaded.firstTouchUtms ?? {};
+      this.lastTouchUtms = loaded.lastTouchUtms ?? {};
+      this.groups = loaded.groups ?? {};
     } else {
       this.routingSeed = randomId("dev");
       this.anonId = randomId("anon");
       this.sessionId = randomId("sess");
       this.lastActivityMs = now;
+      this.optedOut = Boolean(cfg.optOutByDefault);
     }
+
+    this.captureUrlAttribution();
+    this.initReplaySamplingState();
     this.persistState();
 
     const interval = cfg.flushIntervalMs ?? 5000;
@@ -218,6 +346,100 @@ export class PulseWebClient {
       if (cfg.enableWireframeReplay) {
         this.attachReplayClickListener();
       }
+      if (cfg.autocapture) {
+        this.attachAutocaptureListeners(cfg.autocapture);
+      }
+    }
+  }
+
+  private initReplaySamplingState(): void {
+    const rate = this.cfg.replaySampleRate ?? 1.0;
+    const sampled =
+      rate >= 1.0
+        ? true
+        : rate <= 0.0
+          ? false
+          : Number(xxh3_64(this.sessionId) % 10000n) < Math.round(rate * 10000);
+    if (!this.cfg.enableWireframeReplay && this.replayTriggerSet.size === 0) {
+      this.recordingActive = false;
+      return;
+    }
+    this.recordingActive = sampled && this.replayTriggerSet.size === 0;
+  }
+
+  private captureUrlAttribution(): void {
+    if (typeof window === "undefined" || !window.location?.search) return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      for (const key of ATTRIBUTION_PARAMS) {
+        const val = params.get(key);
+        if (val) {
+          this.lastTouchUtms[key] = val;
+          const firstKey = `initial_${key}`;
+          if (!(firstKey in this.firstTouchUtms)) {
+            this.firstTouchUtms[firstKey] = val;
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed search query strings.
+    }
+  }
+
+  private attachAutocaptureListeners(opt: boolean | AutocaptureConfig): void {
+    if (!opt) return;
+    const cfg: AutocaptureConfig =
+      opt === true ? { pageviews: true, clicks: true, forms: true } : opt;
+
+    const emitPageview = () => {
+      this.captureUrlAttribution();
+      this.track("$pageview", collectDefaultContext());
+    };
+
+    if (cfg.pageviews !== false) {
+      emitPageview();
+      this.boundPopstateListener = emitPageview;
+      window.addEventListener("popstate", this.boundPopstateListener);
+    }
+
+    const matchesFilter = (el: HTMLElement | null): boolean => {
+      if (!el || typeof el.closest !== "function") return false;
+      if (cfg.blockSelectors?.some((sel) => el.closest(sel))) return false;
+      if (cfg.allowSelectors?.length) {
+        return cfg.allowSelectors.some((sel) => el.closest(sel));
+      }
+      return true;
+    };
+
+    if (cfg.clicks !== false) {
+      this.boundAutocaptureClickListener = (ev: MouseEvent) => {
+        const target = ev.target as HTMLElement | null;
+        if (!matchesFilter(target)) return;
+        const interactive = target?.closest?.("button, a, [role='button'], input, select") as
+          | HTMLElement
+          | null;
+        if (!interactive) return;
+        const explicitlyUnmasked = Boolean(interactive.closest?.("[data-pulse-unmask]"));
+        this.track("$autocapture", {
+          $event_type: "click",
+          tag: (interactive.tagName || "").toLowerCase(),
+          masked_text: maskPiiText(interactive.textContent || "", explicitlyUnmasked),
+          href: (interactive as HTMLAnchorElement).href || null,
+        });
+      };
+      window.addEventListener("click", this.boundAutocaptureClickListener);
+    }
+
+    if (cfg.forms !== false) {
+      this.boundAutocaptureSubmitListener = (ev: Event) => {
+        const target = ev.target as HTMLElement | null;
+        if (!matchesFilter(target)) return;
+        this.track("$autocapture", {
+          $event_type: "submit",
+          tag: (target?.tagName || "form").toLowerCase(),
+        });
+      };
+      window.addEventListener("submit", this.boundAutocaptureSubmitListener);
     }
   }
 
@@ -239,6 +461,13 @@ export class PulseWebClient {
           userId: typeof parsed.userId === "string" ? parsed.userId : null,
           sessionId: parsed.sessionId,
           lastActivityMs: parsed.lastActivityMs,
+          optedOut: typeof parsed.optedOut === "boolean" ? parsed.optedOut : undefined,
+          explicitOptSet: typeof parsed.explicitOptSet === "boolean" ? parsed.explicitOptSet : undefined,
+          superProps: parsed.superProps && typeof parsed.superProps === "object" ? parsed.superProps : undefined,
+          firstTouchUtms: parsed.firstTouchUtms && typeof parsed.firstTouchUtms === "object" ? parsed.firstTouchUtms : undefined,
+          lastTouchUtms: parsed.lastTouchUtms && typeof parsed.lastTouchUtms === "object" ? parsed.lastTouchUtms : undefined,
+          groups: parsed.groups && typeof parsed.groups === "object" ? parsed.groups : undefined,
+          exposuresSent: Array.isArray(parsed.exposuresSent) ? parsed.exposuresSent : undefined,
         };
       }
     } catch {
@@ -256,6 +485,13 @@ export class PulseWebClient {
         userId: this.userId,
         sessionId: this.sessionId,
         lastActivityMs: this.lastActivityMs,
+        optedOut: this.optedOut,
+        explicitOptSet: this.explicitOptSet,
+        superProps: this.superProps,
+        firstTouchUtms: this.firstTouchUtms,
+        lastTouchUtms: this.lastTouchUtms,
+        groups: this.groups,
+        exposuresSent: Array.from(this.exposuresSent),
       };
       localStorage.setItem(this.storageKey, JSON.stringify(payload));
     } catch {
@@ -318,37 +554,136 @@ export class PulseWebClient {
     }
   }
 
+  // --- Consent & Opt-Out (`Gap 4`) ---
+
+  public optOut(): void {
+    this.optedOut = true;
+    this.explicitOptSet = true;
+    this.eventQueue = [];
+    this.engageQueue = [];
+    this.replayQueue = [];
+    this.replayOps = [];
+    this.timedEvents.clear();
+    this.persistState();
+  }
+
+  public optIn(): void {
+    this.optedOut = false;
+    this.explicitOptSet = true;
+    this.persistState();
+  }
+
+  public hasOptedOut(): boolean {
+    return this.optedOut;
+  }
+
+  public clearOptInOut(): void {
+    this.explicitOptSet = false;
+    this.optedOut = Boolean(this.cfg.optOutByDefault);
+    this.persistState();
+  }
+
+  // --- Super Properties & Timed Events (`Gaps 9, 10`) ---
+
+  public register(props: EventProperties): void {
+    Object.assign(this.superProps, props);
+    this.persistState();
+  }
+
+  public registerOnce(props: EventProperties): void {
+    for (const [k, v] of Object.entries(props)) {
+      if (!(k in this.superProps)) {
+        this.superProps[k] = v;
+      }
+    }
+    this.persistState();
+  }
+
+  public unregister(key: string): void {
+    delete this.superProps[key];
+    this.persistState();
+  }
+
+  public timeEvent(eventName: string): void {
+    if (this.optedOut) return;
+    this.timedEvents.set(eventName, Date.now());
+  }
+
   public track(eventName: string, props: EventProperties = {}): void {
+    if (this.optedOut) return;
     const now = Date.now();
     this.touchSession(now);
     const distinctId = this.getDistinctId();
     this.seqCounter += 1;
 
-    this.enqueueEventsBounded([
-      {
-        event_uuid: `${distinctId}:${this.sessionId}:${eventName}:${now}:${this.seqCounter}`,
-        routing_seed: this.routingSeed,
-        distinct_id: distinctId,
-        session_id: this.sessionId,
-        event_name: eventName,
-        client_event_ts_ms: now,
-        client_sent_ts_ms: 0,
-        props,
-        replay_offset_kb: this.replayOffsetKb,
-      },
-    ]);
+    if (this.replayTriggerSet.has(eventName) && !this.replayTriggered) {
+      this.replayTriggered = true;
+      this.startSessionRecording();
+    }
+
+    const merged: EventProperties = {
+      ...collectDefaultContext(),
+      ...this.firstTouchUtms,
+      ...this.lastTouchUtms,
+      ...this.superProps,
+    };
+    for (const [gk, gv] of Object.entries(this.groups)) {
+      merged[`$group_${gk}`] = gv;
+    }
+
+    const startTime = this.timedEvents.get(eventName);
+    if (typeof startTime === "number") {
+      this.timedEvents.delete(eventName);
+      const durationMs = Math.max(0, now - startTime);
+      merged.$duration_ms = durationMs;
+      merged.$duration = Math.round(durationMs) / 1000;
+    }
+
+    Object.assign(merged, props);
+    for (const blocked of this.propertyBlacklist) {
+      delete merged[blocked];
+    }
+
+    let eventObj: Record<string, unknown> | null = {
+      event_uuid: `${distinctId}:${this.sessionId}:${eventName}:${now}:${this.seqCounter}`,
+      routing_seed: this.routingSeed,
+      distinct_id: distinctId,
+      session_id: this.sessionId,
+      event_name: eventName,
+      client_event_ts_ms: now,
+      client_sent_ts_ms: 0,
+      props: merged,
+      replay_offset_kb: this.replayOffsetKb,
+    };
+
+    if (this.cfg.beforeSend) {
+      eventObj = this.cfg.beforeSend(eventObj);
+      if (!eventObj) return;
+    }
+
+    this.enqueueEventsBounded([eventObj]);
 
     if (this.eventQueue.length >= this.flushBatchSize) {
       void this.flush();
     }
   }
 
-  public async identify(userId: string): Promise<void> {
+  public async identify(userId: string, userProps?: EventProperties): Promise<void> {
+    if (this.optedOut) return;
     const now = Date.now();
     this.touchSession(now);
     const prevAnon = this.anonId;
     this.userId = userId;
     this.persistState();
+
+    const bodyPayload: Record<string, unknown> = {
+      anon_id: prevAnon,
+      user_id: userId,
+      routing_seed: this.routingSeed,
+    };
+    if (userProps) {
+      bodyPayload.user_properties = userProps;
+    }
 
     const res = await fetch(`${this.endpoint}/v1/identify`, {
       method: "POST",
@@ -356,15 +691,121 @@ export class PulseWebClient {
         "Content-Type": "application/json",
         "x-pulse-key": this.apiKey,
       },
-      body: JSON.stringify({
-        anon_id: prevAnon,
-        user_id: userId,
-        routing_seed: this.routingSeed,
-      }),
+      body: JSON.stringify(bodyPayload),
     });
     if (!res.ok) {
       throw new Error(`identify failed with HTTP ${res.status}`);
     }
+  }
+
+  // --- User Profiles, Groups & Revenue (`Gaps 1, 5, 8`) ---
+
+  public async engage(ops: Record<string, unknown>): Promise<void> {
+    if (this.optedOut) return;
+    const payload = {
+      $distinct_id: this.getDistinctId(),
+      routing_seed: this.routingSeed,
+      ...ops,
+    };
+    try {
+      const res = await fetch(`${this.endpoint}/v1/engage`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-pulse-key": this.apiKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) return;
+    } catch {
+      // Queue offline retry below
+    }
+    this.engageQueue.push(payload);
+  }
+
+  public setUserProperties(props: EventProperties): Promise<void> {
+    return this.engage({ $set: props });
+  }
+
+  public setUserPropertiesOnce(props: EventProperties): Promise<void> {
+    return this.engage({ $setOnce: props });
+  }
+
+  public incrementUserProperty(prop: string, by = 1): Promise<void> {
+    return this.engage({ $add: { [prop]: by } });
+  }
+
+  public unsetUserProperties(keys: string[]): Promise<void> {
+    return this.engage({ $unset: keys });
+  }
+
+  public appendUserProperty(prop: string, value: PropPrimitive): Promise<void> {
+    return this.engage({ $append: { [prop]: value } });
+  }
+
+  public unionUserProperty(prop: string, values: PropPrimitive[]): Promise<void> {
+    return this.engage({ $union: { [prop]: values } });
+  }
+
+  public removeUserProperty(prop: string, value: PropPrimitive): Promise<void> {
+    return this.engage({ $remove: { [prop]: value } });
+  }
+
+  public async deleteUser(): Promise<void> {
+    await this.engage({ $delete_user: true });
+    this.reset();
+  }
+
+  public setGroup(groupType: string, groupId: string): void {
+    if (this.optedOut) return;
+    this.groups[groupType] = groupId;
+    this.persistState();
+  }
+
+  public async setGroupProperties(
+    groupType: string,
+    groupId: string,
+    props: EventProperties,
+  ): Promise<void> {
+    if (this.optedOut) return;
+    this.groups[groupType] = groupId;
+    this.persistState();
+    await fetch(`${this.endpoint}/v1/groups`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-pulse-key": this.apiKey,
+      },
+      body: JSON.stringify({
+        group_type: groupType,
+        group_id: groupId,
+        $set: props,
+      }),
+    });
+  }
+
+  public async trackRevenue(params: RevenueParams): Promise<void> {
+    if (this.optedOut) return;
+    const currency = params.currency ?? "INR";
+    const quantity = params.quantity ?? 1;
+    const totalAmount = params.amount * quantity;
+    const evProps: EventProperties = {
+      ...(params.props ?? {}),
+      amount: totalAmount,
+      currency,
+      quantity,
+    };
+    if (params.productId) evProps.product_id = params.productId;
+    if (params.revenueType) evProps.revenue_type = params.revenueType;
+    this.track("$revenue", evProps);
+    await this.engage({
+      $track_charge: {
+        $amount: totalAmount,
+        currency,
+        ...(params.productId ? { product_id: params.productId } : {}),
+        ...(params.revenueType ? { revenue_type: params.revenueType } : {}),
+      },
+    });
   }
 
   /**
@@ -378,17 +819,54 @@ export class PulseWebClient {
     this.sessionId = randomId("sess");
     this.replayOffsetKb = 0;
     this.recentClicks = [];
+    this.exposuresSent.clear();
+    this.timedEvents.clear();
     this.lastActivityMs = Date.now();
     this.persistState();
   }
 
-  public async getVariant(flagKey: string): Promise<string | null> {
-    if (this.flagRules.size === 0) {
-      await this.refreshFlags();
-    }
+  // --- Flags, Experiments & Exposure Tracking (`Gap 13`) ---
+
+  public getVariantSync(flagKey: string): string | null {
     const rule = this.flagRules.get(flagKey);
     if (!rule) return null;
     return evaluateEdgeFlag(rule, this.getDistinctId());
+  }
+
+  public isEnabled(flagKey: string): boolean {
+    const v = this.getVariantSync(flagKey);
+    return v !== null && v !== "off" && v !== "false" && v !== "control";
+  }
+
+  public getVariantPayload(flagKey: string): unknown | null {
+    const rule = this.flagRules.get(flagKey);
+    if (!rule) return null;
+    const chosen = evaluateEdgeFlag(rule, this.getDistinctId());
+    if (!chosen) return null;
+    return rule.variants.find((v) => v.key === chosen)?.payload ?? null;
+  }
+
+  public trackExposure(flagKey: string, variant: string | null): void {
+    if (this.optedOut || !variant) return;
+    const dedupKey = `${flagKey}:${variant}`;
+    if (this.exposuresSent.has(dedupKey)) return;
+    this.exposuresSent.add(dedupKey);
+    this.persistState();
+    this.track("$experiment_started", { flag_key: flagKey, variant });
+  }
+
+  public async getVariant(
+    flagKey: string,
+    options?: { trackExposure?: boolean },
+  ): Promise<string | null> {
+    if (this.flagRules.size === 0) {
+      await this.refreshFlags();
+    }
+    const variant = this.getVariantSync(flagKey);
+    if (options?.trackExposure && variant) {
+      this.trackExposure(flagKey, variant);
+    }
+    return variant;
   }
 
   public async refreshFlags(): Promise<void> {
@@ -411,10 +889,82 @@ export class PulseWebClient {
     }
   }
 
+  // --- Session Replay Controls (`Gap 11`) ---
+
+  public startSessionRecording(): void {
+    this.recordingActive = true;
+    this.recordingPaused = false;
+  }
+
+  public stopSessionRecording(): void {
+    this.recordingActive = false;
+    this.recordingPaused = false;
+    this.sealPendingReplayOps();
+  }
+
+  public pauseSessionRecording(): void {
+    this.recordingPaused = true;
+  }
+
+  public resumeSessionRecording(): void {
+    if (this.recordingActive) {
+      this.recordingPaused = false;
+    }
+  }
+
+  public isRecordingSession(): boolean {
+    return !this.optedOut && this.recordingActive && !this.recordingPaused;
+  }
+
+  public getSessionReplayUrl(): string {
+    return `${this.endpoint}/#/replays?session=${encodeURIComponent(this.sessionId)}`;
+  }
+
+  public recordNetworkBreadcrumb(
+    method: string,
+    path: string,
+    statusCode: number,
+    durationMs: number,
+  ): void {
+    if (this.optedOut || (this.cfg.enableWireframeReplay && !this.isRecordingSession())) return;
+    const now = Date.now();
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    this.replayOps.push({
+      op: "network_breadcrumb",
+      ts_offset_ms: Math.max(0, now - this.chunkStartTsMs),
+      method: method.slice(0, 16),
+      path: path.slice(0, 256),
+      status_code: statusCode,
+      duration_ms: durationMs,
+    });
+  }
+
+  public recordConsoleError(message: string): void {
+    if (this.optedOut) return;
+    const now = Date.now();
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    this.replayOps.push({
+      op: "node_upsert",
+      node_id: 99_000 + this.replayOps.length,
+      parent_id: 1,
+      kind: "error_banner",
+      x: 16,
+      y: 16,
+      w: 340,
+      h: 44,
+      bg_rgba: 0xdc2626ff,
+      masked_label: maskPiiText(message, true),
+    });
+    this.track("$error", { message: message.slice(0, 256) });
+  }
+
   /**
    * Walks live DOM bounding boxes and emits a default-deny masked wireframe snapshot (`P3-01`).
    */
   public captureDomWireframeSnapshot(): void {
+    if (this.optedOut || !this.isRecordingSession()) return;
     if (typeof window === "undefined" || typeof document === "undefined") return;
     const now = Date.now();
     this.touchSession(now);
@@ -439,6 +989,9 @@ export class PulseWebClient {
 
     const elements = document.body ? Array.from(document.body.querySelectorAll("*")).slice(0, 120) : [];
     for (const el of elements) {
+      if (this.cfg.blockSelectors?.some((sel) => typeof (el as HTMLElement).closest === "function" && (el as HTMLElement).closest(sel))) {
+        continue;
+      }
       const rect = el.getBoundingClientRect();
       if (rect.width < 4 || rect.height < 4) continue;
       if (rect.bottom < 0 || rect.top > vpH) continue;
@@ -451,7 +1004,14 @@ export class PulseWebClient {
         tag === "select" ||
         htmlEl.isContentEditable ||
         el.hasAttribute("contenteditable");
-      const explicitlyUnmasked = !isEditable && Boolean(el.closest("[data-pulse-unmask]"));
+      const forceMasked = Boolean(
+        this.cfg.maskSelectors?.some((sel) => typeof htmlEl.closest === "function" && htmlEl.closest(sel)),
+      );
+      const customUnmask = Boolean(
+        this.cfg.unmaskSelectors?.some((sel) => typeof htmlEl.closest === "function" && htmlEl.closest(sel)),
+      );
+      const explicitlyUnmasked =
+        !isEditable && !forceMasked && (customUnmask || Boolean(el.closest("[data-pulse-unmask]")));
 
       let kind: NodeKind = "container";
       let label = "";
@@ -500,6 +1060,7 @@ export class PulseWebClient {
 
   private attachReplayClickListener(): void {
     this.boundClickListener = (ev: MouseEvent) => {
+      if (this.optedOut || !this.isRecordingSession()) return;
       const now = Date.now();
       this.touchSession(now);
       const x = Math.max(0, Math.round(ev.clientX));
@@ -613,6 +1174,25 @@ export class PulseWebClient {
       }
     }
 
+    if (this.engageQueue.length > 0) {
+      const engageBatch = this.engageQueue.splice(0, this.engageQueue.length);
+      try {
+        const res = await fetch(`${this.endpoint}/v1/engage`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-pulse-key": this.apiKey,
+          },
+          body: JSON.stringify(engageBatch),
+        });
+        if (!res.ok && res.status >= 500) {
+          this.engageQueue.unshift(...engageBatch);
+        }
+      } catch {
+        this.engageQueue.unshift(...engageBatch);
+      }
+    }
+
     if (this.eventQueue.length > 0) {
       const batch = this.eventQueue.splice(0, this.eventQueue.length);
       const sentNow = Date.now();
@@ -669,6 +1249,21 @@ export class PulseWebClient {
       });
     }
 
+    if (this.engageQueue.length > 0) {
+      const engageBatch = this.engageQueue.splice(0, this.engageQueue.length);
+      fetch(`${this.endpoint}/v1/engage`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-pulse-key": this.apiKey,
+        },
+        body: JSON.stringify(engageBatch),
+        keepalive: true,
+      }).catch(() => {
+        this.engageQueue.unshift(...engageBatch);
+      });
+    }
+
     if (this.eventQueue.length > 0) {
       const batch = this.eventQueue.splice(0, this.eventQueue.length);
       const sentNow = Date.now();
@@ -696,6 +1291,18 @@ export class PulseWebClient {
       if (this.boundClickListener) {
         window.removeEventListener("click", this.boundClickListener);
         this.boundClickListener = null;
+      }
+      if (this.boundAutocaptureClickListener) {
+        window.removeEventListener("click", this.boundAutocaptureClickListener);
+        this.boundAutocaptureClickListener = null;
+      }
+      if (this.boundAutocaptureSubmitListener) {
+        window.removeEventListener("submit", this.boundAutocaptureSubmitListener);
+        this.boundAutocaptureSubmitListener = null;
+      }
+      if (this.boundPopstateListener) {
+        window.removeEventListener("popstate", this.boundPopstateListener);
+        this.boundPopstateListener = null;
       }
       if (this.boundVisibilityListener) {
         window.removeEventListener("visibilitychange", this.boundVisibilityListener);

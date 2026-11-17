@@ -1016,6 +1016,8 @@ async fn assert_case_matches_oracle(case: GeneratedCase) {
                     user_id: user_id.clone(),
                     routing_seed: Some(user_seed),
                     anon_routing_seed: Some(anon_seed),
+                    user_properties: None,
+                    operations: None,
                 },
             )
             .await

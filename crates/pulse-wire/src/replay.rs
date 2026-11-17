@@ -119,6 +119,42 @@ pub fn mask_input_value(_raw: &str) -> String {
     FIXED_MASK_PLACEHOLDER.to_string()
 }
 
+/// Masks PII-like user identifiers (email addresses and phone numbers) before surfacing them
+/// in query, session-explorer, or MCP tool responses (`PR-3`). Opaque IDs pass through unchanged.
+pub fn mask_user_identifier(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((local, domain)) = trimmed.split_once('@') {
+        if !local.is_empty() && !domain.is_empty() && !domain.contains(char::is_whitespace) {
+            let first: String = local.chars().take(1).collect();
+            return format!("{first}•••@{domain}");
+        }
+    }
+    let only_phone_chars = !trimmed.is_empty()
+        && trimmed.starts_with(|c: char| c == '+' || c.is_ascii_digit())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'));
+    if only_phone_chars {
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 8 {
+            let tail: String = digits
+                .chars()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if trimmed.starts_with('+') && digits.len() > 5 {
+                let cc: String = digits.chars().take(2).collect();
+                return format!("+{cc} •••• {tail}");
+            }
+            return format!("•••• {tail}");
+        }
+    }
+    raw.to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InteractionKind {

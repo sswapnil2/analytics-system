@@ -9,11 +9,13 @@ use axum::{Json, Router};
 
 use crate::service::{IdentifyRequest, IngestError, IngestService};
 
-/// Builds the Axum router serving `/v1/ingest`, `/v1/identify`, and `/v1/replay/chunk`.
+/// Builds the Axum router serving `/v1/ingest`, `/v1/identify`, `/v1/engage`, `/v1/groups`, and `/v1/replay/chunk`.
 pub fn build_ingest_router(service: Arc<IngestService>) -> Router {
     Router::new()
         .route("/v1/ingest", post(handle_ingest))
         .route("/v1/identify", post(handle_identify))
+        .route("/v1/engage", post(handle_engage))
+        .route("/v1/groups", post(handle_groups))
         .route("/v1/replay/chunk", post(handle_replay_chunk))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(service)
@@ -53,10 +55,31 @@ async fn handle_ingest(
 async fn handle_identify(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
-    Json(req): Json<IdentifyRequest>,
+    body: Bytes,
 ) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
+    let req: IdentifyRequest = serde_json::from_slice(&body).map_err(IngestError::Json)?;
     let resp = service.identify(api_key, req).await?;
+    Ok(Json(resp))
+}
+
+async fn handle_engage(
+    State(service): State<Arc<IngestService>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
+    let resp = service.engage(api_key, &body).await?;
+    Ok(Json(resp))
+}
+
+async fn handle_groups(
+    State(service): State<Arc<IngestService>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
+    let resp = service.group_engage(api_key, &body).await?;
     Ok(Json(resp))
 }
 
@@ -97,9 +120,18 @@ impl IntoResponse for ApiError {
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let message = match &self.0 {
+            IngestError::Wire(pulse_wire::WireError::Json(e)) | IngestError::Json(e) => {
+                format!(
+                    "invalid JSON payload: {}",
+                    pulse_wire::sanitize_json_error_message(&e.to_string())
+                )
+            }
+            other => other.to_string(),
+        };
         let body = serde_json::json!({
             "status": "error",
-            "message": self.0.to_string(),
+            "message": message,
         });
         (status, Json(body)).into_response()
     }

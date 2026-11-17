@@ -151,7 +151,34 @@ pub async fn load_project_chunks(
     requested_props: &[String],
     event_bloom_hint: Option<u64>,
 ) -> Result<Vec<DataChunk>> {
+    load_project_chunks_with_id(
+        ps,
+        snap,
+        cache,
+        catalog,
+        time_range,
+        requested_props,
+        event_bloom_hint,
+        None,
+    )
+    .await
+}
+
+/// Variant of `load_project_chunks` carrying `id_snap` so user profile properties (`user.*`)
+/// and DPDP erasure tombstones resolve consistently across pre-login and post-login events (`Gaps 1, 4`).
+#[allow(clippy::too_many_arguments)]
+pub async fn load_project_chunks_with_id(
+    ps: &ProjectStorage,
+    snap: &StorageSnapshot,
+    cache: &SegmentBlockCache,
+    catalog: &VirtualCatalog,
+    time_range: Option<TimeRange>,
+    requested_props: &[String],
+    event_bloom_hint: Option<u64>,
+    id_snap: Option<&IdentitySnapshot>,
+) -> Result<Vec<DataChunk>> {
     let dict = ps.dictionary();
+    let deleted_uids = catalog.deleted_uids_snapshot();
 
     // Expand requested properties to include dependencies of Custom Properties & Lookup Tables
     let mut base_props_needed: HashSet<String> = HashSet::new();
@@ -159,16 +186,21 @@ pub async fn load_project_chunks(
 
     for p in requested_props {
         final_props_set.insert(p.clone());
+        if p.starts_with("user.") || p.starts_with("$cohort:") {
+            continue;
+        }
         // Physical properties ALWAYS take precedence over virtual/lookup columns (`P2-09j`)!
         if dict.lookup_prop_key(p).is_some() {
             base_props_needed.insert(p.clone());
         } else if let Some(cp) = catalog.custom_properties.get(p) {
             for dep in cp.referenced_columns() {
-                base_props_needed.insert(dep);
+                if !dep.starts_with("user.") {
+                    base_props_needed.insert(dep);
+                }
             }
         } else if let Some((lt, _)) = catalog.resolve_lookup_column(p) {
             base_props_needed.insert(lt.join_prop.clone());
-        } else if !p.starts_with("$cohort:") {
+        } else if !catalog.has_user_prop(p) {
             base_props_needed.insert(p.clone());
         }
     }
@@ -209,28 +241,79 @@ pub async fn load_project_chunks(
     let futs = filtered_segments.iter().map(|seg| {
         let base_props_ref = &base_props_vec;
         let final_props_ref = &final_props_vec;
+        let deleted_ref = &deleted_uids;
         async move {
-            let tier_a = cache.get_tier_a(seg).await?;
-            let n = tier_a.len();
+            let mut tier_a = cache.get_tier_a(seg).await?;
+            let orig_n = tier_a.len();
             let mut base_map: HashMap<String, Arc<Vec<PropValue>>> = HashMap::new();
 
             for bp in base_props_ref {
                 let col = if let Some(pk) = dict.lookup_prop_key(bp) {
                     cache.get_property_column(seg, pk).await?
                 } else {
-                    Arc::new(vec![PropValue::Null; n])
+                    Arc::new(vec![PropValue::Null; orig_n])
                 };
                 base_map.insert(bp.clone(), col);
             }
 
-            let prop_cols = materialize_virtual_columns(n, &base_map, final_props_ref, catalog)?;
+            let mut seg_meta_opt = Some(seg.clone());
+            if !deleted_ref.is_empty()
+                && tier_a.uid_internal.iter().any(|&u| {
+                    deleted_ref.contains(u)
+                        || id_snap.is_some_and(|s| deleted_ref.contains(s.resolve(u)))
+                })
+            {
+                let keep_idx: Vec<usize> = (0..orig_n)
+                    .filter(|&r| {
+                        let u = tier_a.uid_internal[r];
+                        !(deleted_ref.contains(u)
+                            || id_snap.is_some_and(|s| deleted_ref.contains(s.resolve(u))))
+                    })
+                    .collect();
+                let mut f_uid = Vec::with_capacity(keep_idx.len());
+                let mut f_sh = Vec::with_capacity(keep_idx.len());
+                let mut f_ev = Vec::with_capacity(keep_idx.len());
+                let mut f_ts = Vec::with_capacity(keep_idx.len());
+                let mut f_rkb = Vec::with_capacity(keep_idx.len());
+                for &idx in &keep_idx {
+                    f_uid.push(tier_a.uid_internal[idx]);
+                    f_sh.push(tier_a.session_hash[idx]);
+                    f_ev.push(tier_a.event_id[idx]);
+                    f_ts.push(tier_a.event_ts_ms[idx]);
+                    f_rkb.push(tier_a.replay_offset_kb[idx]);
+                }
+                tier_a = Arc::new(TierAColumns {
+                    uid_internal: f_uid,
+                    session_hash: f_sh,
+                    event_id: f_ev,
+                    event_ts_ms: f_ts,
+                    replay_offset_kb: f_rkb,
+                    session_index: tier_a.session_index.clone(),
+                });
+                for col in base_map.values_mut() {
+                    let compacted: Vec<PropValue> =
+                        keep_idx.iter().map(|&i| col[i].clone()).collect();
+                    *col = Arc::new(compacted);
+                }
+                seg_meta_opt = None;
+            }
+
+            let n = tier_a.len();
+            let prop_cols = materialize_virtual_columns(
+                n,
+                &tier_a.uid_internal,
+                &base_map,
+                final_props_ref,
+                catalog,
+                id_snap,
+            )?;
 
             Ok::<DataChunk, ExecError>(DataChunk {
                 bucket_id: seg.bucket_id,
                 tier_a,
                 prop_cols,
                 l0_rows: None,
-                segment_meta: Some(seg.clone()),
+                segment_meta: seg_meta_opt,
             })
         }
     });
@@ -243,7 +326,13 @@ pub async fn load_project_chunks(
         let l0_rows: Vec<StoredRow> = ps
             .snapshot_l0_bucket(snap, bucket_id)
             .into_iter()
-            .filter(|r| time_range.is_none_or(|tr| tr.contains(r.event_ts_ms)))
+            .filter(|r| {
+                time_range.is_none_or(|tr| tr.contains(r.event_ts_ms))
+                    && (deleted_uids.is_empty()
+                        || !(deleted_uids.contains(r.uid_internal)
+                            || id_snap
+                                .is_some_and(|s| deleted_uids.contains(s.resolve(r.uid_internal)))))
+            })
             .collect();
         if l0_rows.is_empty() {
             continue;
@@ -283,7 +372,14 @@ pub async fn load_project_chunks(
             }
         }
 
-        let prop_cols = materialize_virtual_columns(n, &base_map, &final_props_vec, catalog)?;
+        let prop_cols = materialize_virtual_columns(
+            n,
+            &uid_internal,
+            &base_map,
+            &final_props_vec,
+            catalog,
+            id_snap,
+        )?;
         let empty_sidx = Arc::new(pulse_storage::SegmentSessionIndex {
             headers: Vec::new(),
             session_ids: Vec::new(),
@@ -310,15 +406,36 @@ pub async fn load_project_chunks(
 
 fn materialize_virtual_columns(
     num_rows: usize,
+    uid_internal: &[u32],
     base_map: &HashMap<String, Arc<Vec<PropValue>>>,
     final_props: &[String],
     catalog: &VirtualCatalog,
+    id_snap: Option<&IdentitySnapshot>,
 ) -> Result<HashMap<String, Arc<Vec<PropValue>>>> {
     let mut out: HashMap<String, Arc<Vec<PropValue>>> = HashMap::with_capacity(final_props.len());
     for p in final_props {
+        if p.starts_with("user.") {
+            let vals = catalog.resolve_user_prop_column(uid_internal, id_snap, p);
+            out.insert(p.clone(), Arc::new(vals));
         // Physical property in `base_map` ALWAYS wins over custom/lookup columns (`P2-09j`)!
-        if let Some(col) = base_map.get(p) {
-            out.insert(p.clone(), col.clone());
+        } else if let Some(col) = base_map.get(p) {
+            if catalog.has_user_prop(p) && col.iter().any(|v| matches!(v, PropValue::Null)) {
+                let user_col = catalog.resolve_user_prop_column(uid_internal, id_snap, p);
+                let merged: Vec<PropValue> = col
+                    .iter()
+                    .zip(user_col)
+                    .map(|(ev_v, u_v)| {
+                        if matches!(ev_v, PropValue::Null) {
+                            u_v
+                        } else {
+                            ev_v.clone()
+                        }
+                    })
+                    .collect();
+                out.insert(p.clone(), Arc::new(merged));
+            } else {
+                out.insert(p.clone(), col.clone());
+            }
         } else if let Some(cp) = catalog.custom_properties.get(p) {
             let computed =
                 evaluate_custom_property(&cp, num_rows, base_map).map_err(ExecError::Expression)?;
@@ -340,6 +457,9 @@ fn materialize_virtual_columns(
                 joined.push(val);
             }
             out.insert(p.clone(), Arc::new(joined));
+        } else if catalog.has_user_prop(p) {
+            let vals = catalog.resolve_user_prop_column(uid_internal, id_snap, p);
+            out.insert(p.clone(), Arc::new(vals));
         } else {
             out.insert(p.clone(), Arc::new(vec![PropValue::Null; num_rows]));
         }
@@ -538,7 +658,7 @@ fn evaluate_cohort_bounded<'a>(
                     where_clauses.iter().map(|p| p.prop_name.clone()).collect();
                 props.extend(target.required_props());
 
-                let chunks = load_project_chunks(
+                let chunks = load_project_chunks_with_id(
                     ps,
                     snap,
                     cache,
@@ -546,6 +666,7 @@ fn evaluate_cohort_bounded<'a>(
                     eff_range,
                     &props,
                     Some(target.bloom_mask_64),
+                    Some(id_snap),
                 )
                 .await?;
 
@@ -601,8 +722,17 @@ fn evaluate_cohort_bounded<'a>(
             } => {
                 let eff_range = time_range.or(default_range);
                 // Universe of active users in window minus those who performed `event_name` >= 1 time
-                let all_chunks =
-                    load_project_chunks(ps, snap, cache, catalog, eff_range, &[], None).await?;
+                let all_chunks = load_project_chunks_with_id(
+                    ps,
+                    snap,
+                    cache,
+                    catalog,
+                    eff_range,
+                    &[],
+                    None,
+                    Some(id_snap),
+                )
+                .await?;
                 let mut universe = RoaringBitmap::new();
                 for chunk in &all_chunks {
                     for i in 0..chunk.len() {
@@ -636,7 +766,7 @@ fn evaluate_cohort_bounded<'a>(
                 time_range,
             } => {
                 let eff_range = time_range.or(default_range);
-                let chunks = load_project_chunks(
+                let chunks = load_project_chunks_with_id(
                     ps,
                     snap,
                     cache,
@@ -644,6 +774,7 @@ fn evaluate_cohort_bounded<'a>(
                     eff_range,
                     std::slice::from_ref(&predicate.prop_name),
                     None,
+                    Some(id_snap),
                 )
                 .await?;
                 let mut out = RoaringBitmap::new();

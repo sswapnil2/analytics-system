@@ -115,14 +115,6 @@ pub struct WireBatch {
     pub events: Vec<WireEvent>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum JsonBatchEnvelope {
-    Wrapped { events: Vec<WireEvent> },
-    Bare(Vec<WireEvent>),
-    Single(WireEvent),
-}
-
 impl WireBatch {
     pub fn new(events: Vec<WireEvent>) -> Self {
         Self { events }
@@ -141,18 +133,51 @@ impl WireBatch {
         Ok(serde_json::to_vec(self)?)
     }
 
-    /// Deserializes a JSON payload accepting `{"events":[...]}`, `[...]`, or a single event `{...}`.
+    /// Deserializes a JSON payload accepting `{"events":[...]}`, `{"batch":[...]}`, `[...]`,
+    /// or a single event object `{...}` (Pulse, Segment, or Mixpanel schema) (`PR-8`, `EN-4`).
     pub fn decode_json(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_DECOMPRESSED_BYTES {
             return Err(WireError::ResourceLimitExceeded(
                 "json batch exceeds 64 MiB limit",
             ));
         }
-        let env: JsonBatchEnvelope = serde_json::from_slice(bytes)?;
-        let events = match env {
-            JsonBatchEnvelope::Wrapped { events } => events,
-            JsonBatchEnvelope::Bare(events) => events,
-            JsonBatchEnvelope::Single(ev) => vec![ev],
+        let val: serde_json::Value = serde_json::from_slice(bytes)?;
+        let events: Vec<WireEvent> = match val {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    WireEvent::deserialize(item)
+                        .map_err(|e| WireError::InvalidPayload(format!("event at index {i}: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            serde_json::Value::Object(mut map) => {
+                if let Some(ev_val) = map.remove("events").or_else(|| map.remove("batch")) {
+                    let arr = ev_val.as_array().ok_or_else(|| {
+                        WireError::InvalidPayload(
+                            "expected \"events\" or \"batch\" to be a JSON array of event objects"
+                                .to_string(),
+                        )
+                    })?;
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            WireEvent::deserialize(item).map_err(|e| {
+                                WireError::InvalidPayload(format!("event at index {i}: {e}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    vec![WireEvent::deserialize(serde_json::Value::Object(map))
+                        .map_err(|e| WireError::InvalidPayload(e.to_string()))?]
+                }
+            }
+            _ => {
+                return Err(WireError::InvalidPayload(
+                    "expected a JSON event object, array of events, or {\"events\": [...]} wrapper"
+                        .to_string(),
+                ));
+            }
         };
         if events.len() > MAX_BATCH_EVENTS {
             return Err(WireError::ResourceLimitExceeded(

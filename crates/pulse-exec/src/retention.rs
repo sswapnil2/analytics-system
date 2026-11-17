@@ -10,7 +10,7 @@ use crate::ast::{RetentionCohortRow, RetentionMode, RetentionQuery, RetentionRes
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
+    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
     row_matches_predicates, ExecError, Result,
 };
 
@@ -82,7 +82,7 @@ impl RetentionEngine {
         let props_vec: Vec<String> = props_needed.into_iter().collect();
 
         let bloom = start_tgt.bloom_mask_64 | return_tgt.bloom_mask_64;
-        let chunks = load_project_chunks(
+        let chunks = load_project_chunks_with_id(
             ps,
             snap,
             cache,
@@ -90,6 +90,7 @@ impl RetentionEngine {
             Some(scan_range),
             &props_vec,
             (bloom != 0).then_some(bloom),
+            Some(id_snap),
         )
         .await?;
 

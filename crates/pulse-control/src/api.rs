@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -18,32 +19,44 @@ use pulse_exec::{
     TimeRange,
 };
 use pulse_ingest::{DiscoveredEventSchema, GovernanceProvider, IngestService, ProjectLexiconRules};
-use pulse_wire::{PropValue, WireframeOp};
+use pulse_wire::{mask_user_identifier, PropValue, WireBatch, WireEvent, WireframeOp};
+use roaring::RoaringBitmap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod auth;
+pub use auth::AuthConfig;
+
 use crate::db::{MetaError, MetaStore};
 use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
-    generate_random_api_key, generate_root_admin_token, mask_key_prefix, sha256_bytes, sha256_hex,
-    ApiKeyRecord, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconEvent, LexiconProperty, Organization, Project,
-    SavedReport, VariantAllocation, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS,
+    apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_key_prefix,
+    sha256_bytes, sha256_hex, AlertRule, ApiKeyRecord, CohortRecord, CreatedApiKeyResponse,
+    CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, Experiment,
+    ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty,
+    Organization, Project, SavedReport, UserProfileRecord, VariantAllocation, KEY_ROLE_ADMIN,
+    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
 pub enum AuthPrincipal {
     RootAdmin,
-    ProjectAdmin { project_id: String },
+    ProjectAdmin {
+        project_id: String,
+    },
+    /// Dashboard user signed in with a `ps_` session token; single-org deployment, so authorized like `RootAdmin`.
+    User {
+        user_id: String,
+    },
 }
 
 impl AuthPrincipal {
     fn authorize_project(&self, target_project_id: &str) -> Result<(), CtrlError> {
         match self {
-            AuthPrincipal::RootAdmin => Ok(()),
+            AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(()),
             AuthPrincipal::ProjectAdmin { project_id } => {
                 if project_id == target_project_id {
                     Ok(())
@@ -62,7 +75,7 @@ impl AuthPrincipal {
         default_pid: &str,
     ) -> Result<String, CtrlError> {
         match self {
-            AuthPrincipal::RootAdmin => Ok(requested
+            AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(requested
                 .filter(|s| !s.is_empty())
                 .unwrap_or(default_pid)
                 .to_string()),
@@ -104,6 +117,8 @@ pub struct ControlPlaneService {
     known_projects: DashSet<String>,
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
+    auth_cfg: parking_lot::RwLock<AuthConfig>,
+    auth_state: auth::AuthState,
 }
 
 impl ControlPlaneService {
@@ -156,6 +171,8 @@ impl ControlPlaneService {
             known_projects: DashSet::new(),
             lexicon_cache: DashMap::new(),
             discovery_tx: tx,
+            auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
+            auth_state: auth::AuthState::default(),
         });
 
         let generated_ingest = svc
@@ -445,7 +462,171 @@ impl ControlPlaneService {
             cat.saved_cohorts.insert(c.id.clone(), c.definition);
         }
 
+        let profiles = self
+            .meta
+            .list_user_profiles(project_id, 1000)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut prof_map: HashMap<u32, HashMap<String, PropValue>> =
+            HashMap::with_capacity(profiles.len());
+        for p in profiles {
+            if p.canonical_uid > 0 || !p.props.is_empty() {
+                let mut converted = HashMap::with_capacity(p.props.len());
+                for (k, v) in &p.props {
+                    converted.insert(k.clone(), json_value_to_prop_value(v));
+                }
+                prof_map
+                    .entry(p.canonical_uid)
+                    .or_default()
+                    .extend(converted);
+            }
+        }
+        cat.set_user_profiles(prof_map);
+
+        let erased = self
+            .meta
+            .list_erased_uids(project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut erased_bm = RoaringBitmap::new();
+        for u in erased {
+            erased_bm.insert(u);
+        }
+        cat.set_deleted_uids(erased_bm);
+
         Ok(())
+    }
+
+    async fn erase_user_dpdp(
+        &self,
+        project_id: &str,
+        distinct_id: &str,
+        requested_by: &str,
+    ) -> Result<DeletionAuditRecord, CtrlError> {
+        let id_graph = self
+            .qengine
+            .storage()
+            .identity_router()
+            .get_or_open(project_id)
+            .await
+            .map_err(|e| CtrlError::internal(e.to_string()))?;
+
+        let existing_prof = self
+            .meta
+            .get_user_profile(project_id, distinct_id)
+            .await
+            .map_err(CtrlError::meta)?;
+
+        let mut uids_bm = RoaringBitmap::new();
+        let mut canon_uid = 0u32;
+        if let Some(c) = id_graph
+            .lookup_canonical(distinct_id)
+            .or_else(|| id_graph.lookup_raw(distinct_id))
+            .or_else(|| existing_prof.as_ref().map(|p| p.canonical_uid))
+        {
+            canon_uid = c;
+            uids_bm = id_graph.all_raw_uids_for_canonical_root(canon_uid);
+        } else if let Some(digits) = distinct_id.strip_prefix("uid_") {
+            if let Ok(parsed) = digits.parse::<u32>() {
+                canon_uid = parsed;
+                uids_bm = id_graph.all_raw_uids_for_canonical_root(canon_uid);
+            }
+        }
+
+        let mut all_ids = id_graph.external_ids_for_canonical_roots(&uids_bm);
+        if !all_ids.iter().any(|x| x == distinct_id) {
+            all_ids.push(distinct_id.to_string());
+        }
+
+        let mut events_purged = 0u64;
+        let mut sessions_to_delete: Vec<String> = Vec::new();
+        if !uids_bm.is_empty() {
+            if let Ok(evs) = self
+                .qengine
+                .export_events(project_id, None, Some(canon_uid), 50_000, false)
+                .await
+            {
+                events_purged = evs.len() as u64;
+                for ev in evs {
+                    if !ev.session_id.is_empty() {
+                        sessions_to_delete.push(ev.session_id);
+                    }
+                }
+            }
+            if let Ok(ps) = self.qengine.storage().get_or_open_project(project_id).await {
+                let (l0_purged, mut l0_sids) = ps.purge_user_l0(&uids_bm);
+                if events_purged == 0 {
+                    events_purged = l0_purged;
+                }
+                sessions_to_delete.append(&mut l0_sids);
+            }
+        }
+
+        sessions_to_delete.sort_unstable();
+        sessions_to_delete.dedup();
+        let mut replays_purged = 0u64;
+        let rstore = self.qengine.storage().replay_store();
+        for sid in &sessions_to_delete {
+            if rstore
+                .delete_session(project_id, sid)
+                .await
+                .unwrap_or(false)
+            {
+                replays_purged += 1;
+            }
+        }
+
+        let _ = self
+            .meta
+            .delete_user_profiles_for_ids(project_id, &all_ids)
+            .await
+            .map_err(CtrlError::meta)?;
+
+        let uid_vec: Vec<u32> = uids_bm.iter().collect();
+        self.meta
+            .insert_erased_uids(project_id, &uid_vec)
+            .await
+            .map_err(CtrlError::meta)?;
+
+        let cat = self.qengine.catalogs().for_project(project_id);
+        cat.mark_deleted_uids(&uids_bm);
+        cat.remove_user_profile(canon_uid);
+
+        let rec = DeletionAuditRecord {
+            id: format!("del_{}", &Uuid::new_v4().simple().to_string()[..12]),
+            project_id: project_id.to_string(),
+            distinct_id_masked: mask_user_identifier(distinct_id),
+            canonical_uid: canon_uid,
+            events_purged,
+            replays_purged,
+            requested_by: requested_by.to_string(),
+            deleted_at_ms: Utc::now().timestamp_millis(),
+        };
+        self.meta
+            .insert_deletion_audit(&rec)
+            .await
+            .map_err(CtrlError::meta)?;
+        Ok(rec)
+    }
+}
+
+fn json_value_to_prop_value(v: &Value) -> PropValue {
+    match v {
+        Value::Null => PropValue::Null,
+        Value::Bool(b) => PropValue::Bool(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                PropValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                PropValue::Float(f)
+            } else {
+                PropValue::Null
+            }
+        }
+        Value::String(s) => PropValue::Str(s.clone()),
+        Value::Array(_) | Value::Object(_) => {
+            PropValue::Str(serde_json::to_string(v).unwrap_or_default())
+        }
     }
 }
 
@@ -471,6 +652,89 @@ impl GovernanceProvider for ControlPlaneService {
 
     fn record_discovery(&self, items: Vec<DiscoveredEventSchema>) {
         let _ = self.discovery_tx.send(items);
+    }
+
+    async fn apply_engage(
+        &self,
+        project_id: &str,
+        distinct_id: &str,
+        canonical_uid: u32,
+        ops: &Value,
+    ) {
+        let existing = self
+            .meta
+            .get_user_profile(project_id, distinct_id)
+            .await
+            .ok()
+            .flatten();
+        let mut props = existing
+            .as_ref()
+            .map(|p| p.props.clone())
+            .unwrap_or_default();
+        let mut total_revenue = existing.as_ref().map(|p| p.total_revenue).unwrap_or(0.0);
+
+        let out = apply_profile_ops(&mut props, &mut total_revenue, ops);
+        if out.delete_requested {
+            let _ = self
+                .erase_user_dpdp(project_id, distinct_id, "sdk:$delete_user")
+                .await;
+            return;
+        }
+        if !out.modified && existing.is_some() {
+            return;
+        }
+
+        let rec = UserProfileRecord {
+            project_id: project_id.to_string(),
+            distinct_id: distinct_id.to_string(),
+            canonical_uid,
+            props: props.clone(),
+            total_revenue,
+            updated_at_ms: Utc::now().timestamp_millis(),
+        };
+        let _ = self.meta.upsert_user_profile(&rec).await;
+
+        let mut converted = HashMap::with_capacity(props.len() + 1);
+        for (k, v) in &props {
+            converted.insert(k.clone(), json_value_to_prop_value(v));
+        }
+        converted.insert("total_revenue".to_string(), PropValue::Float(total_revenue));
+        self.qengine
+            .catalogs()
+            .for_project(project_id)
+            .upsert_user_profile(canonical_uid, converted);
+    }
+
+    async fn apply_group_engage(
+        &self,
+        project_id: &str,
+        group_type: &str,
+        group_id: &str,
+        ops: &Value,
+    ) {
+        let existing = self
+            .meta
+            .get_group_profile(project_id, group_type, group_id)
+            .await
+            .ok()
+            .flatten();
+        let mut props = existing
+            .as_ref()
+            .map(|g| g.props.clone())
+            .unwrap_or_default();
+        let mut rev = 0.0;
+        let out = apply_profile_ops(&mut props, &mut rev, ops);
+        if !out.modified && existing.is_some() {
+            return;
+        }
+        let rec = GroupProfileRecord {
+            project_id: project_id.to_string(),
+            group_type: group_type.to_string(),
+            group_id: group_id.to_string(),
+            props,
+            updated_at_ms: Utc::now().timestamp_millis(),
+        };
+        let _ = self.meta.upsert_group_profile(&rec).await;
     }
 }
 
@@ -509,7 +773,18 @@ async fn require_admin_auth(
             "missing Authorization: Bearer <sk_...> header",
         ));
     };
-    let principal = ctrl.verify_admin_token(token)?;
+    let session_user = if token.starts_with("ps_") {
+        ctrl.meta
+            .get_session_user_id(&sha256_hex(token), Utc::now().timestamp_millis())
+            .await
+            .map_err(CtrlError::meta)?
+    } else {
+        None
+    };
+    let principal = match session_user {
+        Some(user_id) => AuthPrincipal::User { user_id },
+        None => ctrl.verify_admin_token(token)?,
+    };
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
@@ -580,6 +855,28 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_preview_cohort),
         )
         .route(
+            "/v1/projects/:id/cohorts/:cohort_id/export",
+            get(handle_export_cohort),
+        )
+        // User Profiles, DPDP Erasure, Batch Import/Export, Revenue & Alerts (`Gaps 1, 4, 5, 7, 14, 15, 16`)
+        .route("/v1/projects/:id/users", get(handle_list_user_profiles))
+        .route(
+            "/v1/projects/:id/users/:distinct_id",
+            get(handle_get_user_detail).delete(handle_delete_user_profile),
+        )
+        .route("/v1/projects/:id/deletions", get(handle_list_deletions))
+        .route("/v1/projects/:id/import", post(handle_import_events))
+        .route("/v1/projects/:id/export", get(handle_export_events))
+        .route("/v1/projects/:id/revenue", get(handle_get_revenue_summary))
+        .route(
+            "/v1/projects/:id/alerts",
+            get(handle_list_alerts).post(handle_create_alert),
+        )
+        .route(
+            "/v1/projects/:id/alerts/:alert_id",
+            axum::routing::delete(handle_delete_alert),
+        )
+        .route(
             "/v1/projects/:id/schema-extensions",
             get(handle_get_schema_extensions),
         )
@@ -601,8 +898,20 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             get(handle_list_reports).post(handle_save_report),
         )
         .route(
+            "/v1/projects/:id/saved-reports/:rep_id",
+            get(handle_get_report)
+                .put(handle_update_report)
+                .delete(handle_delete_report),
+        )
+        .route(
             "/v1/projects/:id/dashboards",
             get(handle_list_dashboards).post(handle_save_dashboard),
+        )
+        .route(
+            "/v1/projects/:id/dashboards/:dash_id",
+            get(handle_get_dashboard)
+                .put(handle_replace_dashboard)
+                .delete(handle_delete_dashboard),
         )
         // Feature Flags & Experimentation
         .route(
@@ -620,10 +929,15 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
+        .route("/v1/auth/me", get(auth::handle_me))
+        .route("/v1/auth/logout", post(auth::handle_logout))
         .route_layer(middleware::from_fn_with_state(
             ctrl.clone(),
             require_admin_auth,
         ))
+        // Sign-in routes are merged after `route_layer`, so they stay outside the bearer middleware
+        // but share the admin CORS policy.
+        .merge(auth::public_auth_router())
         .with_state(ctrl)
 }
 
@@ -728,7 +1042,7 @@ async fn handle_status(
 
     let all_projects = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
     let projects: Vec<Project> = match &principal {
-        AuthPrincipal::RootAdmin => all_projects,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => all_projects,
         AuthPrincipal::ProjectAdmin { project_id } => all_projects
             .into_iter()
             .filter(|p| &p.id == project_id)
@@ -758,7 +1072,10 @@ async fn handle_admin_flush(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiRes<Value> {
-    if !matches!(principal, AuthPrincipal::RootAdmin) {
+    if !matches!(
+        principal,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. }
+    ) {
         return Err(CtrlError::forbidden(
             "cluster flush requires root admin token",
         ));
@@ -788,7 +1105,7 @@ async fn handle_list_projects(
 ) -> ApiRes<Vec<Project>> {
     let list = ctrl.meta.list_projects().await.map_err(CtrlError::meta)?;
     let scoped = match principal {
-        AuthPrincipal::RootAdmin => list,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => list,
         AuthPrincipal::ProjectAdmin { project_id } => {
             list.into_iter().filter(|p| p.id == project_id).collect()
         }
@@ -808,7 +1125,10 @@ async fn handle_create_project(
     Extension(principal): Extension<AuthPrincipal>,
     Json(req): Json<CreateProjectReq>,
 ) -> ApiRes<Value> {
-    if !matches!(principal, AuthPrincipal::RootAdmin) {
+    if !matches!(
+        principal,
+        AuthPrincipal::RootAdmin | AuthPrincipal::User { .. }
+    ) {
         return Err(CtrlError::forbidden(
             "creating projects requires root admin token",
         ));
@@ -948,11 +1268,36 @@ async fn handle_create_key(
 
 // ------------------- Queries -------------------
 
+fn parse_json_body<T: serde::de::DeserializeOwned>(
+    label: &str,
+    bytes: &[u8],
+) -> Result<T, CtrlError> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        CtrlError::bad(format!(
+            "invalid {label} request: {}",
+            pulse_wire::sanitize_json_error_message(&e.to_string())
+        ))
+    })
+}
+
+fn parse_query_value<T: serde::de::DeserializeOwned>(
+    label: &str,
+    value: Value,
+) -> Result<T, CtrlError> {
+    serde_json::from_value(value).map_err(|e| {
+        CtrlError::bad(format!(
+            "invalid {label} query: {}",
+            pulse_wire::sanitize_json_error_message(&e.to_string())
+        ))
+    })
+}
+
 async fn handle_unified_query(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
-    Json(payload): Json<Value>,
+    body: Bytes,
 ) -> ApiRes<Value> {
+    let payload: Value = parse_json_body("query", &body)?;
     let req_pid = payload.get("project_id").and_then(|v| v.as_str());
     let pid = principal.resolve_project(req_pid, &ctrl.default_project_id)?;
     ctrl.ensure_known_project(&pid).await?;
@@ -966,8 +1311,7 @@ async fn handle_unified_query(
     let inner = payload.get("query").cloned().unwrap_or(payload.clone());
     match kind {
         "insights" => {
-            let q: InsightsQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: InsightsQuery = parse_query_value("insights", inner)?;
             let res = ctrl
                 .qengine
                 .query_insights(&pid, &q)
@@ -976,8 +1320,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "funnel" | "funnels" => {
-            let q: FunnelQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: FunnelQuery = parse_query_value("funnel", inner)?;
             let res = ctrl
                 .qengine
                 .query_funnel(&pid, &q)
@@ -986,8 +1329,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "retention" => {
-            let q: RetentionQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: RetentionQuery = parse_query_value("retention", inner)?;
             let res = ctrl
                 .qengine
                 .query_retention(&pid, &q)
@@ -996,8 +1338,7 @@ async fn handle_unified_query(
             Ok(Json(serde_json::to_value(res).unwrap()))
         }
         "flows" | "flow" => {
-            let q: FlowsQuery =
-                serde_json::from_value(inner).map_err(|e| CtrlError::bad(e.to_string()))?;
+            let q: FlowsQuery = parse_query_value("flows", inner)?;
             let res = ctrl
                 .qengine
                 .query_flows(&pid, &q)
@@ -1013,9 +1354,10 @@ async fn handle_query_insights(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<InsightsQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::InsightsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: InsightsQuery = parse_json_body("insights query", &body)?;
     let res = ctrl
         .qengine
         .query_insights(&id, &q)
@@ -1028,9 +1370,10 @@ async fn handle_query_funnel(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<FunnelQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::FunnelResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FunnelQuery = parse_json_body("funnel query", &body)?;
     let res = ctrl
         .qengine
         .query_funnel(&id, &q)
@@ -1043,9 +1386,10 @@ async fn handle_query_retention(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<RetentionQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::RetentionResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: RetentionQuery = parse_json_body("retention query", &body)?;
     let res = ctrl
         .qengine
         .query_retention(&id, &q)
@@ -1058,9 +1402,10 @@ async fn handle_query_flows(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
-    Json(q): Json<FlowsQuery>,
+    body: Bytes,
 ) -> ApiRes<pulse_exec::FlowsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FlowsQuery = parse_json_body("flows query", &body)?;
     let res = ctrl
         .qengine
         .query_flows(&id, &q)
@@ -1648,6 +1993,136 @@ async fn handle_create_custom_property(
 
 // ------------------- Saved Reports & Dashboards -------------------
 
+const MAX_DASHBOARD_CARDS: usize = 60;
+const MAX_TEXT_CARD_CHARS: usize = 5000;
+const MAX_DESCRIPTION_CHARS: usize = 1000;
+
+fn validate_name(raw: &str) -> Result<String, CtrlError> {
+    let name = raw.trim();
+    if !(1..=120).contains(&name.chars().count()) {
+        return Err(CtrlError::bad("name must be between 1 and 120 characters"));
+    }
+    Ok(name.to_string())
+}
+
+fn new_card_id() -> String {
+    format!("card_{}", &Uuid::new_v4().simple().to_string()[..12])
+}
+
+impl ControlPlaneService {
+    /// Who to record as `created_by`: the user's email for sessions, otherwise `"admin token"`.
+    async fn principal_label(&self, principal: &AuthPrincipal) -> Result<String, CtrlError> {
+        if let AuthPrincipal::User { user_id } = principal {
+            if let Some(u) = self
+                .meta
+                .get_user_by_id(user_id)
+                .await
+                .map_err(CtrlError::meta)?
+            {
+                return Ok(u.email);
+            }
+        }
+        Ok("admin token".to_string())
+    }
+
+    async fn validate_cards(
+        &self,
+        project_id: &str,
+        cards: Vec<DashboardCard>,
+    ) -> Result<Vec<DashboardCard>, CtrlError> {
+        if cards.len() > MAX_DASHBOARD_CARDS {
+            return Err(CtrlError::bad(format!(
+                "a dashboard can hold at most {MAX_DASHBOARD_CARDS} cards"
+            )));
+        }
+        let report_ids: std::collections::HashSet<String> = self
+            .meta
+            .list_saved_reports(project_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(cards.len());
+        for mut card in cards {
+            if card.id.trim().is_empty() {
+                card.id = new_card_id();
+            }
+            if !seen.insert(card.id.clone()) {
+                return Err(CtrlError::bad(format!("duplicate card id '{}'", card.id)));
+            }
+            if card.width != 1 && card.width != 2 {
+                return Err(CtrlError::bad(
+                    "card width must be 1 (half row) or 2 (full row)",
+                ));
+            }
+            match card.kind.as_str() {
+                "report" => {
+                    let rid = card.report_id.as_deref().unwrap_or_default();
+                    if !report_ids.contains(rid) {
+                        return Err(CtrlError::bad(format!(
+                            "report card '{}' references unknown report '{rid}'",
+                            card.id
+                        )));
+                    }
+                    card.text = None;
+                }
+                "text" => {
+                    let text = card.text.as_deref().unwrap_or_default();
+                    if text.chars().count() > MAX_TEXT_CARD_CHARS {
+                        return Err(CtrlError::bad(format!(
+                            "text cards are limited to {MAX_TEXT_CARD_CHARS} characters"
+                        )));
+                    }
+                    card.text = Some(text.to_string());
+                    card.report_id = None;
+                }
+                _ => return Err(CtrlError::bad("card kind must be 'report' or 'text'")),
+            }
+            out.push(card);
+        }
+        Ok(out)
+    }
+
+    async fn dashboard_or_404(
+        &self,
+        project_id: &str,
+        dash_id: &str,
+    ) -> Result<Dashboard, CtrlError> {
+        self.meta
+            .get_dashboard(project_id, dash_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::not_found(format!("dashboard '{dash_id}' not found")))
+    }
+
+    async fn report_or_404(
+        &self,
+        project_id: &str,
+        rep_id: &str,
+    ) -> Result<SavedReport, CtrlError> {
+        self.meta
+            .get_saved_report(project_id, rep_id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::not_found(format!("report '{rep_id}' not found")))
+    }
+}
+
+fn validate_description(raw: Option<String>) -> Result<Option<String>, CtrlError> {
+    let desc = raw.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+    if desc
+        .as_ref()
+        .is_some_and(|d| d.chars().count() > MAX_DESCRIPTION_CHARS)
+    {
+        return Err(CtrlError::bad(format!(
+            "description must be at most {MAX_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    Ok(desc)
+}
+
 async fn handle_list_reports(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1682,19 +2157,100 @@ async fn handle_save_report(
             "report id is generated by the server and must not be client-supplied",
         ));
     }
+    if !REPORT_KINDS.contains(&req.report_kind.as_str()) {
+        return Err(CtrlError::bad(
+            "report_kind must be one of funnel, insights, retention, flows",
+        ));
+    }
+    let now = Utc::now().timestamp_millis();
     let rep = SavedReport {
         id: format!("rep_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id,
-        name: req.name,
+        name: validate_name(&req.name)?,
         report_kind: req.report_kind,
         query_json: req.query_json,
-        created_at_ms: Utc::now().timestamp_millis(),
+        created_at_ms: now,
+        updated_at_ms: now,
     };
     ctrl.meta
         .upsert_saved_report(&rep)
         .await
         .map_err(CtrlError::meta)?;
     Ok(Json(rep))
+}
+
+async fn handle_get_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+) -> ApiRes<SavedReport> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(ctrl.report_or_404(&id, &rep_id).await?))
+}
+
+#[derive(Deserialize)]
+struct UpdateReportReq {
+    name: String,
+    query_json: Value,
+}
+
+async fn handle_update_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+    Json(req): Json<UpdateReportReq>,
+) -> ApiRes<SavedReport> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let mut rep = ctrl.report_or_404(&id, &rep_id).await?;
+    rep.name = validate_name(&req.name)?;
+    rep.query_json = req.query_json;
+    rep.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_saved_report(&rep)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(rep))
+}
+
+async fn handle_delete_report(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, rep_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_saved_report(&id, &rep_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("report '{rep_id}' not found")));
+    }
+    // ponytail: not transactional with the delete; a crash in between leaves dangling report
+    // cards, which the UI must already tolerate. Wrap in a transaction if that ever matters.
+    let now = Utc::now().timestamp_millis();
+    let mut dashboards_updated = 0;
+    for mut dash in ctrl
+        .meta
+        .list_dashboards(&id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        let before = dash.cards.len();
+        dash.cards
+            .retain(|c| c.report_id.as_deref() != Some(rep_id.as_str()));
+        if dash.cards.len() != before {
+            dash.updated_at_ms = now;
+            ctrl.meta
+                .upsert_dashboard(&dash)
+                .await
+                .map_err(CtrlError::meta)?;
+            dashboards_updated += 1;
+        }
+    }
+    Ok(Json(
+        json!({ "status": "ok", "dashboards_updated": dashboards_updated }),
+    ))
 }
 
 async fn handle_list_dashboards(
@@ -1715,7 +2271,8 @@ async fn handle_list_dashboards(
 struct SaveDashboardReq {
     id: Option<String>,
     name: String,
-    report_ids: Vec<String>,
+    description: Option<String>,
+    cards: Option<Vec<DashboardCard>>,
 }
 
 async fn handle_save_dashboard(
@@ -1730,18 +2287,81 @@ async fn handle_save_dashboard(
             "dashboard id is generated by the server and must not be client-supplied",
         ));
     }
+    let name = validate_name(&req.name)?;
+    let description = validate_description(req.description)?;
+    let cards = ctrl
+        .validate_cards(&id, req.cards.unwrap_or_default())
+        .await?;
+    let now = Utc::now().timestamp_millis();
     let dash = Dashboard {
         id: format!("dash_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id,
-        name: req.name,
-        report_ids: req.report_ids,
-        created_at_ms: Utc::now().timestamp_millis(),
+        name,
+        description,
+        cards,
+        created_by: Some(ctrl.principal_label(&principal).await?),
+        created_at_ms: now,
+        updated_at_ms: now,
     };
     ctrl.meta
         .upsert_dashboard(&dash)
         .await
         .map_err(CtrlError::meta)?;
     Ok(Json(dash))
+}
+
+async fn handle_get_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+) -> ApiRes<Dashboard> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(ctrl.dashboard_or_404(&id, &dash_id).await?))
+}
+
+#[derive(Deserialize)]
+struct ReplaceDashboardReq {
+    name: String,
+    description: Option<String>,
+    cards: Vec<DashboardCard>,
+}
+
+async fn handle_replace_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+    Json(req): Json<ReplaceDashboardReq>,
+) -> ApiRes<Dashboard> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let mut dash = ctrl.dashboard_or_404(&id, &dash_id).await?;
+    dash.name = validate_name(&req.name)?;
+    dash.description = validate_description(req.description)?;
+    dash.cards = ctrl.validate_cards(&id, req.cards).await?;
+    dash.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_dashboard(&dash)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(dash))
+}
+
+async fn handle_delete_dashboard(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, dash_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_dashboard(&id, &dash_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!(
+            "dashboard '{dash_id}' not found"
+        )));
+    }
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 // ------------------- Feature Flags & Experiments (`P0-03`, `P0-04`, `P2-10`) -------------------
@@ -2033,4 +2653,647 @@ async fn handle_mcp(
     ctrl.ensure_known_project(&bound_pid).await?;
     let resp = handle_mcp_request(req, &bound_pid, &ctrl.meta, &ctrl.qengine).await;
     Ok(Json(resp))
+}
+
+// ------------------- User Profiles, DPDP Erasure, Import/Export, Revenue & Alerts -------------------
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(cur.trim().to_string());
+    fields
+}
+
+async fn handle_list_user_profiles(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiRes<Vec<Value>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let search = q.get("search").map(|s| s.trim().to_ascii_lowercase());
+    let profiles = ctrl
+        .meta
+        .list_user_profiles(&id, 1000)
+        .await
+        .map_err(CtrlError::meta)?;
+
+    let out: Vec<Value> = profiles
+        .into_iter()
+        .filter(|p| match &search {
+            Some(s) if !s.is_empty() => {
+                p.distinct_id.to_ascii_lowercase().contains(s)
+                    || mask_user_identifier(&p.distinct_id)
+                        .to_ascii_lowercase()
+                        .contains(s)
+                    || p.props
+                        .values()
+                        .any(|v| v.to_string().to_ascii_lowercase().contains(s))
+            }
+            _ => true,
+        })
+        .take(limit)
+        .map(|p| {
+            json!({
+                "project_id": p.project_id,
+                "distinct_id": p.distinct_id,
+                "distinct_id_masked": mask_user_identifier(&p.distinct_id),
+                "canonical_uid": p.canonical_uid,
+                "props": p.props,
+                "total_revenue": p.total_revenue,
+                "updated_at_ms": p.updated_at_ms,
+            })
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn handle_get_user_detail(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, distinct_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let id_graph = ctrl
+        .qengine
+        .storage()
+        .identity_router()
+        .get_or_open(&id)
+        .await
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
+
+    let profile = ctrl
+        .meta
+        .get_user_profile(&id, &distinct_id)
+        .await
+        .map_err(CtrlError::meta)?;
+
+    let canon_uid = id_graph
+        .lookup_canonical(&distinct_id)
+        .or_else(|| id_graph.lookup_raw(&distinct_id))
+        .or_else(|| profile.as_ref().map(|p| p.canonical_uid))
+        .unwrap_or(0);
+
+    let events = if canon_uid > 0 || id_graph.lookup_raw(&distinct_id).is_some() {
+        ctrl.qengine
+            .export_events(&id, None, Some(canon_uid), 200, true)
+            .await
+            .map_err(CtrlError::exec)?
+    } else {
+        Vec::new()
+    };
+
+    let rstore = ctrl.qengine.storage().replay_store();
+    let mut replay_sessions: Vec<String> = Vec::new();
+    for ev in &events {
+        if !ev.session_id.is_empty()
+            && !replay_sessions.contains(&ev.session_id)
+            && rstore.has_session(&id, &ev.session_id).await
+        {
+            replay_sessions.push(ev.session_id.clone());
+        }
+    }
+
+    Ok(Json(json!({
+        "distinct_id": distinct_id,
+        "distinct_id_masked": mask_user_identifier(&distinct_id),
+        "canonical_uid": canon_uid,
+        "profile": profile,
+        "events": events,
+        "replay_sessions": replay_sessions,
+    })))
+}
+
+async fn handle_delete_user_profile(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, distinct_id)): AxumPath<(String, String)>,
+) -> ApiRes<DeletionAuditRecord> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let who = match &principal {
+        AuthPrincipal::RootAdmin => "root_admin",
+        AuthPrincipal::ProjectAdmin { .. } => "project_admin",
+        AuthPrincipal::User { user_id } => user_id.as_str(),
+    };
+    let rec = ctrl.erase_user_dpdp(&id, &distinct_id, who).await?;
+    Ok(Json(rec))
+}
+
+async fn handle_list_deletions(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<DeletionAuditRecord>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let list = ctrl
+        .meta
+        .list_deletion_audit(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(list))
+}
+
+async fn handle_import_events(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let ingest_guard = ctrl.ingest.read().await;
+    let Some(ingest) = ingest_guard.as_ref() else {
+        return Err(CtrlError::internal("ingest service unavailable"));
+    };
+
+    let ctype = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let first_non_ws = body.iter().copied().find(|b| !b.is_ascii_whitespace());
+    let batch = if ctype.contains("csv")
+        || (first_non_ws != Some(b'{') && first_non_ws != Some(b'['))
+    {
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| CtrlError::bad("CSV/NDJSON import must be valid UTF-8"))?;
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') {
+            // NDJSON lines
+            let mut events = Vec::new();
+            for (idx, line) in trimmed.lines().enumerate() {
+                let l = line.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                let ev: WireEvent = serde_json::from_str(l).map_err(|e| {
+                    CtrlError::bad(format!(
+                        "NDJSON line {}: {}",
+                        idx + 1,
+                        pulse_wire::sanitize_json_error_message(&e.to_string())
+                    ))
+                })?;
+                events.push(ev);
+            }
+            WireBatch::new(events)
+        } else {
+            // CSV with header
+            let mut lines = trimmed.lines().filter(|l| !l.trim().is_empty());
+            let Some(header_line) = lines.next() else {
+                return Err(CtrlError::bad("CSV import body is empty"));
+            };
+            let cols = parse_csv_line(header_line);
+            let mut events = Vec::new();
+            for (row_idx, line) in lines.enumerate() {
+                let vals = parse_csv_line(line);
+                let mut map = serde_json::Map::new();
+                let mut props_map = serde_json::Map::new();
+                for (c_idx, col_name) in cols.iter().enumerate() {
+                    let raw_v = vals.get(c_idx).map(String::as_str).unwrap_or("");
+                    if raw_v.is_empty() {
+                        continue;
+                    }
+                    match col_name.as_str() {
+                        "event" | "event_name" | "distinct_id" | "user_id" | "userId"
+                        | "anonymous_id" | "session_id" | "timestamp" | "client_event_ts_ms"
+                        | "insert_id" | "messageId" => {
+                            map.insert(col_name.clone(), Value::String(raw_v.to_string()));
+                        }
+                        other => {
+                            if let Ok(i) = raw_v.parse::<i64>() {
+                                props_map.insert(other.to_string(), Value::from(i));
+                            } else if let Ok(f) = raw_v.parse::<f64>() {
+                                props_map.insert(other.to_string(), Value::from(f));
+                            } else if raw_v == "true" || raw_v == "false" {
+                                props_map.insert(other.to_string(), Value::Bool(raw_v == "true"));
+                            } else {
+                                props_map
+                                    .insert(other.to_string(), Value::String(raw_v.to_string()));
+                            }
+                        }
+                    }
+                }
+                if !props_map.is_empty() {
+                    map.insert("properties".to_string(), Value::Object(props_map));
+                }
+                let ev: WireEvent = serde_json::from_value(Value::Object(map)).map_err(|e| {
+                    CtrlError::bad(format!(
+                        "CSV row {}: {}",
+                        row_idx + 1,
+                        pulse_wire::sanitize_json_error_message(&e.to_string())
+                    ))
+                })?;
+                events.push(ev);
+            }
+            WireBatch::new(events)
+        }
+    } else {
+        WireBatch::decode_json(&body).map_err(|e| CtrlError::bad(e.to_string()))?
+    };
+
+    let now_ms = Utc::now().timestamp_millis();
+    let res = ingest
+        .ingest_for_project(&id, batch, now_ms)
+        .await
+        .map_err(|e| CtrlError::bad(e.to_string()))?;
+    let _ = ctrl.qengine.storage().flush_all_projects().await;
+
+    Ok(Json(json!({
+        "status": res.status,
+        "accepted": res.accepted,
+        "deduped": res.deduped,
+        "dropped": res.dropped,
+        "server_ts_ms": res.server_ts_ms,
+    })))
+}
+
+async fn handle_export_events(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, CtrlError> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let time_range = match (
+        q.get("start_ts_ms").and_then(|s| s.parse::<i64>().ok()),
+        q.get("end_ts_ms").and_then(|s| s.parse::<i64>().ok()),
+    ) {
+        (Some(s), Some(e)) => Some(TimeRange {
+            start_ts_ms: s,
+            end_ts_ms: e,
+        }),
+        _ => None,
+    };
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5_000)
+        .clamp(1, 50_000);
+    let format = q
+        .get("format")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "ndjson".to_string());
+
+    let rows = ctrl
+        .qengine
+        .export_events(&id, time_range, None, limit, true)
+        .await
+        .map_err(CtrlError::exec)?;
+
+    if format == "json" {
+        return Ok(Json(json!({ "events": rows, "count": rows.len() })).into_response());
+    }
+    if format == "csv" {
+        let mut out =
+            String::from("event_ts_ms,event_name,distinct_id,session_id,properties_json\n");
+        for r in &rows {
+            let pjson = serde_json::to_string(&r.props).unwrap_or_else(|_| "{}".into());
+            out.push_str(&format!(
+                "{},{},{},{},{}\n",
+                r.event_ts_ms,
+                csv_escape(&r.event_name),
+                csv_escape(&r.distinct_id),
+                csv_escape(&r.session_id),
+                csv_escape(&pjson),
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"pulse_events_export.csv\"",
+                ),
+            ],
+            out,
+        )
+            .into_response());
+    }
+
+    let mut ndjson = String::with_capacity(rows.len() * 160);
+    for r in &rows {
+        if let Ok(line) = serde_json::to_string(r) {
+            ndjson.push_str(&line);
+            ndjson.push('\n');
+        }
+    }
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        ndjson,
+    )
+        .into_response())
+}
+
+async fn handle_export_cohort(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, cohort_id)): AxumPath<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, CtrlError> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let members = ctrl
+        .qengine
+        .evaluate_saved_cohort_uids(&id, &cohort_id)
+        .await
+        .map_err(CtrlError::exec)?;
+    let profiles = ctrl
+        .meta
+        .list_user_profiles(&id, 1000)
+        .await
+        .map_err(CtrlError::meta)?;
+    let by_uid: HashMap<u32, UserProfileRecord> =
+        profiles.into_iter().map(|p| (p.canonical_uid, p)).collect();
+
+    let format = q
+        .get("format")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "csv".to_string());
+
+    if format == "json" {
+        let users: Vec<Value> = members
+            .iter()
+            .map(|(uid, masked_did)| {
+                let prof = by_uid.get(uid);
+                json!({
+                    "canonical_uid": uid,
+                    "distinct_id": masked_did,
+                    "props": prof.map(|p| &p.props),
+                    "total_revenue": prof.map(|p| p.total_revenue).unwrap_or(0.0),
+                })
+            })
+            .collect();
+        return Ok(
+            Json(json!({ "cohort_id": cohort_id, "count": users.len(), "users": users }))
+                .into_response(),
+        );
+    }
+
+    let mut csv = String::from("canonical_uid,distinct_id,plan,utm_source,total_revenue\n");
+    for (uid, masked_did) in &members {
+        let prof = by_uid.get(uid);
+        let plan = prof
+            .and_then(|p| p.props.get("plan").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let utm = prof
+            .and_then(|p| p.props.get("utm_source").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let rev = prof.map(|p| p.total_revenue).unwrap_or(0.0);
+        csv.push_str(&format!(
+            "{},{},{},{},{:.2}\n",
+            uid,
+            csv_escape(masked_did),
+            csv_escape(plan),
+            csv_escape(utm),
+            rev,
+        ));
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"cohort_{cohort_id}.csv\""),
+            ),
+        ],
+        csv,
+    )
+        .into_response())
+}
+
+async fn handle_get_revenue_summary(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let profiles = ctrl
+        .meta
+        .list_user_profiles(&id, 1000)
+        .await
+        .map_err(CtrlError::meta)?;
+
+    let mut total_revenue = 0.0;
+    let mut paying_users = 0usize;
+    let total_profiles = profiles.len();
+    for p in &profiles {
+        if p.total_revenue > 0.0 {
+            paying_users += 1;
+            total_revenue += p.total_revenue;
+        }
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let iq = InsightsQuery {
+        time_range: TimeRange {
+            start_ts_ms: now_ms - 14 * 86_400_000,
+            end_ts_ms: now_ms,
+        },
+        interval: pulse_exec::TimeInterval::Day,
+        series: vec![
+            pulse_exec::InsightsSeriesSpec {
+                label: "Transaction Volume".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric: pulse_exec::InsightsMetric::PropSum {
+                    prop: "amount".to_string(),
+                },
+                filters: Vec::new(),
+            },
+            pulse_exec::InsightsSeriesSpec {
+                label: "Paying Users".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric: pulse_exec::InsightsMetric::Uniques,
+                filters: Vec::new(),
+            },
+        ],
+        breakdown_by: Vec::new(),
+        global_filter: Default::default(),
+        compare_previous_period: false,
+        formula: None,
+    };
+    let ins_opt = ctrl.qengine.query_insights(&id, &iq).await.ok();
+
+    let arpu = if total_profiles > 0 {
+        total_revenue / (total_profiles as f64)
+    } else {
+        0.0
+    };
+    let arppu = if paying_users > 0 {
+        total_revenue / (paying_users as f64)
+    } else {
+        0.0
+    };
+
+    Ok(Json(json!({
+        "total_revenue": total_revenue,
+        "paying_users": paying_users,
+        "total_profiles": total_profiles,
+        "arpu": arpu,
+        "arppu": arppu,
+        "daily_series": ins_opt.map(|r| r.series).unwrap_or_default(),
+    })))
+}
+
+async fn handle_list_alerts(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let alerts = ctrl
+        .meta
+        .list_alert_rules(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+
+    let now_ms = Utc::now().timestamp_millis();
+    let range = TimeRange {
+        start_ts_ms: now_ms - 86_400_000,
+        end_ts_ms: now_ms,
+    };
+    let mut out = Vec::with_capacity(alerts.len());
+    for mut a in alerts {
+        let iq = InsightsQuery {
+            time_range: range,
+            interval: pulse_exec::TimeInterval::Day,
+            series: vec![pulse_exec::InsightsSeriesSpec {
+                label: a.name.clone(),
+                event_name: a.event_name.clone(),
+                metric: pulse_exec::InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: Default::default(),
+            compare_previous_period: false,
+            formula: None,
+        };
+        let current_value = ctrl
+            .qengine
+            .query_insights(&id, &iq)
+            .await
+            .ok()
+            .and_then(|r| r.series.first().and_then(|s| s.overall_value))
+            .unwrap_or(0.0);
+        let triggered = match a.operator.as_str() {
+            "lt" => current_value < a.threshold,
+            "lte" => current_value <= a.threshold,
+            _ => current_value >= a.threshold,
+        };
+        if triggered {
+            a.last_triggered_ms = Some(now_ms);
+        }
+        out.push(json!({
+            "id": a.id,
+            "project_id": a.project_id,
+            "name": a.name,
+            "event_name": a.event_name,
+            "operator": a.operator,
+            "threshold": a.threshold,
+            "webhook_url": a.webhook_url,
+            "last_triggered_ms": a.last_triggered_ms,
+            "created_at_ms": a.created_at_ms,
+            "current_value": current_value,
+            "triggered": triggered,
+        }));
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct CreateAlertReq {
+    name: String,
+    event_name: String,
+    #[serde(default = "default_gt_op")]
+    operator: String,
+    threshold: f64,
+    #[serde(default)]
+    webhook_url: Option<String>,
+}
+
+fn default_gt_op() -> String {
+    "gt".to_string()
+}
+
+async fn handle_create_alert(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateAlertReq>,
+) -> ApiRes<AlertRule> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if req.name.trim().is_empty() || req.event_name.trim().is_empty() {
+        return Err(CtrlError::bad("alert name and event_name are required"));
+    }
+    let rec = AlertRule {
+        id: format!("alr_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id,
+        name: req.name.trim().to_string(),
+        event_name: req.event_name.trim().to_string(),
+        operator: req.operator,
+        threshold: req.threshold,
+        webhook_url: req.webhook_url.filter(|s| !s.trim().is_empty()),
+        last_triggered_ms: None,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .upsert_alert_rule(&rec)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(rec))
+}
+
+async fn handle_delete_alert(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, alert_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let deleted = ctrl
+        .meta
+        .delete_alert_rule(&id, &alert_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    if deleted == 0 {
+        return Err(CtrlError::not_found("alert rule not found"));
+    }
+    Ok(Json(json!({ "status": "ok", "id": alert_id })))
 }

@@ -11,6 +11,7 @@ use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use pulse_identity::IdentityRouter;
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
+use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -25,7 +26,7 @@ use crate::replay_store::{ReplayAppendResult, ReplayStore};
 use crate::segment::{write_vortex_segment, SegmentMeta, VortexSegmentReader};
 use crate::wal::BucketWal;
 
-pub const DEFAULT_NUM_BUCKETS: u16 = 256;
+pub const DEFAULT_NUM_BUCKETS: u16 = 16;
 /// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback (`P3-04`).
 const DEDUP_SEED_LOOKBACK_MS: i64 = 30 * 60 * 1_000;
 const MAX_SESSION_FLAGS_CACHE_ENTRIES: u64 = 262_144;
@@ -570,10 +571,22 @@ impl ProjectStorage {
     /// Background/manual Late-Data Compactor: merges any `(date, bucket)` partition with `>= min_segments`
     /// overlapping L1 segments into a single sorted Vortex segment under a per-partition lock (`P1-06`).
     pub async fn compact_overdue(&self, reader: &VortexSegmentReader) -> Result<usize> {
+        self.compact_min_segments(reader, self.config.compaction_min_segments)
+            .await
+    }
+
+    /// Merges any `(date, bucket)` partition with `>= min_segments` overlapping L1 segments into a
+    /// single sorted Vortex segment (`EN-3`).
+    pub async fn compact_min_segments(
+        &self,
+        reader: &VortexSegmentReader,
+        min_segments: usize,
+    ) -> Result<usize> {
+        let min_segments = min_segments.max(2);
         let candidates = self
             .manifest
             .read()
-            .partitions_needing_compaction(self.config.compaction_min_segments);
+            .partitions_needing_compaction(min_segments);
 
         let mut compacted_partitions = 0usize;
         for (date, bucket_id) in candidates {
@@ -587,7 +600,7 @@ impl ProjectStorage {
             let source_segments = {
                 let mf = self.manifest.read();
                 match mf.active_segments.get(&(date, bucket_id)) {
-                    Some(segs) if segs.len() >= self.config.compaction_min_segments => segs.clone(),
+                    Some(segs) if segs.len() >= min_segments => segs.clone(),
                     _ => continue,
                 }
             };
@@ -697,6 +710,20 @@ impl ProjectStorage {
             }
         }
         Ok(deleted)
+    }
+
+    /// Removes in-memory L0 events belonging to erased UIDs, returning `(purged_rows, session_ids)` (`Gap 4`).
+    pub fn purge_user_l0(&self, uids: &RoaringBitmap) -> (u64, Vec<String>) {
+        let mut total_purged = 0u64;
+        let mut sessions = Vec::new();
+        for bucket in &self.mem_buckets {
+            let (purged, mut sids) = bucket.purge_uids(uids);
+            total_purged += purged;
+            sessions.append(&mut sids);
+        }
+        sessions.sort_unstable();
+        sessions.dedup();
+        (total_purged, sessions)
     }
 }
 
@@ -830,6 +857,18 @@ impl StorageEngine {
         let mut total = 0usize;
         for p in list {
             total += p.compact_overdue(&self.segment_reader).await?;
+        }
+        Ok(total)
+    }
+
+    pub async fn compact_all_with_min_segments(&self, min_segments: usize) -> Result<usize> {
+        let list: Vec<Arc<ProjectStorage>> =
+            self.projects.iter().map(|e| e.value().clone()).collect();
+        let mut total = 0usize;
+        for p in list {
+            total += p
+                .compact_min_segments(&self.segment_reader, min_segments)
+                .await?;
         }
         Ok(total)
     }

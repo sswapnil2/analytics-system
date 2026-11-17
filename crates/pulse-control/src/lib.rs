@@ -5,8 +5,8 @@ pub mod mcp;
 pub mod models;
 
 pub use api::{
-    build_admin_control_router, build_control_router, build_public_flag_router, AuthPrincipal,
-    BootstrapCredentials, ControlPlaneService,
+    build_admin_control_router, build_control_router, build_public_flag_router, AuthConfig,
+    AuthPrincipal, BootstrapCredentials, ControlPlaneService,
 };
 pub use db::{MetaError, MetaStore};
 pub use experiments::{

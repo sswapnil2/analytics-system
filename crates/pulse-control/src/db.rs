@@ -1,15 +1,19 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 
 use pulse_exec::{CustomEventDef, CustomPropertyDef, LookupTableDef};
+use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use thiserror::Error;
 
+use crate::models::DashboardCard;
 use crate::models::{
-    ApiKeyRecord, CohortRecord, Dashboard, Experiment, FeatureFlag, LexiconEvent, LexiconProperty,
-    LookupTableSummary, Organization, Project, SavedReport,
+    AlertRule, ApiKeyRecord, CohortRecord, Dashboard, DeletionAuditRecord, Experiment, FeatureFlag,
+    GroupProfileRecord, LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project,
+    SavedReport, User, UserProfileRecord,
 };
 
 #[derive(Debug, Error)]
@@ -94,6 +98,64 @@ macro_rules! db_map_opt {
             }
         }
     }};
+}
+
+fn saved_report_from_row<R>(r: &R) -> SavedReport
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    let qstr: String = r.get("query_json");
+    SavedReport {
+        id: r.get("id"),
+        project_id: r.get("project_id"),
+        name: r.get("name"),
+        report_kind: r.get("report_kind"),
+        query_json: serde_json::from_str(&qstr).unwrap_or(serde_json::Value::Null),
+        created_at_ms: r.get("created_at_ms"),
+        updated_at_ms: r.get("updated_at_ms"),
+    }
+}
+
+/// Rows written before `0003` have no `cards_json`; each legacy report id becomes a half-width card.
+fn dashboard_from_row<R>(r: &R) -> Dashboard
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    Option<String>: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    let cards = match r.get::<Option<String>, _>("cards_json") {
+        Some(cjson) => serde_json::from_str(&cjson).unwrap_or_default(),
+        None => {
+            let rstr: String = r.get("report_ids_json");
+            serde_json::from_str::<Vec<String>>(&rstr)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, report_id)| DashboardCard {
+                    id: format!("card_legacy_{i}"),
+                    kind: "report".to_string(),
+                    report_id: Some(report_id),
+                    text: None,
+                    width: 1,
+                })
+                .collect()
+        }
+    };
+    Dashboard {
+        id: r.get("id"),
+        project_id: r.get("project_id"),
+        name: r.get("name"),
+        description: r.get("description"),
+        cards,
+        created_by: r.get("created_by"),
+        created_at_ms: r.get("created_at_ms"),
+        updated_at_ms: r.get("updated_at_ms"),
+    }
 }
 
 impl MetaStore {
@@ -827,12 +889,13 @@ impl MetaStore {
         let qjson = serde_json::to_string(&rep.query_json).unwrap_or_else(|_| "{}".into());
         let affected = db_exec!(
             self,
-            "INSERT INTO saved_reports (id, project_id, name, report_kind, query_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO saved_reports (id, project_id, name, report_kind, query_json, created_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 report_kind = excluded.report_kind,
-                query_json = excluded.query_json
+                query_json = excluded.query_json,
+                updated_at_ms = excluded.updated_at_ms
              WHERE saved_reports.project_id = excluded.project_id",
             &rep.id,
             &rep.project_id,
@@ -840,6 +903,7 @@ impl MetaStore {
             &rep.report_kind,
             &qjson,
             rep.created_at_ms,
+            rep.updated_at_ms,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -856,39 +920,74 @@ impl MetaStore {
     ) -> Result<Vec<SavedReport>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, report_kind, query_json, created_at_ms
+            "SELECT id, project_id, name, report_kind, query_json, created_at_ms,
+                    COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
              FROM saved_reports WHERE project_id = ? ORDER BY created_at_ms DESC",
-            |r| {
-                let qstr: String = r.get("query_json");
-                SavedReport {
-                    id: r.get("id"),
-                    project_id: r.get("project_id"),
-                    name: r.get("name"),
-                    report_kind: r.get("report_kind"),
-                    query_json: serde_json::from_str(&qstr).unwrap_or(serde_json::Value::Null),
-                    created_at_ms: r.get("created_at_ms"),
-                }
-            },
+            |r| { saved_report_from_row(&r) },
             project_id,
         );
         Ok(rows)
     }
 
-    pub async fn upsert_dashboard(&self, d: &Dashboard) -> Result<(), MetaError> {
-        let rjson = serde_json::to_string(&d.report_ids).unwrap_or_else(|_| "[]".into());
+    pub async fn get_saved_report(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<SavedReport>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT id, project_id, name, report_kind, query_json, created_at_ms,
+                    COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM saved_reports WHERE project_id = ? AND id = ?",
+            |r| { saved_report_from_row(&r) },
+            project_id,
+            id,
+        );
+        Ok(row)
+    }
+
+    /// Returns `false` when no report with this id exists in the project.
+    pub async fn delete_saved_report(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
         let affected = db_exec!(
             self,
-            "INSERT INTO dashboards (id, project_id, name, report_ids_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?)
+            "DELETE FROM saved_reports WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
+    /// Writes `cards_json` plus the derived legacy `report_ids_json`. `created_by` and
+    /// `created_at_ms` are kept from the original row on update.
+    pub async fn upsert_dashboard(&self, d: &Dashboard) -> Result<(), MetaError> {
+        let report_ids: Vec<&str> = d
+            .cards
+            .iter()
+            .filter_map(|c| c.report_id.as_deref())
+            .collect();
+        let rjson = serde_json::to_string(&report_ids).unwrap_or_else(|_| "[]".into());
+        let cjson = serde_json::to_string(&d.cards).unwrap_or_else(|_| "[]".into());
+        let affected = db_exec!(
+            self,
+            "INSERT INTO dashboards (id, project_id, name, report_ids_json, created_at_ms,
+                                     description, cards_json, created_by, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
-                report_ids_json = excluded.report_ids_json
+                report_ids_json = excluded.report_ids_json,
+                description = excluded.description,
+                cards_json = excluded.cards_json,
+                updated_at_ms = excluded.updated_at_ms
              WHERE dashboards.project_id = excluded.project_id",
             &d.id,
             &d.project_id,
             &d.name,
             &rjson,
             d.created_at_ms,
+            &d.description,
+            &cjson,
+            &d.created_by,
+            d.updated_at_ms,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -902,20 +1001,442 @@ impl MetaStore {
     pub async fn list_dashboards(&self, project_id: &str) -> Result<Vec<Dashboard>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, report_ids_json, created_at_ms
-             FROM dashboards WHERE project_id = ? ORDER BY created_at_ms DESC",
+            "SELECT id, project_id, name, report_ids_json, created_at_ms, description, cards_json,
+                    created_by, COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM dashboards WHERE project_id = ?
+             ORDER BY COALESCE(updated_at_ms, created_at_ms) DESC, id ASC",
+            |r| { dashboard_from_row(&r) },
+            project_id,
+        );
+        Ok(rows)
+    }
+
+    pub async fn get_dashboard(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<Dashboard>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT id, project_id, name, report_ids_json, created_at_ms, description, cards_json,
+                    created_by, COALESCE(updated_at_ms, created_at_ms) AS updated_at_ms
+             FROM dashboards WHERE project_id = ? AND id = ?",
+            |r| { dashboard_from_row(&r) },
+            project_id,
+            id,
+        );
+        Ok(row)
+    }
+
+    /// Returns `false` when no dashboard with this id exists in the project.
+    pub async fn delete_dashboard(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM dashboards WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
+    // ------------------- Users & Sessions -------------------
+
+    pub async fn count_users(&self) -> Result<i64, MetaError> {
+        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM users", |r| {
+            r.get::<i64, _>("n")
+        });
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Inserts a new user; `Conflict` when the email (or Google subject) is already taken.
+    pub async fn insert_user(&self, u: &User) -> Result<(), MetaError> {
+        let affected = db_exec!(
+            self,
+            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
+            &u.id,
+            &u.email,
+            &u.name,
+            &u.password_hash,
+            &u.google_sub,
+            u.created_at_ms,
+        );
+        if affected == 0 {
+            return Err(MetaError::Conflict(
+                "an account with this email already exists".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `column` is always a hard-coded identifier from this module, never user input.
+    async fn get_user_by(
+        &self,
+        column: &'static str,
+        value: &str,
+    ) -> Result<Option<User>, MetaError> {
+        let sql = format!(
+            "SELECT id, email, name, password_hash, google_sub, created_at_ms FROM users WHERE {column} = ?"
+        );
+        let user = db_map_opt!(
+            self,
+            &sql,
             |r| {
-                let rstr: String = r.get("report_ids_json");
-                Dashboard {
+                User {
+                    id: r.get("id"),
+                    email: r.get("email"),
+                    name: r.get("name"),
+                    password_hash: r.get("password_hash"),
+                    google_sub: r.get("google_sub"),
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            value,
+        );
+        Ok(user)
+    }
+
+    pub async fn get_user_by_id(&self, id: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("id", id).await
+    }
+
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("email", email).await
+    }
+
+    pub async fn get_user_by_google_sub(&self, sub: &str) -> Result<Option<User>, MetaError> {
+        self.get_user_by("google_sub", sub).await
+    }
+
+    pub async fn set_user_google_sub(&self, user_id: &str, sub: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET google_sub = ? WHERE id = ?",
+            sub,
+            user_id,
+        );
+        Ok(())
+    }
+
+    pub async fn insert_session(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO user_sessions (token_hash, user_id, created_at_ms, expires_at_ms)
+             VALUES (?, ?, ?, ?)",
+            token_hash,
+            user_id,
+            created_at_ms,
+            expires_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Returns the user id of a live (unexpired) session whose user still exists.
+    pub async fn get_session_user_id(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, MetaError> {
+        let uid = db_map_opt!(
+            self,
+            "SELECT s.user_id AS user_id FROM user_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ? AND s.expires_at_ms > ?",
+            |r| { r.get::<String, _>("user_id") },
+            token_hash,
+            now_ms,
+        );
+        Ok(uid)
+    }
+
+    pub async fn delete_session(&self, token_hash: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "DELETE FROM user_sessions WHERE token_hash = ?",
+            token_hash
+        );
+        Ok(())
+    }
+
+    // ------------------- User Profiles, Groups, DPDP Erasure & Alerts (`Gaps 1, 4, 8, 14`) -------------------
+
+    pub async fn upsert_user_profile(&self, prof: &UserProfileRecord) -> Result<(), MetaError> {
+        let pjson = serde_json::to_string(&prof.props).unwrap_or_else(|_| "{}".into());
+        let _ = db_exec!(
+            self,
+            "INSERT INTO user_profiles (project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(project_id, distinct_id) DO UPDATE SET
+                canonical_uid = excluded.canonical_uid,
+                props_json = excluded.props_json,
+                total_revenue = excluded.total_revenue,
+                updated_at_ms = excluded.updated_at_ms",
+            &prof.project_id,
+            &prof.distinct_id,
+            prof.canonical_uid as i64,
+            pjson,
+            prof.total_revenue,
+            prof.updated_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn get_user_profile(
+        &self,
+        project_id: &str,
+        distinct_id: &str,
+    ) -> Result<Option<UserProfileRecord>, MetaError> {
+        let rec = db_map_opt!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? AND distinct_id = ?",
+            |r| {
+                let pstr: String = r.get("props_json");
+                let props: BTreeMap<String, Value> =
+                    serde_json::from_str(&pstr).unwrap_or_default();
+                UserProfileRecord {
+                    project_id: r.get("project_id"),
+                    distinct_id: r.get("distinct_id"),
+                    canonical_uid: r.get::<i64, _>("canonical_uid").max(0) as u32,
+                    props,
+                    total_revenue: r.get("total_revenue"),
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            project_id,
+            distinct_id,
+        );
+        Ok(rec)
+    }
+
+    pub async fn list_user_profiles(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<UserProfileRecord>, MetaError> {
+        let lim = (limit.clamp(1, 1000)) as i64;
+        let rows = db_map_all!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? ORDER BY updated_at_ms DESC LIMIT ?",
+            |r| {
+                let pstr: String = r.get("props_json");
+                let props: BTreeMap<String, Value> =
+                    serde_json::from_str(&pstr).unwrap_or_default();
+                UserProfileRecord {
+                    project_id: r.get("project_id"),
+                    distinct_id: r.get("distinct_id"),
+                    canonical_uid: r.get::<i64, _>("canonical_uid").max(0) as u32,
+                    props,
+                    total_revenue: r.get("total_revenue"),
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            project_id,
+            lim,
+        );
+        Ok(rows)
+    }
+
+    pub async fn delete_user_profiles_for_ids(
+        &self,
+        project_id: &str,
+        distinct_ids: &[String],
+    ) -> Result<u64, MetaError> {
+        let mut removed = 0u64;
+        for did in distinct_ids {
+            removed += db_exec!(
+                self,
+                "DELETE FROM user_profiles WHERE project_id = ? AND distinct_id = ?",
+                project_id,
+                did,
+            );
+        }
+        Ok(removed)
+    }
+
+    pub async fn upsert_group_profile(&self, grp: &GroupProfileRecord) -> Result<(), MetaError> {
+        let pjson = serde_json::to_string(&grp.props).unwrap_or_else(|_| "{}".into());
+        let _ = db_exec!(
+            self,
+            "INSERT INTO group_profiles (project_id, group_type, group_id, props_json, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(project_id, group_type, group_id) DO UPDATE SET
+                props_json = excluded.props_json,
+                updated_at_ms = excluded.updated_at_ms",
+            &grp.project_id,
+            &grp.group_type,
+            &grp.group_id,
+            pjson,
+            grp.updated_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn get_group_profile(
+        &self,
+        project_id: &str,
+        group_type: &str,
+        group_id: &str,
+    ) -> Result<Option<GroupProfileRecord>, MetaError> {
+        let rec = db_map_opt!(
+            self,
+            "SELECT project_id, group_type, group_id, props_json, updated_at_ms
+             FROM group_profiles WHERE project_id = ? AND group_type = ? AND group_id = ?",
+            |r| {
+                let pstr: String = r.get("props_json");
+                let props: BTreeMap<String, Value> =
+                    serde_json::from_str(&pstr).unwrap_or_default();
+                GroupProfileRecord {
+                    project_id: r.get("project_id"),
+                    group_type: r.get("group_type"),
+                    group_id: r.get("group_id"),
+                    props,
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            project_id,
+            group_type,
+            group_id,
+        );
+        Ok(rec)
+    }
+
+    pub async fn insert_deletion_audit(&self, rec: &DeletionAuditRecord) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO deletion_audit_log
+             (id, project_id, distinct_id_masked, canonical_uid, events_purged, replays_purged, requested_by, deleted_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &rec.id,
+            &rec.project_id,
+            &rec.distinct_id_masked,
+            rec.canonical_uid as i64,
+            rec.events_purged as i64,
+            rec.replays_purged as i64,
+            &rec.requested_by,
+            rec.deleted_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn list_deletion_audit(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<DeletionAuditRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, distinct_id_masked, canonical_uid, events_purged, replays_purged, requested_by, deleted_at_ms
+             FROM deletion_audit_log WHERE project_id = ? ORDER BY deleted_at_ms DESC LIMIT 200",
+            |r| {
+                DeletionAuditRecord {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    distinct_id_masked: r.get("distinct_id_masked"),
+                    canonical_uid: r.get::<i64, _>("canonical_uid").max(0) as u32,
+                    events_purged: r.get::<i64, _>("events_purged").max(0) as u64,
+                    replays_purged: r.get::<i64, _>("replays_purged").max(0) as u64,
+                    requested_by: r.get("requested_by"),
+                    deleted_at_ms: r.get("deleted_at_ms"),
+                }
+            },
+            project_id,
+        );
+        Ok(rows)
+    }
+
+    pub async fn insert_erased_uids(
+        &self,
+        project_id: &str,
+        uids: &[u32],
+    ) -> Result<(), MetaError> {
+        for &uid in uids {
+            let _ = db_exec!(
+                self,
+                "INSERT INTO erased_uids (project_id, uid) VALUES (?, ?)
+                 ON CONFLICT(project_id, uid) DO NOTHING",
+                project_id,
+                uid as i64,
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn list_erased_uids(&self, project_id: &str) -> Result<Vec<u32>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT uid FROM erased_uids WHERE project_id = ?",
+            |r| { r.get::<i64, _>("uid").max(0) as u32 },
+            project_id,
+        );
+        Ok(rows)
+    }
+
+    pub async fn upsert_alert_rule(&self, alert: &AlertRule) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO alert_rules (id, project_id, name, event_name, operator, threshold, webhook_url, last_triggered_ms, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                event_name = excluded.event_name,
+                operator = excluded.operator,
+                threshold = excluded.threshold,
+                webhook_url = excluded.webhook_url,
+                last_triggered_ms = excluded.last_triggered_ms",
+            &alert.id,
+            &alert.project_id,
+            &alert.name,
+            &alert.event_name,
+            &alert.operator,
+            alert.threshold,
+            alert.webhook_url.as_deref(),
+            alert.last_triggered_ms,
+            alert.created_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn list_alert_rules(&self, project_id: &str) -> Result<Vec<AlertRule>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, name, event_name, operator, threshold, webhook_url, last_triggered_ms, created_at_ms
+             FROM alert_rules WHERE project_id = ? ORDER BY created_at_ms DESC",
+            |r| {
+                AlertRule {
                     id: r.get("id"),
                     project_id: r.get("project_id"),
                     name: r.get("name"),
-                    report_ids: serde_json::from_str(&rstr).unwrap_or_default(),
+                    event_name: r.get("event_name"),
+                    operator: r.get("operator"),
+                    threshold: r.get("threshold"),
+                    webhook_url: r.get("webhook_url"),
+                    last_triggered_ms: r.get("last_triggered_ms"),
                     created_at_ms: r.get("created_at_ms"),
                 }
             },
             project_id,
         );
         Ok(rows)
+    }
+
+    pub async fn delete_alert_rule(
+        &self,
+        project_id: &str,
+        alert_id: &str,
+    ) -> Result<u64, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM alert_rules WHERE project_id = ? AND id = ?",
+            project_id,
+            alert_id,
+        );
+        Ok(affected)
     }
 }

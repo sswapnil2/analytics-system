@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use pulse_identity::{IdentitySnapshot, ProjectIdentityGraph};
-use pulse_storage::{ProjectStorage, StorageSnapshot};
+use pulse_storage::{ProjectStorage, ReplayStore, StorageSnapshot};
 use pulse_wire::PropValue;
 use rayon::prelude::*;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
@@ -15,7 +15,7 @@ use crate::ast::{
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
+    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
     row_matches_predicates, DataChunk, ExecError, Result,
 };
 
@@ -33,6 +33,7 @@ struct UserEvent {
     breakdown_id: u32,
     chunk_idx: u32,
     row_idx: u32,
+    has_replay_hint: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +61,30 @@ impl ShardSummary {
         }
     }
 
+    fn push_dropped_sample(
+        dropped_samples: &mut Vec<(usize, UserEvent)>,
+        dropped_before: usize,
+        ev: UserEvent,
+    ) {
+        let mut count_for_step = 0usize;
+        let mut unrecorded_idx = None;
+        for (idx, (st, existing)) in dropped_samples.iter().enumerate() {
+            if *st == dropped_before {
+                count_for_step += 1;
+                if !existing.has_replay_hint && unrecorded_idx.is_none() {
+                    unrecorded_idx = Some(idx);
+                }
+            }
+        }
+        if count_for_step < MAX_DROPPED_SAMPLES_PER_STEP {
+            dropped_samples.push((dropped_before, ev));
+        } else if ev.has_replay_hint {
+            if let Some(replace_idx) = unrecorded_idx {
+                dropped_samples[replace_idx] = (dropped_before, ev);
+            }
+        }
+    }
+
     fn record(&mut self, out: UserFunnelOutcome, k: usize, track_breakdown: bool) {
         for s in 0..=out.max_step {
             self.step_counts[s] += 1;
@@ -79,14 +104,7 @@ impl ShardSummary {
             }
         } else {
             let dropped_before = out.max_step + 1;
-            let cur_count = self
-                .dropped_samples
-                .iter()
-                .filter(|(st, _)| *st == dropped_before)
-                .count();
-            if cur_count < MAX_DROPPED_SAMPLES_PER_STEP {
-                self.dropped_samples.push((dropped_before, out.last_ev));
-            }
+            Self::push_dropped_sample(&mut self.dropped_samples, dropped_before, out.last_ev);
         }
     }
 
@@ -108,14 +126,7 @@ impl ShardSummary {
         }
         self.ttc_values.append(&mut other.ttc_values);
         for (step_idx, ev) in other.dropped_samples {
-            let cur = self
-                .dropped_samples
-                .iter()
-                .filter(|(st, _)| *st == step_idx)
-                .count();
-            if cur < MAX_DROPPED_SAMPLES_PER_STEP {
-                self.dropped_samples.push((step_idx, ev));
-            }
+            Self::push_dropped_sample(&mut self.dropped_samples, step_idx, ev);
         }
     }
 }
@@ -123,6 +134,7 @@ impl ShardSummary {
 pub struct FunnelEngine;
 
 impl FunnelEngine {
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         query: &FunnelQuery,
         ps: &ProjectStorage,
@@ -131,6 +143,7 @@ impl FunnelEngine {
         id_snap: &IdentitySnapshot,
         cache: &SegmentBlockCache,
         catalog: &VirtualCatalog,
+        rstore: &ReplayStore,
     ) -> Result<FunnelResult> {
         let t0 = Instant::now();
         if query.time_range.start_ts_ms > query.time_range.end_ts_ms {
@@ -239,9 +252,18 @@ impl FunnelEngine {
         };
 
         let props_vec: Vec<String> = props_needed.into_iter().collect();
-        let chunks =
-            load_project_chunks(ps, snap, cache, catalog, scan_range, &props_vec, bloom_hint)
-                .await?;
+        let chunks = load_project_chunks_with_id(
+            ps,
+            snap,
+            cache,
+            catalog,
+            scan_range,
+            &props_vec,
+            bloom_hint,
+            Some(id_snap),
+        )
+        .await?;
+        let recorded_hashes = rstore.recorded_hashes_for_project(ps.project_id()).await;
 
         // Fast event_id -> (base_step_mask, base_excl_mask) lookup table for pure event-ID checks
         let max_ev_id = dict.all_events().len().max(64);
@@ -409,6 +431,10 @@ impl FunnelEngine {
                             0
                         };
 
+                        let has_replay_hint = ta.replay_offset_kb[r] > 0
+                            || (!recorded_hashes.is_empty()
+                                && recorded_hashes.contains(&ta.session_hash[r]));
+
                         let uev = UserEvent {
                             canon_uid,
                             ts_ms: ts,
@@ -418,6 +444,7 @@ impl FunnelEngine {
                             breakdown_id,
                             chunk_idx,
                             row_idx: r as u32,
+                            has_replay_hint,
                         };
 
                         if id_snap.is_cross_bucket(canon_uid) {
@@ -536,16 +563,18 @@ impl FunnelEngine {
 
         let time_to_convert = build_ttc_stats(&final_summary.ttc_values);
 
-        // Materialize dropped sample sessions with `session_id`, `distinct_id`, and `replay_offset_kb`
+        // Materialize dropped sample sessions with `session_id`, `distinct_id`, `replay_offset_kb`, and `has_replay` (`PR-1`)
         let mut dropped_sample_sessions = Vec::with_capacity(final_summary.dropped_samples.len());
         for (dropped_before_step, ev) in final_summary.dropped_samples {
             let chunk = &chunks[ev.chunk_idx as usize];
             let r_idx = ev.row_idx as usize;
             let session_id = chunk.session_id_for_row(r_idx);
             let replay_offset_kb = chunk.tier_a.replay_offset_kb[r_idx];
-            let distinct_id = id_graph
+            let has_replay = rstore.has_session(ps.project_id(), &session_id).await;
+            let raw_did = id_graph
                 .external_id(ev.canon_uid)
                 .unwrap_or_else(|| format!("uid_{}", ev.canon_uid));
+            let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
 
             dropped_sample_sessions.push(DroppedSessionSample {
                 dropped_before_step,
@@ -554,8 +583,11 @@ impl FunnelEngine {
                 distinct_id,
                 drop_ts_ms: ev.ts_ms,
                 replay_offset_kb,
+                has_replay,
             });
         }
+        dropped_sample_sessions
+            .sort_by_key(|d| (d.dropped_before_step, !d.has_replay, d.drop_ts_ms));
 
         Ok(FunnelResult {
             snapshot_epoch: snap.epoch(),

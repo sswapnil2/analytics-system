@@ -16,8 +16,10 @@ use datafusion::common::DFSchema;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use parking_lot::RwLock;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use pulse_identity::IdentitySnapshot;
 use pulse_storage::extract_arrow_str;
 use pulse_wire::PropValue;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{BehavioralCohortDef, PropPredicate};
@@ -536,12 +538,15 @@ impl LookupTableDef {
     }
 }
 
-/// Per-project virtual schema catalog (Custom Events, Custom Properties, pre-indexed Lookup Tables, Saved Cohorts, and IANA Timezone).
+/// Per-project virtual schema catalog (Custom Events, Custom Properties, Lookup Tables, Saved Cohorts, User Profiles, Deleted UIDs, and IANA Timezone).
 pub struct VirtualCatalog {
     pub custom_events: DashMap<String, CustomEventDef>,
     pub custom_properties: DashMap<String, CustomPropertyDef>,
     pub lookup_tables: DashMap<String, Arc<LookupTableDef>>,
     pub saved_cohorts: DashMap<String, BehavioralCohortDef>,
+    user_profiles: RwLock<HashMap<u32, HashMap<String, PropValue>>>,
+    user_prop_keys: RwLock<HashSet<String>>,
+    deleted_uids: RwLock<RoaringBitmap>,
     timezone: RwLock<Tz>,
 }
 
@@ -552,6 +557,9 @@ impl Default for VirtualCatalog {
             custom_properties: DashMap::new(),
             lookup_tables: DashMap::new(),
             saved_cohorts: DashMap::new(),
+            user_profiles: RwLock::new(HashMap::new()),
+            user_prop_keys: RwLock::new(HashSet::new()),
+            deleted_uids: RwLock::new(RoaringBitmap::new()),
             timezone: RwLock::new(chrono_tz::UTC),
         }
     }
@@ -575,6 +583,74 @@ impl VirtualCatalog {
     pub fn insert_lookup_table(&self, def: LookupTableDef) {
         let name = def.name.clone();
         self.lookup_tables.insert(name, def.into_indexed_arc());
+    }
+
+    pub fn set_user_profiles(&self, profiles: HashMap<u32, HashMap<String, PropValue>>) {
+        let mut keys = HashSet::new();
+        for p in profiles.values() {
+            for k in p.keys() {
+                keys.insert(k.clone());
+            }
+        }
+        *self.user_prop_keys.write() = keys;
+        *self.user_profiles.write() = profiles;
+    }
+
+    pub fn upsert_user_profile(&self, canon_uid: u32, props: HashMap<String, PropValue>) {
+        {
+            let mut keys = self.user_prop_keys.write();
+            for k in props.keys() {
+                keys.insert(k.clone());
+            }
+        }
+        self.user_profiles.write().insert(canon_uid, props);
+    }
+
+    pub fn remove_user_profile(&self, canon_uid: u32) {
+        self.user_profiles.write().remove(&canon_uid);
+    }
+
+    pub fn set_deleted_uids(&self, uids: RoaringBitmap) {
+        *self.deleted_uids.write() = uids;
+    }
+
+    pub fn mark_deleted_uids(&self, uids: &RoaringBitmap) {
+        let mut guard = self.deleted_uids.write();
+        *guard |= uids;
+    }
+
+    pub fn deleted_uids_snapshot(&self) -> RoaringBitmap {
+        self.deleted_uids.read().clone()
+    }
+
+    pub fn has_user_prop(&self, prop_name: &str) -> bool {
+        let key = prop_name.strip_prefix("user.").unwrap_or(prop_name);
+        self.user_prop_keys.read().contains(key)
+    }
+
+    pub fn resolve_user_prop_column(
+        &self,
+        raw_uids: &[u32],
+        id_snap: Option<&IdentitySnapshot>,
+        prop_name: &str,
+    ) -> Vec<PropValue> {
+        let key = prop_name.strip_prefix("user.").unwrap_or(prop_name);
+        let profiles = self.user_profiles.read();
+        if profiles.is_empty() {
+            return vec![PropValue::Null; raw_uids.len()];
+        }
+        raw_uids
+            .iter()
+            .map(|&raw| {
+                let canon = id_snap.map(|s| s.resolve(raw)).unwrap_or(raw);
+                profiles
+                    .get(&canon)
+                    .or_else(|| profiles.get(&raw))
+                    .and_then(|m| m.get(key))
+                    .cloned()
+                    .unwrap_or(PropValue::Null)
+            })
+            .collect()
     }
 
     /// Resolves `(Arc<LookupTableDef>, attr_col)` strictly for qualified `"table.col"` names in O(1) (`P2-09j`).

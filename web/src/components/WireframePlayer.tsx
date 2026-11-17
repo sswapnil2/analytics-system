@@ -1,15 +1,22 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Pause, Play, RotateCcw, ShieldCheck, WifiOff, Zap } from "lucide-react";
-import { ReplayChunk, WireNode } from "../api/client";
-
-interface Props {
-  sessionId: string;
-  chunks: ReplayChunk[];
-}
+import { Pause, Play, RotateCcw, ShieldCheck, VideoOff, WifiOff, Zap } from "lucide-react";
+import { api, ReplayChunk, WireNode } from "../api/client";
+import { errorMessage, formatDuration, isNotFound } from "../lib/format";
+import { EmptyState, ErrorNotice, Spinner, btn } from "./ui";
 
 interface TimelineAction {
   absOffsetMs: number;
   op: ReplayChunk["ops"][number];
+}
+
+/** Text colour that stays readable on a recorded button colour (light buttons get dark text). */
+function onColor(bgRgba: number): string {
+  const r = (bgRgba >>> 24) & 0xff;
+  const g = (bgRgba >>> 16) & 0xff;
+  const b = (bgRgba >>> 8) & 0xff;
+  const a = (bgRgba & 0xff) / 255;
+  if (a < 0.5) return "rgb(var(--ink))";
+  return 0.299 * r + 0.587 * g + 0.114 * b > 160 ? "#141A17" : "#FFFFFF";
 }
 
 function rgbaHex(bgRgba: number): string {
@@ -21,39 +28,98 @@ function rgbaHex(bgRgba: number): string {
   return `rgba(${r}, ${g}, ${b}, ${a.toFixed(2)})`;
 }
 
-export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
+function clock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Loader: fetches one session's recording and owns every non-happy state.
+// ---------------------------------------------------------------------------
+
+type ReplayState =
+  | { kind: "loading" }
+  | { kind: "ready"; chunks: ReplayChunk[] }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
+export const SessionReplay: React.FC<{
+  projectId: string;
+  sessionId: string;
+  offsetKb?: number;
+}> = ({ projectId, sessionId, offsetKb = 0 }) => {
+  const [state, setState] = useState<ReplayState>({ kind: "loading" });
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ kind: "loading" });
+    api
+      .getReplay(projectId, sessionId, offsetKb)
+      .then((res) => {
+        if (cancelled) return;
+        setState(res.chunks.length > 0 ? { kind: "ready", chunks: res.chunks } : { kind: "missing" });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setState(isNotFound(err) ? { kind: "missing" } : { kind: "error", message: errorMessage(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, sessionId, offsetKb, attempt]);
+
+  if (state.kind === "loading") {
+    return (
+      <div className="flex h-64 items-center justify-center">
+        <Spinner label="Loading recording" />
+      </div>
+    );
+  }
+  if (state.kind === "missing") {
+    return (
+      <EmptyState
+        icon={VideoOff}
+        title="No recording for this session"
+        body="Pulse records a session only when the app has screen recording turned on in its SDK settings. The events for this session are still counted in every report."
+      />
+    );
+  }
+  if (state.kind === "error") {
+    return (
+      <ErrorNotice
+        message={`Couldn't load this recording: ${state.message}`}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
+    );
+  }
+  return <WireframePlayer sessionId={sessionId} chunks={state.chunks} />;
+};
+
+// ---------------------------------------------------------------------------
+// Player
+// ---------------------------------------------------------------------------
+
+export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[] }> = ({
+  sessionId,
+  chunks,
+}) => {
   const [playing, setPlaying] = useState<boolean>(true);
   const [speed, setSpeed] = useState<1 | 2 | 4>(1);
   const [cursorMs, setCursorMs] = useState<number>(0);
 
-  const { timeline, durationMs, viewport, networkBreadcrumbs, rageMarkers } = useMemo(() => {
-    if (chunks.length === 0) {
-      return {
-        timeline: [] as TimelineAction[],
-        durationMs: 1000,
-        viewport: { w: 390, h: 844 },
-        networkBreadcrumbs: [] as Array<{
-          ts: number;
-          method: string;
-          path: string;
-          status: number;
-          dur: number;
-        }>,
-        rageMarkers: [] as Array<{ ts: number; count: number }>,
-      };
-    }
-
-    const baseStart = chunks[0].chunk_start_ts_ms;
+  const { timeline, durationMs, viewport, moments } = useMemo(() => {
     const items: TimelineAction[] = [];
+    const found: Moment[] = [];
     let vp = { w: 390, h: 844 };
-    const nets: Array<{ ts: number; method: string; path: string; status: number; dur: number }> =
-      [];
-    const rages: Array<{ ts: number; count: number }> = [];
+    if (chunks.length === 0) {
+      return { timeline: items, durationMs: 1000, viewport: vp, moments: found };
+    }
+    const baseStart = chunks[0].chunk_start_ts_ms;
 
     for (const chunk of chunks) {
       const chunkDelta = Math.max(0, chunk.chunk_start_ts_ms - baseStart);
       let runningOffset = chunkDelta;
-
       for (const op of chunk.ops) {
         if (op.op === "full_snapshot") {
           vp = { w: op.width || 390, h: op.height || 844 };
@@ -64,15 +130,15 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
           const t = chunkDelta + op.ts_offset_ms;
           runningOffset = Math.max(runningOffset, t);
           items.push({ absOffsetMs: t, op });
-          if (op.kind.type === "rage_tap") {
-            rages.push({ ts: t, count: op.kind.count });
-          }
+          if (op.kind.type === "rage_tap") found.push({ ts: t, kind: "rage", count: op.kind.count });
+          if (op.kind.type === "dead_tap") found.push({ ts: t, kind: "dead" });
         } else if (op.op === "network_breadcrumb") {
           const t = chunkDelta + op.ts_offset_ms;
           runningOffset = Math.max(runningOffset, t);
           items.push({ absOffsetMs: t, op });
-          nets.push({
+          found.push({
             ts: t,
+            kind: op.status_code >= 400 ? "net-error" : "net",
             method: op.method,
             path: op.path,
             status: op.status_code,
@@ -83,23 +149,14 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
     }
 
     items.sort((a, b) => a.absOffsetMs - b.absOffsetMs);
-    const maxTs = Math.max(
-      2000,
-      items.length > 0 ? items[items.length - 1].absOffsetMs + 800 : 2000,
-    );
-
-    return {
-      timeline: items,
-      durationMs: maxTs,
-      viewport: vp,
-      networkBreadcrumbs: nets,
-      rageMarkers: rages,
-    };
+    found.sort((a, b) => a.ts - b.ts);
+    const maxTs = Math.max(2000, items.length > 0 ? items[items.length - 1].absOffsetMs + 800 : 2000);
+    return { timeline: items, durationMs: maxTs, viewport: vp, moments: found };
   }, [chunks]);
 
   useEffect(() => {
     setCursorMs(0);
-    setPlaying(true);
+    setPlaying(!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
   }, [sessionId, chunks]);
 
   useEffect(() => {
@@ -118,25 +175,20 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
     return () => clearInterval(id);
   }, [playing, speed, durationMs]);
 
-  // Reconstruct wireframe DOM state and active pointer interactions at `cursorMs`
   const { activeNodes, activePointers } = useMemo(() => {
     const nodeMap = new Map<number, WireNode>();
     const pointers: Array<{
       x: number;
       y: number;
-      ageMs: number;
       kind: "tap" | "rage_tap" | "dead_tap" | "scroll";
       count?: number;
     }> = [];
-
     for (const item of timeline) {
       if (item.absOffsetMs > cursorMs) break;
       const op = item.op;
       if (op.op === "full_snapshot") {
         nodeMap.clear();
-        for (const n of op.nodes) {
-          nodeMap.set(n.node_id, n);
-        }
+        for (const n of op.nodes) nodeMap.set(n.node_id, n);
       } else if (op.op === "node_upsert") {
         nodeMap.set(op.node_id, op);
       } else if (op.op === "node_remove") {
@@ -147,47 +199,41 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
           pointers.push({
             x: op.x,
             y: op.y,
-            ageMs: age,
             kind: op.kind.type,
             count: op.kind.type === "rage_tap" ? op.kind.count : undefined,
           });
         }
       }
     }
-
-    return {
-      activeNodes: Array.from(nodeMap.values()),
-      activePointers: pointers,
-    };
+    return { activeNodes: Array.from(nodeMap.values()), activePointers: pointers };
   }, [timeline, cursorMs]);
+
+  const seek = (ts: number) => {
+    setCursorMs(ts);
+    setPlaying(false);
+  };
 
   const scale = 0.72;
   const frameW = Math.round(viewport.w * scale);
   const frameH = Math.round(viewport.h * scale);
 
   return (
-    <div className="flex flex-col lg:flex-row gap-5 items-start">
-      {/* Phone Wireframe Viewport */}
-      <div className="flex flex-col items-center">
-        <div className="mb-2 flex items-center gap-2 text-xs text-emerald-400 bg-emerald-950/50 border border-emerald-800/50 px-2.5 py-1 rounded-full">
-          <ShieldCheck className="w-3.5 h-3.5" />
-          <span>Privacy-by-Design Binary Wireframe • Zero Pixels • Client-Masked PII</span>
-        </div>
-
+    <div className="flex flex-col items-center gap-6 xl:flex-row xl:items-start">
+      {/* Phone */}
+      <figure className="flex shrink-0 flex-col items-center gap-2">
         <div
-          className="relative rounded-[32px] border-[6px] border-slate-800 bg-[#070b13] shadow-2xl overflow-hidden"
-          style={{ width: frameW + 12, height: frameH + 12 }}
+          className="relative overflow-hidden rounded-[30px] border-[6px] border-ink/85 bg-panel"
+          style={{ width: frameW + 12, height: frameH + 12, maxWidth: "100%" }}
+          aria-label="Screen recording"
+          role="img"
         >
-          {/* Phone Notch */}
-          <div className="absolute top-1.5 left-1/2 -translate-x-1/2 w-24 h-3.5 bg-slate-900 rounded-full z-30 border border-slate-800" />
-
-          <div className="relative w-full h-full">
+          <div className="absolute left-1/2 top-1.5 z-30 h-3.5 w-20 -translate-x-1/2 rounded-full bg-ink/85" />
+          <div className="relative h-full w-full">
             {activeNodes.map((n) => {
               const isScreen = n.kind === "screen";
               const isBtn = n.kind === "button";
               const isMasked = n.kind === "masked_input";
               const isErr = n.kind === "error_banner";
-
               return (
                 <div
                   key={n.node_id}
@@ -197,22 +243,23 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
                     top: Math.round(n.y * scale),
                     width: Math.round(n.w * scale),
                     height: Math.round(n.h * scale),
-                    backgroundColor: rgbaHex(n.bg_rgba),
+                    backgroundColor: isScreen ? undefined : rgbaHex(n.bg_rgba),
+                    color: isBtn && !isErr && !isScreen ? onColor(n.bg_rgba) : undefined,
                   }}
-                  className={`transition-all duration-150 ${
+                  className={
                     isScreen
-                      ? "z-0"
+                      ? "z-0 bg-panel"
                       : isErr
-                        ? "z-20 rounded-lg border border-red-400/80 px-2.5 py-1.5 flex items-center text-[11px] font-medium text-white shadow-lg shadow-red-950/60"
+                        ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
                         : isBtn
-                          ? "z-10 rounded-lg border border-blue-400/40 flex items-center justify-center text-xs font-semibold text-white shadow-md"
+                          ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold"
                           : isMasked
-                            ? "z-10 rounded-lg border border-amber-500/40 px-2.5 flex items-center font-mono text-xs text-amber-200 tracking-wider"
-                            : "z-10 rounded-lg px-2 py-1 flex items-center text-[11px] text-slate-300"
-                  }`}
+                            ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
+                            : "z-10 flex items-center px-1 text-[11px] text-ink-2"
+                  }
                 >
                   {isScreen ? (
-                    <div className="absolute top-6 left-3 right-3 text-xs font-semibold text-slate-200 border-b border-slate-800/80 pb-1.5">
+                    <div className="absolute left-3 right-3 top-6 border-b border-line pb-1.5 text-xs font-semibold text-ink">
                       {n.masked_label}
                     </div>
                   ) : (
@@ -222,7 +269,6 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
               );
             })}
 
-            {/* Pointer & Rage Tap Overlays */}
             {activePointers.map((pt, idx) => {
               const isRage = pt.kind === "rage_tap";
               const isDead = pt.kind === "dead_tap";
@@ -231,24 +277,19 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
                   key={idx}
                   style={{
                     position: "absolute",
-                    left: Math.round(pt.x * scale) - 18,
-                    top: Math.round(pt.y * scale) - 18,
+                    left: Math.round(pt.x * scale) - 16,
+                    top: Math.round(pt.y * scale) - 16,
                   }}
-                  className="z-40 pointer-events-none"
+                  className="pointer-events-none z-40"
                 >
                   <div
-                    className={`w-9 h-9 rounded-full flex items-center justify-center animate-ping ${
-                      isRage
-                        ? "bg-red-500/60 border-2 border-red-400"
-                        : isDead
-                          ? "bg-amber-500/50 border border-amber-300"
-                          : "bg-blue-400/50 border border-blue-300"
+                    className={`h-8 w-8 rounded-full border-2 motion-safe:animate-ping ${
+                      isRage ? "border-danger bg-danger/40" : isDead ? "border-warn bg-warn/40" : "border-brand bg-brand/30"
                     }`}
                   />
                   {isRage && (
-                    <div className="absolute -top-6 -left-4 flex items-center gap-1 bg-red-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow-lg whitespace-nowrap">
-                      <Zap className="w-3 h-3 fill-yellow-300 text-yellow-300" />
-                      {pt.count ?? 4}x RAGE TAP
+                    <div className="absolute -left-3 -top-6 whitespace-nowrap rounded bg-danger px-1.5 py-0.5 text-[10px] font-semibold text-on-brand">
+                      Rage tap ×{pt.count ?? 4}
                     </div>
                   )}
                 </div>
@@ -256,143 +297,151 @@ export const WireframePlayer: React.FC<Props> = ({ sessionId, chunks }) => {
             })}
           </div>
         </div>
-      </div>
+        <figcaption className="flex items-center gap-1.5 text-xs text-muted">
+          <ShieldCheck className="h-3.5 w-3.5 text-ok" />
+          Wireframe only. Typed values are masked on the device.
+        </figcaption>
+      </figure>
 
-      {/* Controls, Scrubber & Breadcrumb Inspector */}
-      <div className="flex-1 w-full bg-[#0e1422] border border-slate-800/80 rounded-xl p-4 space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-xs text-slate-400">Wireframe Session Stream</div>
-            <div className="font-mono text-sm text-slate-100">{sessionId}</div>
-          </div>
-          <div className="flex items-center gap-1.5">
-            {([1, 2, 4] as const).map((sp) => (
-              <button
-                key={sp}
-                onClick={() => setSpeed(sp)}
-                className={`px-2.5 py-1 rounded text-xs font-mono transition ${
-                  speed === sp
-                    ? "bg-blue-600 text-white"
-                    : "bg-slate-800/80 text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                {sp}x
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Scrubber with Red Lightning Rage Tap Markers */}
+      {/* Controls and moments */}
+      <div className="w-full min-w-0 flex-1 space-y-5">
         <div className="space-y-2">
-          <div className="relative h-7 flex items-center">
-            {rageMarkers.map((rm, idx) => {
-              const pct = Math.min(98, Math.max(2, (rm.ts / durationMs) * 100));
-              return (
+          <div className="relative pt-4">
+            {moments
+              .filter((m) => m.kind === "rage" || m.kind === "net-error")
+              .map((m, idx) => (
                 <button
                   key={idx}
-                  onClick={() => {
-                    setCursorMs(rm.ts);
-                    setPlaying(false);
-                  }}
-                  title={`Rage Tap (${rm.count}x) at ${(rm.ts / 1000).toFixed(1)}s`}
-                  style={{ left: `${pct}%` }}
-                  className="absolute -top-2 -translate-x-1/2 z-20 text-red-400 hover:scale-125 transition"
-                >
-                  <Zap className="w-4 h-4 fill-red-500 text-red-300" />
-                </button>
-              );
-            })}
+                  type="button"
+                  onClick={() => seek(m.ts)}
+                  aria-label={`Jump to ${momentTitle(m)} at ${clock(m.ts)}`}
+                  title={`${momentTitle(m)} at ${clock(m.ts)}`}
+                  style={{ left: `${Math.min(98, Math.max(2, (m.ts / durationMs) * 100))}%` }}
+                  className={`absolute top-0 h-3 w-1.5 -translate-x-1/2 rounded-sm ${
+                    m.kind === "rage" ? "bg-danger" : "bg-warn"
+                  }`}
+                />
+              ))}
             <input
               type="range"
               min={0}
               max={durationMs}
               value={cursorMs}
-              onChange={(e) => {
-                setCursorMs(Number(e.target.value));
-                setPlaying(false);
-              }}
-              className="w-full accent-blue-500 cursor-pointer"
+              onChange={(e) => seek(Number(e.target.value))}
+              className="w-full cursor-pointer accent-brand"
+              aria-label="Playback position"
             />
           </div>
 
-          <div className="flex items-center justify-between text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <button
+                type="button"
                 onClick={() => {
                   if (cursorMs >= durationMs) setCursorMs(0);
                   setPlaying((p) => !p);
                 }}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium"
+                className={btn.primary}
               >
-                {playing ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                 {playing ? "Pause" : "Play"}
               </button>
               <button
+                type="button"
                 onClick={() => {
                   setCursorMs(0);
                   setPlaying(true);
                 }}
-                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                className={btn.secondary}
+                aria-label="Restart"
                 title="Restart"
               >
-                <RotateCcw className="w-3.5 h-3.5" />
+                <RotateCcw className="h-4 w-4" />
               </button>
+              <div className="ml-1 flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Playback speed">
+                {([1, 2, 4] as const).map((sp) => (
+                  <button
+                    key={sp}
+                    type="button"
+                    onClick={() => setSpeed(sp)}
+                    aria-pressed={speed === sp}
+                    className={`rounded px-2 py-0.5 text-xs tabular ${
+                      speed === sp ? "bg-brand text-on-brand" : "text-muted hover:text-ink"
+                    }`}
+                  >
+                    {sp}×
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="font-mono text-slate-400">
-              {(cursorMs / 1000).toFixed(2)}s / {(durationMs / 1000).toFixed(2)}s
-            </div>
+            <span className="text-sm text-muted tabular">
+              {clock(cursorMs)} / {clock(durationMs)}
+            </span>
           </div>
         </div>
 
-        {/* Network 5xx & Frustration Breadcrumbs */}
-        <div className="border-t border-slate-800 pt-3">
-          <div className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-            Wireframe Op &amp; Network 5xx Breadcrumbs
-          </div>
-          <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
-            {networkBreadcrumbs.map((nb, idx) => (
-              <button
-                key={`net-${idx}`}
-                onClick={() => {
-                  setCursorMs(nb.ts);
-                  setPlaying(false);
-                }}
-                className="w-full text-left flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-red-950/30 border border-red-900/50 hover:bg-red-950/50 text-xs"
-              >
-                <div className="flex items-center gap-2 truncate">
-                  <WifiOff className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                  <span className="font-mono text-red-300 font-semibold">
-                    {nb.method} {nb.status}
-                  </span>
-                  <span className="font-mono text-slate-300 truncate">{nb.path}</span>
-                </div>
-                <span className="font-mono text-slate-400 shrink-0 ml-2">
-                  {nb.dur}ms @ {(nb.ts / 1000).toFixed(1)}s
-                </span>
-              </button>
-            ))}
-
-            {rageMarkers.map((rm, idx) => (
-              <button
-                key={`rage-${idx}`}
-                onClick={() => {
-                  setCursorMs(rm.ts);
-                  setPlaying(false);
-                }}
-                className="w-full text-left flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-amber-950/30 border border-amber-800/40 hover:bg-amber-950/50 text-xs"
-              >
-                <div className="flex items-center gap-2">
-                  <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-                  <span className="text-amber-200 font-medium">
-                    Rage Tap Detected ({rm.count} rapid taps within 800ms)
-                  </span>
-                </div>
-                <span className="font-mono text-slate-400">@ {(rm.ts / 1000).toFixed(1)}s</span>
-              </button>
-            ))}
-          </div>
+        <div>
+          <h3 className="mb-2 text-sm font-semibold text-ink">What happened</h3>
+          {moments.length === 0 ? (
+            <p className="text-sm text-muted">No taps of note or network errors in this recording.</p>
+          ) : (
+            <ol className="divide-y divide-line rounded-lg border border-line">
+              {moments.map((m, idx) => (
+                <li key={idx}>
+                  <button
+                    type="button"
+                    onClick={() => seek(m.ts)}
+                    className="flex w-full items-start gap-3 px-3 py-2 text-left text-sm hover:bg-hover"
+                  >
+                    <span className="w-10 shrink-0 text-muted tabular">{clock(m.ts)}</span>
+                    {m.kind === "rage" && <Zap className="mt-0.5 h-4 w-4 shrink-0 text-danger" />}
+                    {m.kind === "dead" && <Zap className="mt-0.5 h-4 w-4 shrink-0 text-warn" />}
+                    {(m.kind === "net" || m.kind === "net-error") && (
+                      <WifiOff
+                        className={`mt-0.5 h-4 w-4 shrink-0 ${m.kind === "net-error" ? "text-warn" : "text-faint"}`}
+                      />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="text-ink">{momentTitle(m)}</span>
+                      {m.path && (
+                        <span className="block truncate font-mono text-xs text-muted">
+                          {m.method} {m.path}
+                        </span>
+                      )}
+                    </span>
+                    {m.dur !== undefined && (
+                      <span className="shrink-0 text-xs text-muted tabular">{formatDuration(m.dur)}</span>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
         </div>
       </div>
     </div>
   );
 };
+
+interface Moment {
+  ts: number;
+  kind: "rage" | "dead" | "net" | "net-error";
+  count?: number;
+  method?: string;
+  path?: string;
+  status?: number;
+  dur?: number;
+}
+
+function momentTitle(m: Moment): string {
+  switch (m.kind) {
+    case "rage":
+      return `Rage tap: ${m.count ?? "several"} quick taps on one spot`;
+    case "dead":
+      return "Tap with no response";
+    case "net-error":
+      return `Request failed (${m.status})`;
+    case "net":
+      return `Request ${m.status}`;
+  }
+}

@@ -57,7 +57,7 @@ pub struct IngestResponse {
     pub server_ts_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IdentifyRequest {
     pub anon_id: String,
     pub user_id: String,
@@ -65,6 +65,10 @@ pub struct IdentifyRequest {
     pub routing_seed: Option<String>,
     #[serde(default)]
     pub anon_routing_seed: Option<String>,
+    #[serde(default)]
+    pub user_properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub operations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,10 +420,158 @@ impl IngestService {
             .alias_durable(&req.anon_id, &req.user_id, anon_bucket, user_bucket)
             .await?;
 
+        if let Some(up) = req.user_properties {
+            let payload = serde_json::json!({ "$set": up });
+            self.governance
+                .apply_engage(project_id, &req.user_id, canonical_uid, &payload)
+                .await;
+        }
+        if let Some(ops) = req.operations {
+            self.governance
+                .apply_engage(project_id, &req.user_id, canonical_uid, &ops)
+                .await;
+        }
+
         Ok(IdentifyResponse {
             status: "ok".to_string(),
             canonical_uid,
         })
+    }
+
+    /// Processes Mixpanel `/engage` or Amplitude Identify user profile mutations (`Gap 1`).
+    pub async fn engage(&self, api_key: &str, body: &[u8]) -> Result<serde_json::Value> {
+        let project_id = self
+            .governance
+            .authenticate_api_key(api_key)
+            .await
+            .ok_or(IngestError::Unauthorized)?;
+        let val: serde_json::Value = serde_json::from_slice(body)?;
+        let updated = self.engage_for_project(&project_id, val).await?;
+        Ok(serde_json::json!({
+            "status": "ok",
+            "updated": updated,
+        }))
+    }
+
+    pub async fn engage_for_project(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<usize> {
+        let ps = self
+            .ensure_project_ready(project_id, Utc::now().timestamp_millis())
+            .await?;
+        let id_graph = self
+            .storage
+            .identity_router()
+            .get_or_open(project_id)
+            .await?;
+        let num_buckets = ps.config().num_buckets;
+
+        let items: Vec<serde_json::Value> = match payload {
+            serde_json::Value::Array(arr) => arr,
+            serde_json::Value::Object(mut obj) => {
+                if let Some(serde_json::Value::Array(arr)) =
+                    obj.remove("profiles").or_else(|| obj.remove("batch"))
+                {
+                    arr
+                } else {
+                    vec![serde_json::Value::Object(obj)]
+                }
+            }
+            _ => {
+                return Err(IngestError::Wire(WireError::InvalidPayload(
+                    "expected a JSON profile object or array".to_string(),
+                )));
+            }
+        };
+
+        let mut updated = 0usize;
+        let mut need_flush = false;
+        for item in &items {
+            let distinct_id = [
+                "distinct_id",
+                "$distinct_id",
+                "user_id",
+                "$user_id",
+                "userId",
+            ]
+            .iter()
+            .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+            let Some(did) = distinct_id else {
+                continue;
+            };
+            let seed = item
+                .get("routing_seed")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(did);
+            let bucket_id = route_bucket(seed, num_buckets);
+            let raw_uid = id_graph.get_or_intern(did, bucket_id);
+            let canon_uid = id_graph.lookup_canonical(did).unwrap_or(raw_uid);
+            need_flush = true;
+            self.governance
+                .apply_engage(project_id, did, canon_uid, item)
+                .await;
+            updated += 1;
+        }
+        if need_flush {
+            id_graph.flush().await?;
+        }
+        Ok(updated)
+    }
+
+    /// Processes Group Analytics `/groups` property updates (`Gap 8`).
+    pub async fn group_engage(&self, api_key: &str, body: &[u8]) -> Result<serde_json::Value> {
+        let project_id = self
+            .governance
+            .authenticate_api_key(api_key)
+            .await
+            .ok_or(IngestError::Unauthorized)?;
+        let val: serde_json::Value = serde_json::from_slice(body)?;
+        let updated = self.group_engage_for_project(&project_id, val).await?;
+        Ok(serde_json::json!({
+            "status": "ok",
+            "updated": updated,
+        }))
+    }
+
+    pub async fn group_engage_for_project(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<usize> {
+        let items: Vec<serde_json::Value> = match payload {
+            serde_json::Value::Array(arr) => arr,
+            serde_json::Value::Object(_) => vec![payload],
+            _ => {
+                return Err(IngestError::Wire(WireError::InvalidPayload(
+                    "expected a JSON group object or array".to_string(),
+                )));
+            }
+        };
+        let mut updated = 0usize;
+        for item in &items {
+            let group_type = ["group_type", "$group_key", "type"]
+                .iter()
+                .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let group_id = ["group_id", "$group_id", "id"]
+                .iter()
+                .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let (Some(gt), Some(gid)) = (group_type, group_id) {
+                self.governance
+                    .apply_group_engage(project_id, gt, gid, item)
+                    .await;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub async fn ingest_replay(

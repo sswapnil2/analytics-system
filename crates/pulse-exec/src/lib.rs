@@ -14,7 +14,7 @@ pub use catalog::{
     arrow_array_to_prop_values, evaluate_custom_property, extract_sql_identifiers, CatalogRegistry,
     CustomEventDef, CustomPropertyDef, LookupTableDef, VirtualCatalog,
 };
-pub use engine::QueryEngine;
+pub use engine::{ExportedEventRow, QueryEngine};
 pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;
 pub use insights::{eval_math_expr, InsightsEngine};
@@ -128,6 +128,8 @@ mod tests {
                         user_id: user.clone(),
                         routing_seed: Some(seed.clone()),
                         anon_routing_seed: Some(seed.clone()),
+                        user_properties: None,
+                        operations: None,
                     },
                 )
                 .await
@@ -180,6 +182,8 @@ mod tests {
                         user_id: user.clone(),
                         routing_seed: Some(seed_b.clone()),
                         anon_routing_seed: Some(seed_a.clone()),
+                        user_properties: None,
+                        operations: None,
                     },
                 )
                 .await
@@ -423,10 +427,17 @@ mod tests {
         );
 
         #[cfg(not(debug_assertions))]
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "expected < 50ms for 1,000,000-event 4-step Funnel in --release, took {elapsed:?}"
-        );
+        {
+            assert!(
+                Duration::from_micros(warmup.exec_time_us) < Duration::from_millis(250),
+                "expected < 250ms cold scan for 1,000,000-event 4-step Funnel in --release, took {:.2}ms",
+                warmup.exec_time_us as f64 / 1000.0
+            );
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "expected < 50ms for 1,000,000-event 4-step Funnel in --release, took {elapsed:?}"
+            );
+        }
         assert_eq!(res.overall_steps[3].entered_users, 7_500);
 
         id_router.close_all().await.unwrap();

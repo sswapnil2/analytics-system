@@ -1,26 +1,34 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
-  Activity,
-  Bot,
-  Cpu,
-  Database,
-  Filter,
+  Check,
+  Copy,
   FlaskConical,
   GitBranch,
-  Grid3X3,
-  HardDrive,
-  KeyRound,
+  CalendarCheck,
   LineChart,
-  Smartphone,
-  Sparkles,
+  Filter,
+  LayoutDashboard,
+  LogOut,
+  Monitor,
+  Moon,
+  PlayCircle,
+  ShieldCheck,
+  Sun,
+  Terminal,
+  Users,
+  X,
 } from "lucide-react";
 import {
   api,
   ApiAuthError,
+  AuthUser,
   getStoredAdminToken,
   NodeStatus,
   setStoredAdminToken,
 } from "./api/client";
+import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
+import { btn, Panel } from "./components/ui";
+import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
 import { FlowsWorkspace } from "./workspaces/FlowsWorkspace";
@@ -29,108 +37,149 @@ import { InsightsWorkspace } from "./workspaces/InsightsWorkspace";
 import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
 import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
+import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
 
 type WorkspaceId =
-  | "insights"
+  | "dashboards"
+  | "trends"
   | "funnels"
-  | "flows"
+  | "journeys"
   | "retention"
-  | "sessions"
+  | "replays"
   | "cohorts"
   | "experiments"
-  | "lexicon";
+  | "events";
 
 interface NavItem {
   id: WorkspaceId;
   label: string;
-  subtitle: string;
   icon: React.ComponentType<{ className?: string }>;
 }
 
-const NAV_ITEMS: NavItem[] = [
+const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
-    id: "insights",
-    label: "Insights",
-    subtitle: "Series · DDSketch · Formulas",
-    icon: LineChart,
+    label: "",
+    items: [{ id: "dashboards", label: "Dashboards", icon: LayoutDashboard }],
   },
   {
-    id: "funnels",
-    label: "Funnels",
-    subtitle: "Exact u32 · Drop-Off Replay",
-    icon: Filter,
+    label: "Analyze",
+    items: [
+      { id: "funnels", label: "Funnels", icon: Filter },
+      { id: "trends", label: "Trends", icon: LineChart },
+      { id: "journeys", label: "Journeys", icon: GitBranch },
+      { id: "retention", label: "Retention", icon: CalendarCheck },
+    ],
   },
   {
-    id: "flows",
-    label: "Flows",
-    subtitle: "Forward & Reverse Sankey",
-    icon: GitBranch,
+    label: "Investigate",
+    items: [{ id: "replays", label: "Session replays", icon: PlayCircle }],
   },
   {
-    id: "retention",
-    label: "Retention",
-    subtitle: "N-Day · Unbounded · Stickiness",
-    icon: Grid3X3,
-  },
-  {
-    id: "sessions",
-    label: "Sessions & Replay",
-    subtitle: "Bloom Pruned · Phone Player",
-    icon: Smartphone,
-  },
-  {
-    id: "cohorts",
-    label: "Cohorts & Lookups",
-    subtitle: "RoaringBitmap · SQL Props",
-    icon: Database,
-  },
-  {
-    id: "experiments",
-    label: "Experiments & Flags",
-    subtitle: "Z-Test · Bayesian · Edge ETag",
-    icon: FlaskConical,
-  },
-  {
-    id: "lexicon",
-    label: "Lexicon & MCP",
-    subtitle: "Governance · JSON-RPC Tools",
-    icon: Bot,
+    label: "Audience and shipping",
+    items: [
+      { id: "cohorts", label: "Cohorts", icon: Users },
+      { id: "experiments", label: "Experiments", icon: FlaskConical },
+      { id: "events", label: "Events and privacy", icon: ShieldCheck },
+    ],
   },
 ];
 
-function formatLatency(us: number): string {
-  if (us <= 0) return "—";
-  if (us < 1000) return `${us} µs`;
-  return `${(us / 1000).toFixed(2)} ms`;
+const ALL_IDS = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id));
+const DEFAULT_TAB: WorkspaceId = "funnels";
+
+function tabFromHash(): WorkspaceId {
+  const h = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
+  return ALL_IDS.includes(h) ? h : DEFAULT_TAB;
 }
 
+type ThemePref = "system" | "light" | "dark";
+const THEME_KEY = "pulse_theme";
+
+function readTheme(): ThemePref {
+  try {
+    const t = window.localStorage.getItem(THEME_KEY);
+    return t === "light" || t === "dark" ? t : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function applyTheme(t: ThemePref) {
+  const el = document.documentElement;
+  if (t === "system") el.removeAttribute("data-theme");
+  else el.setAttribute("data-theme", t);
+  try {
+    window.localStorage.setItem(THEME_KEY, t);
+  } catch {
+    // storage unavailable: theme still applies for this visit
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<WorkspaceId>("funnels");
+  const [signedIn, setSignedIn] = useState<boolean>(() => !!getStoredAdminToken());
+  const [authRoute, setAuthRoute] = useState(parseAuthHash);
+  const [signInReason, setSignInReason] = useState<string | undefined>();
+  const [activeTab, setActiveTab] = useState<WorkspaceId>(tabFromHash);
   const [projectId, setProjectId] = useState<string>("");
   const [status, setStatus] = useState<NodeStatus | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
   const [refreshToken, setRefreshToken] = useState<number>(0);
-  const [flushing, setFlushing] = useState<boolean>(false);
-  const [toast, setToast] = useState<string | null>(null);
+  const [theme, setTheme] = useState<ThemePref>(readTheme);
+  const [flushing, setFlushing] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [quickstartOpen, setQuickstartOpen] = useState(false);
+  const [quickstartDismissed, setQuickstartDismissed] = useState(false);
+  const [copiedQuickstart, setCopiedQuickstart] = useState(false);
 
-  const [authRequired, setAuthRequired] = useState<boolean>(() => !getStoredAdminToken());
-  const [tokenDraft, setTokenDraft] = useState<string>(() => getStoredAdminToken());
+  useEffect(() => applyTheme(theme), [theme]);
+
+  useEffect(() => {
+    const onHash = () => {
+      setActiveTab(tabFromHash());
+      setAuthRoute(parseAuthHash());
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const signOut = useCallback((reason?: string) => {
+    setStoredAdminToken("");
+    setStatus(null);
+    setUser(null);
+    setProjectId("");
+    setSignInReason(reason);
+    setSignedIn(false);
+    window.history.replaceState(null, "", "#/signin");
+    setAuthRoute(parseAuthHash());
+  }, []);
+
+  const handleSignedIn = useCallback(() => {
+    setSignInReason(undefined);
+    setSignedIn(true);
+    setRefreshToken((n) => n + 1);
+    const seg = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
+    if (!ALL_IDS.includes(seg)) {
+      window.history.replaceState(null, "", `#/${DEFAULT_TAB}`);
+      setActiveTab(DEFAULT_TAB);
+    }
+  }, []);
 
   const loadStatus = useCallback(async () => {
     try {
       const s = await api.getStatus(projectId || undefined);
       setStatus(s);
-      setAuthRequired(false);
-      if (!projectId && s.active_project_id) {
-        setProjectId(s.active_project_id);
-      }
+      if (!projectId && s.active_project_id) setProjectId(s.active_project_id);
     } catch (err) {
-      if (err instanceof ApiAuthError) {
-        setAuthRequired(true);
-      }
+      if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
     }
-  }, [projectId]);
+  }, [projectId, signOut]);
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
@@ -140,317 +189,404 @@ export const App: React.FC = () => {
         api.getSchemaExtensions(projectId),
       ]);
       const evNames = new Set<string>();
-      for (const ev of lex.events) {
-        if (ev.status !== "dropped") {
-          evNames.add(ev.name);
-        }
-      }
-      for (const ce of ext.custom_events) {
-        evNames.add(ce.name);
-      }
+      for (const ev of lex.events) if (ev.status !== "dropped") evNames.add(ev.name);
+      for (const ce of ext.custom_events) evNames.add(ce.name);
       const propNames = new Set<string>();
-      for (const p of lex.properties) {
-        propNames.add(p.name);
-      }
-      for (const cp of ext.custom_properties) {
-        propNames.add(cp.name);
-      }
-      for (const lt of ext.lookup_tables) {
-        for (const col of lt.sample_columns) {
-          propNames.add(`${lt.name}.${col}`);
-        }
-      }
+      for (const p of lex.properties) propNames.add(p.name);
+      for (const cp of ext.custom_properties) propNames.add(cp.name);
+      for (const lt of ext.lookup_tables)
+        for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
       setAvailableEvents(Array.from(evNames).sort());
       setAvailableProps(Array.from(propNames).sort());
-    } catch {
-      // Handled by auth state
+    } catch (err) {
+      if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
     }
-  }, [projectId]);
+  }, [projectId, signOut]);
+
+  // Poll status only while signed in and the tab is visible.
+  useEffect(() => {
+    if (!signedIn) return;
+    void loadStatus();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadStatus();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [signedIn, loadStatus]);
 
   useEffect(() => {
-    void loadStatus();
-    void loadCatalog();
-    const timer = window.setInterval(() => {
-      void loadStatus();
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [loadStatus, loadCatalog]);
+    if (signedIn) void loadCatalog();
+  }, [signedIn, loadCatalog]);
 
-  const handleUnlock = (e: React.FormEvent) => {
-    e.preventDefault();
-    setStoredAdminToken(tokenDraft);
-    setAuthRequired(false);
-    void loadStatus();
-    setRefreshToken((n) => n + 1);
+  // Who is signed in. Admin tokens aren't a person, so /me answers 404 for them.
+  useEffect(() => {
+    if (!signedIn) return;
+    api
+      .getMe()
+      .then(setUser)
+      .catch((err) => {
+        if (!isNotFound(err)) setUser(null);
+      });
+  }, [signedIn]);
+
+  const go = (id: WorkspaceId) => {
+    window.location.hash = `/${id}`;
+    setActiveTab(id);
   };
 
-  const handleFlushStorage = async () => {
+  const handleSignOut = async () => {
+    try {
+      await api.logOut();
+    } catch {
+      // Session may already be gone; clearing locally is what matters.
+    }
+    signOut();
+  };
+
+  const handleFlush = async () => {
     setFlushing(true);
     try {
       const res = await api.flushStorage();
       await loadStatus();
       setRefreshToken((n) => n + 1);
-      setToast(
-        `Flushed ${res.segments_flushed} Vortex segment(s) · ${res.partitions_compacted} compacted`,
+      setNotice(
+        `Saved buffered events to storage (${res.segments_flushed} file${res.segments_flushed === 1 ? "" : "s"}).`,
       );
-      window.setTimeout(() => setToast(null), 4500);
+    } catch (err) {
+      setNotice(`Couldn't save buffered events: ${errorMessage(err)}`);
     } finally {
       setFlushing(false);
+      window.setTimeout(() => setNotice(null), 5000);
     }
   };
 
-  if (authRequired) {
-    return (
-      <div className="min-h-screen bg-[#090d16] text-slate-100 flex items-center justify-center p-6">
-        <form
-          onSubmit={handleUnlock}
-          className="w-full max-w-md bg-[#0e1422] border border-slate-800 rounded-xl p-6 space-y-4 shadow-2xl"
-        >
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-blue-600/20 border border-blue-500/40 flex items-center justify-center">
-              <KeyRound className="w-4 h-4 text-blue-400" />
-            </div>
-            <div>
-              <h1 className="text-sm font-semibold text-white">Unlock Pulse Analytics Studio</h1>
-              <p className="text-xs text-slate-400">
-                Enter your Admin Bearer Token (<code className="font-mono">sk_…</code>)
-              </p>
-            </div>
-          </div>
-          <input
-            type="password"
-            value={tokenDraft}
-            onChange={(e) => setTokenDraft(e.target.value)}
-            placeholder="sk_root_… or project sk_live_…"
-            className="w-full bg-[#111827] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-blue-500"
-            autoFocus
-          />
-          <button
-            type="submit"
-            className="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white transition"
-          >
-            Authenticate Session
-          </button>
-        </form>
-      </div>
+  if (authRoute.view === "callback") {
+    return <AuthCallback code={authRoute.params.get("code")} onSignedIn={handleSignedIn} />;
+  }
+
+  if (!signedIn) {
+    return authRoute.view === "signup" ? (
+      <SignUpScreen onSignedIn={handleSignedIn} />
+    ) : (
+      <SignInScreen
+        onSignedIn={handleSignedIn}
+        reason={signInReason}
+        googleError={authRoute.params.get("error")}
+      />
     );
   }
 
-  const activePid = projectId || status?.active_project_id || "proj_default";
-  const totalStoredRows = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
+  const activePid = projectId || status?.active_project_id || "";
+  const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
+  const projects = status?.projects ?? [];
+  const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
+  const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
+  const displayName = user?.name || user?.email || "Admin token";
+  const initials =
+    (user?.name || user?.email || "A")
+      .split(/[\s@.]+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase())
+      .join("") || "A";
+
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8080";
+  const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
+  const curlSnippet = `curl -X POST "${origin}/v1/ingest" \\
+  -H "Content-Type: application/json" \\
+  -H "x-pulse-key: YOUR_INGEST_KEY" \\
+  -d '{
+    "event": "KYC_PAN_Submitted",
+    "userId": "usr_1042",
+    "properties": { "city": "Bengaluru", "plan": "pro" }
+  }'`;
+
+  const copyQuickstart = async () => {
+    try {
+      await navigator.clipboard.writeText(curlSnippet);
+      setCopiedQuickstart(true);
+      window.setTimeout(() => setCopiedQuickstart(false), 2000);
+    } catch {
+      // Clipboard may be restricted in headless contexts.
+    }
+  };
+
+  const accountControls = (
+    <div className="flex items-center gap-0.5">
+      <button
+        type="button"
+        onClick={() => {
+          setQuickstartDismissed(false);
+          setQuickstartOpen((v) => !v);
+        }}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label="Send events quickstart"
+        title="Send events quickstart"
+      >
+        <Terminal className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        onClick={() => setTheme(nextTheme[theme])}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label={`Theme: ${theme}. Switch to ${nextTheme[theme]}`}
+        title={`Theme: ${theme}`}
+      >
+        <ThemeIcon className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        onClick={() => void handleSignOut()}
+        className={`${btn.ghost} h-8 w-8 px-0`}
+        aria-label="Sign out"
+        title="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
+    </div>
+  );
 
   return (
-    <div className="min-h-screen bg-[#090d16] text-slate-100 flex flex-col font-sans antialiased">
-      {/* Global Topbar */}
-      <header className="h-14 border-b border-slate-800/90 bg-[#0c1220]/95 backdrop-blur px-4 flex items-center justify-between gap-3 sticky top-0 z-30">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/20">
-            <Sparkles className="w-4 h-4 text-slate-950" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-semibold tracking-tight text-sm text-white">
-                PULSE ANALYTICS
-              </span>
-              <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-500/30">
-                Vortex + Roaring u32
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 leading-none mt-0.5">
-              Zero-Middleware Disaggregated S3 + Ephemeral NVMe Engine
-            </p>
-          </div>
+    <div className="flex min-h-screen flex-col bg-canvas text-ink md:flex-row">
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-panel focus:px-3 focus:py-2"
+      >
+        Skip to content
+      </a>
 
-          {/* Project Switcher */}
-          <div className="ml-3 pl-3 border-l border-slate-800">
-            <select
-              aria-label="Active Project"
-              value={activePid}
-              onChange={(e) => {
-                setProjectId(e.target.value);
-                setRefreshToken((n) => n + 1);
-              }}
-              className="bg-[#111827] border border-slate-700/80 text-xs text-slate-200 rounded-md px-2.5 py-1.5 focus:outline-none focus:border-blue-500"
-            >
-              {(status?.projects && status.projects.length > 0
-                ? status.projects
-                : [{ id: activePid, org_id: "org_default", name: activePid, timezone: "UTC", created_at_ms: 0 }]
-              ).map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} ({p.id})
-                </option>
-              ))}
-            </select>
-          </div>
+      {/* Sidebar: full height on desktop, a scrolling tab strip on small screens. */}
+      <aside className="shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:w-60 md:flex-col md:gap-5 md:border-b-0 md:border-r md:px-3.5 md:py-5">
+        <div className="flex items-center justify-between gap-2.5 px-4 py-3 md:px-1.5 md:py-0">
+          <span className="flex items-center gap-2.5">
+            <Logo size="sm" />
+            <span className="text-[1.0625rem] font-bold tracking-[-0.01em]">Pulse</span>
+          </span>
+          <span className="md:hidden">{accountControls}</span>
         </div>
 
-        {/* Live Telemetry Pills */}
-        <div className="flex items-center gap-2.5 flex-wrap justify-end">
-          {toast && (
-            <div className="text-xs px-2.5 py-1 rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-mono">
-              {toast}
-            </div>
-          )}
-
-          <div className="flex items-center gap-2 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs">
-            <Activity className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="text-slate-400">Ingest:</span>
-            <span className="font-mono text-emerald-300 font-medium">
-              {(status?.live_eps ?? 0).toLocaleString()} eps
-            </span>
-            <span className="text-slate-600">·</span>
-            <span className="font-mono text-slate-200">
-              {totalStoredRows.toLocaleString()} rows
-            </span>
-          </div>
-
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs">
-            <Cpu className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="text-slate-400">Engine:</span>
-            <span className="font-mono text-cyan-300 font-semibold">
-              {formatLatency(status?.last_query_latency_us ?? 0)}
-            </span>
-          </div>
-
-          <div className="hidden xl:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#111827] border border-slate-800 text-xs font-mono">
-            <span className="text-purple-300">Epoch #{status?.snapshot_epoch ?? 0}</span>
-            <span className="text-slate-600">·</span>
-            <span className="text-slate-300">{status?.segment_count ?? 0} Vortex segs</span>
-            <span className="text-slate-600">·</span>
-            <span className="text-blue-300">
-              {(status?.interned_users ?? 0).toLocaleString()} u32 IDs
-            </span>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => void handleFlushStorage()}
-            disabled={flushing}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white shadow-sm shadow-blue-600/30 transition"
+        <label className="mx-4 mb-3 flex flex-col gap-0.5 rounded-lg border border-line bg-canvas px-2.5 py-1.5 md:mx-0 md:mb-0">
+          <span className="text-xs text-muted">Project</span>
+          <select
+            value={activePid}
+            onChange={(e) => {
+              setProjectId(e.target.value);
+              setRefreshToken((n) => n + 1);
+            }}
+            className="w-full truncate bg-transparent text-sm font-semibold text-ink focus:outline-none"
+            disabled={projects.length === 0}
           >
-            <HardDrive className="w-3.5 h-3.5" />
-            {flushing ? "Flushing…" : "Flush & Compact"}
-          </button>
-        </div>
-      </header>
+            {projects.length === 0 && <option value={activePid}>{activePid || "Loading…"}</option>}
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
 
-      {/* Main Studio Body */}
-      <div className="flex-1 flex min-h-0">
-        <aside className="w-60 shrink-0 border-r border-slate-800/90 bg-[#0b101c] p-3 flex flex-col justify-between">
-          <nav className="space-y-1">
-            {NAV_ITEMS.map((item) => {
-              const Icon = item.icon;
-              const isActive = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setActiveTab(item.id)}
-                  className={`w-full text-left px-3 py-2.5 rounded-lg transition flex items-start gap-2.5 border ${
-                    isActive
-                      ? "bg-blue-600/15 border-blue-500/40 text-white"
-                      : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
-                  }`}
-                >
-                  <Icon
-                    className={`w-4 h-4 mt-0.5 shrink-0 ${
-                      isActive ? "text-blue-400" : "text-slate-500"
+        <nav
+          aria-label="Workspaces"
+          className="no-scrollbar flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-[18px] md:overflow-y-auto md:px-0 md:pb-0"
+        >
+          {NAV_GROUPS.map((group) => (
+            <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">
+              {group.label && <div className="hidden px-2.5 pb-1 text-xs text-muted md:block">{group.label}</div>}
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                const active = activeTab === item.id;
+                return (
+                  <a
+                    key={item.id}
+                    href={`#/${item.id}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      go(item.id);
+                    }}
+                    aria-current={active ? "page" : undefined}
+                    className={`flex h-9 shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 text-sm ${
+                      active
+                        ? "bg-brand-soft font-semibold text-brand"
+                        : "text-ink-2 hover:bg-hover hover:text-ink"
                     }`}
-                  />
-                  <div className="min-w-0">
-                    <div className="text-xs font-medium leading-tight truncate">{item.label}</div>
-                    <div className="text-[10px] text-slate-500 truncate mt-0.5">
-                      {item.subtitle}
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </nav>
+                  >
+                    <Icon className="h-[17px] w-[17px] shrink-0" />
+                    {item.label}
+                  </a>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
 
-          <div className="mt-6 p-3 rounded-lg bg-[#0f172a]/80 border border-slate-800/80 space-y-1.5 text-[11px] text-slate-400">
-            <div className="font-semibold text-slate-200 flex items-center justify-between">
-              <span>Physical Storage</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setStoredAdminToken("");
-                  setAuthRequired(true);
-                }}
-                className="text-[10px] font-mono text-slate-400 hover:text-white underline"
-              >
-                Lock
-              </button>
-            </div>
-            <div className="font-mono text-[10px] text-slate-400 leading-relaxed">
-              <div>L0 Hot RAM: {(status?.l0_rows ?? 0).toLocaleString()}</div>
-              <div>L1 Vortex: {(status?.l1_rows ?? 0).toLocaleString()}</div>
-              <div>Project: {activePid}</div>
-            </div>
+        <div className="hidden space-y-1.5 px-1.5 text-xs text-muted md:block">
+          <div className="tabular">
+            <span className="text-ink-2">{formatCount(totalEvents)}</span> events stored
           </div>
-        </aside>
+          <div className="tabular">
+            {(status?.live_eps ?? 0) > 0 ? (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-ok" aria-hidden="true" />
+                Receiving {formatCount(status?.live_eps)} events/s
+              </span>
+            ) : (
+              "No events in the last few seconds"
+            )}
+          </div>
+          {(status?.l0_rows ?? 0) > 0 && (
+            <button
+              type="button"
+              onClick={() => void handleFlush()}
+              disabled={flushing}
+              className="text-left text-brand hover:underline disabled:opacity-50"
+              title="Writes events still held in memory to durable storage"
+            >
+              {flushing ? "Saving…" : `Save ${formatCount(status?.l0_rows)} buffered events now`}
+            </button>
+          )}
+          {notice && (
+            <p role="status" className="text-ink-2">
+              {notice}
+            </p>
+          )}
+        </div>
 
-        <main className="flex-1 min-w-0 p-5 overflow-y-auto">
-          {activeTab === "insights" && (
-            <InsightsWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              availableProps={availableProps}
-              refreshToken={refreshToken}
-            />
+        <div className="hidden items-center gap-2.5 border-t border-line px-1.5 pt-3 md:flex">
+          <span
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-[0.8125rem] font-semibold text-ink-2"
+            aria-hidden="true"
+          >
+            {initials}
+          </span>
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="truncate text-sm font-semibold">{displayName}</span>
+            {user?.name && <span className="truncate text-xs text-muted">{user.email}</span>}
+          </span>
+          {accountControls}
+        </div>
+      </aside>
+
+      <main id="main" tabIndex={-1} className="min-w-0 flex-1 px-4 py-7 outline-none md:px-8">
+        <div className="mx-auto max-w-[1200px] space-y-5">
+          {showQuickstart && (
+            <Panel
+              title={totalEvents === 0 ? "Send your first event" : "Send events to this project"}
+              meta={activePid || undefined}
+              actions={
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      go("events");
+                      setQuickstartOpen(false);
+                    }}
+                    className={btn.ghost}
+                  >
+                    Create API key
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQuickstartOpen(false);
+                      setQuickstartDismissed(true);
+                    }}
+                    className={`${btn.ghost} h-8 w-8 px-0`}
+                    aria-label="Close quickstart"
+                    title="Close"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              }
+            >
+              <p className="mb-3 text-sm text-ink-2">
+                Accepts Segment, Mixpanel arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
+              </p>
+              <div className="relative rounded-lg border border-line bg-sunken p-3.5">
+                <button
+                  type="button"
+                  onClick={() => void copyQuickstart()}
+                  className={`${btn.ghost} absolute right-2 top-2 h-7 px-2 text-xs`}
+                >
+                  {copiedQuickstart ? <Check className="h-3.5 w-3.5 text-ok" /> : <Copy className="h-3.5 w-3.5" />}
+                  {copiedQuickstart ? "Copied" : "Copy"}
+                </button>
+                <pre className="overflow-x-auto pr-20 font-mono text-xs leading-relaxed text-ink">
+                  {curlSnippet}
+                </pre>
+              </div>
+            </Panel>
           )}
-          {activeTab === "funnels" && (
-            <FunnelsWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              refreshToken={refreshToken}
-            />
-          )}
-          {activeTab === "flows" && (
-            <FlowsWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              refreshToken={refreshToken}
-            />
-          )}
-          {activeTab === "retention" && (
-            <RetentionWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              refreshToken={refreshToken}
-            />
-          )}
-          {activeTab === "sessions" && (
-            <SessionsReplayWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              refreshToken={refreshToken}
-            />
-          )}
-          {activeTab === "cohorts" && (
-            <CohortsLookupsWorkspace
-              projectId={activePid}
-              availableEvents={availableEvents}
-              onCatalogChanged={() => {
-                void loadCatalog();
-                setRefreshToken((n) => n + 1);
-              }}
-            />
-          )}
-          {activeTab === "experiments" && (
-            <ExperimentsFlagsWorkspace projectId={activePid} refreshToken={refreshToken} />
-          )}
-          {activeTab === "lexicon" && (
-            <LexiconMcpWorkspace
-              projectId={activePid}
-              onLexiconChanged={() => {
-                void loadCatalog();
-                setRefreshToken((n) => n + 1);
-              }}
-            />
-          )}
-        </main>
-      </div>
+            {!activePid ? (
+              <p className="text-sm text-muted" role="status">
+                Loading your workspace…
+              </p>
+            ) : (
+              <>
+                {activeTab === "dashboards" && (
+                  <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                )}
+                {activeTab === "trends" && (
+                  <InsightsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    availableProps={availableProps}
+                    refreshToken={refreshToken}
+                  />
+                )}
+                {activeTab === "funnels" && (
+                  <FunnelsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
+                )}
+                {activeTab === "journeys" && (
+                  <FlowsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
+                )}
+                {activeTab === "retention" && (
+                  <RetentionWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
+                )}
+                {activeTab === "replays" && (
+                  <SessionsReplayWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
+                )}
+                {activeTab === "cohorts" && (
+                  <CohortsLookupsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    onCatalogChanged={() => {
+                      void loadCatalog();
+                      setRefreshToken((n) => n + 1);
+                    }}
+                  />
+                )}
+                {activeTab === "experiments" && (
+                  <ExperimentsFlagsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                )}
+                {activeTab === "events" && (
+                  <LexiconMcpWorkspace
+                    projectId={activePid}
+                    onLexiconChanged={() => {
+                      void loadCatalog();
+                      setRefreshToken((n) => n + 1);
+                    }}
+                  />
+                )}
+              </>
+            )}
+        </div>
+      </main>
     </div>
   );
 };

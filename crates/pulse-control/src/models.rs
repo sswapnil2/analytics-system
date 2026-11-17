@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +20,19 @@ pub struct Project {
     pub org_id: String,
     pub name: String,
     pub timezone: String,
+    pub created_at_ms: i64,
+}
+
+/// Dashboard user account. Deliberately not `Serialize` so `password_hash` can never leak into a response.
+#[derive(Debug, Clone)]
+pub struct User {
+    pub id: String,
+    /// Always stored lowercased.
+    pub email: String,
+    pub name: Option<String>,
+    /// Argon2id PHC string; `None` for Google-only accounts.
+    pub password_hash: Option<String>,
+    pub google_sub: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -126,6 +142,30 @@ pub struct SavedReport {
     pub report_kind: String,
     pub query_json: serde_json::Value,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+pub const REPORT_KINDS: [&str; 4] = ["funnel", "insights", "retention", "flows"];
+
+/// One tile on a dashboard: a saved report or a markdown/text note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardCard {
+    /// Server-generated when empty on write.
+    #[serde(default)]
+    pub id: String,
+    /// `"report"` or `"text"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `1` = half row, `2` = full row.
+    #[serde(default = "default_card_width")]
+    pub width: i64,
+}
+
+fn default_card_width() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +173,12 @@ pub struct Dashboard {
     pub id: String,
     pub project_id: String,
     pub name: String,
-    pub report_ids: Vec<String>,
+    pub description: Option<String>,
+    pub cards: Vec<DashboardCard>,
+    /// User email, `"admin token"`, or `None` for rows created before ownership was recorded.
+    pub created_by: Option<String>,
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,4 +327,412 @@ pub struct CustomSchemaBundle {
     pub custom_events: Vec<CustomEventDef>,
     pub custom_properties: Vec<CustomPropertyDef>,
     pub lookup_tables: Vec<LookupTableSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfileRecord {
+    pub project_id: String,
+    pub distinct_id: String,
+    pub canonical_uid: u32,
+    pub props: BTreeMap<String, Value>,
+    pub total_revenue: f64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupProfileRecord {
+    pub project_id: String,
+    pub group_type: String,
+    pub group_id: String,
+    pub props: BTreeMap<String, Value>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletionAuditRecord {
+    pub id: String,
+    pub project_id: String,
+    pub distinct_id_masked: String,
+    pub canonical_uid: u32,
+    pub events_purged: u64,
+    pub replays_purged: u64,
+    pub requested_by: String,
+    pub deleted_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRule {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub event_name: String,
+    pub operator: String,
+    pub threshold: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_triggered_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileOpOutcome {
+    pub modified: bool,
+    pub delete_requested: bool,
+}
+
+fn ensure_array_mut<'a>(props: &'a mut BTreeMap<String, Value>, key: &str) -> &'a mut Vec<Value> {
+    let entry = props
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !entry.is_array() {
+        let prev = entry.clone();
+        *entry = Value::Array(if prev.is_null() { vec![] } else { vec![prev] });
+    }
+    entry.as_array_mut().expect("guaranteed array")
+}
+
+fn items_from_val(val: &Value) -> Vec<Value> {
+    match val {
+        Value::Array(arr) => arr.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// Applies Mixpanel People and Amplitude Identify profile operators in deterministic arrival order (`Gap 1`).
+pub fn apply_profile_ops(
+    props: &mut BTreeMap<String, Value>,
+    total_revenue: &mut f64,
+    payload: &Value,
+) -> ProfileOpOutcome {
+    let mut outcome = ProfileOpOutcome::default();
+
+    let Some(obj) = payload.as_object() else {
+        return outcome;
+    };
+
+    const META_KEYS: &[&str] = &[
+        "distinct_id",
+        "$distinct_id",
+        "user_id",
+        "$user_id",
+        "anon_id",
+        "anonymous_id",
+        "group_type",
+        "$group_key",
+        "group_id",
+        "$group_id",
+        "routing_seed",
+        "$token",
+        "$ip",
+        "$time",
+        "project_id",
+    ];
+
+    let mut handled_any_op = false;
+
+    let mut apply_op = |op_name: &str, op_val: &Value| {
+        handled_any_op = true;
+        match op_name {
+            "$clearAll" | "clear_all" => {
+                if op_val.as_bool().unwrap_or(true) {
+                    props.clear();
+                    *total_revenue = 0.0;
+                    outcome.modified = true;
+                }
+            }
+            "$delete_user" | "delete_user" => {
+                if !matches!(op_val, Value::Bool(false) | Value::Null) {
+                    outcome.delete_requested = true;
+                }
+            }
+            "$set" | "set" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        props.insert(k.clone(), v.clone());
+                        outcome.modified = true;
+                    }
+                }
+            }
+            "$setOnce" | "$set_once" | "set_once" | "setOnce" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        if !props.contains_key(k) {
+                            props.insert(k.clone(), v.clone());
+                            outcome.modified = true;
+                        }
+                    }
+                }
+            }
+            "$unset" | "unset" => match op_val {
+                Value::Array(keys) => {
+                    for k in keys.iter().filter_map(|v| v.as_str()) {
+                        if props.remove(k).is_some() {
+                            outcome.modified = true;
+                        }
+                    }
+                }
+                Value::Object(m) => {
+                    for k in m.keys() {
+                        if props.remove(k).is_some() {
+                            outcome.modified = true;
+                        }
+                    }
+                }
+                Value::String(k) => {
+                    if props.remove(k).is_some() {
+                        outcome.modified = true;
+                    }
+                }
+                _ => {}
+            },
+            "$add" | "increment" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        if let Some(delta) = v.as_f64() {
+                            let cur = props.get(k).and_then(|c| c.as_f64()).unwrap_or(0.0);
+                            let next = cur + delta;
+                            if next.fract() == 0.0
+                                && v.is_i64()
+                                && props.get(k).is_none_or(|c| c.is_i64())
+                                && next >= (i64::MIN as f64)
+                                && next <= (i64::MAX as f64)
+                            {
+                                props.insert(k.clone(), Value::from(next as i64));
+                            } else {
+                                props.insert(k.clone(), Value::from(next));
+                            }
+                            outcome.modified = true;
+                        }
+                    }
+                }
+            }
+            "$append" | "append" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let arr = ensure_array_mut(props, k);
+                        arr.push(v.clone());
+                        outcome.modified = true;
+                    }
+                }
+            }
+            "$prepend" | "prepend" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let items = items_from_val(v);
+                        let arr = ensure_array_mut(props, k);
+                        for (idx, it) in items.into_iter().enumerate() {
+                            arr.insert(idx, it);
+                        }
+                        outcome.modified = true;
+                    }
+                }
+            }
+            "$union" | "union" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let items = items_from_val(v);
+                        let arr = ensure_array_mut(props, k);
+                        for it in items {
+                            if !arr.contains(&it) {
+                                arr.push(it);
+                                outcome.modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            "$preInsert" | "preInsert" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let items = items_from_val(v);
+                        let arr = ensure_array_mut(props, k);
+                        for it in items.into_iter().rev() {
+                            if !arr.contains(&it) {
+                                arr.insert(0, it);
+                                outcome.modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            "$postInsert" | "postInsert" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let items = items_from_val(v);
+                        let arr = ensure_array_mut(props, k);
+                        for it in items {
+                            if !arr.contains(&it) {
+                                arr.push(it);
+                                outcome.modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            "$remove" | "remove" => {
+                if let Some(m) = op_val.as_object() {
+                    for (k, v) in m {
+                        let items = items_from_val(v);
+                        if let Some(Value::Array(arr)) = props.get_mut(k) {
+                            let prev = arr.len();
+                            arr.retain(|existing| !items.contains(existing));
+                            if arr.len() != prev {
+                                outcome.modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            "$track_charge" | "track_charge" => {
+                let charges = items_from_val(op_val);
+                for ch in charges {
+                    if let Some(amt) = ch
+                        .get("$amount")
+                        .or_else(|| ch.get("amount"))
+                        .and_then(|v| v.as_f64())
+                    {
+                        *total_revenue += amt;
+                        props.insert("$total_revenue".to_string(), Value::from(*total_revenue));
+                        let txns = ensure_array_mut(props, "$transactions");
+                        txns.push(ch);
+                        outcome.modified = true;
+                    }
+                }
+            }
+            "$clear_charges" | "clear_charges" => {
+                if !matches!(op_val, Value::Bool(false)) {
+                    *total_revenue = 0.0;
+                    props.remove("$total_revenue");
+                    props.remove("$transactions");
+                    outcome.modified = true;
+                }
+            }
+            _ => {
+                handled_any_op = false;
+            }
+        }
+    };
+
+    const OP_ORDER: &[&str] = &[
+        "$clearAll",
+        "clear_all",
+        "$set",
+        "set",
+        "$setOnce",
+        "$set_once",
+        "set_once",
+        "setOnce",
+        "$add",
+        "increment",
+        "$append",
+        "append",
+        "$prepend",
+        "prepend",
+        "$union",
+        "union",
+        "$preInsert",
+        "preInsert",
+        "$postInsert",
+        "postInsert",
+        "$remove",
+        "remove",
+        "$unset",
+        "unset",
+        "$track_charge",
+        "track_charge",
+        "$clear_charges",
+        "clear_charges",
+        "$delete_user",
+        "delete_user",
+    ];
+
+    for key in OP_ORDER {
+        if let Some(val) = obj.get(*key) {
+            apply_op(key, val);
+        }
+    }
+
+    if let Some(ops_val) = obj.get("operations").or_else(|| obj.get("ops")) {
+        if let Some(arr) = ops_val.as_array() {
+            for step in arr {
+                let sub = apply_profile_ops(props, total_revenue, step);
+                outcome.modified |= sub.modified;
+                outcome.delete_requested |= sub.delete_requested;
+            }
+            handled_any_op = true;
+        } else if ops_val.is_object() {
+            let sub = apply_profile_ops(props, total_revenue, ops_val);
+            outcome.modified |= sub.modified;
+            outcome.delete_requested |= sub.delete_requested;
+            handled_any_op = true;
+        }
+    }
+
+    if let Some(up) = obj.get("user_properties").and_then(|v| v.as_object()) {
+        for (k, v) in up {
+            props.insert(k.clone(), v.clone());
+            outcome.modified = true;
+        }
+        handled_any_op = true;
+    }
+
+    if !handled_any_op {
+        for (k, v) in obj {
+            if !META_KEYS.contains(&k.as_str()) {
+                props.insert(k.clone(), v.clone());
+                outcome.modified = true;
+            }
+        }
+    }
+
+    outcome
+}
+
+#[cfg(test)]
+mod profile_op_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gap1_all_profile_operators_apply_cleanly() {
+        let mut props = BTreeMap::new();
+        let mut rev = 0.0;
+
+        let out1 = apply_profile_ops(
+            &mut props,
+            &mut rev,
+            &json!({
+                "$set": { "plan": "pro", "city": "Bengaluru" },
+                "$setOnce": { "plan": "free", "initial_utm_source": "google" },
+                "$add": { "logins": 3 },
+                "$append": { "tags": "vip" },
+                "$prepend": { "tags": "kyc_done" },
+                "$union": { "tags": ["vip", "early"] },
+                "$preInsert": { "tags": ["first", "vip"] },
+                "$postInsert": { "tags": ["last", "first"] },
+                "$remove": { "tags": "kyc_done" },
+                "$track_charge": { "$amount": 499.0, "plan": "pro" }
+            }),
+        );
+        assert!(out1.modified && !out1.delete_requested);
+        assert_eq!(props["plan"], json!("pro"));
+        assert_eq!(props["initial_utm_source"], json!("google"));
+        assert_eq!(props["logins"], json!(3));
+        assert_eq!(props["tags"], json!(["first", "vip", "early", "last"]));
+        assert_eq!(rev, 499.0);
+
+        let out2 = apply_profile_ops(
+            &mut props,
+            &mut rev,
+            &json!({
+                "$unset": ["city"],
+                "$clear_charges": true,
+                "$delete_user": true
+            }),
+        );
+        assert!(out2.modified && out2.delete_requested);
+        assert!(!props.contains_key("city"));
+        assert_eq!(rev, 0.0);
+    }
 }

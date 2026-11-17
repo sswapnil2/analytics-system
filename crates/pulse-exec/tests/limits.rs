@@ -901,3 +901,318 @@ async fn p3_02_per_query_deadline_enforces_timeout() {
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn pr1_funnel_drop_off_prioritizes_recorded_sessions() {
+    use pulse_wire::{InteractionKind, NodeKind, ReplayChunk, WireNode, WireframeOp};
+
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    // Record session for only the 26th dropped user (`u_025`), after 25 unrecorded dropped users (`u_000..u_024`)
+    storage
+        .append_replay_chunk(&ReplayChunk {
+            project_id: "proj_pr1".to_string(),
+            session_id: "sess_rec_025".to_string(),
+            chunk_start_ts_ms: ts,
+            ops: vec![
+                WireframeOp::FullSnapshot {
+                    width: 390,
+                    height: 844,
+                    nodes: vec![WireNode {
+                        node_id: 1,
+                        parent_id: 0,
+                        kind: NodeKind::Screen,
+                        x: 0,
+                        y: 0,
+                        w: 390,
+                        h: 844,
+                        bg_rgba: 0x090D_16FF,
+                        masked_label: "Checkout".to_string(),
+                    }],
+                },
+                WireframeOp::PointerInteraction {
+                    ts_offset_ms: 400,
+                    x: 100,
+                    y: 200,
+                    kind: InteractionKind::RageTap { count: 3 },
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    let mut batch = Vec::new();
+    for u in 0..30u64 {
+        let uid = format!("u_{u:03}");
+        let sid = if u == 25 {
+            "sess_rec_025".to_string()
+        } else {
+            format!("sess_unrec_{u:03}")
+        };
+        batch.push(ev(
+            u + 1,
+            &uid,
+            &sid,
+            "Step_A",
+            ts + (u as i64) * 100,
+            Vec::new(),
+        ));
+    }
+    ingest
+        .ingest_for_project("proj_pr1", WireBatch::new(batch), ts + 10_000)
+        .await
+        .unwrap();
+
+    let res = qengine
+        .query_funnel(
+            "proj_pr1",
+            &FunnelQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ts - 1_000,
+                    end_ts_ms: ts + 10_000,
+                },
+                steps: vec![
+                    FunnelStepSpec {
+                        event_name: "Step_A".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                    FunnelStepSpec {
+                        event_name: "Step_B".into(),
+                        filters: Vec::new(),
+                        first_time_ever: false,
+                    },
+                ],
+                order_mode: FunnelOrderMode::LooseOrder,
+                conversion_window_ms: 60_000,
+                exclusions: Vec::new(),
+                hold_constant_props: Vec::new(),
+                breakdown_by: None,
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let step1_samples: Vec<_> = res
+        .dropped_sample_sessions
+        .iter()
+        .filter(|d| d.dropped_before_step == 1)
+        .collect();
+    assert!(!step1_samples.is_empty());
+    assert!(
+        step1_samples[0].has_replay && step1_samples[0].session_id == "sess_rec_025",
+        "recorded session must appear first in dropped samples even after 25 unrecorded drops: {step1_samples:?}"
+    );
+
+    id_router.close_all().await.unwrap();
+}
+
+#[test]
+fn pr8_en4_flexible_query_enums_and_readable_errors() {
+    let insights_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "interval": "Hour",
+        "series": [
+            { "label": "Total", "event_name": "App_Open", "metric": "total_events" },
+            { "label": "Unique", "event_name": "App_Open", "metric": "Unique_Users" },
+            { "label": "Revenue", "event_name": "Paid", "metric": { "type": "Prop_Sum", "prop": "amount" } }
+        ]
+    });
+    let iq: InsightsQuery =
+        serde_json::from_value(insights_json).expect("flexible InsightsQuery deserialization");
+    assert_eq!(iq.interval, TimeInterval::Hour);
+    assert_eq!(iq.series[0].metric, InsightsMetric::Totals);
+    assert_eq!(iq.series[1].metric, InsightsMetric::Uniques);
+    assert_eq!(
+        iq.series[2].metric,
+        InsightsMetric::PropSum {
+            prop: "amount".into()
+        }
+    );
+
+    let funnel_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "steps": [{ "event_name": "Step_A" }, { "event_name": "Step_B" }],
+        "order_mode": "Strict_Order",
+        "conversion_window_ms": 60_000
+    });
+    let fq: FunnelQuery =
+        serde_json::from_value(funnel_json).expect("flexible FunnelQuery deserialization");
+    assert_eq!(fq.order_mode, FunnelOrderMode::StrictOrder);
+
+    let ret_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "start_event": "App_Open",
+        "return_event": "App_Open",
+        "mode": "stickiness",
+        "unit": "Weekly",
+        "num_periods": 7
+    });
+    let rq: RetentionQuery =
+        serde_json::from_value(ret_json).expect("flexible RetentionQuery deserialization");
+    assert_eq!(rq.mode, RetentionMode::FrequencyStickiness);
+    assert_eq!(rq.unit, TimeInterval::Week);
+
+    let flows_json = serde_json::json!({
+        "time_range": { "start_ts_ms": 1_760_000_000_000i64, "end_ts_ms": 1_760_086_400_000i64 },
+        "anchor_event": "Checkout",
+        "direction": "backward",
+        "steps": 3,
+        "top_n_per_step": 5
+    });
+    let flq: FlowsQuery =
+        serde_json::from_value(flows_json).expect("flexible FlowsQuery deserialization");
+    assert_eq!(flq.direction, FlowDirection::Reverse);
+
+    let bad_interval = serde_json::json!({
+        "time_range": { "start_ts_ms": 1, "end_ts_ms": 2 },
+        "interval": "Year",
+        "series": []
+    });
+    let err = serde_json::from_value::<InsightsQuery>(bad_interval).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid interval 'Year': expected hour, day, week, or month"),
+        "unexpected error message: {msg}"
+    );
+    assert!(!msg.contains("TimeInterval"), "leaked Rust enum: {msg}");
+}
+
+#[tokio::test]
+async fn pr10_flows_hides_system_events_unless_anchored() {
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    let mut batch = Vec::new();
+    for u in 0..5u64 {
+        let uid = format!("flow_u_{u}");
+        let sid = format!("flow_s_{u}");
+        batch.push(ev(
+            u * 3 + 1,
+            &uid,
+            &sid,
+            "App_Open",
+            ts + 1_000,
+            Vec::new(),
+        ));
+        batch.push(ev(
+            u * 3 + 2,
+            &uid,
+            &sid,
+            "$experiment_started",
+            ts + 2_000,
+            Vec::new(),
+        ));
+        batch.push(ev(
+            u * 3 + 3,
+            &uid,
+            &sid,
+            "Checkout",
+            ts + 3_000,
+            Vec::new(),
+        ));
+    }
+    ingest
+        .ingest_for_project("proj_pr10", WireBatch::new(batch), ts + 10_000)
+        .await
+        .unwrap();
+
+    let range = TimeRange {
+        start_ts_ms: ts,
+        end_ts_ms: ts + 10_000,
+    };
+
+    let product_flows = qengine
+        .query_flows(
+            "proj_pr10",
+            &FlowsQuery {
+                time_range: range,
+                anchor_event: "App_Open".to_string(),
+                direction: FlowDirection::Forward,
+                steps: 3,
+                top_n_per_step: Some(10),
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !product_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name.starts_with('$') && n.event_name != "$Drop_Off"),
+        "system $-prefixed events must not clutter user journeys anchored on App_Open: {:?}",
+        product_flows.nodes
+    );
+    assert!(
+        product_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name == "Checkout" && n.step_offset == 1),
+        "Checkout should advance directly to step +1 once system event is excluded: {:?}",
+        product_flows.nodes
+    );
+
+    let exp_flows = qengine
+        .query_flows(
+            "proj_pr10",
+            &FlowsQuery {
+                time_range: range,
+                anchor_event: "$experiment_started".to_string(),
+                direction: FlowDirection::Forward,
+                steps: 2,
+                top_n_per_step: Some(10),
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        exp_flows
+            .nodes
+            .iter()
+            .any(|n| n.event_name == "$experiment_started" && n.step_offset == 0),
+        "anchoring directly on a $ system event must still include it: {:?}",
+        exp_flows.nodes
+    );
+
+    id_router.close_all().await.unwrap();
+}

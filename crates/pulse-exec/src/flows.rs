@@ -9,7 +9,7 @@ use crate::ast::{FlowDirection, FlowLink, FlowNode, FlowsQuery, FlowsResult};
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks, resolve_event_target, resolve_global_cohort_bitmap,
+    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
     row_matches_predicates, ExecError, Result,
 };
 
@@ -59,7 +59,7 @@ impl FlowsEngine {
             .collect();
         props_needed.extend(anchor_tgt.required_props());
 
-        let chunks = load_project_chunks(
+        let chunks = load_project_chunks_with_id(
             ps,
             snap,
             cache,
@@ -67,11 +67,17 @@ impl FlowsEngine {
             Some(query.time_range),
             &props_needed,
             None,
+            Some(id_snap),
         )
         .await?;
 
-        // Map `event_id -> event_name` once
+        // Map `event_id -> event_name` once and identify `$`-prefixed system events (`PR-10`)
         let id_to_name: HashMap<u16, String> = dict.all_events().into_iter().collect();
+        let include_system_events = query.anchor_event.starts_with('$');
+        let system_eids: HashSet<u16> = id_to_name
+            .iter()
+            .filter_map(|(&eid, name)| name.starts_with('$').then_some(eid))
+            .collect();
 
         // Collect chronological `(ts_ms, event_id, is_anchor)` per canonical user with resource bounds (`P3-02`)
         let mut timelines: HashMap<u32, Vec<(i64, u16, bool)>> = HashMap::new();
@@ -94,18 +100,21 @@ impl FlowsEngine {
                     continue;
                 }
 
+                let eid = ta.event_id[r];
+                let is_anchor = anchor_tgt.matches_id(eid)
+                    && anchor_tgt.extra_filter.as_ref().is_none_or(|ef| {
+                        row_matches_predicates(chunk, r, std::slice::from_ref(ef))
+                    });
+                if !include_system_events && !is_anchor && system_eids.contains(&eid) {
+                    continue;
+                }
+
                 total_collected += 1;
                 if total_collected > MAX_FLOWS_SCANNED_EVENTS {
                     return Err(ExecError::InvalidQuery(format!(
                         "flows query exceeded maximum scanned event budget ({MAX_FLOWS_SCANNED_EVENTS}); narrow time_range or add global_filter"
                     )));
                 }
-
-                let eid = ta.event_id[r];
-                let is_anchor = anchor_tgt.matches_id(eid)
-                    && anchor_tgt.extra_filter.as_ref().is_none_or(|ef| {
-                        row_matches_predicates(chunk, r, std::slice::from_ref(ef))
-                    });
 
                 let user_tl = timelines.entry(canon_uid).or_default();
                 if user_tl.len() < MAX_FLOWS_EVENTS_PER_USER || is_anchor {

@@ -91,6 +91,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.8"
 sha2 = "0.10.9"
+argon2 = "0.5"
+base64 = "0.22"
 hex = "0.4.3"
 constant_time_eq = "0.4.2"
 chrono-tz = "0.10.4"
@@ -99,6 +101,13 @@ tempfile = "3.12"
 
 # FFI
 uniffi = { version = "0.28.3", features = ["tokio"] }
+
+# Argon2 is unusably slow unoptimized; keep debug builds/tests fast.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

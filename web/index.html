@@ -1,12 +1,19 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Pulse Analytics — Product Analytics &amp; Wireframe Session Intelligence</title>
+    <meta name="color-scheme" content="light dark" />
+    <title>Pulse</title>
+    <script>
+      // Apply a saved theme before first paint to avoid a flash.
+      try {
+        var t = localStorage.getItem("pulse_theme");
+        if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
   </head>
-  <body class="bg-[#090d16] text-slate-100 antialiased selection:bg-blue-500/30">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
-</html>

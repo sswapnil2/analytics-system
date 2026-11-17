@@ -1,10 +1,13 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use dashmap::DashSet;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as OsError, ObjectStore, PutMode, PutOptions, PutPayload};
 use pulse_wire::ReplayChunk;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Result, StorageError};
 
@@ -51,11 +54,80 @@ fn parse_chunk_seq(path: &str) -> Option<u64> {
 /// conditional `PutMode::Create`, and avoids UTC midnight file splits across process restarts.
 pub struct ReplayStore {
     object_store: Arc<dyn ObjectStore>,
+    recorded_sessions: DashSet<(String, String)>,
+    recorded_hashes: DashSet<(String, u64)>,
+    warmed_projects: DashSet<String>,
 }
 
 impl ReplayStore {
     pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
-        Self { object_store }
+        Self {
+            object_store,
+            recorded_sessions: DashSet::new(),
+            recorded_hashes: DashSet::new(),
+            warmed_projects: DashSet::new(),
+        }
+    }
+
+    fn index_session(&self, project_id: &str, session_id: &str) {
+        self.recorded_sessions
+            .insert((project_id.to_string(), session_id.to_string()));
+        self.recorded_hashes
+            .insert((project_id.to_string(), xxh3_64(session_id.as_bytes())));
+    }
+
+    /// Scans `replays/{project_id}/` once to populate the in-memory recorded-session index (`PR-1`).
+    pub async fn warm_project(&self, project_id: &str) {
+        if self.warmed_projects.contains(project_id) {
+            return;
+        }
+        if validate_replay_identifier("project_id", project_id).is_err() {
+            return;
+        }
+        let prefix = ObjectPath::from(format!("replays/{project_id}/"));
+        if let Ok(mut stream) = self
+            .object_store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            for m in stream.drain(..) {
+                let mut parts = m.location.parts();
+                let _p0 = parts.next(); // "replays"
+                let _p1 = parts.next(); // project_id
+                if let Some(sess_part) = parts.next() {
+                    let sid = sess_part.as_ref();
+                    if !sid.is_empty() {
+                        self.index_session(project_id, sid);
+                    }
+                }
+            }
+            self.warmed_projects.insert(project_id.to_string());
+        }
+    }
+
+    /// Returns the set of `xxh3_64(session_id)` hashes that currently have a recorded replay (`PR-1`).
+    pub async fn recorded_hashes_for_project(&self, project_id: &str) -> HashSet<u64> {
+        self.warm_project(project_id).await;
+        self.recorded_hashes
+            .iter()
+            .filter_map(|entry| (entry.0 == project_id).then_some(entry.1))
+            .collect()
+    }
+
+    /// Returns `true` if `session_id` has at least one `.plsr` replay chunk in `project_id` (`PR-1`).
+    pub async fn has_session(&self, project_id: &str, session_id: &str) -> bool {
+        let key = (project_id.to_string(), session_id.to_string());
+        if self.recorded_sessions.contains(&key) {
+            return true;
+        }
+        match self.total_session_bytes(project_id, session_id).await {
+            Ok(Some(bytes)) if bytes > 0 => {
+                self.index_session(project_id, session_id);
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn list_session_chunks(
@@ -113,6 +185,7 @@ impl ReplayStore {
                 .await
             {
                 Ok(_) => {
+                    self.index_session(&chunk.project_id, &chunk.session_id);
                     return Ok(ReplayAppendResult {
                         object_path: rel_path,
                         byte_offset,
@@ -220,5 +293,26 @@ impl ReplayStore {
             cursor = chunk_end;
         }
         Ok(out)
+    }
+
+    /// Deletes all `.plsr` replay chunks belonging to `session_id` under `project_id` (`Gap 4`).
+    pub async fn delete_session(&self, project_id: &str, session_id: &str) -> Result<bool> {
+        let chunks = self.list_session_chunks(project_id, session_id).await?;
+        let had_any = !chunks.is_empty();
+        for c in chunks {
+            let _ = self.object_store.delete(&c.location).await;
+        }
+        self.recorded_sessions
+            .remove(&(project_id.to_string(), session_id.to_string()));
+        let target_hash = xxh3_64(session_id.as_bytes());
+        let still_colliding = self
+            .recorded_sessions
+            .iter()
+            .any(|e| e.0 == project_id && xxh3_64(e.1.as_bytes()) == target_hash);
+        if !still_colliding {
+            self.recorded_hashes
+                .remove(&(project_id.to_string(), target_hash));
+        }
+        Ok(had_any)
     }
 }

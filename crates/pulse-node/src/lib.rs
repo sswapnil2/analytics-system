@@ -96,7 +96,11 @@ impl Default for NodeConfig {
                 .filter(|s| !s.trim().is_empty()),
             allowed_origins,
             auto_seed: seed_enabled,
-            num_buckets: DEFAULT_NUM_BUCKETS,
+            num_buckets: std::env::var("PULSE_NUM_BUCKETS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .map(|n| n.clamp(1, 256))
+                .unwrap_or(DEFAULT_NUM_BUCKETS),
         }
     }
 }
@@ -360,6 +364,12 @@ mod tests {
             .unwrap();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+        // Pick a deterministic phone ID enrolled in the 50% `one_tap_upi_mandate` rollout
+        let sdk_user_id = (0..32)
+            .map(|i| format!("+9199000999{i:02}"))
+            .find(|id| pulse_wire::flag_rollout_slot("one_tap_upi_mandate", id) < 5_000)
+            .expect("deterministic phone id inside 50% rollout");
+
         // 2. Offline SDK phase using the freshly minted random `pk_live_...` key
         {
             let offline_sdk = PulseClient::new(SdkConfig {
@@ -416,7 +426,7 @@ mod tests {
                     r#"{"amount": 2499, "city": "Bengaluru"}"#.into(),
                 )
                 .unwrap();
-            offline_sdk.identify("+919900099999".into()).unwrap();
+            offline_sdk.identify(sdk_user_id.clone()).unwrap();
             offline_sdk
                 .track(
                     "SDK_Order_Completed".into(),
@@ -470,15 +480,18 @@ mod tests {
         );
 
         // Verify SDK wireframe replay stored masked PAN (`ZZZZZ9999Z` must NEVER appear!)
-        let replay_resp: Value = http
+        let replay_http = http
             .get(format!("{base_url}/v1/replay/{sdk_session_id}"))
             .bearer_auth(&admin_token)
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
             .unwrap();
+        assert_eq!(
+            replay_http.status(),
+            reqwest::StatusCode::OK,
+            "expected HTTP 200 for /v1/replay/{sdk_session_id}"
+        );
+        let replay_resp: Value = replay_http.json().await.unwrap();
         let replay_text = replay_resp.to_string();
         assert!(!replay_text.contains("ZZZZZ9999Z"));
         assert!(replay_text.contains("████"));
@@ -504,12 +517,12 @@ mod tests {
             .json(&json!({
                 "events": [
                     {
-                        "distinct_id": "+919900099999",
+                        "distinct_id": &sdk_user_id,
                         "event_name": "Noisy_Debug_Spam",
                         "client_event_ts_ms": chrono::Utc::now().timestamp_millis()
                     },
                     {
-                        "distinct_id": "+919900099999",
+                        "distinct_id": &sdk_user_id,
                         "event_name": "Valid_Post_Lexicon_Event",
                         "client_event_ts_ms": chrono::Utc::now().timestamp_millis()
                     }
