@@ -323,7 +323,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
           <Panel title="Reference data">
             <div className="space-y-3">
               <p className="text-sm text-muted">
-                Upload a CSV to add columns like merchant category to your events, matched on a shared key.
+                Upload a CSV to add columns like plan tier to your events, matched on a shared key.
               </p>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div className="space-y-1">

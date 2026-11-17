@@ -1744,6 +1744,9 @@ fn session_query_from_params(params: &HashMap<String, String>) -> SessionSearchQ
             .get("errors")
             .or_else(|| params.get("only_errors"))
             .is_some_and(|v| v == "true" || v == "1"),
+        only_with_replay: params
+            .get("only_with_replay")
+            .is_some_and(|v| v == "true" || v == "1"),
         limit: params.get("limit").and_then(|s| s.parse().ok()),
     }
 }

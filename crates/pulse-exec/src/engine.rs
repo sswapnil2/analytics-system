@@ -535,6 +535,17 @@ impl QueryEngine {
             if query.only_errors {
                 required_flags |= SESSION_FLAG_ERROR;
             }
+            // Recorded sessions by session-id hash, the same check funnels use for drop-off replays.
+            let recorded = if query.only_with_replay {
+                Some(self.storage.replay_store().recorded_hashes_for_project(project_id).await)
+            } else {
+                None
+            };
+            let is_recorded = |sid: &str| {
+                recorded
+                    .as_ref()
+                    .is_none_or(|h| h.contains(&xxhash_rust::xxh3::xxh3_64(sid.as_bytes())))
+            };
 
             let target = query
                 .event_name
@@ -587,7 +598,7 @@ impl QueryEngine {
                 for &(_, eid, _) in &evs {
                     bloom |= SessionHeader::event_bit(eid);
                 }
-                if (flags & required_flags) != required_flags {
+                if (flags & required_flags) != required_flags || !is_recorded(&session_id) {
                     sessions_pruned_by_bloom += 1;
                     continue;
                 }
@@ -722,6 +733,9 @@ impl QueryEngine {
                                 break;
                             }
                         }
+                    }
+                    if !is_recorded(sidx.session_id(&hdr)) {
+                        continue;
                     }
                     if let Some(tgt) = &target {
                         let actually_has = (r_start..r_end).any(|r| tgt.matches_id(ta.event_id[r]));

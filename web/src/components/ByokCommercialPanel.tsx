@@ -20,6 +20,7 @@ import {
 } from "../api/client";
 import {
   ErrorNotice,
+  PageHeader,
   Panel,
   Spinner,
   btn,
@@ -319,6 +320,10 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
 
   return (
     <div className="space-y-6">
+      <PageHeader
+        title="Enterprise and security"
+        description="Encryption at rest, licence, your own AI provider keys, and the audit log."
+      />
       {/* 1. Open-Source Cluster Encryption at Rest */}
       <Panel
         title="Cluster Encryption at Rest (AES-256-GCM)"

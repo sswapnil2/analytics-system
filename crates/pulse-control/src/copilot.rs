@@ -370,6 +370,7 @@ pub async fn run_byok_copilot(
                 only_rage_tap: false,
                 only_dead_tap: false,
                 only_errors: true,
+                only_with_replay: false,
                 limit: Some(5),
             },
         )

@@ -39,66 +39,67 @@
   --info-soft: 230 232 248;
 }
 
-/* Dark values are repeated in the media query below; CSS cannot share them. */
+/* Dark matches the homepage: neutral near-black, zinc text, lime accent.
+   Values are repeated in the media query below; CSS cannot share them. */
 :root[data-theme="dark"] {
   color-scheme: dark;
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgb(150%2C163%2C157)' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  --canvas: 15 21 19;
-  --panel: 22 29 26;
-  --sunken: 18 24 22;
-  --field: 26 34 31;
-  --hover: 32 42 38;
-  --line: 40 51 46;
-  --line-strong: 58 72 66;
-  --ink: 232 237 234;
-  --ink-2: 200 209 204;
-  --muted: 150 163 157;
-  --faint: 124 137 131;
-  --brand: 52 184 160;
-  --brand-hover: 84 200 178;
-  --brand-soft: 20 50 44;
-  --on-brand: 6 26 22;
-  --danger: 240 128 74;
-  --danger-soft: 60 30 18;
+  --canvas: 9 9 11;
+  --panel: 14 14 17;
+  --sunken: 11 11 14;
+  --field: 20 20 24;
+  --hover: 28 28 33;
+  --line: 31 31 37;
+  --line-strong: 52 52 60;
+  --ink: 237 237 239;
+  --ink-2: 212 212 216;
+  --muted: 161 161 170;
+  --faint: 138 138 147;
+  --brand: 200 240 74;
+  --brand-hover: 214 245 122;
+  --brand-soft: 38 46 18;
+  --on-brand: 9 9 11;
+  --danger: 244 162 97;
+  --danger-soft: 58 36 20;
   --destructive: 248 113 102;
   --destructive-soft: 66 24 22;
   --warn: 230 178 80;
   --warn-soft: 52 40 16;
-  --ok: 52 184 160;
-  --ok-soft: 20 50 44;
-  --info: 150 160 240;
-  --info-soft: 32 36 70;
+  --ok: 200 240 74;
+  --ok-soft: 38 46 18;
+  --info: 110 123 255;
+  --info-soft: 28 30 64;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgb(150%2C163%2C157)' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    --canvas: 15 21 19;
-    --panel: 22 29 26;
-    --sunken: 18 24 22;
-    --field: 26 34 31;
-    --hover: 32 42 38;
-    --line: 40 51 46;
-    --line-strong: 58 72 66;
-    --ink: 232 237 234;
-    --ink-2: 200 209 204;
-    --muted: 150 163 157;
-    --faint: 124 137 131;
-    --brand: 52 184 160;
-    --brand-hover: 84 200 178;
-    --brand-soft: 20 50 44;
-    --on-brand: 6 26 22;
-    --danger: 240 128 74;
-    --danger-soft: 60 30 18;
+    --canvas: 9 9 11;
+    --panel: 14 14 17;
+    --sunken: 11 11 14;
+    --field: 20 20 24;
+    --hover: 28 28 33;
+    --line: 31 31 37;
+    --line-strong: 52 52 60;
+    --ink: 237 237 239;
+    --ink-2: 212 212 216;
+    --muted: 161 161 170;
+    --faint: 138 138 147;
+    --brand: 200 240 74;
+    --brand-hover: 214 245 122;
+    --brand-soft: 38 46 18;
+    --on-brand: 9 9 11;
+    --danger: 244 162 97;
+    --danger-soft: 58 36 20;
     --destructive: 248 113 102;
     --destructive-soft: 66 24 22;
     --warn: 230 178 80;
     --warn-soft: 52 40 16;
-    --ok: 52 184 160;
-    --ok-soft: 20 50 44;
-    --info: 150 160 240;
-    --info-soft: 32 36 70;
+    --ok: 200 240 74;
+    --ok-soft: 38 46 18;
+    --info: 110 123 255;
+    --info-soft: 28 30 64;
   }
 }
 
