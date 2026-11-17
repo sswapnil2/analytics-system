@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, CtrlError};
-use crate::models::{sha256_bytes, sha256_hex, User};
+use crate::models::{sha256_bytes, sha256_hex, Role, User};
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const GOOGLE_STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -122,7 +122,7 @@ impl ControlPlaneService {
         email: &str,
         setup_code: Option<&str>,
         org_name: Option<&str>,
-    ) -> Result<Option<SignupOrg>, CtrlError> {
+    ) -> Result<Option<(SignupOrg, bool)>, CtrlError> {
         let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
         let (domain_ok, allow_new_orgs) = {
             let cfg = self.auth_cfg.read();
@@ -140,20 +140,35 @@ impl ControlPlaneService {
                 .is_some_and(|c| {
                     constant_time_eq::constant_time_eq(&sha256_bytes(c), &self.root_admin_hash)
                 });
-            return Ok((domain_ok || code_ok).then_some(SignupOrg::Default));
+            // The setup code proves the caller runs the node, so that account needs no email check.
+            return Ok((domain_ok || code_ok).then_some((SignupOrg::Default, code_ok)));
         }
         let org_name = org_name.map(str::trim).filter(|n| !n.is_empty());
         Ok(match org_name {
-            Some(name) if allow_new_orgs => Some(SignupOrg::New(name.chars().take(80).collect())),
-            _ if domain_ok => Some(SignupOrg::Default),
+            Some(name) if allow_new_orgs => {
+                Some((SignupOrg::New(name.chars().take(80).collect()), false))
+            }
+            _ if domain_ok => Some((SignupOrg::Default, false)),
             _ => None,
         })
     }
 
-    /// Resolves `SignupOrg` to an org id, creating the org and its first project when it's new.
-    async fn org_for_signup(&self, org: SignupOrg) -> Result<String, CtrlError> {
-        match org {
-            SignupOrg::Default => Ok("org_default".to_string()),
+    /// Puts an existing account (inserted first, in `PENDING_ORG`) into its sign-up organisation.
+    /// A new organisation is created only now, after the account row exists, so a sign-up that
+    /// loses a race on its email never leaves an empty organisation behind. Whoever creates an
+    /// org owns it; the first account in the default org owns it; later ones are members.
+    pub(super) async fn assign_org(&self, user_id: &str, org: SignupOrg) -> Result<(String, Role), CtrlError> {
+        let (org_id, role) = match org {
+            SignupOrg::Default => {
+                let empty = self
+                    .meta
+                    .list_org_users("org_default")
+                    .await
+                    .map_err(CtrlError::meta)?
+                    .is_empty();
+                let role = if empty { Role::Owner } else { Role::Member };
+                ("org_default".to_string(), role)
+            }
             SignupOrg::New(name) => {
                 let id = format!("org_{}", &Uuid::new_v4().simple().to_string()[..12]);
                 self.meta
@@ -161,28 +176,64 @@ impl ControlPlaneService {
                     .await
                     .map_err(CtrlError::meta)?;
                 self.create_project_in_org(&id, &name, None).await?;
-                Ok(id)
+                (id, Role::Owner)
             }
-        }
+        };
+        self.meta
+            .set_user_org(user_id, &org_id, role)
+            .await
+            .map_err(CtrlError::meta)?;
+        Ok((org_id, role))
     }
 
-    async fn create_session(&self, user_id: &str) -> Result<String, CtrlError> {
+    /// Inserts a new account with no organisation yet. An unverified account with the same email
+    /// is replaced: it has no session and no data, and must not let a stranger squat an address.
+    pub(super) async fn insert_pending_user(&self, mut user: User) -> Result<User, CtrlError> {
+        if let Some(old) = self
+            .meta
+            .get_user_by_email(&user.email)
+            .await
+            .map_err(CtrlError::meta)?
+            .filter(|u| u.org_id == PENDING_ORG)
+        {
+            self.meta
+                .delete_user(PENDING_ORG, &old.id)
+                .await
+                .map_err(CtrlError::meta)?;
+        }
+        user.org_id = PENDING_ORG.to_string();
+        user.role = Role::Viewer;
+        self.meta.insert_user(&user).await.map_err(CtrlError::meta)?;
+        Ok(user)
+    }
+
+    async fn create_session(&self, user_id: &str, headers: &HeaderMap) -> Result<String, CtrlError> {
         let token = format!("ps_{}", random_hex());
         let now = now_ms();
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.chars().take(256).collect::<String>());
         self.meta
-            .insert_session(&sha256_hex(&token), user_id, now, now + SESSION_TTL_MS)
+            .insert_session(&sha256_hex(&token), user_id, now, now + SESSION_TTL_MS, ua.as_deref())
             .await
             .map_err(CtrlError::meta)?;
         Ok(token)
     }
 
-    async fn session_response(&self, user: &User) -> ApiRes<Value> {
-        let token = self.create_session(&user.id).await?;
+    pub(super) async fn session_response(&self, user: &User, headers: &HeaderMap) -> ApiRes<Value> {
+        let token = self.create_session(&user.id, headers).await?;
+        self.record_enterprise_audit(&format!("user:{}", user.id), "auth.login", &format!("org:{}", user.org_id), json!({ "email": user.email }))
+            .await;
         Ok(Json(json!({ "token": token, "user": user_json(user) })))
     }
 }
 
-enum SignupOrg {
+/// Placeholder organisation for sign-ups that haven't verified their email. It has no projects.
+pub(super) const PENDING_ORG: &str = "org_pending";
+const VERIFY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+pub(super) enum SignupOrg {
     Default,
     New(String),
 }
@@ -198,17 +249,17 @@ pub(super) fn public_auth_router() -> Router<Arc<ControlPlaneService>> {
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-fn random_hex() -> String {
+pub(super) fn random_hex() -> String {
     let mut raw = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     hex::encode(raw)
 }
 
-fn user_json(u: &User) -> Value {
+pub(super) fn user_json(u: &User) -> Value {
     json!({
         "id": u.id,
         "org_id": u.org_id,
@@ -216,11 +267,12 @@ fn user_json(u: &User) -> Value {
         "name": u.name,
         "has_password": u.password_hash.is_some(),
         "has_google": u.google_sub.is_some(),
+        "role": u.role.as_str(),
     })
 }
 
 /// Lowercases and checks a basic `local@domain.tld` shape.
-fn normalize_email(raw: &str) -> Option<String> {
+pub(super) fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
     let (local, domain) = email.split_once('@')?;
     let ok = !local.is_empty()
@@ -260,7 +312,7 @@ fn take_pending(map: &DashMap<String, (String, i64)>, key: &str) -> Option<Strin
         .map(|(_, (v, _))| v)
 }
 
-fn hash_password(password: &str) -> Result<String, String> {
+pub(super) fn hash_password(password: &str) -> Result<String, String> {
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
@@ -270,7 +322,7 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn verify_password(password: &str, phc: &str) -> bool {
+pub(super) fn verify_password(password: &str, phc: &str) -> bool {
     PasswordHash::new(phc)
         .map(|h| {
             Argon2::default()
@@ -331,6 +383,7 @@ struct SignupReq {
 
 async fn handle_signup(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<SignupReq>,
 ) -> ApiRes<Value> {
     let email =
@@ -341,7 +394,7 @@ async fn handle_signup(
             "password must be between 10 and 256 characters",
         ));
     }
-    let Some(org) = ctrl
+    let Some((org, verified)) = ctrl
         .signup_org(&email, req.setup_code.as_deref(), req.org_name.as_deref())
         .await?
     else {
@@ -353,41 +406,55 @@ async fn handle_signup(
         }
         return Err(CtrlError::forbidden(SIGNUP_CLOSED));
     };
-    if ctrl
-        .meta
-        .get_user_by_email(&email)
-        .await
-        .map_err(CtrlError::meta)?
-        .is_some()
-    {
-        return Err(CtrlError::conflict(
-            "an account with this email already exists",
-        ));
-    }
 
     let password = req.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(CtrlError::internal)?
         .map_err(CtrlError::internal)?;
-    let org_id = ctrl.org_for_signup(org).await?;
-    let user = User {
-        id: format!("user_{}", Uuid::new_v4().simple()),
-        email,
-        name: req
-            .name
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty()),
-        password_hash: Some(password_hash),
-        google_sub: None,
-        created_at_ms: now_ms(),
-        org_id,
+    // The account row goes in first; the email's unique constraint settles concurrent sign-ups
+    // before any organisation is created.
+    let user = ctrl
+        .insert_pending_user(User {
+            id: format!("user_{}", Uuid::new_v4().simple()),
+            email,
+            name: req
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            password_hash: Some(password_hash),
+            google_sub: None,
+            created_at_ms: now_ms(),
+            org_id: String::new(),
+            role: Role::Viewer,
+        })
+        .await?;
+
+    if verified {
+        ctrl.assign_org(&user.id, org).await?;
+        let user = ctrl
+            .meta
+            .get_user_by_id(&user.id)
+            .await
+            .map_err(CtrlError::meta)?
+            .ok_or_else(|| CtrlError::internal("account vanished"))?;
+        return ctrl.session_response(&user, &headers).await;
+    }
+
+    // Everyone else proves the address first. Pulse has no mailer: the link goes to the node log.
+    let token = random_hex();
+    let org_name = match &org {
+        SignupOrg::New(name) => Some(name.as_str()),
+        SignupOrg::Default => None,
     };
     ctrl.meta
-        .insert_user(&user)
+        .insert_email_verification(&sha256_hex(&token), &user.id, org_name, now_ms() + VERIFY_TTL_MS)
         .await
         .map_err(CtrlError::meta)?;
-    ctrl.session_response(&user).await
+    let url = format!("{}/#/verify/{token}", ctrl.auth_cfg.read().public_url);
+    // ponytail: the log is the mailer. Add SMTP when someone needs links delivered.
+    tracing::info!(email = %user.email, "email verification link: {url}");
+    Ok(Json(json!({ "verification_required": true, "email": user.email })))
 }
 
 #[derive(Deserialize)]
@@ -398,6 +465,7 @@ struct LoginReq {
 
 async fn handle_login(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> ApiRes<Value> {
     let email = req.email.trim().to_lowercase();
@@ -433,15 +501,22 @@ async fn handle_login(
         .map_err(CtrlError::internal)?;
 
     match user {
+        Some(user) if matched && has_password && user.org_id == PENDING_ORG => {
+            Err(CtrlError::forbidden(
+                "Verify your email first with the link from sign-up. To get a new link, sign up again.",
+            ))
+        }
         Some(user) if matched && has_password => {
             failures.remove(&email);
-            ctrl.session_response(&user).await
+            ctrl.session_response(&user, &headers).await
         }
         _ => {
             if failures.len() >= MAX_PENDING_ENTRIES {
                 failures.retain(|_, ts| ts.iter().any(|t| *t > now - LOGIN_FAILURE_WINDOW_MS));
             }
-            failures.entry(email).or_default().push(now);
+            failures.entry(email.clone()).or_default().push(now);
+            ctrl.record_enterprise_audit("anonymous", "auth.login_failed", "auth", json!({ "email": email }))
+                .await;
             Err(CtrlError::unauthorized(BAD_LOGIN))
         }
     }
@@ -454,6 +529,7 @@ struct ExchangeReq {
 
 async fn handle_exchange(
     State(ctrl): State<Arc<ControlPlaneService>>,
+    headers: HeaderMap,
     Json(req): Json<ExchangeReq>,
 ) -> ApiRes<Value> {
     let invalid = || CtrlError::unauthorized("Sign-in code is invalid or expired");
@@ -464,7 +540,7 @@ async fn handle_exchange(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invalid)?;
-    ctrl.session_response(&user).await
+    ctrl.session_response(&user, &headers).await
 }
 
 pub(super) async fn handle_me(
@@ -607,6 +683,8 @@ async fn google_callback(
         .get_user_by_email(&email)
         .await
         .map_err(|_| "google_token")?
+        // An unverified password sign-up is not linked: the branch below replaces it.
+        .filter(|u| u.org_id != PENDING_ORG)
     {
         // Link by verified email, but never re-point an account already bound to another Google identity.
         if u.google_sub.is_some() {
@@ -630,7 +708,7 @@ async fn google_callback(
         else {
             return Err("signup_closed");
         };
-        let org_id = ctrl.org_for_signup(org).await.map_err(|_| "google_token")?;
+        let (org, _) = org;
         let user = User {
             id: format!("user_{}", Uuid::new_v4().simple()),
             email,
@@ -641,9 +719,12 @@ async fn google_callback(
             password_hash: None,
             google_sub: Some(sub.to_string()),
             created_at_ms: now_ms(),
-            org_id,
+            org_id: String::new(),
+            role: Role::Viewer,
         };
-        meta.insert_user(&user).await.map_err(|_| "google_token")?;
+        // Google has already verified the email, so the account joins its organisation at once.
+        let user = ctrl.insert_pending_user(user).await.map_err(|_| "google_token")?;
+        ctrl.assign_org(&user.id, org).await.map_err(|_| "google_token")?;
         user.id
     };
 

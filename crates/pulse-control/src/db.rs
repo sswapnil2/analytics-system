@@ -15,8 +15,44 @@ use crate::models::{
     AlertRule, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard, DeletionAuditRecord,
     EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord, LexiconEvent,
     LexiconProperty, LookupTableSummary, Organization, Project, SavedReport, SystemKeyringRecord,
-    User, UserProfileRecord,
+    Role, User, UserProfileRecord,
 };
+
+/// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub user_agent: Option<String>,
+    pub created_at_ms: i64,
+    pub last_seen_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrgInvite {
+    pub id: String,
+    #[serde(skip)]
+    pub org_id: String,
+    pub email: String,
+    pub role: String,
+    pub invited_by: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+/// What the auth middleware needs about a live session.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    pub user_id: String,
+    pub org_id: String,
+    pub role: Role,
+    pub last_seen_ms: i64,
+}
+
+/// Unknown role strings read as viewer, so a bad row never grants more than read access.
+fn role_of(s: &str) -> Role {
+    Role::parse(s).unwrap_or(Role::Viewer)
+}
 
 #[derive(Debug, Error)]
 pub enum MetaError {
@@ -1054,19 +1090,83 @@ impl MetaStore {
 
     // ------------------- Users & Sessions -------------------
 
+    /// Accounts with an organisation; sign-ups still waiting to verify their email don't count.
     pub async fn count_users(&self) -> Result<i64, MetaError> {
-        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM users", |r| {
+        let n = db_map_opt!(
+            self,
+            "SELECT COUNT(*) AS n FROM users WHERE org_id <> 'org_pending'",
+            |r| { r.get::<i64, _>("n") }
+        );
+        Ok(n.unwrap_or(0))
+    }
+
+    pub async fn count_orgs(&self) -> Result<i64, MetaError> {
+        let n = db_map_opt!(self, "SELECT COUNT(*) AS n FROM orgs", |r| {
             r.get::<i64, _>("n")
         });
         Ok(n.unwrap_or(0))
+    }
+
+    /// Moves an account into an organisation with a role (verifying, or accepting an invite).
+    pub async fn set_user_org(&self, user_id: &str, org_id: &str, role: Role) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET org_id = ?, role = ? WHERE id = ?",
+            org_id,
+            role.as_str(),
+            user_id,
+        );
+        Ok(())
+    }
+
+    pub async fn insert_email_verification(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        org_name: Option<&str>,
+        expires_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO email_verifications (token_hash, user_id, org_name, expires_at_ms) VALUES (?, ?, ?, ?)",
+            token_hash,
+            user_id,
+            org_name,
+            expires_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Uses a verification token once; returns its user id and the organisation name to create.
+    pub async fn take_email_verification(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<(String, Option<String>)>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT user_id, org_name FROM email_verifications
+             WHERE token_hash = ? AND used_at_ms IS NULL AND expires_at_ms > ?",
+            |r| { (r.get::<String, _>("user_id"), r.get::<Option<String>, _>("org_name")) },
+            token_hash,
+            now_ms,
+        );
+        let Some(row) = row else { return Ok(None) };
+        let n = db_exec!(
+            self,
+            "UPDATE email_verifications SET used_at_ms = ? WHERE token_hash = ? AND used_at_ms IS NULL",
+            now_ms,
+            token_hash,
+        );
+        Ok((n > 0).then_some(row))
     }
 
     /// Inserts a new user; `Conflict` when the email (or Google subject) is already taken.
     pub async fn insert_user(&self, u: &User) -> Result<(), MetaError> {
         let affected = db_exec!(
             self,
-            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms, org_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO users (id, email, name, password_hash, google_sub, created_at_ms, org_id, role)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
             &u.id,
             &u.email,
@@ -1075,6 +1175,7 @@ impl MetaStore {
             &u.google_sub,
             u.created_at_ms,
             &u.org_id,
+            u.role.as_str(),
         );
         if affected == 0 {
             return Err(MetaError::Conflict(
@@ -1091,7 +1192,7 @@ impl MetaStore {
         value: &str,
     ) -> Result<Option<User>, MetaError> {
         let sql = format!(
-            "SELECT id, email, name, password_hash, google_sub, created_at_ms, org_id FROM users WHERE {column} = ?"
+            "SELECT id, email, name, password_hash, google_sub, created_at_ms, org_id, role FROM users WHERE {column} = ?"
         );
         let user = db_map_opt!(
             self,
@@ -1105,6 +1206,7 @@ impl MetaStore {
                     google_sub: r.get("google_sub"),
                     created_at_ms: r.get("created_at_ms"),
                     org_id: r.get("org_id"),
+                    role: role_of(&r.get::<String, _>("role")),
                 }
             },
             value,
@@ -1140,35 +1242,302 @@ impl MetaStore {
         user_id: &str,
         created_at_ms: i64,
         expires_at_ms: i64,
+        user_agent: Option<&str>,
     ) -> Result<(), MetaError> {
         let _ = db_exec!(
             self,
-            "INSERT INTO user_sessions (token_hash, user_id, created_at_ms, expires_at_ms)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO user_sessions (token_hash, user_id, created_at_ms, expires_at_ms, user_agent, last_seen_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
             token_hash,
             user_id,
             created_at_ms,
+            expires_at_ms,
+            user_agent,
+            created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// The signed-in user's id, organisation and role for a live (unexpired) session whose user still exists.
+    pub async fn get_session_user(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<SessionUser>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT s.user_id AS user_id, u.org_id AS org_id, u.role AS role, s.last_seen_ms AS last_seen_ms
+             FROM user_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ? AND s.expires_at_ms > ?",
+            |r| {
+                SessionUser {
+                    user_id: r.get("user_id"),
+                    org_id: r.get("org_id"),
+                    role: role_of(&r.get::<String, _>("role")),
+                    last_seen_ms: r.get("last_seen_ms"),
+                }
+            },
+            token_hash,
+            now_ms,
+        );
+        Ok(row)
+    }
+
+    pub async fn touch_session(&self, token_hash: &str, now_ms: i64) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE user_sessions SET last_seen_ms = ? WHERE token_hash = ?",
+            now_ms,
+            token_hash,
+        );
+        Ok(())
+    }
+
+    pub async fn list_sessions(
+        &self,
+        user_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<(String, SessionInfo)>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT token_hash, user_agent, created_at_ms, last_seen_ms, expires_at_ms FROM user_sessions
+             WHERE user_id = ? AND expires_at_ms > ? ORDER BY last_seen_ms DESC",
+            |r| {
+                let hash: String = r.get("token_hash");
+                let info = SessionInfo {
+                    id: hash[..16].to_string(),
+                    user_agent: r.get("user_agent"),
+                    created_at_ms: r.get("created_at_ms"),
+                    last_seen_ms: r.get("last_seen_ms"),
+                    expires_at_ms: r.get("expires_at_ms"),
+                };
+                (hash, info)
+            },
+            user_id,
+            now_ms,
+        );
+        Ok(rows)
+    }
+
+    /// Deletes `user_id`'s sessions: the one whose hash starts with `id_prefix`, or, with `None`,
+    /// all of them except `keep_hash` (if given).
+    pub async fn delete_user_sessions(
+        &self,
+        user_id: &str,
+        id_prefix: Option<&str>,
+        keep_hash: Option<&str>,
+    ) -> Result<u64, MetaError> {
+        let n = match id_prefix {
+            Some(prefix) => db_exec!(
+                self,
+                "DELETE FROM user_sessions WHERE user_id = ? AND substr(token_hash, 1, 16) = ?",
+                user_id,
+                prefix,
+            ),
+            None => db_exec!(
+                self,
+                "DELETE FROM user_sessions WHERE user_id = ? AND token_hash <> ?",
+                user_id,
+                keep_hash.unwrap_or(""),
+            ),
+        };
+        Ok(n)
+    }
+
+    pub async fn update_user_name(&self, user_id: &str, name: Option<&str>) -> Result<(), MetaError> {
+        let _ = db_exec!(self, "UPDATE users SET name = ? WHERE id = ?", name, user_id);
+        Ok(())
+    }
+
+    pub async fn update_user_password(&self, user_id: &str, phc: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            phc,
+            user_id,
+        );
+        Ok(())
+    }
+
+    pub async fn update_user_role(&self, org_id: &str, user_id: &str, role: Role) -> Result<bool, MetaError> {
+        let n = db_exec!(
+            self,
+            "UPDATE users SET role = ? WHERE id = ? AND org_id = ?",
+            role.as_str(),
+            user_id,
+            org_id,
+        );
+        Ok(n > 0)
+    }
+
+    /// Removes an account from its organisation. A user has exactly one organisation, so this
+    /// deletes the account and its sessions.
+    pub async fn delete_user(&self, org_id: &str, user_id: &str) -> Result<bool, MetaError> {
+        let n = db_exec!(
+            self,
+            "DELETE FROM users WHERE id = ? AND org_id = ?",
+            user_id,
+            org_id,
+        );
+        if n > 0 {
+            let _ = db_exec!(self, "DELETE FROM user_sessions WHERE user_id = ?", user_id);
+            let _ = db_exec!(self, "DELETE FROM password_resets WHERE user_id = ?", user_id);
+            let _ = db_exec!(self, "DELETE FROM email_verifications WHERE user_id = ?", user_id);
+        }
+        Ok(n > 0)
+    }
+
+    pub async fn list_org_users(&self, org_id: &str) -> Result<Vec<User>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, email, name, password_hash, google_sub, created_at_ms, org_id, role FROM users
+             WHERE org_id = ? ORDER BY created_at_ms",
+            |r| {
+                User {
+                    id: r.get("id"),
+                    email: r.get("email"),
+                    name: r.get("name"),
+                    password_hash: r.get("password_hash"),
+                    google_sub: r.get("google_sub"),
+                    created_at_ms: r.get("created_at_ms"),
+                    org_id: r.get("org_id"),
+                    role: role_of(&r.get::<String, _>("role")),
+                }
+            },
+            org_id,
+        );
+        Ok(rows)
+    }
+
+    pub async fn rename_org(&self, id: &str, name: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(self, "UPDATE orgs SET name = ? WHERE id = ?", name, id);
+        Ok(())
+    }
+
+    /// Stores an invite, replacing any pending one for the same email in the same organisation.
+    pub async fn insert_invite(&self, inv: &OrgInvite, token_hash: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "DELETE FROM org_invites WHERE org_id = ? AND email = ? AND accepted_at_ms IS NULL",
+            &inv.org_id,
+            &inv.email,
+        );
+        let _ = db_exec!(
+            self,
+            "INSERT INTO org_invites (id, token_hash, org_id, email, role, invited_by, created_at_ms, expires_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &inv.id,
+            token_hash,
+            &inv.org_id,
+            &inv.email,
+            &inv.role,
+            &inv.invited_by,
+            inv.created_at_ms,
+            inv.expires_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Pending (unaccepted, unexpired) invites of an organisation, newest first.
+    pub async fn list_invites(&self, org_id: &str, now_ms: i64) -> Result<Vec<OrgInvite>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, org_id, email, role, invited_by, created_at_ms, expires_at_ms FROM org_invites
+             WHERE org_id = ? AND accepted_at_ms IS NULL AND expires_at_ms > ? ORDER BY created_at_ms DESC",
+            |r| {
+                OrgInvite {
+                    id: r.get("id"),
+                    org_id: r.get("org_id"),
+                    email: r.get("email"),
+                    role: r.get("role"),
+                    invited_by: r.get("invited_by"),
+                    created_at_ms: r.get("created_at_ms"),
+                    expires_at_ms: r.get("expires_at_ms"),
+                }
+            },
+            org_id,
+            now_ms,
+        );
+        Ok(rows)
+    }
+
+    /// A pending invite by its token hash.
+    pub async fn get_invite(&self, token_hash: &str, now_ms: i64) -> Result<Option<OrgInvite>, MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT id, org_id, email, role, invited_by, created_at_ms, expires_at_ms FROM org_invites
+             WHERE token_hash = ? AND accepted_at_ms IS NULL AND expires_at_ms > ?",
+            |r| {
+                OrgInvite {
+                    id: r.get("id"),
+                    org_id: r.get("org_id"),
+                    email: r.get("email"),
+                    role: r.get("role"),
+                    invited_by: r.get("invited_by"),
+                    created_at_ms: r.get("created_at_ms"),
+                    expires_at_ms: r.get("expires_at_ms"),
+                }
+            },
+            token_hash,
+            now_ms,
+        );
+        Ok(row)
+    }
+
+    /// Marks an invite used. `false` when someone else used it first.
+    pub async fn accept_invite(&self, id: &str, now_ms: i64) -> Result<bool, MetaError> {
+        let n = db_exec!(
+            self,
+            "UPDATE org_invites SET accepted_at_ms = ? WHERE id = ? AND accepted_at_ms IS NULL",
+            now_ms,
+            id,
+        );
+        Ok(n > 0)
+    }
+
+    pub async fn delete_invite(&self, org_id: &str, id: &str) -> Result<bool, MetaError> {
+        let n = db_exec!(
+            self,
+            "DELETE FROM org_invites WHERE id = ? AND org_id = ? AND accepted_at_ms IS NULL",
+            id,
+            org_id,
+        );
+        Ok(n > 0)
+    }
+
+    pub async fn insert_password_reset(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "INSERT INTO password_resets (token_hash, user_id, expires_at_ms) VALUES (?, ?, ?)",
+            token_hash,
+            user_id,
             expires_at_ms,
         );
         Ok(())
     }
 
-    /// Returns the user id of a live (unexpired) session whose user still exists.
-    /// The signed-in user's id and organisation for a live session.
-    pub async fn get_session_user(
-        &self,
-        token_hash: &str,
-        now_ms: i64,
-    ) -> Result<Option<(String, String)>, MetaError> {
-        let row = db_map_opt!(
+    /// Uses a reset token once; returns its user id when it was live.
+    pub async fn take_password_reset(&self, token_hash: &str, now_ms: i64) -> Result<Option<String>, MetaError> {
+        let uid = db_map_opt!(
             self,
-            "SELECT s.user_id AS user_id, u.org_id AS org_id FROM user_sessions s JOIN users u ON u.id = s.user_id
-             WHERE s.token_hash = ? AND s.expires_at_ms > ?",
-            |r| { (r.get::<String, _>("user_id"), r.get::<String, _>("org_id")) },
+            "SELECT user_id FROM password_resets WHERE token_hash = ? AND used_at_ms IS NULL AND expires_at_ms > ?",
+            |r| { r.get::<String, _>("user_id") },
             token_hash,
             now_ms,
         );
-        Ok(row)
+        let Some(uid) = uid else { return Ok(None) };
+        let n = db_exec!(
+            self,
+            "UPDATE password_resets SET used_at_ms = ? WHERE token_hash = ? AND used_at_ms IS NULL",
+            now_ms,
+            token_hash,
+        );
+        Ok((n > 0).then_some(uid))
     }
 
     pub async fn insert_org(

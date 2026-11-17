@@ -11,7 +11,7 @@ pub use api::{
     AuthPrincipal, BootstrapCredentials, ControlPlaneService,
 };
 pub use copilot::{CopilotRequest, CopilotResponse};
-pub use db::{MetaError, MetaStore};
+pub use db::{MetaError, MetaStore, OrgInvite, SessionInfo, SessionUser};
 pub use experiments::{
     build_edge_flag_bundle, build_edge_flag_bundle_with_cohorts, compute_sample_ratio_mismatch,
     compute_statistical_lift_table, evaluate_edge_flag, evaluate_experiment_results,

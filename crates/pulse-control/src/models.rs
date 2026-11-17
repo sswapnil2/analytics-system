@@ -38,6 +38,48 @@ pub struct User {
     pub created_at_ms: i64,
     /// The organisation whose projects this account can see.
     pub org_id: String,
+    /// The account's role in `org_id`.
+    pub role: Role,
+}
+
+/// A user's role in their organisation. Ordered: each role can do everything the ones before it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    /// Reads reports, dashboards and runs queries.
+    Viewer,
+    /// Also creates and edits reports, dashboards, cohorts, flags, experiments and alerts.
+    Member,
+    /// Also manages API keys, members, invites, BYOK and data import/export.
+    Admin,
+    /// Also renames the organisation and manages other owners.
+    Owner,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Member => "member",
+            Role::Admin => "admin",
+            Role::Owner => "owner",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        Some(match s {
+            "viewer" => Role::Viewer,
+            "member" => Role::Member,
+            "admin" => Role::Admin,
+            "owner" => Role::Owner,
+            _ => return None,
+        })
+    }
+
+    /// Whether this role may grant `other`, or change or remove an account that holds it:
+    /// owners manage anyone, everyone else only roles below their own.
+    pub fn outranks(self, other: Role) -> bool {
+        self == Role::Owner || other < self
+    }
 }
 
 pub const KEY_ROLE_INGEST_AND_FLAGS: &str = "ingest_and_flags";

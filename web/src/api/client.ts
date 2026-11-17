@@ -394,6 +394,49 @@ export interface AuthUser {
   name: string | null;
   has_password: boolean;
   has_google: boolean;
+  role?: Role;
+  org_id?: string;
+}
+
+export type Role = "viewer" | "member" | "admin" | "owner";
+export const ROLES: Role[] = ["viewer", "member", "admin", "owner"];
+/** Mirrors the server: each role can do what the ones before it can. */
+export function roleAtLeast(role: Role | undefined, min: Role): boolean {
+  return ROLES.indexOf(role ?? "viewer") >= ROLES.indexOf(min);
+}
+/** Mirrors `Role::outranks`: owners manage anyone, others only lower roles. */
+export function outranks(me: Role | undefined, other: Role): boolean {
+  return me === "owner" || ROLES.indexOf(other) < ROLES.indexOf(me ?? "viewer");
+}
+
+export interface OrgInfo {
+  id: string;
+  name: string | null;
+  role: Role;
+}
+
+export interface OrgMember extends AuthUser {
+  role: Role;
+  created_at_ms: number;
+}
+
+export interface OrgInvite {
+  id: string;
+  email: string;
+  role: Role;
+  invited_by: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  invite_url?: string;
+}
+
+export interface ActiveSession {
+  id: string;
+  user_agent: string | null;
+  created_at_ms: number;
+  last_seen_ms: number;
+  expires_at_ms: number;
+  current: boolean;
 }
 
 export interface AuthConfig {
@@ -610,12 +653,51 @@ export function default14DayRange(): TimeRange {
 export const api = {
   getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
   signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string }) =>
-    fetchJson<AuthSession>("/v1/auth/signup", { method: "POST", body: JSON.stringify(body) }),
+    // A session, or `verification_required` when the address must be proven first.
+    fetchJson<AuthSession | { verification_required: true; email: string }>("/v1/auth/signup", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  verifyEmail: (token: string) =>
+    fetchJson<AuthSession>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) }),
+  joinOrg: (token: string) =>
+    fetchJson<AuthUser>("/v1/auth/join-org", { method: "POST", body: JSON.stringify({ token }) }),
   logIn: (body: { email: string; password: string }) =>
     fetchJson<AuthSession>("/v1/auth/login", { method: "POST", body: JSON.stringify(body) }),
   exchangeLoginCode: (code: string) =>
     fetchJson<AuthSession>("/v1/auth/exchange", { method: "POST", body: JSON.stringify({ code }) }),
   getMe: () => fetchJson<AuthUser>("/v1/auth/me"),
+  updateMe: (body: { name: string }) =>
+    fetchJson<AuthUser>("/v1/auth/me", { method: "PATCH", body: JSON.stringify(body) }),
+  changePassword: (body: { current_password: string; new_password: string }) =>
+    fetchJson<{ other_sessions_signed_out: number }>("/v1/auth/password", { method: "POST", body: JSON.stringify(body) }),
+  listSessions: () => fetchJson<ActiveSession[]>("/v1/auth/sessions"),
+  revokeSession: (id: string) =>
+    fetchJson<unknown>(`/v1/auth/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  revokeOtherSessions: () => fetchJson<{ signed_out: number }>("/v1/auth/sessions/revoke-others", { method: "POST" }),
+  getOrg: () => fetchJson<OrgInfo>("/v1/org"),
+  renameOrg: (name: string) => fetchJson<OrgInfo>("/v1/org", { method: "PATCH", body: JSON.stringify({ name }) }),
+  listMembers: () => fetchJson<OrgMember[]>("/v1/org/members"),
+  setMemberRole: (userId: string, role: Role) =>
+    fetchJson<unknown>(`/v1/org/members/${encodeURIComponent(userId)}`, { method: "PATCH", body: JSON.stringify({ role }) }),
+  removeMember: (userId: string) =>
+    fetchJson<unknown>(`/v1/org/members/${encodeURIComponent(userId)}`, { method: "DELETE" }),
+  memberResetLink: (userId: string) =>
+    fetchJson<{ reset_url: string }>(`/v1/org/members/${encodeURIComponent(userId)}/password-reset`, { method: "POST" }),
+  listInvites: () => fetchJson<OrgInvite[]>("/v1/org/invites"),
+  createInvite: (body: { email: string; role: Role }) =>
+    fetchJson<OrgInvite>("/v1/org/invites", { method: "POST", body: JSON.stringify(body) }),
+  deleteInvite: (id: string) => fetchJson<unknown>(`/v1/org/invites/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  getInvite: (token: string) =>
+    fetchJson<{ email: string; role: Role; org_name: string | null; has_account: boolean }>(
+      `/v1/auth/invites/${encodeURIComponent(token)}`,
+    ),
+  acceptInvite: (body: { token: string; password: string; name?: string }) =>
+    fetchJson<AuthSession>("/v1/auth/invites/accept", { method: "POST", body: JSON.stringify(body) }),
+  requestPasswordReset: (email: string) =>
+    fetchJson<unknown>("/v1/auth/password-reset/request", { method: "POST", body: JSON.stringify({ email }) }),
+  resetPassword: (body: { token: string; new_password: string }) =>
+    fetchJson<unknown>("/v1/auth/password-reset", { method: "POST", body: JSON.stringify(body) }),
   logOut: () => fetchJson<unknown>("/v1/auth/logout", { method: "POST" }),
   listReports: (projectId: string) =>
     fetchJson<SavedReport[]>(`/v1/projects/${encodeURIComponent(projectId)}/saved-reports`),
@@ -659,6 +741,11 @@ export const api = {
 
   listApiKeys: (projectId: string) =>
     fetchJson<ApiKeyRecord[]>(`/v1/projects/${encodeURIComponent(projectId)}/api-keys`),
+
+  revokeApiKey: (projectId: string, keyId: string) =>
+    fetchJson<unknown>(`/v1/projects/${encodeURIComponent(projectId)}/api-keys/${encodeURIComponent(keyId)}`, {
+      method: "DELETE",
+    }),
 
   createApiKey: (projectId: string, body: { label: string; role?: string }) =>
     fetchJson<CreatedApiKeyResponse>(`/v1/projects/${encodeURIComponent(projectId)}/api-keys`, {

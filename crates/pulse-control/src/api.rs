@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{MatchedPath, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod accounts;
 mod auth;
 pub use auth::AuthConfig;
 
@@ -54,7 +55,7 @@ use crate::models::{
     DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord, Experiment, ExperimentMetricSpec,
     FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project,
     SavedReport, SystemKeyringRecord, UserProfileRecord, VariantAllocation, BYOK_CATEGORIES,
-    KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    Role, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -67,10 +68,20 @@ pub enum AuthPrincipal {
     User {
         user_id: String,
         org_id: String,
+        role: Role,
     },
 }
 
 impl AuthPrincipal {
+    /// The root token acts as an owner everywhere; a project admin key as an admin of its project.
+    fn role(&self) -> Role {
+        match self {
+            AuthPrincipal::RootAdmin => Role::Owner,
+            AuthPrincipal::ProjectAdmin { .. } => Role::Admin,
+            AuthPrincipal::User { role, .. } => *role,
+        }
+    }
+
     fn authorize_project(&self, target_project_id: &str) -> Result<(), CtrlError> {
         match self {
             AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(()),
@@ -1101,10 +1112,33 @@ async fn require_admin_auth(
     } else {
         None
     };
+    let now = Utc::now().timestamp_millis();
     let principal = match session_user {
-        Some((user_id, org_id)) => AuthPrincipal::User { user_id, org_id },
+        Some(su) => {
+            // Last-seen for the active-sessions list, written at most once a minute per session.
+            if now - su.last_seen_ms > 60_000 {
+                let _ = ctrl.meta.touch_session(&sha256_hex(token), now).await;
+            }
+            AuthPrincipal::User {
+                user_id: su.user_id,
+                org_id: su.org_id,
+                role: su.role,
+            }
+        }
         None => ctrl.verify_admin_token(token)?,
     };
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    let needed = accounts::required_role(req.method(), &path);
+    if principal.role() < needed {
+        return Err(CtrlError::forbidden(format!(
+            "your role can't do this; it needs {} or above",
+            needed.as_str()
+        )));
+    }
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
@@ -1280,8 +1314,9 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_warehouse_export),
         )
         .route("/v1/projects/:id/ai/copilot", post(handle_byok_copilot))
-        .route("/v1/auth/me", get(auth::handle_me))
+        .route("/v1/auth/me", get(auth::handle_me).patch(accounts::handle_update_me))
         .route("/v1/auth/logout", post(auth::handle_logout))
+        .merge(accounts::account_router())
         .route_layer(middleware::from_fn_with_state(
             ctrl.clone(),
             require_admin_auth,
@@ -1289,6 +1324,7 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         // Sign-in routes are merged after `route_layer`, so they stay outside the bearer middleware
         // but share the admin CORS policy.
         .merge(auth::public_auth_router())
+        .merge(accounts::public_router())
         .with_state(ctrl)
 }
 
@@ -1590,6 +1626,13 @@ async fn handle_revoke_key(
         .map_err(CtrlError::meta)?;
     // Other nodes drop it on their next cache reload.
     ctrl.api_key_cache.remove(&key.key_hash);
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "api_key.revoked",
+        &format!("project:{id}"),
+        json!({ "key_id": key_id, "label": key.label }),
+    )
+    .await;
     Ok(Json(json!({"id": key_id, "revoked": true})))
 }
 
@@ -1637,10 +1680,17 @@ async fn handle_create_key(
     ctrl.api_key_cache.insert(
         key_hash,
         CachedApiKey {
-            project_id: id,
-            role,
+            project_id: id.clone(),
+            role: role.clone(),
         },
     );
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "api_key.created",
+        &format!("project:{id}"),
+        json!({ "key_id": record.id, "label": record.label, "role": role }),
+    )
+    .await;
     Ok(Json(CreatedApiKeyResponse {
         record,
         plaintext_key,
@@ -4565,6 +4615,7 @@ mod cluster_admin_tests {
         let user = AuthPrincipal::User {
             user_id: "u1".into(),
             org_id: "org_default".into(),
+            role: crate::models::Role::Owner,
         };
         assert!(user.require_cluster_admin().is_err());
         let proj = AuthPrincipal::ProjectAdmin {
