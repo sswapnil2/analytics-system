@@ -1,18 +1,22 @@
 # MCP for agents
 
 Every Pulse node serves a [Model Context Protocol](https://modelcontextprotocol.io) server at
-`POST /v1/mcp` on its normal port. Agents such as Claude Code, Claude Desktop and Cursor can use it to
-read the event schema and run funnel, retention, insights and session queries in plain language.
+`POST /v1/mcp` on its normal port. Any agent that speaks MCP over Streamable HTTP and can send an
+`Authorization` header can use it to read the event schema and run funnel, retention, insights and
+session queries in plain language: Claude Code, Claude Desktop, Cursor, OpenAI Codex, the OpenAI
+Responses API, Gemini CLI and Google Antigravity are covered below.
 
 ## Transport and protocol
 
 - **Transport:** Streamable HTTP, JSON responses only (no SSE stream; `GET /v1/mcp` returns `405`).
   Stateless: no session id is issued.
-- **Protocol versions:** `2025-06-18`, `2025-03-26` and `2024-11-05`. The server echoes the client's
-  requested version if it is one of these, otherwise answers with `2025-06-18`.
+- **Protocol versions:** `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05`. The server echoes
+  the client's requested version if it is one of these, otherwise answers with `2025-11-25`.
 - **Methods:** `initialize`, `ping`, `tools/list`, `tools/call`. Notifications (such as
   `notifications/initialized`) are accepted with `202`.
 - **Capabilities:** tools only (no resources, prompts or sampling).
+- **Auth:** a static bearer token. Pulse has no OAuth, so clients that only accept OAuth-protected
+  remote servers (for example ChatGPT connectors) cannot connect directly.
 - **Errors:** an unknown tool or method is a JSON-RPC error; a tool that fails (bad arguments, query
   error) returns a normal result with `isError: true` and the message as text.
 
@@ -96,6 +100,74 @@ Commit this and keep the token in each developer's environment:
 }
 ```
 
+### OpenAI Codex (CLI and IDE extension)
+
+Codex reads `~/.codex/config.toml`. Put the token in an environment variable rather than the file:
+
+```toml
+[mcp_servers.pulse]
+url = "http://127.0.0.1:8080/v1/mcp"
+bearer_token_env_var = "PULSE_TOKEN"
+# with a root token, choose the project from another env var:
+# env_http_headers = { "x-pulse-project" = "PULSE_PROJECT" }
+```
+
+Then `export PULSE_TOKEN=sk_live_…` before starting `codex`, and check with `/mcp` inside Codex.
+
+### OpenAI Responses API / Agents SDK
+
+The Responses API calls MCP servers from OpenAI's side, so the node must be reachable at a public
+HTTPS URL (for example behind a reverse proxy). Pass the token as a header on each request:
+
+```json
+{
+  "type": "mcp",
+  "server_label": "pulse",
+  "server_url": "https://pulse.example.com/v1/mcp",
+  "headers": { "Authorization": "Bearer sk_live_…" },
+  "require_approval": "never"
+}
+```
+
+Use a project admin key here, and a dedicated one, since the token leaves your network with each request.
+
+### Gemini CLI
+
+```bash
+gemini mcp add --transport http --header "Authorization: Bearer sk_live_…" pulse http://127.0.0.1:8080/v1/mcp
+```
+
+or in `~/.gemini/settings.json` (or `.gemini/settings.json` in a project). Use `httpUrl` (Streamable
+HTTP), not `url` (which Gemini CLI treats as SSE):
+
+```json
+{
+  "mcpServers": {
+    "pulse": {
+      "httpUrl": "http://127.0.0.1:8080/v1/mcp",
+      "headers": { "Authorization": "Bearer sk_live_…" }
+    }
+  }
+}
+```
+
+Check with `/mcp` inside Gemini CLI.
+
+### Google Antigravity (`agy` CLI and IDE)
+
+```bash
+agy mcp add --header "Authorization: Bearer sk_live_…" pulse http://127.0.0.1:8080/v1/mcp
+```
+
+This writes a `serverUrl` entry to `~/.gemini/config/mcp_config.json`; the IDE reads the same file
+(or `.agents/mcp_config.json` in a workspace). Write the token literally: Antigravity does not expand
+`${VAR}` placeholders in this file. In headless mode (`agy -p`) MCP calls need an allow rule, for
+example `{"permissions": {"allow": ["mcp(pulse/*)"]}}` in a file passed with `--settings`.
+
+`agy plugin install <path>/integrations/claude-code-plugin` also installs the Pulse skills into
+Antigravity, but its MCP entry relies on `${PULSE_URL}` / `${PULSE_TOKEN}`, which Antigravity leaves
+unexpanded, so add the server with `agy mcp add` as above.
+
 ### Claude Desktop
 
 Claude Desktop's config file starts local (stdio) servers, so bridge to the HTTP endpoint with
@@ -131,4 +203,6 @@ curl -s -X POST http://127.0.0.1:8080/v1/mcp \
 - **`403`:** a `pk_` key was used, or a project admin key asked for another project via `x-pulse-project`.
 - **Empty results:** check the project (`x-pulse-project`) and the date range. The `--seed` demo data
   lives in `proj_fintech_in`.
+- **A cloud-hosted agent can't connect:** `127.0.0.1` is only reachable from your machine. Hosted
+  agents (the Responses API, web-based assistants) need the node behind a public HTTPS URL.
 - **Browser-based clients:** admin routes, including `/v1/mcp`, only allow the origins in `PULSE_CORS_ORIGINS`.

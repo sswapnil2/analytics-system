@@ -13,7 +13,7 @@ Single-binary product analytics, session wireframe replay, feature flags, and ex
 
 - [Quickstart](docs/quickstart.md): build, run, admin token and ingest keys
 - [Web SDK](docs/web-sdk.md) and [mobile core (beta)](docs/mobile-core.md)
-- [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude Code, Claude Desktop, Cursor)
+- [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude, Cursor, OpenAI Codex and Responses API, Gemini CLI, Antigravity)
 - [Claude Code plugin](integrations/claude-code-plugin/README.md): `/plugin marketplace add sswapnil2/analytics-system`, then `/plugin install pulse@pulse`
 
 ## 60-Second Quickstart

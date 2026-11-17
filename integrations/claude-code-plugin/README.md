@@ -33,3 +33,6 @@ claude
 
 Run `/mcp` in Claude Code to check that `plugin:pulse:pulse` is connected. See [docs/mcp.md](../../docs/mcp.md)
 for the tools, how to create a key, and troubleshooting.
+
+Using another agent? The MCP server itself works with any Streamable HTTP client; see
+[docs/mcp.md](../../docs/mcp.md#connect-a-client) for OpenAI Codex, Gemini CLI and Antigravity config.

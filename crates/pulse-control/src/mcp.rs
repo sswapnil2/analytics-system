@@ -216,7 +216,8 @@ pub async fn handle_mcp_request(
 
 /// MCP revisions this server can speak; it has no SSE stream, sampling or resources, so the
 /// differences between them do not affect it.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Echoes the client's requested protocol version when supported, otherwise offers the latest.
 fn negotiate_protocol_version(params: &Value) -> &'static str {
