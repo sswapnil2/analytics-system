@@ -114,7 +114,7 @@ take simpler arguments.
 | GET | `/v1/projects/:id/deletions` | Erasure audit log |
 | POST | `/v1/projects/:id/import` | Batch import events (JSON, NDJSON or CSV body) |
 | GET | `/v1/projects/:id/export` | Export events: `?format=ndjson` (default) `\|json\|csv`, `start_ts_ms` + `end_ts_ms`, `limit` (default 5000, max 50000) |
-| GET | `/v1/projects/:id/revenue` | Revenue summary from user profiles' `total_revenue` (built from `$track_charge` profile operations) |
+| GET | `/v1/projects/:id/revenue` | Revenue summary from user profiles' `total_revenue` (built from `$track_charge` profile operations), plus a 14-day daily series of `$revenue` events (sum of `amount`, unique payers). Pass `?event=Order_Paid` to chart your own purchase event instead |
 | GET, POST | `/v1/projects/:id/alerts` | List / create metric alerts |
 | DELETE | `/v1/projects/:id/alerts/:alert_id` | Delete an alert |
 | GET | `/v1/projects/:id/schema-extensions` | Lookup tables, custom events and custom properties |
