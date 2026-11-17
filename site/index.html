@@ -5,9 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pulse — open-source product analytics you own</title>
 <meta name="description" content="Funnels, retention, feature flags and privacy-first session replay. Open source (Apache-2.0), self-hosted, one binary.">
+<link rel="canonical" href="https://sswapnil2.github.io/analytics-system/">
 <meta property="og:title" content="Pulse — product analytics you actually own">
 <meta property="og:description" content="Open-source, self-hosted product analytics: funnels, retention, flags and privacy-first session replay.">
 <meta property="og:type" content="website">
+<meta property="og:url" content="https://sswapnil2.github.io/analytics-system/">
+<meta property="og:site_name" content="Pulse">
+<meta property="og:image" content="https://sswapnil2.github.io/analytics-system/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Pulse — product analytics you actually own. Open source, self-hosted, one Rust binary.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Pulse — product analytics you actually own">
+<meta name="twitter:description" content="Open-source, self-hosted product analytics: funnels, retention, flags and privacy-first session replay.">
+<meta name="twitter:image" content="https://sswapnil2.github.io/analytics-system/og.png">
+<meta name="twitter:image:alt" content="Pulse — product analytics you actually own. Open source, self-hosted, one Rust binary.">
+<meta name="keywords" content="product analytics, open source, self-hosted, session replay, feature flags, funnels, retention, Rust, MCP">
 <meta name="theme-color" content="#09090B">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -60,6 +73,7 @@ summary::-webkit-details-marker{display:none}summary{list-style:none}
 <a href="#product" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Product</a>
 <a href="#privacy" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Privacy</a>
 <a href="#selfhost" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Self-host</a>
+<a href="#agent" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Agent setup</a>
 <a href="#editions" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Editions</a>
 <a href="https://github.com/sswapnil2/analytics-system#readme" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Docs</a>
 </div>
@@ -410,6 +424,46 @@ pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
 </div>
 </section>
 
+<!-- AGENT SETUP -->
+<section id="agent" aria-labelledby="agent-h" style="max-width: 1240px; margin: 0 auto; padding: 0 24px 120px; display: flex; flex-direction: column; gap: 28px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
+<h2 id="agent-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">Or let your agent<br><span style="color: #71717A">set it all up.</span></h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 420px">Paste this into Claude Code, Codex, Cursor or Gemini CLI from your app's repo. It runs Pulse, adds the SDK, picks your key events and connects itself over MCP, so you can ask it where users drop off.</p>
+</div>
+<div style="border: 1px solid #1F1F25; border-radius: 16px; background: #0B0B0E; overflow: hidden">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 8px 8px 16px; border-bottom: 1px solid #1C1C21; font-family: 'Geist Mono', monospace; font-size: 12.5px; color: #8A8A93">
+<span>prompt.txt</span>
+<button type="button" id="pl-copy" style="min-height: 36px; padding: 0 14px; border-radius: 8px; border: 1px solid #2A2A30; background: #141418; color: #EDEDEF; font: inherit; cursor: pointer">Copy prompt</button>
+</div>
+<pre id="pl-prompt" style="margin: 0; padding: 22px 24px 26px; max-height: 360px; overflow: auto; font-family: 'Geist Mono', monospace; font-size: 13px; line-height: 1.75; color: #D4D4D8; white-space: pre-wrap">Set up Pulse (open-source product analytics, https://github.com/sswapnil2/analytics-system) for this project.
+
+1. Clone https://github.com/sswapnil2/analytics-system into ../pulse (skip if it exists).
+   In that folder run:
+     npm --prefix web ci &amp;&amp; npm --prefix web run build
+     cargo build -p pulse-node
+2. Create a root admin token with `openssl rand -hex 24`, prefixed with `sk_root_`.
+   Save it as PULSE_ADMIN_TOKEN in ../pulse/.env (create the file, never commit it).
+   Start the node in the background from ../pulse:
+     PULSE_ADMIN_TOKEN=&lt;token&gt; ./target/debug/pulse-node --port 8080 --data-dir ./pulse_data
+   Wait until `curl -s http://127.0.0.1:8080/v1/status -H &quot;Authorization: Bearer &lt;token&gt;&quot;` succeeds.
+3. Create two keys for the default project `proj_default` with
+   POST http://127.0.0.1:8080/v1/projects/proj_default/api-keys (Bearer &lt;token&gt;, JSON body):
+     {&quot;label&quot;: &quot;web app&quot;, &quot;role&quot;: &quot;ingest_and_flags&quot;}  -&gt; pk_live_… ingest key for the app
+     {&quot;label&quot;: &quot;agent&quot;,   &quot;role&quot;: &quot;admin&quot;}             -&gt; sk_live_… project admin key for MCP
+   Each `plaintext_key` is shown only once; keep both in ../pulse/.env.
+4. If this project is a browser app, follow ../pulse/docs/web-sdk.md: install ../pulse/sdks/ts-web,
+   initialise PulseWebClient with endpointUrl http://127.0.0.1:8080 and the pk_live_ key read from
+   an environment variable, call identify() after login, and track() the 5–10 events that matter most
+   for this product (sign-up, activation, the core action, purchase). Show me the event list first.
+5. Connect yourself to Pulse over MCP using ../pulse/docs/mcp.md. URL http://127.0.0.1:8080/v1/mcp,
+   bearer token = the sk_live_ admin key. In Claude Code you can instead install the plugin:
+   /plugin marketplace add sswapnil2/analytics-system  then  /plugin install pulse@pulse
+6. Send one test event to /v1/ingest, then confirm it through MCP, and tell me the Studio URL
+   (http://127.0.0.1:8080) and where the tokens are saved.</pre>
+</div>
+<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/agent-setup.md" style="align-self: flex-start; display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: #FFFFFF; text-decoration: none; font-weight: 500; font-size: 15px">Read the agent setup guide →</a>
+</section>
+
 <!-- EDITIONS -->
 <section id="editions" aria-labelledby="editions-h" style="border-top: 1px solid #1C1C21">
 <div style="max-width: 1240px; margin: 0 auto; padding: 120px 24px; display: flex; flex-direction: column; gap: 48px">
@@ -499,6 +553,12 @@ pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
 </footer>
 
 </div>
+<script>
+document.getElementById('pl-copy').addEventListener('click',function(){
+  var b=this,t=document.getElementById('pl-prompt').textContent;
+  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='Copied';},function(){b.textContent='Select and copy';}).then(function(){setTimeout(function(){b.textContent='Copy prompt';},2000);});
+});
+</script>
 <script>
 // Fade sections in on scroll. Content stays visible if this script never runs.
 (function(){
