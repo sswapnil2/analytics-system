@@ -42,6 +42,12 @@ Open <http://127.0.0.1:8080> for the Studio. Sign in with the admin token, or cr
 | | `PULSE_CORS_ORIGINS` | the node's own origin + `:5173` | Comma-separated browser origins allowed on admin/query routes |
 | | `PULSE_NUM_BUCKETS` | built-in default | Storage buckets per day partition (1–256) |
 | | `RUST_LOG` | `info,slatedb=warn` | Log filter |
+| | `PULSE_VAULT_KEK` | `.pulse_cluster.kek` next to SQLite | 64-hex key that seals stored secrets. **Required with Postgres or several nodes**; keep it outside the data backup |
+| | `PULSE_ENCRYPTION_STRICT` | off | `1` refuses to read unencrypted objects once an encryption key is loaded. Only for stores encrypted from day one |
+
+Webhook requests carry `X-Pulse-Timestamp` (Unix seconds) and `X-Pulse-Signature-256: sha256=<hex>`,
+the HMAC-SHA256 of `"{timestamp}.{body}"` under your `signing_secret` (at least 16 characters).
+Recompute it, compare in constant time, and reject timestamps more than a few minutes old.
 
 ## 3. Get the admin token
 

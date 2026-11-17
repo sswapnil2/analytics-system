@@ -814,6 +814,40 @@ pub fn sanitize_byok_config_json(cfg: &Value) -> Value {
     Value::Object(out)
 }
 
+/// `config_json` keys that hold secrets. At rest they live only as `<key>_sealed` (vault KEK).
+const SEALED_BYOK_CONFIG_KEYS: &[&str] = &["access_key", "signing_secret"];
+
+/// What gets written to the DB: allow-listed metadata plus sealed secret fields, no plaintext secrets.
+pub fn seal_byok_config_json(kek: &[u8; 32], cfg: &Value) -> Value {
+    let mut out = sanitize_byok_config_json(cfg);
+    if let Some(obj) = out.as_object_mut() {
+        for &key in SEALED_BYOK_CONFIG_KEYS {
+            if let Some(s) = cfg
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert(format!("{key}_sealed"), Value::String(seal_secret(kek, s)));
+            }
+        }
+    }
+    out
+}
+
+/// Restores sealed secret fields for use. Rows saved before sealing keep their plaintext values.
+pub fn unseal_byok_config_json(kek: &[u8; 32], cfg: &Value) -> Result<Value, String> {
+    let mut out = cfg.clone();
+    if let Some(obj) = out.as_object_mut() {
+        for &key in SEALED_BYOK_CONFIG_KEYS {
+            if let Some(hex) = cfg.get(format!("{key}_sealed")).and_then(Value::as_str) {
+                obj.insert(key.to_string(), Value::String(unseal_secret(kek, hex)?));
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl From<&ByokCredentialRecord> for ByokCredentialView {
     fn from(r: &ByokCredentialRecord) -> Self {
         Self {
@@ -888,4 +922,26 @@ pub fn unseal_secret(kek: &[u8; 32], sealed_hex: &str) -> Result<String, String>
             "sealed secret authentication failed (wrong cluster KEK or corrupted DB)".to_string()
         })?;
     String::from_utf8(pt.to_vec()).map_err(|_| "sealed secret is not valid UTF-8".to_string())
+}
+
+#[cfg(test)]
+mod byok_config_seal_tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_sealed_at_rest_and_restored_for_use() {
+        let kek = [3u8; 32];
+        let cfg = serde_json::json!({"url": "s3://b", "access_key": "AKIA123", "signing_secret": "s".repeat(20), "junk": 1});
+        let stored = seal_byok_config_json(&kek, &cfg);
+        let text = stored.to_string();
+        assert!(
+            !text.contains("AKIA123") && !text.contains(&"s".repeat(20)) && !text.contains("junk")
+        );
+        let used = unseal_byok_config_json(&kek, &stored).unwrap();
+        assert_eq!(used["access_key"], "AKIA123");
+        assert_eq!(used["url"], "s3://b");
+        assert!(sanitize_byok_config_json(&stored)
+            .get("access_key_sealed")
+            .is_none());
+    }
 }

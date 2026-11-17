@@ -285,11 +285,11 @@ async fn test_full_oss_and_commercial_suite() {
     let rep_res1 = storage.append_replay_chunk(&replay_k1).await.unwrap();
     storage.flush_all_projects().await.unwrap();
 
-    // Verify raw bytes in object store are ENCRYPTED with AES-256-GCM envelope magic (PLSEAGM1)
+    // Verify raw bytes in object store are ENCRYPTED with AES-256-GCM envelope magic (PLSEAGM2, path-bound)
     let raw_store = enc_store.raw_inner();
     let rep_path: object_store::path::Path = rep_res1.object_path.as_str().into();
     let raw_rep_head = raw_store.get_range(&rep_path, 0..8).await.unwrap();
-    assert_eq!(raw_rep_head.as_ref(), b"PLSEAGM1");
+    assert_eq!(raw_rep_head.as_ref(), b"PLSEAGM2");
 
     // Bit-flip tamper check: modifying ciphertext in raw store causes AES-256-GCM authentication failure!
     let tampered_raw = {
