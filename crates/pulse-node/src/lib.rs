@@ -19,7 +19,10 @@ use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, Quic
 use pulse_storage::{build_object_store, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS};
 use tokio::sync::{oneshot, watch};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::compression::predicate::{NotForContentType, Predicate};
+use tower_http::compression::{CompressionLayer, DefaultPredicate};
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeader;
 use tracing::info;
 
 pub use seeder::{seed_indian_fintech_dataset, SeedSummary};
@@ -255,7 +258,24 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     let app = if index_file.exists() {
         let serve_dir =
             ServeDir::new(&config.web_dist_dir).not_found_service(ServeFile::new(index_file));
-        api_router.fallback_service(serve_dir)
+        // ponytail: everything in dist except index.html is under content-hashed assets/, so
+        // non-HTML can be cached forever. Add a path check if un-hashed files land in dist/.
+        let cached_dir = SetResponseHeader::overriding(
+            serve_dir,
+            header::CACHE_CONTROL,
+            |res: &axum::http::Response<_>| {
+                let html = res
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+                Some(HeaderValue::from_static(if html {
+                    "no-cache"
+                } else {
+                    "public, max-age=31536000, immutable"
+                }))
+            },
+        );
+        api_router.fallback_service(cached_dir)
     } else {
         api_router.fallback(get(|| async {
             Html(
@@ -267,6 +287,11 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
             )
         }))
     };
+    // gzip/br for the web app and JSON. Replay frames are served by byte range, and
+    // compressing a range response would corrupt it, so they stay as they are.
+    let app = app.layer(CompressionLayer::new().compress_when(
+        DefaultPredicate::new().and(NotForContentType::const_new("application/x-pulse-frame")),
+    ));
 
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
     let bound_http_addr = listener.local_addr()?;
