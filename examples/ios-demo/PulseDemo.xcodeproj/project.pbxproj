@@ -1,0 +1,100 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* App.swift */; };
+		A1000002 /* pulse_sdk_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* pulse_sdk_core.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A2000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		A2000002 /* pulse_sdk_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseSDK/pulse_sdk_core.swift; sourceTree = SOURCE_ROOT; };
+		A2000003 /* PulseDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PulseDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A3000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A4000001 = {isa = PBXGroup; children = (A4000002, A2000002, A4000003); sourceTree = "<group>"; };
+		A4000002 /* PulseDemo */ = {isa = PBXGroup; children = (A2000001); path = PulseDemo; sourceTree = "<group>"; };
+		A4000003 /* Products */ = {isa = PBXGroup; children = (A2000003); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A5000001 /* PulseDemo */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A7000002;
+			buildPhases = (A6000001, A3000001);
+			buildRules = ();
+			dependencies = ();
+			name = PulseDemo;
+			productName = PulseDemo;
+			productReference = A2000003;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A0000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 1600;};
+			buildConfigurationList = A7000001;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base);
+			mainGroup = A4000001;
+			productRefGroup = A4000003;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (A5000001);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A6000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000001, A1000002); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A8000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				SDKROOT = iphoneos;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				SWIFT_VERSION = 5.0;
+				ONLY_ACTIVE_ARCH = YES;
+			};
+			name = Debug;
+		};
+		A8000002 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.pulse.demo;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_IDENTITY = "-";
+				TARGETED_DEVICE_FAMILY = 1;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/PulseSDK";
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/PulseSDK";
+				OTHER_LDFLAGS = "-lpulse_sdk_core";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A7000001 = {isa = XCConfigurationList; buildConfigurations = (A8000001); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		A7000002 = {isa = XCConfigurationList; buildConfigurations = (A8000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A0000001;
+}
