@@ -53,9 +53,9 @@ use crate::models::{
     unseal_byok_config_json, unseal_secret, AlertRule, ApiKeyRecord, ByokCredentialRecord,
     ByokCredentialView, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard,
     DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord, Experiment, ExperimentMetricSpec,
-    FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project,
+    FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project, Role,
     SavedReport, SystemKeyringRecord, UserProfileRecord, VariantAllocation, BYOK_CATEGORIES,
-    Role, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -171,6 +171,8 @@ pub struct ControlPlaneService {
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
     auth_cfg: parking_lot::RwLock<AuthConfig>,
     auth_state: auth::AuthState,
+    /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
+    outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
 }
 
 impl ControlPlaneService {
@@ -239,6 +241,7 @@ impl ControlPlaneService {
             discovery_tx: tx,
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
+            outbox_path: parking_lot::RwLock::new(None),
         });
 
         let generated_ingest = svc
@@ -1314,7 +1317,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_warehouse_export),
         )
         .route("/v1/projects/:id/ai/copilot", post(handle_byok_copilot))
-        .route("/v1/auth/me", get(auth::handle_me).patch(accounts::handle_update_me))
+        .route(
+            "/v1/auth/me",
+            get(auth::handle_me).patch(accounts::handle_update_me),
+        )
         .route("/v1/auth/logout", post(auth::handle_logout))
         .merge(accounts::account_router())
         .route_layer(middleware::from_fn_with_state(

@@ -3,6 +3,7 @@ import { CheckCircle2, Download, Upload, Users } from "lucide-react";
 import { api } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { UserProfilesDpdpPanel } from "../components/UserProfilesDpdpPanel";
+import { useAccess } from "../auth/access";
 import { downloadTextFile, errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -50,6 +51,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   availableProps,
   onCatalogChanged,
 }) => {
+  const { canEdit, canAdmin } = useAccess();
   const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
   const [cohortName, setCohortName] = useState<string>("");
   const [cohortEvent, setCohortEvent] = useState<string>(() => cleanEvents[0] ?? "");
@@ -286,9 +288,11 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               ) : null}
             </div>
 
-            <button type="button" onClick={() => void saveCohort()} disabled={savingCohort} className={`${btn.primary} w-full`}>
-              {savingCohort ? "Saving…" : "Save cohort"}
-            </button>
+            {canEdit && (
+              <button type="button" onClick={() => void saveCohort()} disabled={savingCohort} className={`${btn.primary} w-full`}>
+                {savingCohort ? "Saving…" : "Save cohort"}
+              </button>
+            )}
             <FeedbackLine feedback={cohortFeedback} />
           </div>
 
@@ -314,7 +318,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                         <div className="text-sm font-medium text-ink">{c.name}</div>
                         <div className="text-xs text-muted">{c.description}</div>
                       </div>
-                      <button
+                      {canAdmin && <button
                         type="button"
                         disabled={exportingCohortId === c.id}
                         onClick={() => handleExportCohortCsv(c.id)}
@@ -328,7 +332,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                             Export CSV
                           </>
                         )}
-                      </button>
+                      </button>}
                     </li>
                   ))}
                 </ul>
@@ -382,7 +386,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   className={`${field} w-full font-mono text-xs`}
                 />
               </div>
-              <button type="button" onClick={() => void uploadLookup()} disabled={uploadingLookup} className={btn.primary}>
+              <button type="button" onClick={() => void uploadLookup()} disabled={uploadingLookup || !canEdit} title={canEdit ? undefined : "Viewers can't change project data"} className={btn.primary}>
                 <Upload className="h-3.5 w-3.5" />
                 {uploadingLookup ? "Uploading…" : "Upload table"}
               </button>
@@ -434,7 +438,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   className={`${field} w-full font-mono`}
                 />
               </div>
-              <button type="button" onClick={() => void saveCustomProp()} disabled={savingProp} className={btn.primary}>
+              <button type="button" onClick={() => void saveCustomProp()} disabled={savingProp || !canEdit} title={canEdit ? undefined : "Viewers can't change project data"} className={btn.primary}>
                 {savingProp ? "Saving…" : "Save property"}
               </button>
               <FeedbackLine feedback={propFeedback} />

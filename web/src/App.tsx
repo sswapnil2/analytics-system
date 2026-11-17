@@ -55,6 +55,7 @@ import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
 import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
 import { ByokCommercialPanel } from "./components/ByokCommercialPanel";
+import { AccessContext } from "./auth/access";
 
 type WorkspaceId =
   | "dashboards"
@@ -350,6 +351,7 @@ export const App: React.FC = () => {
 
   // Admin tokens have no user and act as admins; signed-in users by their role.
   const canManageKeys = !user || roleAtLeast(user.role, "admin");
+  const access = { canEdit: !user || roleAtLeast(user.role, "member"), canAdmin: canManageKeys };
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
   const sampleEvent = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
@@ -496,7 +498,7 @@ export const App: React.FC = () => {
           {NAV_GROUPS.map((group) => (
             <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">
               {group.label && <div className="hidden px-2.5 pb-1 text-xs text-muted md:block">{group.label}</div>}
-              {group.items.map((item) => {
+              {group.items.filter((item) => item.id !== "security" || canManageKeys).map((item) => {
                 const Icon = item.icon;
                 const active = activeTab === item.id;
                 return (
@@ -676,7 +678,7 @@ export const App: React.FC = () => {
                 }
               />
             ) : (
-              <React.Fragment key={activePid}>
+              <AccessContext.Provider key={activePid} value={access}>
                 {activeTab === "dashboards" && (
                   <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
                 )}
@@ -746,10 +748,10 @@ export const App: React.FC = () => {
                     }}
                   />
                 )}
-                {activeTab === "security" && (
+                {activeTab === "security" && canManageKeys && (
                   <ByokCommercialPanel projectId={activePid} />
                 )}
-              </React.Fragment>
+              </AccessContext.Provider>
             )}
         </div>
       </main>

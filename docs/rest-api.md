@@ -76,8 +76,8 @@ account accepts an invite while signed in (`POST /v1/auth/join-org`), which move
 sessions to the inviting organisation with the invited role. The last owner of an organisation that
 still has other members must make someone else an owner first.
 
-Pulse has no mailer. Invite and password-reset links are returned to the admin who created them and
-also written to the node log. Email-verification links are written to the node log.
+Pulse has no mailer. Invite links are returned only to the admin who created them. Email-verification and
+password-reset links are appended to the owner-only `outbox` file in the data directory (never the log).
 
 ## Health
 
@@ -211,7 +211,7 @@ take simpler arguments.
 | POST | `/v1/auth/verify-email` | `{token}`: finishes a sign-up that answered `verification_required`; returns a session |
 | GET | `/v1/auth/invites/:token` | Email, role and organisation of a pending invite, and `has_account` (then sign in and use `join-org`) |
 | POST | `/v1/auth/invites/accept` | `{token, password, name?}`: creates the account with the invite's role and returns a session |
-| POST | `/v1/auth/password-reset/request` | `{email}`: always `204`. If the account exists, the link goes to the node log |
+| POST | `/v1/auth/password-reset/request` | `{email}`: always `204`. If the account exists, the link goes to the `outbox` file; at most one request per email every 5 minutes |
 | POST | `/v1/auth/password-reset` | `{token, new_password}`: one use; signs out every session of the account |
 
 ## Account and organisation (Studio session)

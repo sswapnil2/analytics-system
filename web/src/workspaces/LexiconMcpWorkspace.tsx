@@ -3,6 +3,7 @@ import { Bot, Check, Copy, KeyRound, Play, Plus } from "lucide-react";
 import { api, ApiKeyRecord, LexiconEvent, LexiconProperty } from "../api/client";
 import { BatchImportExportPanel } from "../components/BatchImportExportPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
+import { useAccess } from "../auth/access";
 import { displayUserId, errorMessage, formatCount, formatTimestamp, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -51,6 +52,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
   availableProps,
   onLexiconChanged,
 }) => {
+  const { canEdit, canAdmin } = useAccess();
   const [events, setEvents] = useState<LexiconEvent[]>([]);
   const [props, setProps] = useState<LexiconProperty[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKeyRecord[]>([]);
@@ -261,6 +263,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
                           <select
                             aria-label={`Status for ${humanizeEvent(ev.name)}`}
                             value={ev.status}
+                            disabled={!canEdit}
                             onChange={(e) => void setEventStatus(ev, e.target.value)}
                             className={`${field} py-1 ${
                               ev.status === "dropped" ? "text-danger" : ev.status === "hidden" ? "text-warn" : ""
@@ -301,6 +304,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
                           <select
                             aria-label={`Privacy for ${p.name}`}
                             value={p.pii_masked ? "masked" : "shown"}
+                            disabled={!canEdit}
                             onChange={(e) => void setPiiMask(p, e.target.value === "masked")}
                             className={`${field} py-1 ${p.pii_masked ? "text-warn" : ""}`}
                           >
@@ -316,6 +320,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
             )}
           </Panel>
 
+          {canAdmin && (<>
           <BatchImportExportPanel
             projectId={projectId}
             availableEvents={availableEvents}
@@ -400,6 +405,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
               )}
             </div>
           </Panel>
+          </>)}
         </div>
 
         <Panel title="AI tools" className="xl:col-span-5">

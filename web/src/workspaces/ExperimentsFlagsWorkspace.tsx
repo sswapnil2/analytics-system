@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, FlaskConical, Plus, RefreshCw, ToggleLeft } from "lucide-react";
 import { api, Experiment, ExperimentResults, FeatureFlag } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
+import { useAccess } from "../auth/access";
 import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -27,6 +28,7 @@ function validateFlagKey(key: string): string | null {
 }
 
 export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
+  const { canEdit } = useAccess();
   const [flags, setFlags] = useState<FeatureFlag[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [selectedExpId, setSelectedExpId] = useState<string>("");
@@ -173,10 +175,12 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
               Update results
             </button>
-            <button type="button" onClick={() => setExpFormOpen((v) => !v)} className={btn.primary}>
-              <Plus className="h-3.5 w-3.5" />
-              New experiment
-            </button>
+            {canEdit && (
+              <button type="button" onClick={() => setExpFormOpen((v) => !v)} className={btn.primary}>
+                <Plus className="h-3.5 w-3.5" />
+                New experiment
+              </button>
+            )}
           </div>
         }
       />
@@ -310,10 +314,12 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             title="No experiments yet"
             body="An experiment compares the variants of a feature flag on one conversion event."
             action={
-              <button type="button" onClick={() => setExpFormOpen(true)} className={btn.primary}>
-                <Plus className="h-3.5 w-3.5" />
-                New experiment
-              </button>
+              canEdit && (
+                <button type="button" onClick={() => setExpFormOpen(true)} className={btn.primary}>
+                  <Plus className="h-3.5 w-3.5" />
+                  New experiment
+                </button>
+              )
             }
           />
         ) : !expResults ? (
@@ -508,6 +514,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           role="switch"
                           aria-checked={f.enabled}
                           aria-label={`${f.key} enabled`}
+                          disabled={!canEdit}
                           onClick={() => void patchFlag(f, { enabled: !f.enabled })}
                           className={`rounded px-2 py-0.5 text-xs font-medium ${
                             f.enabled ? "border border-ok/40 bg-ok/15 text-ok" : "border border-line bg-hover text-muted"
@@ -530,6 +537,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         max={100}
                         value={pct}
                         aria-valuetext={`${pct}% of users`}
+                        disabled={!canEdit}
                         onChange={(e) => void patchFlag(f, { rollout_pct: Number(e.target.value) })}
                         className="w-full accent-brand sm:w-40"
                       />
@@ -541,7 +549,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             </ul>
           )}
 
-          <form
+          {canEdit && <form
             noValidate
             onSubmit={(e) => {
               e.preventDefault();
@@ -587,7 +595,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               <Plus className="h-3.5 w-3.5" />
               {creating ? "Creating…" : "Create flag"}
             </button>
-          </form>
+          </form>}
         </div>
       </Panel>
     </div>

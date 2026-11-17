@@ -19,6 +19,7 @@ import { api, Dashboard, DashboardCard, SavedReport } from "../api/client";
 import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Skeleton } from "../components/ui";
 import { errorMessage, formatCount } from "../lib/format";
 import { KIND_LABEL, RangePresets, RangeSel, rangeLabel, ReportCardBody } from "./ReportCard";
+import { useAccess } from "../auth/access";
 
 /** `#/dashboards` lists them; `#/dashboards/<id>` opens one. */
 export function dashboardIdFromHash(): string | null {
@@ -189,6 +190,7 @@ export const DashboardsWorkspace: React.FC<{ projectId: string; refreshToken: nu
 // ---------------------------------------------------------------------------
 
 const DashboardList: React.FC<{ projectId: string; refreshToken: number }> = ({ projectId, refreshToken }) => {
+  const { canEdit } = useAccess();
   const [list, setList] = useState<Dashboard[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -228,10 +230,12 @@ const DashboardList: React.FC<{ projectId: string; refreshToken: number }> = ({ 
         title="Dashboards"
         description="Saved funnels, trends and retention charts, side by side, ready to share with your team."
         actions={
-          <button type="button" onClick={() => setCreating(true)} className={btn.primary}>
-            <Plus className="h-4 w-4" />
-            New dashboard
-          </button>
+          canEdit && (
+            <button type="button" onClick={() => setCreating(true)} className={btn.primary}>
+              <Plus className="h-4 w-4" />
+              New dashboard
+            </button>
+          )
         }
       />
 
@@ -275,9 +279,11 @@ const DashboardList: React.FC<{ projectId: string; refreshToken: number }> = ({ 
             title="No dashboards yet"
             body="Create one, or open a funnel, trend or retention report and choose Save to dashboard."
             action={
-              <button type="button" onClick={() => setCreating(true)} className={btn.primary}>
-                New dashboard
-              </button>
+              canEdit && (
+                <button type="button" onClick={() => setCreating(true)} className={btn.primary}>
+                  New dashboard
+                </button>
+              )
             }
           />
         </Panel>
@@ -317,6 +323,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
   dashboardId,
   refreshToken,
 }) => {
+  const { canEdit } = useAccess();
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [reports, setReports] = useState<Map<string, SavedReport>>(new Map());
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -454,9 +461,11 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             <div className="group">
               <h1 className="flex items-center gap-2 text-[1.875rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
                 {dash.name}
-                <button type="button" onClick={() => setEditingTitle(true)} className={iconBtn} aria-label="Rename dashboard">
-                  <Pencil className="h-4 w-4" />
-                </button>
+                {canEdit && (
+                  <button type="button" onClick={() => setEditingTitle(true)} className={iconBtn} aria-label="Rename dashboard">
+                    <Pencil className="h-4 w-4" />
+                  </button>
+                )}
               </h1>
               {dash.description && <p className="mt-1 text-[0.9375rem] text-muted">{dash.description}</p>}
             </div>
@@ -465,7 +474,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
         <div className="relative flex flex-wrap items-center gap-2">
           {!tv && (
             <>
-              <Menu
+              {canEdit && <Menu
                 label="Add to dashboard"
                 triggerClass={btn.secondary}
                 trigger={
@@ -480,7 +489,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                   { label: "New retention", href: `#/retention?dashboard=${dash.id}` },
                   { label: "Text note", onSelect: () => void addText() },
                 ]}
-              />
+              />}
               <button
                 type="button"
                 className={btn.secondary}
@@ -491,7 +500,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
               </button>
             </>
           )}
-          {!tv && <button type="button" onClick={() => setSharing((v) => !v)} className={btn.primary} aria-expanded={sharing} data-share-trigger>
+          {!tv && canEdit && <button type="button" onClick={() => setSharing((v) => !v)} className={btn.primary} aria-expanded={sharing} data-share-trigger>
             <Link2 className="h-4 w-4" />
             Share
           </button>}
@@ -529,7 +538,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             icon={LayoutDashboard}
             title="This dashboard is empty"
             body="Start a new report here, or add one you've already saved."
-            action={
+            action={canEdit && (
               <div className="flex flex-wrap justify-center gap-2">
                 <a href={`#/funnels?dashboard=${dash.id}`} className={btn.primary}>
                   New funnel
@@ -544,14 +553,14 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                   Saved report
                 </button>
               </div>
-            }
+            )}
           />
         </Panel>
       ) : (
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
           {cards.map((card, i) => {
             const report = card.report_id ? reports.get(card.report_id) : undefined;
-            const controls = tv ? null : (
+            const controls = tv || !canEdit ? null : (
               <Menu
                 label="Card options"
                 triggerClass={`${iconBtn} shrink-0`}
@@ -673,10 +682,12 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             </button>
           </span>
         ) : (
-          <button type="button" className="inline-flex items-center gap-1 hover:text-destructive" onClick={() => setConfirmDelete(true)}>
-            <Trash2 className="h-3.5 w-3.5" />
-            Delete dashboard
-          </button>
+          canEdit && (
+            <button type="button" className="inline-flex items-center gap-1 hover:text-destructive" onClick={() => setConfirmDelete(true)}>
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete dashboard
+            </button>
+          )
         )}
       </div>
     </div>
