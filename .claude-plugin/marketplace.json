@@ -1,0 +1,16 @@
+{
+  "name": "pulse",
+  "owner": {
+    "name": "Pulse contributors"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for the Pulse self-hosted analytics system."
+  },
+  "plugins": [
+    {
+      "name": "pulse",
+      "source": "./integrations/claude-code-plugin",
+      "description": "Pulse analytics MCP server and analysis skills for Claude Code."
+    }
+  ]
+}

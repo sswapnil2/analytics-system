@@ -78,7 +78,7 @@ pub async fn handle_mcp_request(
         "initialize" => JsonRpcResponse::ok(
             req.id,
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiate_protocol_version(&req.params),
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "pulse-analytics-mcp",
@@ -86,6 +86,7 @@ pub async fn handle_mcp_request(
                 }
             }),
         ),
+        "ping" => JsonRpcResponse::ok(req.id, json!({})),
         "tools/list" => JsonRpcResponse::ok(
             req.id,
             json!({
@@ -149,6 +150,7 @@ pub async fn handle_mcp_request(
                             "properties": {
                                 "event_name": { "type": "string" },
                                 "only_rage_tap": { "type": "boolean", "default": true },
+                                "only_dead_tap": { "type": "boolean", "default": false },
                                 "only_errors": { "type": "boolean", "default": false },
                                 "limit": { "type": "integer", "default": 10 }
                             }
@@ -194,11 +196,36 @@ pub async fn handle_mcp_request(
                         "structuredContent": payload
                     }),
                 ),
-                Err(msg) => JsonRpcResponse::err(req.id, -32000, msg),
+                // Unknown tool is a protocol error; anything else is a tool execution error the
+                // model should see (MCP spec: `isError` result, not a JSON-RPC error).
+                Err(msg) if msg.starts_with("unknown MCP tool") => {
+                    JsonRpcResponse::err(req.id, -32602, msg)
+                }
+                Err(msg) => JsonRpcResponse::ok(
+                    req.id,
+                    json!({
+                        "content": [{ "type": "text", "text": msg }],
+                        "isError": true
+                    }),
+                ),
             }
         }
         other => JsonRpcResponse::err(req.id, -32601, format!("method not found: {other}")),
     }
+}
+
+/// MCP revisions this server can speak; it has no SSE stream, sampling or resources, so the
+/// differences between them do not affect it.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Echoes the client's requested protocol version when supported, otherwise offers the latest.
+fn negotiate_protocol_version(params: &Value) -> &'static str {
+    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+    SUPPORTED_PROTOCOL_VERSIONS
+        .into_iter()
+        .find(|v| Some(*v) == requested)
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
 fn default_range_days(args: &Value) -> TimeRange {

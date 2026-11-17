@@ -728,7 +728,31 @@ mod tests {
         assert!(p_val < 0.01, "expected p < 0.01, got {p_val}");
         assert!(bayes > 0.99, "expected Bayesian > 0.99, got {bayes}");
 
-        // 6. Invoke MCP JSON-RPC 2.0 `tools/list` and `tools/call` over authenticated HTTP
+        // 6. Invoke MCP JSON-RPC 2.0 `initialize`, `tools/list` and `tools/call` over authenticated HTTP
+        let mcp_init: Value = http
+            .post(format!("{base_url}/v1/mcp"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(mcp_init["result"]["protocolVersion"], "2025-06-18");
+        let notif = http
+            .post(format!("{base_url}/v1/mcp"))
+            .bearer_auth(&admin_token)
+            .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(notif.status(), reqwest::StatusCode::ACCEPTED);
         let mcp_list: Value = http
             .post(format!("{base_url}/v1/mcp"))
             .bearer_auth(&admin_token)
