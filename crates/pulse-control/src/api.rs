@@ -1386,6 +1386,12 @@ impl CtrlError {
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("query exceeded deadline ({ms} ms)"),
             ),
+            e @ pulse_exec::ExecError::QueryTooLarge { .. } => {
+                Self(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+            }
+            e @ pulse_exec::ExecError::Overloaded(_) => {
+                Self(StatusCode::TOO_MANY_REQUESTS, e.to_string())
+            }
             pulse_exec::ExecError::InvalidQuery(msg) | pulse_exec::ExecError::Expression(msg) => {
                 Self::bad(msg)
             }
