@@ -1744,6 +1744,9 @@ fn session_query_from_params(params: &HashMap<String, String>) -> SessionSearchQ
             .get("errors")
             .or_else(|| params.get("only_errors"))
             .is_some_and(|v| v == "true" || v == "1"),
+        only_with_replay: params
+            .get("only_with_replay")
+            .is_some_and(|v| v == "true" || v == "1"),
         limit: params.get("limit").and_then(|s| s.parse().ok()),
     }
 }
@@ -3410,8 +3413,16 @@ async fn handle_get_revenue_summary(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    // The SDKs' trackRevenue sends `$revenue` with `amount`; `?event=` covers apps that log purchases under their own event.
+    let revenue_event = params
+        .get("event")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("$revenue")
+        .to_string();
     let profiles = ctrl
         .meta
         .list_user_profiles(&id, 1000)
@@ -3437,8 +3448,8 @@ async fn handle_get_revenue_summary(
         interval: pulse_exec::TimeInterval::Day,
         series: vec![
             pulse_exec::InsightsSeriesSpec {
-                label: "Transaction Volume".to_string(),
-                event_name: "First_Disbursal_Success".to_string(),
+                label: "Revenue".to_string(),
+                event_name: revenue_event.clone(),
                 metric: pulse_exec::InsightsMetric::PropSum {
                     prop: "amount".to_string(),
                 },
@@ -3446,7 +3457,7 @@ async fn handle_get_revenue_summary(
             },
             pulse_exec::InsightsSeriesSpec {
                 label: "Paying Users".to_string(),
-                event_name: "First_Disbursal_Success".to_string(),
+                event_name: revenue_event.clone(),
                 metric: pulse_exec::InsightsMetric::Uniques,
                 filters: Vec::new(),
             },
@@ -3475,6 +3486,7 @@ async fn handle_get_revenue_summary(
         "total_profiles": total_profiles,
         "arpu": arpu,
         "arppu": arppu,
+        "revenue_event": revenue_event,
         "daily_series": ins_opt.map(|r| r.series).unwrap_or_default(),
     })))
 }

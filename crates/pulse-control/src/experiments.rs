@@ -196,7 +196,6 @@ async fn evaluate_metric_for_experiment(
     expected_variants: &[String],
     qengine: &QueryEngine,
 ) -> Result<(Vec<VariantLiftRow>, BTreeMap<String, (u64, u64)>), ExecError> {
-    let exp_prop = format!("$exp_{}", exp.flag_key);
     let range = TimeRange {
         start_ts_ms: exp.start_ts_ms,
         end_ts_ms: exp.end_ts_ms,
@@ -241,51 +240,16 @@ async fn evaluate_metric_for_experiment(
     let res1 = qengine
         .query_funnel(&exp.project_id, &funnel_from_exposure)
         .await?;
-    let mut total_exposed = 0u64;
     for bg in &res1.breakdowns {
         if bg.breakdown_value != "(none)" && !bg.steps.is_empty() {
             let n = bg.steps[0].entered_users;
             let conv = bg.steps.get(1).map(|s| s.entered_users).unwrap_or(0);
-            total_exposed += n;
             counts_by_variant.insert(bg.breakdown_value.clone(), (n, conv));
         }
     }
 
-    if total_exposed == 0 {
-        let fallback_q = FunnelQuery {
-            time_range: range,
-            steps: vec![
-                FunnelStepSpec {
-                    event_name: "App_Open".to_string(),
-                    filters: vec![PropPredicate {
-                        prop_name: exp_prop.clone(),
-                        filter: pulse_exec::PropFilterOp::IsSet,
-                    }],
-                    first_time_ever: false,
-                },
-                FunnelStepSpec {
-                    event_name: metric.event_name.clone(),
-                    filters: Vec::new(),
-                    first_time_ever: false,
-                },
-            ],
-            order_mode: FunnelOrderMode::LooseOrder,
-            conversion_window_ms: window_ms,
-            exclusions: Vec::new(),
-            hold_constant_props: Vec::new(),
-            breakdown_by: Some(exp_prop),
-            global_filter: pulse_exec::GlobalFilter::default(),
-        };
-        let res2 = qengine.query_funnel(&exp.project_id, &fallback_q).await?;
-        for bg in &res2.breakdowns {
-            if bg.breakdown_value != "(none)" && !bg.steps.is_empty() {
-                let n = bg.steps[0].entered_users;
-                let conv = bg.steps.get(1).map(|s| s.entered_users).unwrap_or(0);
-                counts_by_variant.insert(bg.breakdown_value.clone(), (n, conv));
-            }
-        }
-    }
-
+    // Exposures come only from `$experiment_started`; with none, every variant reports 0 users
+    // and the Studio says how to send them.
     let rows = compute_statistical_lift_table(&counts_by_variant);
     Ok((rows, counts_by_variant))
 }

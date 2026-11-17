@@ -308,6 +308,19 @@ async fn profiles_user_props_groups_dpdp_erasure_and_import_export() {
     let rev_json: Value = serde_json::from_slice(&rev_bytes).unwrap();
     assert_eq!(rev_json["total_revenue"].as_f64(), Some(2000.0));
     assert_eq!(rev_json["paying_users"].as_u64(), Some(2));
+    assert_eq!(rev_json["revenue_event"].as_str(), Some("$revenue"));
+
+    let (s, rev_bytes) = send_admin(
+        &admin_app,
+        "GET",
+        "/v1/projects/proj_alpha/revenue?event=Order_Paid",
+        None,
+        "application/json",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let rev_json: Value = serde_json::from_slice(&rev_bytes).unwrap();
+    assert_eq!(rev_json["revenue_event"].as_str(), Some("Order_Paid"));
 
     let (s, alr_bytes) = send_admin(
         &admin_app,

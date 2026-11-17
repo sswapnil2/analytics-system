@@ -28,7 +28,7 @@ import {
   setStoredAdminToken,
 } from "./api/client";
 import { AuthCallback, Logo, parseAuthHash, SignInScreen, SignUpScreen } from "./auth/AuthScreens";
-import { btn, Panel } from "./components/ui";
+import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
 import { errorMessage, formatCount, isNotFound } from "./lib/format";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
@@ -89,6 +89,8 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
 ];
 
 const ALL_IDS = NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id));
+// Report builders that default to the project's own events.
+const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
 const DEFAULT_TAB: WorkspaceId = "funnels";
 
 function tabFromHash(): WorkspaceId {
@@ -134,6 +136,8 @@ export const App: React.FC = () => {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState<number>(0);
   const [theme, setTheme] = useState<ThemePref>(readTheme);
   const [flushing, setFlushing] = useState(false);
@@ -189,13 +193,15 @@ export const App: React.FC = () => {
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
+    setCatalogError(null);
     try {
       const [lex, ext] = await Promise.all([
         api.getLexicon(projectId),
         api.getSchemaExtensions(projectId),
       ]);
+      // Busiest events first: reports default to them and pickers list them on top.
       const sortedLex = [...lex.events]
-        .filter((ev) => ev.status !== "dropped" && ev.status !== "hidden")
+        .filter((ev) => ev.status !== "dropped" && ev.status !== "hidden" && !ev.name.startsWith("$"))
         .sort((a, b) => b.volume_24h - a.volume_24h || a.name.localeCompare(b.name));
       const evNames = new Set<string>();
       for (const ev of sortedLex) evNames.add(ev.name);
@@ -207,8 +213,10 @@ export const App: React.FC = () => {
         for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
       setAvailableEvents(Array.from(evNames));
       setAvailableProps(Array.from(propNames).sort());
+      setCatalogLoaded(true);
     } catch (err) {
       if (err instanceof ApiAuthError) signOut("Your session ended. Sign in again to continue.");
+      else setCatalogError(errorMessage(err));
     }
   }, [projectId, signOut]);
 
@@ -394,6 +402,10 @@ export const App: React.FC = () => {
             value={activePid}
             onChange={(e) => {
               setProjectId(e.target.value);
+              // Reports pick their defaults from the catalog, so wait for the new project's.
+              setCatalogLoaded(false);
+              setAvailableEvents([]);
+              setAvailableProps([]);
               setRefreshToken((n) => n + 1);
             }}
             className="w-full truncate bg-transparent text-sm font-semibold text-ink focus:outline-none"
@@ -548,12 +560,31 @@ export const App: React.FC = () => {
               </div>
             </Panel>
           )}
-            {!activePid ? (
+            {catalogError && NEEDS_EVENTS.includes(activeTab) ? (
+              <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
+            ) : !activePid || (!catalogLoaded && NEEDS_EVENTS.includes(activeTab)) ? (
               <p className="text-sm text-muted" role="status">
                 Loading your workspace…
               </p>
+            ) : availableEvents.length === 0 && NEEDS_EVENTS.includes(activeTab) ? (
+              <EmptyState
+                title="No events in this project yet"
+                body="Reports fill in once your app sends its first event."
+                action={
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQuickstartDismissed(false);
+                      setQuickstartOpen(true);
+                    }}
+                    className={btn.primary}
+                  >
+                    Show how to send events
+                  </button>
+                }
+              />
             ) : (
-              <>
+              <React.Fragment key={activePid}>
                 {activeTab === "dashboards" && (
                   <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
                 )}
@@ -606,7 +637,11 @@ export const App: React.FC = () => {
                   />
                 )}
                 {activeTab === "experiments" && (
-                  <ExperimentsFlagsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                  <ExperimentsFlagsWorkspace
+                    projectId={activePid}
+                    availableEvents={availableEvents}
+                    refreshToken={refreshToken}
+                  />
                 )}
                 {activeTab === "events" && (
                   <LexiconMcpWorkspace
@@ -622,7 +657,7 @@ export const App: React.FC = () => {
                 {activeTab === "security" && (
                   <ByokCommercialPanel projectId={activePid} />
                 )}
-              </>
+              </React.Fragment>
             )}
         </div>
       </main>

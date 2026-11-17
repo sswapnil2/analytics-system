@@ -818,6 +818,7 @@ async fn p2_09_semantics_and_p3_02_governance_regression_suite() {
                 only_rage_tap: false,
                 only_dead_tap: false,
                 only_errors: false,
+                only_with_replay: false,
                 limit: Some(2),
             },
         )

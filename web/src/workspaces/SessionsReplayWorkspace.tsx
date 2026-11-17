@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, RefreshCw, Search, Zap } from "lucide-react";
+import { AlertTriangle, RefreshCw, Search, Video, Zap } from "lucide-react";
 import { api, SessionSearchResult, SessionSummaryItem } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, ListSkeleton } from "../components/ui";
@@ -15,7 +15,7 @@ const Toggle: React.FC<{
   pressed: boolean;
   onChange: () => void;
   icon: React.ComponentType<{ className?: string }>;
-  tone: "danger" | "warn";
+  tone: "danger" | "warn" | "brand";
   children: React.ReactNode;
 }> = ({ pressed, onChange, icon: Icon, tone, children }) => (
   <button
@@ -26,7 +26,9 @@ const Toggle: React.FC<{
       pressed
         ? tone === "danger"
           ? "border-danger bg-danger-soft text-danger"
-          : "border-warn bg-warn-soft text-warn"
+          : tone === "warn"
+            ? "border-warn bg-warn-soft text-warn"
+            : "border-brand bg-brand-soft text-brand"
         : "border-line-strong bg-panel text-ink-2 hover:bg-hover"
     }`}
   >
@@ -39,6 +41,8 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
   const [eventFilter, setEventFilter] = useState<string>("");
   const [onlyRage, setOnlyRage] = useState<boolean>(false);
   const [onlyErrors, setOnlyErrors] = useState<boolean>(false);
+  // Most sessions have no recording; open on ones that do.
+  const [onlyRecorded, setOnlyRecorded] = useState<boolean>(true);
   const [searchRes, setSearchRes] = useState<SessionSearchResult | null>(null);
   const [selected, setSelected] = useState<SessionSummaryItem | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
@@ -60,6 +64,7 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
         event_name: eventFilter || null,
         only_rage_tap: onlyRage,
         only_errors: onlyErrors,
+        only_with_replay: onlyRecorded,
         limit: 30,
       });
       setSearchRes(res);
@@ -69,7 +74,7 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
     } finally {
       setLoading(false);
     }
-  }, [projectId, eventFilter, onlyRage, onlyErrors]);
+  }, [projectId, eventFilter, onlyRage, onlyErrors, onlyRecorded]);
 
   useEffect(() => {
     void runSearch();
@@ -97,6 +102,9 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
               ))}
             </select>
           </label>
+          <Toggle pressed={onlyRecorded} onChange={() => setOnlyRecorded((v) => !v)} icon={Video} tone="brand">
+            With recording
+          </Toggle>
           <Toggle pressed={onlyRage} onChange={() => setOnlyRage((v) => !v)} icon={Zap} tone="danger">
             Rage taps
           </Toggle>

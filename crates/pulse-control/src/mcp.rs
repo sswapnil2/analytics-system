@@ -152,6 +152,7 @@ pub async fn handle_mcp_request(
                                 "only_rage_tap": { "type": "boolean", "default": true },
                                 "only_dead_tap": { "type": "boolean", "default": false },
                                 "only_errors": { "type": "boolean", "default": false },
+                                "only_with_replay": { "type": "boolean", "default": false },
                                 "limit": { "type": "integer", "default": 10 }
                             }
                         }
@@ -436,6 +437,10 @@ async fn invoke_tool(
                     .unwrap_or(false),
                 only_errors: args
                     .get("only_errors")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                only_with_replay: args
+                    .get("only_with_replay")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 limit: Some(args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize),

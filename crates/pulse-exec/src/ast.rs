@@ -751,6 +751,9 @@ pub struct SessionSearchQuery {
     pub only_dead_tap: bool,
     #[serde(default)]
     pub only_errors: bool,
+    /// Only sessions that have a screen recording.
+    #[serde(default)]
+    pub only_with_replay: bool,
     pub limit: Option<usize>,
 }
 

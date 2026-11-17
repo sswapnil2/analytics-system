@@ -807,6 +807,24 @@ export const api = {
       },
     ),
 
+  createExperiment: (
+    projectId: string,
+    body: {
+      name: string;
+      flag_key: string;
+      flag_id: string;
+      hypothesis: string;
+      start_ts_ms: number;
+      end_ts_ms: number;
+      primary_metric: { name: string; event_name: string; conversion_window_ms: number };
+      guardrail_metrics: { name: string; event_name: string; conversion_window_ms: number }[];
+    },
+  ) =>
+    fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
   createFlag: (
     projectId: string,
     body: { key: string; description: string; rollout_pct: number },

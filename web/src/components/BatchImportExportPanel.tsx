@@ -165,14 +165,7 @@ export const BatchImportExportPanel: React.FC<{
             aria-label="Batch import events payload"
           />
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <button
-              type="button"
-              onClick={() => setPayload(placeholders[contentType])}
-              className={btn.ghost}
-            >
-              Fill sample
-            </button>
+          <div className="flex flex-wrap items-center justify-end gap-3">
             <button
               type="submit"
               disabled={importing || !payload.trim()}

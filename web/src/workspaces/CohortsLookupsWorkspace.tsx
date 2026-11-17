@@ -341,7 +341,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
           <Panel title="Reference data">
             <div className="space-y-3">
               <p className="text-sm text-muted">
-                Upload a CSV to add columns like merchant category to your events, matched on a shared key.
+                Upload a CSV to add columns like plan tier to your events, matched on a shared key.
               </p>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
@@ -430,7 +430,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   id="prop-formula"
                   value={customSql}
                   onChange={(e) => setCustomSql(e.target.value)}
-                  placeholder="CASE WHEN amount > 5000 THEN 'Prime' ELSE 'Standard' END"
+                  placeholder="e.g. CASE WHEN amount > 5000 THEN 'Large' ELSE 'Small' END"
                   className={`${field} w-full font-mono`}
                 />
               </div>
