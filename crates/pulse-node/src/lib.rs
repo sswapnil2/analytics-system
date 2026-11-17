@@ -18,9 +18,9 @@ use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
 use pulse_storage::{build_object_store, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS};
 use tokio::sync::{oneshot, watch};
-use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::compression::predicate::{NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, DefaultPredicate};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeader;
 use tracing::info;
@@ -165,8 +165,9 @@ fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
 
-    let object_store = build_object_store(&config.data_dir)?;
-    let identity_router = Arc::new(IdentityRouter::new(object_store.clone()));
+    let raw_store = build_object_store(&config.data_dir)?;
+    let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
+    let identity_router = Arc::new(IdentityRouter::new(enc_store.as_object_store()));
 
     let storage_cfg = StorageConfig {
         num_buckets: config.num_buckets,
@@ -174,7 +175,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         l0_flush_max_age: Duration::from_secs(60),
         compaction_min_segments: 4,
     };
-    let storage = StorageEngine::new(storage_cfg, object_store, identity_router);
+    let storage = StorageEngine::new_with_encrypted(storage_cfg, enc_store, identity_router);
 
     let catalogs = CatalogRegistry::new();
     let foyer_dir = config.data_dir.join("foyer_cache");

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef};
 use rand::RngCore;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -735,4 +737,155 @@ mod profile_op_tests {
         assert!(!props.contains_key("city"));
         assert_eq!(rev, 0.0);
     }
+}
+
+pub const BYOK_CATEGORIES: &[&str] = &["llm", "storage", "webhook"];
+const ALLOWED_BYOK_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "endpoint",
+    "url",
+    "bucket_url",
+    "region",
+    "prefix",
+    "channel",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemKeyringRecord {
+    pub key_id: String,
+    pub salt_hex: String,
+    #[serde(skip_serializing)]
+    pub sealed_key_hex: String,
+    pub is_active: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnterpriseAuditRecord {
+    pub id: String,
+    pub actor: String,
+    pub action: String,
+    pub resource: String,
+    pub details_json: Value,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ByokCredentialRecord {
+    pub id: String,
+    pub project_id: String,
+    pub category: String,
+    pub provider: String,
+    pub label: String,
+    pub key_prefix_masked: String,
+    pub sealed_secret_hex: String,
+    pub config_json: Value,
+    pub status: String,
+    pub last_verified_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ByokCredentialView {
+    pub id: String,
+    pub project_id: String,
+    pub category: String,
+    pub provider: String,
+    pub label: String,
+    pub key_prefix_masked: String,
+    pub config_json: Value,
+    pub status: String,
+    pub last_verified_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+/// Allowlists non-secret metadata fields returned in API responses so secrets in `config_json`
+/// (e.g. `access_key`) are never echoed back (`M3`).
+pub fn sanitize_byok_config_json(cfg: &Value) -> Value {
+    let Some(obj) = cfg.as_object() else {
+        return Value::Object(serde_json::Map::new());
+    };
+    let mut out = serde_json::Map::new();
+    for &key in ALLOWED_BYOK_CONFIG_KEYS {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+impl From<&ByokCredentialRecord> for ByokCredentialView {
+    fn from(r: &ByokCredentialRecord) -> Self {
+        Self {
+            id: r.id.clone(),
+            project_id: r.project_id.clone(),
+            category: r.category.clone(),
+            provider: r.provider.clone(),
+            label: r.label.clone(),
+            key_prefix_masked: r.key_prefix_masked.clone(),
+            config_json: sanitize_byok_config_json(&r.config_json),
+            status: r.status.clone(),
+            last_verified_at_ms: r.last_verified_at_ms,
+            updated_at_ms: r.updated_at_ms,
+        }
+    }
+}
+
+pub fn mask_byok_secret(secret: &str) -> String {
+    let trimmed = secret.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let n = chars.len();
+    if n <= 6 {
+        "••••".to_string()
+    } else if n <= 14 {
+        let head: String = chars[..2].iter().collect();
+        format!("{head}••••")
+    } else {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[n - 4..].iter().collect();
+        format!("{head}…{tail}")
+    }
+}
+
+/// Seals a customer BYOK secret or keyring entry using AES-256-GCM with a random 96-bit nonce (`M2`).
+pub fn seal_secret(kek: &[u8; 32], plaintext: &str) -> String {
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes).expect("CSPRNG failure");
+    let unbound = UnboundKey::new(&AES_256_GCM, kek).expect("32-byte KEK");
+    let key = LessSafeKey::new(unbound);
+    let mut ct = plaintext.as_bytes().to_vec();
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce_bytes),
+        Aad::from(b"PULSE_BYOK_VAULT_GCM_V2"),
+        &mut ct,
+    )
+    .expect("AES-256-GCM seal");
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    hex::encode(out)
+}
+
+/// Verifies AES-256-GCM integrity and decrypts a sealed BYOK credential (`M2`).
+pub fn unseal_secret(kek: &[u8; 32], sealed_hex: &str) -> Result<String, String> {
+    let raw = hex::decode(sealed_hex.trim()).map_err(|_| "malformed sealed secret".to_string())?;
+    if raw.len() < 12 + 16 {
+        return Err("sealed secret payload truncated".to_string());
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&raw[..12]);
+    let unbound = UnboundKey::new(&AES_256_GCM, kek).map_err(|_| "invalid KEK".to_string())?;
+    let key = LessSafeKey::new(unbound);
+    let mut ct = raw[12..].to_vec();
+    let pt = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(b"PULSE_BYOK_VAULT_GCM_V2"),
+            &mut ct,
+        )
+        .map_err(|_| {
+            "sealed secret authentication failed (wrong cluster KEK or corrupted DB)".to_string()
+        })?;
+    String::from_utf8(pt.to_vec()).map_err(|_| "sealed secret is not valid UTF-8".to_string())
 }

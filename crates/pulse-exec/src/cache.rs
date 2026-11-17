@@ -13,8 +13,8 @@ use foyer::{
 use moka::sync::Cache;
 use pulse_storage::{
     decode_session_index, decode_tier_c_row, extract_arrow_str, tier_c_key_bit,
-    SegmentInvertedIndex, SegmentMeta, SegmentSessionIndex, StorageError, TierBColumnEntry,
-    VortexSegmentReader,
+    EncryptedObjectStore, SegmentInvertedIndex, SegmentMeta, SegmentSessionIndex, StorageError,
+    TierBColumnEntry, VortexSegmentReader,
 };
 use pulse_wire::PropValue;
 
@@ -57,6 +57,7 @@ impl TierAColumns {
 pub struct SegmentBlockCache {
     hybrid: HybridCache<String, Vec<u8>>,
     reader: Arc<VortexSegmentReader>,
+    enc_store: Option<Arc<EncryptedObjectStore>>,
     tier_a_cache: Cache<String, Arc<TierAColumns>>,
     inverted_cache: Cache<String, Arc<SegmentInvertedIndex>>,
     prop_col_cache: Cache<(String, u16), Arc<Vec<PropValue>>>,
@@ -64,9 +65,19 @@ pub struct SegmentBlockCache {
 
 impl SegmentBlockCache {
     /// Opens a `foyer` HybridCache backed by RAM + optional NVMe directory (`cache_dir`),
-    /// alongside byte-bounded `moka` caches for decoded arrays so compacted segment churn never leaks RAM (`P3-03`).
+    /// sealing NVMe disk cache entries whenever encryption-at-rest is enabled (`H2`).
     pub async fn open(
         reader: Arc<VortexSegmentReader>,
+        memory_bytes: usize,
+        disk_cache_dir: Option<&Path>,
+        disk_bytes: usize,
+    ) -> Result<Arc<Self>, String> {
+        Self::open_with_store(reader, None, memory_bytes, disk_cache_dir, disk_bytes).await
+    }
+
+    pub async fn open_with_store(
+        reader: Arc<VortexSegmentReader>,
+        enc_store: Option<Arc<EncryptedObjectStore>>,
         memory_bytes: usize,
         disk_cache_dir: Option<&Path>,
         disk_bytes: usize,
@@ -138,10 +149,32 @@ impl SegmentBlockCache {
         Ok(Arc::new(Self {
             hybrid,
             reader,
+            enc_store,
             tier_a_cache,
             inverted_cache,
             prop_col_cache,
         }))
+    }
+
+    async fn hybrid_get_unsealed(&self, key: &String) -> Option<Vec<u8>> {
+        let Ok(Some(entry)) = self.hybrid.get(key).await else {
+            return None;
+        };
+        let raw = entry.value();
+        match &self.enc_store {
+            Some(es) => es.unseal_cache_blob(raw).ok(),
+            None => Some(raw.clone()),
+        }
+    }
+
+    fn hybrid_insert_sealed(&self, key: String, val: &[u8]) {
+        if let Some(es) = &self.enc_store {
+            if let Ok(sealed) = es.seal_cache_blob(val) {
+                self.hybrid.insert(key, sealed);
+            }
+        } else {
+            self.hybrid.insert(key, val.to_vec());
+        }
     }
 
     pub fn reader(&self) -> &Arc<VortexSegmentReader> {
@@ -150,11 +183,11 @@ impl SegmentBlockCache {
 
     pub async fn get_vortex_bytes(&self, meta: &SegmentMeta) -> Result<Bytes, StorageError> {
         let key = format!("vtx:{}", meta.segment_id);
-        if let Ok(Some(entry)) = self.hybrid.get(&key).await {
-            return Ok(Bytes::copy_from_slice(entry.value()));
+        if let Some(plain) = self.hybrid_get_unsealed(&key).await {
+            return Ok(Bytes::from(plain));
         }
         let fetched = self.reader.fetch_vortex_bytes(meta).await?;
-        self.hybrid.insert(key, fetched.to_vec());
+        self.hybrid_insert_sealed(key, &fetched);
         Ok(fetched)
     }
 
@@ -166,8 +199,8 @@ impl SegmentBlockCache {
             return Ok(ta.session_index.clone());
         }
         let key = format!("sidx:{}", meta.segment_id);
-        if let Ok(Some(entry)) = self.hybrid.get(&key).await {
-            let decoded = decode_session_index(entry.value())?;
+        if let Some(plain) = self.hybrid_get_unsealed(&key).await {
+            let decoded = decode_session_index(&plain)?;
             return Ok(Arc::new(decoded));
         }
         let path = object_store::path::Path::from(meta.object_path.as_str());
@@ -176,7 +209,7 @@ impl SegmentBlockCache {
             .object_store()
             .get_range(&path, meta.session_idx_offset..meta.file_size)
             .await?;
-        self.hybrid.insert(key, raw.to_vec());
+        self.hybrid_insert_sealed(key, &raw);
         Ok(Arc::new(decode_session_index(&raw)?))
     }
 
@@ -188,8 +221,8 @@ impl SegmentBlockCache {
             return Ok(inv);
         }
         let key = format!("iidx:{}", meta.segment_id);
-        let inv = if let Ok(Some(entry)) = self.hybrid.get(&key).await {
-            Arc::new(SegmentInvertedIndex::decode(entry.value())?)
+        let inv = if let Some(plain) = self.hybrid_get_unsealed(&key).await {
+            Arc::new(SegmentInvertedIndex::decode(&plain)?)
         } else {
             let path = object_store::path::Path::from(meta.object_path.as_str());
             let raw = self
@@ -197,7 +230,7 @@ impl SegmentBlockCache {
                 .object_store()
                 .get_range(&path, meta.inverted_idx_offset..meta.session_idx_offset)
                 .await?;
-            self.hybrid.insert(key, raw.to_vec());
+            self.hybrid_insert_sealed(key, &raw);
             Arc::new(SegmentInvertedIndex::decode(&raw)?)
         };
         self.inverted_cache

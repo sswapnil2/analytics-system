@@ -17,6 +17,7 @@ use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::dictionary::ProjectDictionary;
+use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
 use crate::error::{Result, StorageError};
 use crate::manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
 use crate::mem_bucket::{
@@ -752,6 +753,7 @@ fn is_error_event(event_name: &str, props: &[(String, PropValue)]) -> bool {
 /// Top-level multi-project storage coordinator managing `ProjectStorage`, `ReplayStore`, `VortexSegmentReader`, and `IdentityRouter`.
 pub struct StorageEngine {
     config: StorageConfig,
+    encrypted_store: Arc<EncryptedObjectStore>,
     object_store: Arc<dyn ObjectStore>,
     identity_router: Arc<IdentityRouter>,
     segment_reader: Arc<VortexSegmentReader>,
@@ -766,11 +768,22 @@ impl StorageEngine {
         object_store: Arc<dyn ObjectStore>,
         identity_router: Arc<IdentityRouter>,
     ) -> Arc<Self> {
-        let segment_reader = Arc::new(VortexSegmentReader::new(object_store.clone()));
-        let replay_store = Arc::new(ReplayStore::new(object_store.clone()));
+        let encrypted_store = Arc::new(EncryptedObjectStore::new(object_store));
+        Self::new_with_encrypted(config, encrypted_store, identity_router)
+    }
+
+    pub fn new_with_encrypted(
+        config: StorageConfig,
+        encrypted_store: Arc<EncryptedObjectStore>,
+        identity_router: Arc<IdentityRouter>,
+    ) -> Arc<Self> {
+        let wrapped_store: Arc<dyn ObjectStore> = encrypted_store.clone();
+        let segment_reader = Arc::new(VortexSegmentReader::new(wrapped_store.clone()));
+        let replay_store = Arc::new(ReplayStore::new(wrapped_store.clone()));
         Arc::new(Self {
             config,
-            object_store,
+            encrypted_store,
+            object_store: wrapped_store,
             identity_router,
             segment_reader,
             replay_store,
@@ -779,12 +792,42 @@ impl StorageEngine {
         })
     }
 
+    pub fn encrypted_store(&self) -> &Arc<EncryptedObjectStore> {
+        &self.encrypted_store
+    }
+
     pub fn config(&self) -> &StorageConfig {
         &self.config
     }
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
+    }
+
+    pub fn raw_object_store(&self) -> &Arc<dyn ObjectStore> {
+        self.encrypted_store.raw_inner()
+    }
+
+    pub fn register_byok_master_key(
+        &self,
+        key_id: &str,
+        key: [u8; 32],
+        make_active: bool,
+    ) -> Result<()> {
+        self.encrypted_store
+            .register_master_key(key_id, key, make_active)
+    }
+
+    pub fn set_byok_master_key(&self, key: Option<[u8; 32]>) {
+        self.encrypted_store.set_master_key(key);
+    }
+
+    pub fn disable_new_encryption(&self) {
+        self.encrypted_store.disable_new_encryption();
+    }
+
+    pub fn byok_encryption_status(&self) -> ByokEncryptionStatus {
+        self.encrypted_store.status()
     }
 
     pub fn identity_router(&self) -> &Arc<IdentityRouter> {
