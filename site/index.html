@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse — open-source product analytics you own</title>
+<meta name="description" content="Funnels, retention, feature flags and privacy-first session replay. Open source (Apache-2.0), self-hosted, one binary.">
+<meta property="og:title" content="Pulse — product analytics you actually own">
+<meta property="og:description" content="Open-source, self-hosted product analytics: funnels, retention, flags and privacy-first session replay.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#09090B">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;color-scheme:dark}
+body{margin:0;background:#09090B}
+a{color:#EDEDEF}a:hover{color:#FFFFFF}
+a:focus-visible,summary:focus-visible{outline:2px solid #C8F04A;outline-offset:3px;border-radius:6px}
+summary::-webkit-details-marker{display:none}summary{list-style:none}
+@keyframes pl-blink{0%,100%{opacity:1}50%{opacity:.35}}
+@media (max-width:760px){.pl-navlinks,.pl-sidebar{display:none!important}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{animation:none!important}}
+</style>
+</head>
+<body>
+<div style="font-family: Geist, Inter, system-ui, sans-serif; color: #EDEDEF; background: #09090B; width: 100%; overflow: hidden; -webkit-font-smoothing: antialiased">
+
+<!-- NAV -->
+<header style="position: relative; z-index: 2; border-bottom: 1px solid #1C1C21">
+<nav aria-label="Main" style="max-width: 1240px; margin: 0 auto; padding: 14px 24px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px">
+<a href="#top" style="display: flex; align-items: center; gap: 10px; text-decoration: none; min-height: 44px">
+<svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><polyline points="2,13 7,13 10,5 14,19 17,11 22,11" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></polyline></svg>
+<span style="font-weight: 600; font-size: 18px; letter-spacing: -0.03em; color: #FFFFFF">Pulse</span>
+</a>
+<div class="pl-navlinks" style="display: flex; flex-wrap: wrap; align-items: center; gap: 2px 26px; font-size: 14px">
+<a href="#product" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Product</a>
+<a href="#privacy" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Privacy</a>
+<a href="#selfhost" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Self-host</a>
+<a href="#editions" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Editions</a>
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Docs</a>
+</div>
+<div style="display: flex; align-items: center; gap: 10px">
+<a href="https://github.com/sswapnil2/analytics-system" style="display: inline-flex; align-items: center; gap: 8px; min-height: 40px; box-sizing: border-box; padding: 0 14px; border-radius: 999px; border: 1px solid #2A2A30; color: #EDEDEF; text-decoration: none; font-size: 14px; font-weight: 500">
+<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.7 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5z"></path></svg>
+GitHub
+</a>
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="display: inline-flex; align-items: center; min-height: 40px; box-sizing: border-box; padding: 0 16px; border-radius: 999px; background: #FFFFFF; color: #09090B; text-decoration: none; font-size: 14px; font-weight: 600">Get started</a>
+</div>
+</nav>
+</header>
+
+<!-- HERO -->
+<section id="top" style="position: relative; padding: 96px 24px 0; background-image: radial-gradient(ellipse 60% 50% at 50% 0%, rgba(200,240,74,0.10), rgba(9,9,11,0) 70%), linear-gradient(#141418 1px, transparent 1px), linear-gradient(90deg, #141418 1px, transparent 1px); background-size: 100% 100%, 64px 64px, 64px 64px; background-position: center top">
+<div style="max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; gap: 28px; text-align: center">
+<a href="https://github.com/sswapnil2/analytics-system" style="display: inline-flex; align-items: center; gap: 10px; min-height: 36px; box-sizing: border-box; padding: 0 6px 0 14px; border-radius: 999px; border: 1px solid #2A2A30; background: rgba(17,17,20,0.8); text-decoration: none; font-size: 13px; color: #D4D4D8">
+<span style="width: 7px; height: 7px; border-radius: 50%; background: #C8F04A; animation: pl-blink 2s ease-in-out infinite"></span>
+Apache-2.0 · Rust · one binary
+<span style="display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 999px; background: #1C1C21; color: #EDEDEF; font-size: 12px">Star on GitHub →</span>
+</a>
+<h1 style="margin: 0; font-weight: 600; font-size: clamp(44px, 7.4vw, 96px); line-height: 0.98; letter-spacing: -0.055em; color: #FFFFFF">Product analytics<br><span style="color: #71717A">you actually own.</span></h1>
+<p style="margin: 0; font-size: clamp(17px, 1.6vw, 20px); line-height: 1.55; color: #A1A1AA; max-width: 620px">Funnels, retention, feature flags and privacy-first session replay — open source, self-hosted, and running on your infrastructure in minutes.</p>
+<div style="display: flex; flex-wrap: wrap; justify-content: center; gap: 12px">
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="display: inline-flex; align-items: center; gap: 8px; min-height: 48px; box-sizing: border-box; padding: 0 22px; border-radius: 999px; background: #C8F04A; color: #09090B; text-decoration: none; font-weight: 600; font-size: 15px">Deploy Pulse <span aria-hidden="true">→</span></a>
+<a href="#selfhost" style="display: inline-flex; align-items: center; gap: 10px; min-height: 48px; box-sizing: border-box; padding: 0 20px; border-radius: 999px; border: 1px solid #2A2A30; background: #111114; color: #EDEDEF; text-decoration: none; font-family: 'Geist Mono', monospace; font-size: 13.5px"><span style="color: #71717A">$</span> ./pulse-node --seed</a>
+</div>
+</div>
+
+<!-- PRODUCT WINDOW -->
+<div style="max-width: 1180px; margin: 72px auto 0; position: relative">
+<div style="border: 1px solid #26262C; border-bottom: none; border-radius: 16px 16px 0 0; background: #0E0E11; box-shadow: 0 -40px 120px -40px rgba(200,240,74,0.18), 0 0 0 6px rgba(255,255,255,0.02); overflow: hidden">
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #1C1C21">
+<span style="width: 11px; height: 11px; border-radius: 50%; background: #2A2A30"></span><span style="width: 11px; height: 11px; border-radius: 50%; background: #2A2A30"></span><span style="width: 11px; height: 11px; border-radius: 50%; background: #2A2A30"></span>
+<span style="margin: 0 auto; font-family: 'Geist Mono', monospace; font-size: 12px; color: #8A8A93; background: #141418; border: 1px solid #1C1C21; border-radius: 6px; padding: 4px 40px">pulse.yourcompany.internal</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; min-height: 470px">
+<!-- sidebar -->
+<div class="pl-sidebar" style="flex: 0 0 200px; border-right: 1px solid #1C1C21; padding: 18px 12px; display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: #A1A1AA; box-sizing: border-box">
+<span style="padding: 6px 10px 12px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #8A8A93">Fintech app</span>
+<span style="padding: 8px 10px; border-radius: 6px">Trends</span>
+<span style="padding: 8px 10px; border-radius: 6px; background: #1A1A1F; color: #FFFFFF">Funnels</span>
+<span style="padding: 8px 10px; border-radius: 6px">Retention</span>
+<span style="padding: 8px 10px; border-radius: 6px">Flows</span>
+<span style="padding: 8px 10px; border-radius: 6px">Cohorts</span>
+<span style="padding: 8px 10px; border-radius: 6px">Replays</span>
+<span style="padding: 8px 10px; border-radius: 6px">Flags</span>
+</div>
+<!-- main -->
+<div style="flex: 999 1 560px; min-width: 0; padding: 24px; display: flex; flex-direction: column; gap: 20px; box-sizing: border-box">
+<div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px">
+<div style="display: flex; flex-direction: column; gap: 4px; text-align: left">
+<span style="font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: #FFFFFF">Onboarding → first disbursal</span>
+<span style="font-size: 12.5px; color: #8A8A93">Loose order · 14-day window · last 30 days</span>
+</div>
+<div style="display: flex; gap: 8px; font-size: 12px">
+<span style="padding: 6px 10px; border: 1px solid #26262C; border-radius: 6px; color: #A1A1AA">Breakdown: platform</span>
+<span style="padding: 6px 10px; border: 1px solid #26262C; border-radius: 6px; color: #A1A1AA">Compare</span>
+</div>
+</div>
+<div style="display: flex; gap: clamp(6px, 1.5vw, 14px); align-items: flex-end; height: 260px; padding: 0 4px; border-bottom: 1px solid #1C1C21">
+
+<div style="flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #FFFFFF">100%</span>
+<div style="display: flex; gap: 4px; align-items: flex-end; height: 100%">
+<div style="flex: 1; height: 100%; border-radius: 6px 6px 0 0; background: #C8F04A"></div>
+<div style="flex: 1; height: 92%; border-radius: 6px 6px 0 0; background: #6E7BFF"></div>
+</div>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #FFFFFF">72.0%</span>
+<div style="display: flex; gap: 4px; align-items: flex-end; height: 72%">
+<div style="flex: 1; height: 100%; border-radius: 6px 6px 0 0; background: #C8F04A"></div>
+<div style="flex: 1; height: 64%; border-radius: 6px 6px 0 0; background: #6E7BFF"></div>
+</div>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #FFFFFF">41.0%</span>
+<div style="display: flex; gap: 4px; align-items: flex-end; height: 41%">
+<div style="flex: 1; height: 100%; border-radius: 6px 6px 0 0; background: #C8F04A"></div>
+<div style="flex: 1; height: 47%; border-radius: 6px 6px 0 0; background: #6E7BFF"></div>
+</div>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 8px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #FFFFFF">29.0%</span>
+<div style="display: flex; gap: 4px; align-items: flex-end; height: 29%">
+<div style="flex: 1; height: 100%; border-radius: 6px 6px 0 0; background: #C8F04A"></div>
+<div style="flex: 1; height: 33%; border-radius: 6px 6px 0 0; background: #6E7BFF"></div>
+</div>
+</div>
+
+</div>
+<div style="display: flex; gap: clamp(6px, 1.5vw, 14px); padding: 0 4px; margin-top: -8px">
+
+<div style="flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #D4D4D8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">App_Open</span>
+<span style="font-size: 11.5px; color: #8A8A93">12,480 users</span>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #D4D4D8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">KYC_PAN_Submitted</span>
+<span style="font-size: 11.5px; color: #8A8A93">8,986 users</span>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #D4D4D8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">Mandate_Approved</span>
+<span style="font-size: 11.5px; color: #8A8A93">5,117 users</span>
+</div>
+
+<div style="flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; text-align: left">
+<span style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #D4D4D8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">First_Disbursal</span>
+<span style="font-size: 11.5px; color: #8A8A93">3,619 users</span>
+</div>
+
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: #A1A1AA">
+<span style="display: inline-flex; align-items: center; gap: 6px"><span style="width: 10px; height: 10px; border-radius: 3px; background: #C8F04A"></span>Android</span>
+<span style="display: inline-flex; align-items: center; gap: 6px"><span style="width: 10px; height: 10px; border-radius: 3px; background: #6E7BFF"></span>iOS</span>
+<span style="margin-left: auto; color: #F4A261">Biggest drop: KYC → Mandate · 3 replays with rage taps</span>
+</div>
+</div>
+</div>
+</div>
+<div style="position: absolute; left: 0; right: 0; bottom: 0; height: 160px; background: linear-gradient(rgba(9,9,11,0), #09090B)"></div>
+</div>
+</section>
+
+<!-- TECH STRIP -->
+<section aria-label="Built with" style="border-top: 1px solid #1C1C21; border-bottom: 1px solid #1C1C21">
+<div style="max-width: 1240px; margin: 0 auto; padding: 22px 24px; display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 44px; font-family: 'Geist Mono', monospace; font-size: 13px; color: #8A8A93">
+<span>Rust core</span><span>Columnar storage</span><span>QUIC + HTTP ingest</span><span>Edge flag evaluation</span><span>MCP server</span><span>S3-compatible</span>
+</div>
+</section>
+
+<!-- BENTO -->
+<section id="product" aria-labelledby="product-h" style="max-width: 1240px; margin: 0 auto; padding: 120px 24px 40px; display: flex; flex-direction: column; gap: 48px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
+<h2 id="product-h" style="margin: 0; font-weight: 600; font-size: clamp(34px, 4.4vw, 56px); line-height: 1.02; letter-spacing: -0.045em; max-width: 640px; color: #FFFFFF">The whole analytics stack.<br><span style="color: #71717A">Nothing behind a paywall.</span></h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 380px">Everything below ships in the Apache-2.0 build. No seat limits, no event caps, no licence key.</p>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 16px">
+
+<!-- Retention -->
+<div style="flex: 2 1 520px; min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.025em">Retention that explains itself</h3>
+<p style="margin: 0; font-size: 14.5px; line-height: 1.55; color: #A1A1AA">Cohort grids, stickiness and flows — click a cell to see who churned.</p>
+</div>
+<div style="display: flex; flex-direction: column; gap: 4px; overflow-x: auto">
+
+<div style="display: flex; gap: 4px; align-items: center">
+<span style="flex: 0 0 64px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8A8A93">Week 1</span>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.90); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">100%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.59); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">62%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.47); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">48%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.42); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">41%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.38); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">37%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.36); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">34%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.34); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">32%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.33); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">31%</div>
+
+</div>
+
+<div style="display: flex; gap: 4px; align-items: center">
+<span style="flex: 0 0 64px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8A8A93">Week 2</span>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.90); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">100%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.58); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">61%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.47); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">47%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.41); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">40%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.38); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">36%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.35); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">33%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.33); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">31%</div>
+
+</div>
+
+<div style="display: flex; gap: 4px; align-items: center">
+<span style="flex: 0 0 64px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8A8A93">Week 3</span>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.90); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">100%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.56); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">58%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.44); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">44%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.38); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">37%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.35); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">33%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.33); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">30%</div>
+
+</div>
+
+<div style="display: flex; gap: 4px; align-items: center">
+<span style="flex: 0 0 64px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8A8A93">Week 4</span>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.90); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">100%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.55); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">57%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.43); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">43%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.38); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">36%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.34); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">32%</div>
+
+</div>
+
+<div style="display: flex; gap: 4px; align-items: center">
+<span style="flex: 0 0 64px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8A8A93">Week 5</span>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.90); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #09090B">100%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.52); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">54%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.41); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">40%</div>
+
+<div style="flex: 0 0 calc((100% - 92px) / 8); min-width: 30px; height: 30px; border-radius: 5px; background: rgba(200,240,74,0.35); display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #EDEDEF">33%</div>
+
+</div>
+
+</div>
+</div>
+
+<!-- Flags -->
+<div style="flex: 1 1 340px; min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.025em">Flags &amp; experiments</h3>
+<p style="margin: 0; font-size: 14.5px; line-height: 1.55; color: #A1A1AA">Evaluated at the edge. Lift and sample-ratio checks built in.</p>
+</div>
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: auto">
+<div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border: 1px solid #1F1F25; border-radius: 10px; background: #121216">
+<span style="font-family: 'Geist Mono', monospace; font-size: 12.5px">new_kyc_flow</span>
+<span style="width: 36px; height: 20px; border-radius: 999px; background: #C8F04A; position: relative"><span style="position: absolute; right: 2px; top: 2px; width: 16px; height: 16px; border-radius: 50%; background: #09090B"></span></span>
+</div>
+<div style="padding: 14px; border: 1px solid #1F1F25; border-radius: 10px; background: #121216; display: flex; flex-direction: column; gap: 10px; font-size: 12.5px">
+<div style="display: flex; justify-content: space-between; color: #A1A1AA"><span>control</span><span style="font-family: 'Geist Mono', monospace">41.2%</span></div>
+<div style="height: 6px; border-radius: 3px; background: #1F1F25"><div style="width: 41%; height: 100%; border-radius: 3px; background: #52525B"></div></div>
+<div style="display: flex; justify-content: space-between"><span>variant_b</span><span style="font-family: 'Geist Mono', monospace; color: #C8F04A">48.9% · +18.7%</span></div>
+<div style="height: 6px; border-radius: 3px; background: #1F1F25"><div style="width: 49%; height: 100%; border-radius: 3px; background: #C8F04A"></div></div>
+</div>
+</div>
+</div>
+
+<!-- Replay -->
+<div style="flex: 1 1 340px; min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.025em">Session replay, minus the PII</h3>
+<p style="margin: 0; font-size: 14.5px; line-height: 1.55; color: #A1A1AA">Wireframes, not pixels. Rage taps and errors on the timeline.</p>
+</div>
+<div style="display: flex; gap: 14px; margin-top: auto; align-items: flex-end">
+<div style="flex: 0 0 130px; height: 200px; box-sizing: border-box; border: 1.5px solid #3F3F46; border-radius: 20px; padding: 22px 10px 12px; display: flex; flex-direction: column; gap: 8px">
+<div style="height: 6px; width: 60px; border-radius: 3px; background: #3F3F46"></div>
+<div style="height: 22px; border: 1px solid #2A2A30; border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 10px; display: flex; align-items: center; padding: 0 6px; color: #D4D4D8">████ ███</div>
+<div style="height: 22px; border: 1px solid #2A2A30; border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 10px; display: flex; align-items: center; padding: 0 6px; color: #D4D4D8">██████████</div>
+<div style="margin-top: auto; height: 22px; border-radius: 5px; background: #1F1F25; position: relative"><span style="position: absolute; right: 10px; top: 2px; width: 18px; height: 18px; border-radius: 50%; border: 2px solid #F4A261; box-sizing: border-box"></span></div>
+<div style="height: 22px; border-radius: 5px; background: #3F3F46"></div>
+</div>
+<div style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 8px; font-size: 12px">
+<span style="display: flex; gap: 8px"><span style="font-family: 'Geist Mono', monospace; color: #8A8A93">0:04</span>Details entered</span>
+<span style="display: flex; gap: 8px; color: #F4A261"><span style="font-family: 'Geist Mono', monospace; color: #8A8A93">0:11</span>Rage tap ×4</span>
+<span style="display: flex; gap: 8px; color: #F4A261"><span style="font-family: 'Geist Mono', monospace; color: #8A8A93">0:12</span>Error · promo</span>
+<span style="display: flex; gap: 8px"><span style="font-family: 'Geist Mono', monospace; color: #8A8A93">0:19</span>Plan selected</span>
+</div>
+</div>
+</div>
+
+<!-- MCP -->
+<div style="flex: 2 1 520px; min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 28px; display: flex; flex-direction: column; gap: 22px">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.025em">Ask your data from any AI assistant</h3>
+<p style="margin: 0; font-size: 14.5px; line-height: 1.55; color: #A1A1AA">A built-in MCP server lets Claude, Cursor or your own agent query funnels and cohorts — with your model, your keys.</p>
+</div>
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: auto; font-size: 13.5px; line-height: 1.5">
+<div style="align-self: flex-end; max-width: 80%; padding: 10px 14px; border-radius: 14px 14px 4px 14px; background: #1C1C21">Where do users drop off before their first disbursal?</div>
+<div style="max-width: 88%; padding: 12px 14px; border-radius: 14px 14px 14px 4px; border: 1px solid #1F1F25; background: #121216; color: #D4D4D8; display: flex; flex-direction: column; gap: 8px">
+<span style="font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #8A8A93">→ pulse.query_funnel · pulse.search_sessions</span>
+<span>The biggest drop is <strong style="color: #FFFFFF">KYC submitted → mandate approved</strong>. Three of the dropped sessions show rage taps on “Apply promo code”.</span>
+</div>
+</div>
+</div>
+
+<div style="flex: 1 1 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px">
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 24px; display: flex; flex-direction: column; gap: 8px"><h3 style="margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.02em">Trends &amp; formulas</h3><p style="margin: 0; font-size: 14px; line-height: 1.55; color: #A1A1AA">DAU/WAU/MAU, percentiles, breakdowns, compare periods.</p></div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 24px; display: flex; flex-direction: column; gap: 8px"><h3 style="margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.02em">Cohorts &amp; profiles</h3><p style="margin: 0; font-size: 14px; line-height: 1.55; color: #A1A1AA">Behavioural cohorts, user and group properties.</p></div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 24px; display: flex; flex-direction: column; gap: 8px"><h3 style="margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.02em">Dashboards &amp; alerts</h3><p style="margin: 0; font-size: 14px; line-height: 1.55; color: #A1A1AA">Shared boards and threshold alerts to any webhook.</p></div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 18px; background: #0E0E11; padding: 24px; display: flex; flex-direction: column; gap: 8px"><h3 style="margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.02em">Lexicon &amp; governance</h3><p style="margin: 0; font-size: 14px; line-height: 1.55; color: #A1A1AA">Name, describe and control every event and property.</p></div>
+</div>
+</div>
+</section>
+
+<!-- PRIVACY -->
+<section id="privacy" aria-labelledby="privacy-h" style="max-width: 1240px; margin: 0 auto; padding: 100px 24px">
+<div style="border: 1px solid #1F1F25; border-radius: 24px; background: radial-gradient(ellipse 70% 80% at 100% 0%, rgba(110,123,255,0.10), rgba(14,14,17,0) 60%), #0E0E11; padding: clamp(28px, 5vw, 64px); display: flex; flex-wrap: wrap; gap: 48px; align-items: center">
+<div style="flex: 1 1 440px; min-width: 0; display: flex; flex-direction: column; gap: 22px">
+<span style="font-family: 'Geist Mono', monospace; font-size: 12.5px; letter-spacing: 0.06em; text-transform: uppercase; color: #6E7BFF">Privacy by architecture</span>
+<h2 id="privacy-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">See what users did.<br>Never what they typed.</h2>
+<p style="margin: 0; font-size: 16.5px; line-height: 1.6; color: #A1A1AA; max-width: 520px">Sensitive text is masked on the device before it is sent. Card numbers, PAN and passwords never reach your servers — let alone ours.</p>
+</div>
+<div style="flex: 1 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 1px; border-radius: 14px; overflow: hidden; border: 1px solid #1F1F25; background: #1F1F25">
+<div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">01</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Masked on the device</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Not scrubbed later on a server.</span></div></div>
+<div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">02</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Built for the DPDP Act</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Opt-out and per-user erasure APIs, with an audit record of every deletion.</span></div></div>
+<div style="background: #0B0B0E; padding: 20px 22px; display: flex; gap: 16px"><span style="font-family: 'Geist Mono', monospace; font-size: 13px; color: #C8F04A">03</span><div style="display: flex; flex-direction: column; gap: 4px"><strong style="font-weight: 600; font-size: 15.5px">Data stays in your infrastructure</strong><span style="font-size: 14px; color: #A1A1AA; line-height: 1.5">Local disk or any S3-compatible bucket you control.</span></div></div>
+</div>
+</div>
+</section>
+
+<!-- SELF-HOST -->
+<section id="selfhost" aria-labelledby="selfhost-h" style="max-width: 1240px; margin: 0 auto; padding: 20px 24px 120px; display: flex; flex-wrap: wrap; gap: 56px; align-items: center">
+<div style="flex: 1 1 380px; min-width: 0; display: flex; flex-direction: column; gap: 20px">
+<h2 id="selfhost-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">One binary.<br><span style="color: #71717A">No cluster to babysit.</span></h2>
+<p style="margin: 0; font-size: 16.5px; line-height: 1.6; color: #A1A1AA">Ingest, storage, query engine and Studio run in a single process. Add the web SDK with a few lines; mobile apps use the Rust core with iOS and Android bindings <span style="font-family: 'Geist Mono', monospace; font-size: 12px; border: 1px solid #2A2A30; border-radius: 4px; padding: 1px 6px">beta</span>.</p>
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="align-self: flex-start; display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: #FFFFFF; text-decoration: none; font-weight: 500; font-size: 15px; border-bottom: 1px solid #3F3F46">Read the self-hosting guide <span aria-hidden="true">→</span></a>
+</div>
+<div style="flex: 1.3 1 520px; min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0B0B0E; overflow: hidden">
+<div style="display: flex; gap: 2px; padding: 8px; border-bottom: 1px solid #1C1C21; font-family: 'Geist Mono', monospace; font-size: 12.5px">
+<span style="padding: 6px 12px; border-radius: 6px; background: #1A1A1F; color: #FFFFFF">terminal</span>
+<span style="padding: 6px 12px; color: #8A8A93">app.ts</span>
+</div>
+<pre style="margin: 0; padding: 22px 24px 26px; overflow-x: auto; font-family: 'Geist Mono', monospace; font-size: 13.5px; line-height: 1.8; color: #D4D4D8; white-space: pre"><span style="color: #8A8A93">$</span> cargo build --release -p pulse-node
+<span style="color: #8A8A93">$</span> ./target/release/pulse-node --seed
+<span style="color: #C8F04A">✓</span> Studio      <span style="color: #8A8A93">http://localhost:8090</span>
+<span style="color: #C8F04A">✓</span> Ingest key  <span style="color: #8A8A93">pk_live_••••••••</span>
+
+<span style="color: #C792EA">import</span> { PulseWebClient } <span style="color: #C792EA">from</span> <span style="color: #F4C38B">"@pulse/web"</span>;
+<span style="color: #C792EA">const</span> pulse = <span style="color: #C792EA">new</span> PulseWebClient({ endpointUrl, apiKey,
+  enableWireframeReplay: <span style="color: #C792EA">true</span> });
+pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
+</div>
+</section>
+
+<!-- EDITIONS -->
+<section id="editions" aria-labelledby="editions-h" style="border-top: 1px solid #1C1C21">
+<div style="max-width: 1240px; margin: 0 auto; padding: 120px 24px; display: flex; flex-direction: column; gap: 48px">
+<div style="display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center">
+<h2 id="editions-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">Free to run. Forever.</h2>
+<p style="margin: 0; font-size: 16.5px; line-height: 1.6; color: #A1A1AA; max-width: 540px">Every feature, for every team, under Apache-2.0. No licence key, no event caps, no seat limits.</p>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 16px; justify-content: center">
+<div style="flex: 1 1 380px; max-width: 520px; min-width: 0; border-radius: 20px; padding: 1px; background: linear-gradient(160deg, #C8F04A, #26262C 45%)">
+<div style="height: 100%; box-sizing: border-box; border-radius: 19px; background: #0E0E11; padding: 34px; display: flex; flex-direction: column; gap: 24px">
+<div style="display: flex; justify-content: space-between; align-items: center"><h3 style="margin: 0; font-size: 20px; font-weight: 600">Community</h3><span style="font-family: 'Geist Mono', monospace; font-size: 12px; color: #A1A1AA">Apache-2.0</span></div>
+<p style="margin: 0; font-size: 52px; font-weight: 600; letter-spacing: -0.05em; color: #FFFFFF; line-height: 1">$0<span style="font-size: 16px; font-weight: 400; color: #8A8A93; letter-spacing: 0"> · self-hosted</span></p>
+<ul style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 12px; font-size: 14.5px; color: #D4D4D8">
+<li style="display: flex; gap: 10px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="M5 12l5 5L20 7"></path></svg>Every analytics, replay and flags feature</li>
+<li style="display: flex; gap: 10px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="M5 12l5 5L20 7"></path></svg>Unlimited events, projects and users</li>
+<li style="display: flex; gap: 10px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="M5 12l5 5L20 7"></path></svg>DPDP opt-out and erasure APIs</li>
+<li style="display: flex; gap: 10px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="M5 12l5 5L20 7"></path></svg>MCP server for your own AI assistant</li>
+<li style="display: flex; gap: 10px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex: none"><path d="M5 12l5 5L20 7"></path></svg>Community support on GitHub</li>
+</ul>
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="margin-top: auto; display: inline-flex; justify-content: center; align-items: center; min-height: 48px; border-radius: 999px; background: #C8F04A; color: #09090B; text-decoration: none; font-weight: 600; font-size: 15px">Deploy now</a>
+</div>
+</div>
+<div style="flex: 1 1 380px; max-width: 520px; min-width: 0; box-sizing: border-box; border: 1px solid #1F1F25; border-radius: 20px; background: #0B0B0E; padding: 34px; display: flex; flex-direction: column; gap: 18px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600">Running Pulse at scale?</h3>
+<p style="margin: 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">If you're rolling Pulse out across a larger company, we'd like to hear what you need. Tell us about your setup and we'll help you get it running.</p>
+<a href="https://github.com/sswapnil2/analytics-system/issues/new" style="margin-top: auto; display: inline-flex; justify-content: center; align-items: center; min-height: 48px; border-radius: 999px; border: 1px solid #3F3F46; color: #FFFFFF; text-decoration: none; font-weight: 600; font-size: 15px">Talk to us</a>
+</div>
+</div>
+</div>
+</section>
+
+<!-- FAQ -->
+<section aria-labelledby="faq-h" style="border-top: 1px solid #1C1C21">
+<div style="max-width: 1240px; margin: 0 auto; padding: 100px 24px; display: flex; flex-wrap: wrap; gap: 48px">
+<h2 id="faq-h" style="flex: 1 1 280px; margin: 0; font-weight: 600; font-size: clamp(30px, 3.4vw, 42px); letter-spacing: -0.045em; line-height: 1.05; color: #FFFFFF">Questions,<br><span style="color: #71717A">answered.</span></h2>
+<div style="flex: 2 1 560px; min-width: 0; display: flex; flex-direction: column">
+<details style="border-top: 1px solid #1F1F25; padding: 4px 0 18px" open="">
+<summary style="cursor: pointer; min-height: 48px; display: flex; align-items: center; font-size: 17px; font-weight: 500">Is it really open source?</summary>
+<p style="margin: 4px 0 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">Yes — Apache-2.0. Run it, modify it and redistribute it, including commercially.</p>
+</details>
+<details style="border-top: 1px solid #1F1F25; padding: 4px 0 18px">
+<summary style="cursor: pointer; min-height: 48px; display: flex; align-items: center; font-size: 17px; font-weight: 500">Do I need a licence key?</summary>
+<p style="margin: 4px 0 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">No. Nothing in Community is gated, and there are no event or seat limits.</p>
+</details>
+<details style="border-top: 1px solid #1F1F25; padding: 4px 0 18px">
+<summary style="cursor: pointer; min-height: 48px; display: flex; align-items: center; font-size: 17px; font-weight: 500">Where is my data stored?</summary>
+<p style="margin: 4px 0 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">On the disk or S3-compatible bucket you point Pulse at. For encryption at rest, enable your disk's or bucket's own encryption.</p>
+</details>
+<details style="border-top: 1px solid #1F1F25; padding: 4px 0 18px">
+<summary style="cursor: pointer; min-height: 48px; display: flex; align-items: center; font-size: 17px; font-weight: 500">Can it replace Mixpanel or Amplitude?</summary>
+<p style="margin: 4px 0 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">For funnels, retention, cohorts, flags and replay, yes. Page-view autocapture, marketing attribution and server-side batch import are on the roadmap.</p>
+</details>
+<details style="border-top: 1px solid #1F1F25; border-bottom: 1px solid #1F1F25; padding: 4px 0 18px">
+<summary style="cursor: pointer; min-height: 48px; display: flex; align-items: center; font-size: 17px; font-weight: 500">Will Pulse stay free?</summary>
+<p style="margin: 4px 0 0; font-size: 15px; line-height: 1.6; color: #A1A1AA">Yes. Everything in Pulse today is Apache-2.0 and stays that way.</p>
+</details>
+</div>
+</div>
+</section>
+
+<!-- FINAL CTA -->
+<section aria-labelledby="cta-h" style="padding: 0 24px 100px">
+<div style="max-width: 1240px; margin: 0 auto; border-radius: 28px; padding: clamp(40px, 7vw, 96px) 24px; text-align: center; background: radial-gradient(ellipse 50% 70% at 50% 100%, rgba(200,240,74,0.16), rgba(9,9,11,0) 70%), #0E0E11; border: 1px solid #1F1F25; display: flex; flex-direction: column; align-items: center; gap: 26px">
+<h2 id="cta-h" style="margin: 0; font-weight: 600; font-size: clamp(36px, 5.6vw, 72px); line-height: 1; letter-spacing: -0.055em; color: #FFFFFF">Own your analytics.</h2>
+<p style="margin: 0; font-size: 17px; color: #A1A1AA">Self-host Pulse today. It's free, and it's yours.</p>
+<div style="display: flex; flex-wrap: wrap; justify-content: center; gap: 12px">
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="display: inline-flex; align-items: center; min-height: 48px; box-sizing: border-box; padding: 0 24px; border-radius: 999px; background: #C8F04A; color: #09090B; text-decoration: none; font-weight: 600; font-size: 15px">Deploy Pulse</a>
+<a href="https://github.com/sswapnil2/analytics-system" style="display: inline-flex; align-items: center; min-height: 48px; box-sizing: border-box; padding: 0 24px; border-radius: 999px; border: 1px solid #2A2A30; color: #FFFFFF; text-decoration: none; font-weight: 500; font-size: 15px">View on GitHub</a>
+</div>
+</div>
+</section>
+
+<!-- FOOTER -->
+<footer style="border-top: 1px solid #1C1C21">
+<div style="max-width: 1240px; margin: 0 auto; padding: 32px 24px; display: flex; flex-wrap: wrap; gap: 16px 40px; align-items: center; justify-content: space-between; font-size: 13.5px; color: #8A8A93">
+<div style="display: flex; align-items: center; gap: 10px">
+<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><polyline points="2,13 7,13 10,5 14,19 17,11 22,11" fill="none" stroke="#C8F04A" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></polyline></svg>
+<span style="color: #EDEDEF; font-weight: 600">Pulse</span><span>· Apache-2.0</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 0 24px">
+<a href="https://github.com/sswapnil2/analytics-system#readme" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Docs</a>
+<a href="https://github.com/sswapnil2/analytics-system" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">GitHub</a>
+<a href="https://github.com/sswapnil2/analytics-system/blob/main/LICENSE" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Licence</a>
+<a href="https://github.com/sswapnil2/analytics-system/issues/new" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Contact</a>
+</div>
+</div>
+</footer>
+
+</div>
+</body>
+</html>
