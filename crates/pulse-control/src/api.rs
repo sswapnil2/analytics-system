@@ -115,12 +115,14 @@ impl AuthPrincipal {
         }
     }
 
+    /// Encryption keys and the licence: root admin token only. Studio users (any self-registered
+    /// account in an allowed domain) and project keys are refused.
     fn require_cluster_admin(&self) -> Result<String, CtrlError> {
         match self {
-            AuthPrincipal::RootAdmin | AuthPrincipal::User { .. } => Ok(self.actor_label()),
-            AuthPrincipal::ProjectAdmin { .. } => Err(CtrlError::forbidden(
-                "cluster administration requires root admin privileges",
-            )),
+            AuthPrincipal::RootAdmin => Ok(self.actor_label()),
+            AuthPrincipal::User { .. } | AuthPrincipal::ProjectAdmin { .. } => Err(
+                CtrlError::forbidden("cluster administration requires the root admin token"),
+            ),
         }
     }
 }
@@ -4058,8 +4060,12 @@ async fn handle_verify_byok(
             format!("Verified connectivity to {url} ({entries} root entries visible)")
         }
         "webhook" => {
-            let parsed = validate_outbound_url_ssrf(&secret)
-                .map_err(|e| CtrlError::bad(format!("webhook URL blocked by SSRF policy: {e}")))?;
+            let (parsed, client) =
+                crate::copilot::pinned_outbound_client(&secret, std::time::Duration::from_secs(10))
+                    .await
+                    .map_err(|e| {
+                        CtrlError::bad(format!("webhook URL blocked by SSRF policy: {e}"))
+                    })?;
             let probe_body = json!({
                 "event": "pulse.webhook.verify",
                 "project_id": id,
@@ -4076,10 +4082,6 @@ async fn handle_verify_byok(
             let tag = hmac::sign(&mac_key, &body_bytes);
             let sig_hdr = format!("sha256={}", hex::encode(tag.as_ref()));
 
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(CtrlError::internal)?;
             let resp = client
                 .post(parsed.as_str())
                 .header("Content-Type", "application/json")
@@ -4087,7 +4089,9 @@ async fn handle_verify_byok(
                 .body(body_bytes)
                 .send()
                 .await
-                .map_err(|e| CtrlError::bad_gateway(format!("webhook delivery failed: {e}")))?;
+                .map_err(|e| {
+                    CtrlError::bad_gateway(format!("webhook delivery failed: {}", e.without_url()))
+                })?;
             if !resp.status().is_success() {
                 return Err(CtrlError::bad_gateway(format!(
                     "webhook endpoint returned HTTP {}",
@@ -4304,4 +4308,22 @@ async fn handle_byok_copilot(
     .await;
 
     Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod cluster_admin_tests {
+    use super::AuthPrincipal;
+
+    #[test]
+    fn only_root_token_is_cluster_admin() {
+        assert!(AuthPrincipal::RootAdmin.require_cluster_admin().is_ok());
+        let user = AuthPrincipal::User {
+            user_id: "u1".into(),
+        };
+        assert!(user.require_cluster_admin().is_err());
+        let proj = AuthPrincipal::ProjectAdmin {
+            project_id: "p".into(),
+        };
+        assert!(proj.require_cluster_admin().is_err());
+    }
 }

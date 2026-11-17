@@ -196,23 +196,35 @@ pub fn allow_private_endpoints() -> bool {
     std::env::var("PULSE_ALLOW_PRIVATE_ENDPOINTS").as_deref() == Ok("1")
 }
 
-#[inline]
-fn is_forbidden_ssrf_ip(ip: IpAddr) -> bool {
+/// True for any address an outbound customer-supplied URL must not reach: private, loopback,
+/// link-local/metadata, CGNAT (incl. 100.100.100.200), benchmark, reserved, and IPv6 forms that
+/// embed an IPv4 address (mapped `::ffff:a.b.c.d`, compatible `::a.b.c.d`, NAT64 `64:ff9b::/96`).
+pub fn is_forbidden_ssrf_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
+                || a == 0 // 0.0.0.0/8
+                || (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+                || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24
+                || (a == 198 && (b & 0xfe) == 18) // 198.18.0.0/15
+                || a >= 240 // 240.0.0.0/4 reserved
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            if let Some(v4) = v6.to_ipv4() {
+                return is_forbidden_ssrf_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] == 0x64 && seg[1] == 0xff9b) // NAT64
         }
     }
 }
@@ -263,18 +275,34 @@ pub fn validate_outbound_url_ssrf(raw_url: &str) -> Result<Url> {
 
     let port = parsed.port_or_known_default().unwrap_or(443);
     if !allow_priv {
-        if let Ok(addrs) = (host, port).to_socket_addrs() {
-            for addr in addrs {
-                if is_forbidden_ssrf_ip(addr.ip()) {
-                    return Err(StorageError::Corrupted(format!(
-                        "outbound host '{host}' resolved to private/metadata IP {}",
-                        addr.ip()
-                    )));
-                }
-            }
-        }
+        // Fail closed: a name we can't resolve now is not "safe" (the client would resolve later).
+        let addrs = (host, port).to_socket_addrs().map_err(|e| {
+            StorageError::Corrupted(format!("outbound host '{host}' could not be resolved: {e}"))
+        })?;
+        check_resolved_addrs(host, addrs)?;
     }
     Ok(parsed)
+}
+
+/// Rejects the lookup if it is empty or any address is forbidden; returns the addresses so callers
+/// can pin their HTTP client to exactly what was checked (no DNS rebinding between check and use).
+pub fn check_resolved_addrs(
+    host: &str,
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<_> = addrs.into_iter().collect();
+    if addrs.is_empty() {
+        return Err(StorageError::Corrupted(format!(
+            "outbound host '{host}' resolved to no addresses"
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|a| is_forbidden_ssrf_ip(a.ip())) {
+        return Err(StorageError::Corrupted(format!(
+            "outbound host '{host}' resolved to private/metadata IP {}",
+            bad.ip()
+        )));
+    }
+    Ok(addrs)
 }
 
 /// Builds a customer BYOC object store (S3-compatible, or named `memory://` in private test mode).
@@ -348,4 +376,48 @@ pub async fn validate_object_store_connection(
     let store = build_customer_object_store(raw_url, access_key, secret_key, region, endpoint)?;
     let listed = store.list_with_delimiter(None).await?;
     Ok(listed.objects.len() + listed.common_prefixes.len())
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_internal_addresses_including_embedded_ipv4() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "169.254.169.254",
+            "100.100.100.200",
+            "0.1.2.3",
+            "198.18.0.1",
+            "192.0.0.8",
+            "240.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:a9fe:a9fe",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "fd00:ec2::254",
+            "fe80::1",
+        ] {
+            assert!(
+                is_forbidden_ssrf_ip(ip.parse().unwrap()),
+                "{ip} should be blocked"
+            );
+        }
+        for ip in ["8.8.8.8", "100.128.0.1", "2606:4700:4700::1111"] {
+            assert!(
+                !is_forbidden_ssrf_ip(ip.parse().unwrap()),
+                "{ip} should be allowed"
+            );
+        }
+        assert!(validate_outbound_url_ssrf("https://[::ffff:127.0.0.1]/x").is_err());
+    }
+
+    #[test]
+    fn unresolvable_host_fails_closed() {
+        assert!(validate_outbound_url_ssrf("https://nonexistent.invalid/hook").is_err());
+        assert!(check_resolved_addrs("h", Vec::new()).is_err());
+    }
 }

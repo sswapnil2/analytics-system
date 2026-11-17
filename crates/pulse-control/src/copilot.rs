@@ -7,12 +7,35 @@ use pulse_exec::{
     GlobalFilter, InsightsMetric, InsightsQuery, InsightsSeriesSpec, QueryEngine, RetentionMode,
     RetentionQuery, SessionSearchQuery, TimeInterval, TimeRange,
 };
-use pulse_storage::validate_outbound_url_ssrf;
+use pulse_storage::{allow_private_endpoints, check_resolved_addrs, validate_outbound_url_ssrf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::db::MetaStore;
 use crate::models::ByokCredentialRecord;
+
+/// Validates a customer-supplied outbound URL and returns a client that can only reach the
+/// addresses that passed the SSRF check: redirects are off, and DNS for the host is pinned to the
+/// checked IPs so a rebinding name can't swap in an internal address after validation.
+pub(crate) async fn pinned_outbound_client(
+    raw_url: &str,
+    timeout: std::time::Duration,
+) -> Result<(reqwest::Url, reqwest::Client), String> {
+    let url = validate_outbound_url_ssrf(raw_url).map_err(|e| e.to_string())?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if let (Some(host), false) = (url.domain(), allow_private_endpoints()) {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("outbound host '{host}' could not be resolved: {e}"))?;
+        let addrs = check_resolved_addrs(host, addrs).map_err(|e| e.to_string())?;
+        builder = builder.resolve_to_addrs(host, &addrs);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    Ok((url, client))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CopilotRequest {
@@ -442,14 +465,11 @@ async fn call_external_llm(
         _ => "https://api.openai.com/v1/chat/completions".to_string(),
     };
     let target_url = custom_endpoint.map(str::to_string).unwrap_or(default_url);
-    validate_outbound_url_ssrf(&target_url).map_err(|e| {
-        CopilotError::BadRequest(format!("LLM endpoint blocked by SSRF policy: {e}"))
-    })?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| CopilotError::Upstream(e.to_string()))?;
+    let (_, client) = pinned_outbound_client(&target_url, std::time::Duration::from_secs(15))
+        .await
+        .map_err(|e| {
+            CopilotError::BadRequest(format!("LLM endpoint blocked by SSRF policy: {e}"))
+        })?;
 
     let system_prompt = "You are Pulse Analytics BYOK Copilot. Note: session IDs and aggregate query JSON are sent here under customer BYOK consent. Answer the user's question directly in concise Markdown, referencing exact metrics and session IDs from the provided tool outputs.";
     let user_msg =
