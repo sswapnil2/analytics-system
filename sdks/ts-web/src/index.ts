@@ -125,6 +125,23 @@ interface SealedReplayPacket {
 }
 
 export const FIXED_MASK = "████";
+const ERROR_BANNER_NODE_ID = 99_000;
+
+/** Box of the visible `[role=alert]` showing `message` (or the last visible alert), in viewport px. */
+function visibleAlertBox(message: string): { x: number; y: number; w: number; h: number } | null {
+  if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return null;
+  const alerts = Array.from(document.querySelectorAll("[role='alert']"))
+    .map((el) => ({ el, r: el.getBoundingClientRect() }))
+    .filter(({ r }) => r.width >= 4 && r.height >= 4);
+  const hit = alerts.find(({ el }) => (el.textContent || "").includes(message)) ?? alerts[alerts.length - 1];
+  if (!hit) return null;
+  return {
+    x: Math.max(0, Math.round(hit.r.left)),
+    y: Math.max(0, Math.round(hit.r.top)),
+    w: Math.min(65535, Math.round(hit.r.width)),
+    h: Math.min(65535, Math.round(hit.r.height)),
+  };
+}
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 2_000;
 const MAX_QUEUED_REPLAY_PACKETS = 64;
@@ -942,21 +959,23 @@ export class PulseWebClient {
 
   public recordConsoleError(message: string): void {
     if (this.optedOut) return;
-    const now = Date.now();
-    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
-    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
-    this.replayOps.push({
-      op: "node_upsert",
-      node_id: 99_000 + this.replayOps.length,
-      parent_id: 1,
-      kind: "error_banner",
-      x: 16,
-      y: 16,
-      w: 340,
-      h: 44,
-      bg_rgba: 0xdc2626ff,
-      masked_label: maskPiiText(message, true),
-    });
+    if (this.isRecordingSession()) {
+      const now = Date.now();
+      if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+      if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+      // One stable node, so repeated errors replace the banner instead of stacking copies.
+      // Draw it over the page's own alert when one is visible, else as a toast in the top-left corner.
+      const box = visibleAlertBox(message) ?? { x: 16, y: 16, w: 340, h: 44 };
+      this.replayOps.push({
+        op: "node_upsert",
+        node_id: ERROR_BANNER_NODE_ID,
+        parent_id: 1,
+        kind: "error_banner",
+        ...box,
+        bg_rgba: 0xdc2626ff,
+        masked_label: maskPiiText(message, true),
+      });
+    }
     this.track("$error", { message: message.slice(0, 256) });
   }
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Pause, Play, RotateCcw, ShieldCheck, VideoOff, WifiOff, Zap } from "lucide-react";
 import { api, ReplayChunk, WireNode } from "../api/client";
 import { errorMessage, formatDuration, isNotFound } from "../lib/format";
@@ -107,6 +107,16 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
   const [playing, setPlaying] = useState<boolean>(true);
   const [speed, setSpeed] = useState<1 | 2 | 4>(1);
   const [cursorMs, setCursorMs] = useState<number>(0);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [fitW, setFitW] = useState<number>(Infinity);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([entry]) => setFitW(entry.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const { timeline, durationMs, viewport, moments } = useMemo(() => {
     const items: TimelineAction[] = [];
@@ -213,21 +223,31 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
     setPlaying(false);
   };
 
-  const scale = 0.72;
+  // Web recordings are landscape (e.g. 1024×768): show them in a browser-style frame stacked above
+  // the controls, and shrink any recording to fit the available width instead of clipping it.
+  const landscape = viewport.w > viewport.h;
+  const scale = Math.min(0.72, (fitW - 12) / viewport.w);
   const frameW = Math.round(viewport.w * scale);
   const frameH = Math.round(viewport.h * scale);
 
   return (
-    <div className="flex flex-col items-center gap-6 xl:flex-row xl:items-start">
-      {/* Phone */}
+    <div
+      ref={wrapRef}
+      className={`flex flex-col items-center gap-6 ${landscape ? "" : "xl:flex-row xl:items-start"}`}
+    >
+      {/* Device */}
       <figure className="flex shrink-0 flex-col items-center gap-2">
         <div
-          className="relative overflow-hidden rounded-[30px] border-[6px] border-ink/85 bg-panel"
-          style={{ width: frameW + 12, height: frameH + 12, maxWidth: "100%" }}
+          className={`relative overflow-hidden border-[6px] border-ink/85 bg-panel ${
+            landscape ? "rounded-lg" : "rounded-[30px]"
+          }`}
+          style={{ width: frameW + 12, height: frameH + 12 }}
           aria-label="Screen recording"
           role="img"
         >
-          <div className="absolute left-1/2 top-1.5 z-30 h-3.5 w-20 -translate-x-1/2 rounded-full bg-ink/85" />
+          {!landscape && (
+            <div className="absolute left-1/2 top-1.5 z-30 h-3.5 w-20 -translate-x-1/2 rounded-full bg-ink/85" />
+          )}
           <div className="relative h-full w-full">
             {activeNodes.map((n) => {
               const isScreen = n.kind === "screen";

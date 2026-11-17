@@ -16,10 +16,10 @@ rage-tapped 4×) → choose plan → done.
 | Integration code | ~16 lines | ~64 lines of glue + 11 call sites | ~52 lines of glue + 12 call sites (unbuilt) |
 | Events / identify / user profile | ✅ | ✅ | — |
 | Funnel (4 steps, split by `platform`) | ✅ 1/1 converted | ✅ 1/1 converted | — |
-| Replay plays in Studio | ✅ with glitches (below) | ✅ clean | — |
+| Replay plays in Studio | ✅ (clipping + banner bugs fixed on this branch) | ✅ clean | — |
 | Masked text field in replay | ✅ `████` | ✅ `████` | — |
 | Rage tap detected | ✅ ×3, "What happened" entry | ✅ ×3, "What happened" entry | — |
-| Error shown in replay | ⚠️ yes, but stacked ×4 in the wrong place | ✅ at the real position | — |
+| Error shown in replay | ✅ after fix (was stacked ×4 in the wrong place) | ✅ at the real position | — |
 
 Bottom line: **web is easy; native mobile is a do-it-yourself job.** There is no iOS or Android SDK as
 such — only a Rust core with UniFFI bindings. A mobile team has to cross-compile Rust, regenerate
@@ -66,10 +66,13 @@ this machine.
   readable replay. That's reasonable, but the docs don't cover it.
 
 **Bugs found**
-1. `recordConsoleError` adds a **new** error-banner node on every call, with id `99_000 + replayOps.length`,
+1. **[Fixed on this branch]** `recordConsoleError` added a **new** error-banner node on every call, with id `99_000 + replayOps.length`,
    always at a hard-coded `x:16, y:16` (`sdks/ts-web/src/index.ts:943-960`). Four taps produced four
-   overlapping banners in the corner instead of the real alert box. It also records replay ops when
-   replay is off.
+   overlapping banners in the corner instead of the real alert box. It also recorded replay ops when
+   replay was off. Now it upserts one stable node over the visible `[role=alert]` box (falling back
+   to the corner toast), and only while recording. Covered by `sdks/ts-web/test/sdk.test.mjs`.
+   Remaining limit: the page isn't re-snapshotted, so content the alert pushed down (here
+   "Choose Pro") is still drawn at its old position, under the banner.
 2. Snapshot viewport is clamped to a minimum of 320×480, and elements are capped at the **first 120 in
    DOM order before** filtering hidden ones (`index.ts:974-990`). On a large page, visible content past
    element 120 is silently dropped. In my run the first snapshot came out 320×480 with only the button,
@@ -85,9 +88,11 @@ this machine.
 player DOM at different times:
 - 0.5 s welcome (button only, see bug 2) → 6.2 s "Your details" with both inputs `████` →
   10.5 s "Pick a plan" → 16.1 s error banners + "Rage tap ×3" marker → 22.5 s "You're all set". ✅
-- The player draws a 1024 px desktop viewport inside a phone frame at a fixed `scale = 0.72`
-  (`web/src/components/WireframePlayer.tsx:216`), so web recordings overflow and get **clipped on the
-  right**.
+- **[Fixed on this branch]** The player drew a 1024 px desktop viewport inside a phone frame at a
+  fixed `scale = 0.72`, so web recordings overflowed and got **clipped**. It now measures the
+  available width (ResizeObserver) and scales down to fit, and draws landscape recordings in a
+  browser-style frame stacked above the controls. Re-verified: a 1024×768 recording renders 597 px
+  wide in a 597 px column with no horizontal overflow, and iOS replays are unchanged.
 
 ---
 
@@ -203,9 +208,8 @@ which reaches the host at `10.0.2.2:18190`.
    fix the output path in `sdks/bindings-gen/src/main.rs`.
 7. **Replay page defaults and deep link**: default to "Any event" with no toggles, and honour
    `?session=` so `getSessionReplayUrl()` works.
-8. **Web replay polish**: one error-banner node per error at the alert's real box (or upsert one
-   stable id); scale the player frame to the recorded viewport; don't cap elements before filtering
-   for visibility.
+8. **Web replay polish**: re-snapshot after errors and layout changes, and don't cap elements
+   before filtering for visibility. (Banner stacking and player clipping are already fixed here.)
 9. **Publish `@pulse-analytics/ts-web`** (npm + a UMD/CDN build) and strip query strings from
    `$current_url` by default, or make that configurable.
 10. **Docs**: one "Integrate Pulse" page per platform covering keys, CORS, the masking/unmask model,

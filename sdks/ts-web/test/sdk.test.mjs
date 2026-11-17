@@ -285,6 +285,7 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
   assert.equal(sdk.isRecordingSession(), true);
   sdk.recordNetworkBreadcrumb("POST", "/v1/pay", 504, 1200);
   sdk.recordConsoleError("Unhandled payment timeout");
+  sdk.recordConsoleError("Unhandled payment timeout");
   assert.ok(sdk.getSessionReplayUrl().includes(sdk.getSessionId()));
 
   // Experiment exposure deduplication & remote config payload
@@ -295,6 +296,14 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
   assert.equal(sdk.isEnabled("one_tap_upi_mandate"), true);
   assert.deepEqual(sdk.getVariantPayload("one_tap_upi_mandate"), { theme: "bottom_sheet" });
   await sdk.flush();
+  // Repeated errors upsert one stable banner node instead of stacking copies.
+  const bannerIds = calls
+    .filter((c) => c.url.endsWith("/v1/replay/chunk"))
+    .flatMap((c) => c.body.ops)
+    .filter((op) => op.kind === "error_banner")
+    .map((op) => op.node_id);
+  assert.equal(bannerIds.length, 2);
+  assert.equal(new Set(bannerIds).size, 1);
   const exposureEvents = calls
     .filter((c) => c.url.endsWith("/v1/ingest"))
     .flatMap((c) => c.body.events)
