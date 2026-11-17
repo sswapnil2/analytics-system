@@ -8,8 +8,8 @@ use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use slatedb::config::{DbOptions, WriteOptions};
-use slatedb::{Db, SlateDBError, WriteBatch};
+use slatedb::config::{DbOptions, DbReaderOptions, WriteOptions};
+use slatedb::{Db, DbReader, SlateDBError, WriteBatch};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -385,6 +385,19 @@ impl GraphState {
         }
     }
 
+    /// Builds a path-compressed `IdentitySnapshot` under a shared read lock without blocking writers.
+    fn build_snapshot_ref(&self) -> IdentitySnapshot {
+        let len = self.parent.len();
+        let mut compressed = Vec::with_capacity(len);
+        for i in 0..len {
+            compressed.push(self.find_root_ref(i as u32));
+        }
+        IdentitySnapshot {
+            canonical_map: Arc::new(compressed),
+            cross_bucket_users: Arc::new(self.cross_bucket_users.clone()),
+        }
+    }
+
     fn build_checkpoint(&mut self, next_chunk_seq: u64) -> IdentityCheckpoint {
         let _ = self.compress_all_and_build_snapshot();
         IdentityCheckpoint {
@@ -406,14 +419,118 @@ const CHECKPOINT_INTERVAL_CHUNKS: u64 = 32;
 pub struct ProjectIdentityGraph {
     project_id: String,
     object_store: Arc<dyn ObjectStore>,
+    read_only: bool,
     fast_lookup: DashMap<String, (u32, u8)>,
     state: RwLock<GraphState>,
     snapshot_cache: RwLock<Option<IdentitySnapshot>>,
     snapshot_dirty: AtomicBool,
     next_chunk_seq: AtomicU64,
     last_checkpoint_seq: AtomicU64,
+    mutation_epoch: AtomicU64,
+    flushed_epoch: AtomicU64,
     pending_mutations: Mutex<Vec<MutationEntry>>,
     db: tokio::sync::Mutex<Option<Db>>,
+}
+
+fn restore_checkpoint(
+    state: &mut GraphState,
+    fast_lookup: &DashMap<String, (u32, u8)>,
+    cp: IdentityCheckpoint,
+) -> Result<u64> {
+    if cp.u32_to_external.len() != cp.parent.len()
+        || cp.u32_to_external.len() != cp.bucket_masks.len()
+        || cp.u32_to_external.len() != cp.origin_buckets.len()
+    {
+        return Err(IdentityError::CorruptedRecord(
+            "inconsistent vector lengths in meta/checkpoint",
+        ));
+    }
+    fast_lookup.clear();
+    state.cross_bucket_users.clear();
+    state.identified_roots.clear();
+    for (idx, ext) in cp.u32_to_external.iter().enumerate() {
+        fast_lookup.insert(ext.clone(), (idx as u32, cp.origin_buckets[idx]));
+    }
+    for (idx, mask) in cp.bucket_masks.iter().enumerate() {
+        if cp.parent[idx] == idx as u32 && mask.is_cross_bucket() {
+            state.cross_bucket_users.insert(idx as u32);
+        }
+    }
+    for r in cp.identified_roots {
+        state.identified_roots.insert(r);
+    }
+    state.u32_to_external = cp.u32_to_external;
+    state.origin_buckets = cp.origin_buckets;
+    state.parent = cp.parent;
+    state.bucket_masks = cp.bucket_masks;
+    Ok(cp.next_chunk_seq)
+}
+
+fn apply_mutation_entries(
+    state: &mut GraphState,
+    fast_lookup: &DashMap<String, (u32, u8)>,
+    entries: Vec<MutationEntry>,
+) -> Result<()> {
+    for entry in entries {
+        match entry {
+            MutationEntry::Intern {
+                uid,
+                origin_bucket,
+                distinct_id,
+            } => {
+                let cur_len = state.u32_to_external.len();
+                if (uid as usize) > cur_len {
+                    return Err(IdentityError::CorruptedRecord(
+                        "non-contiguous intern uid gap in mutation log",
+                    ));
+                }
+                if (uid as usize) == cur_len {
+                    state.u32_to_external.push(distinct_id.clone());
+                    state.origin_buckets.push(origin_bucket);
+                    state.parent.push(uid);
+                    state.bucket_masks.push(BucketMask::single(origin_bucket));
+                } else {
+                    state.u32_to_external[uid as usize] = distinct_id.clone();
+                    state.origin_buckets[uid as usize] = origin_bucket;
+                    state.bucket_masks[uid as usize].insert(origin_bucket);
+                }
+                if state.bucket_masks[uid as usize].is_cross_bucket() {
+                    state.cross_bucket_users.insert(uid);
+                }
+                fast_lookup.insert(distinct_id, (uid, origin_bucket));
+            }
+            MutationEntry::ExtraBucket { uid, bucket_id } => {
+                if (uid as usize) >= state.bucket_masks.len() {
+                    return Err(IdentityError::CorruptedRecord(
+                        "dangling uid reference in ExtraBucket log entry",
+                    ));
+                }
+                state.bucket_masks[uid as usize].insert(bucket_id);
+                let root = state.find_root_mut(uid);
+                state.bucket_masks[root as usize].insert(bucket_id);
+                if state.bucket_masks[root as usize].is_cross_bucket() {
+                    state.cross_bucket_users.insert(root);
+                }
+            }
+            MutationEntry::Alias {
+                anon_u32,
+                user_u32,
+                anon_bucket,
+                user_bucket,
+            } => {
+                if (anon_u32 as usize) >= state.parent.len()
+                    || (user_u32 as usize) >= state.parent.len()
+                {
+                    return Err(IdentityError::CorruptedRecord(
+                        "dangling uid reference in Alias log entry",
+                    ));
+                }
+                // Apply deterministically; ignore conflict only if historical duplicate alias was logged
+                let _ = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn open_slatedb_handle(project_id: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
@@ -466,30 +583,7 @@ impl ProjectIdentityGraph {
         if let Some(cp_bytes) = db.get(META_CHECKPOINT_KEY).await? {
             let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
                 .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
-            if cp.u32_to_external.len() != cp.parent.len()
-                || cp.u32_to_external.len() != cp.bucket_masks.len()
-                || cp.u32_to_external.len() != cp.origin_buckets.len()
-            {
-                return Err(IdentityError::CorruptedRecord(
-                    "inconsistent vector lengths in meta/checkpoint",
-                ));
-            }
-            start_seq = cp.next_chunk_seq;
-            for (idx, ext) in cp.u32_to_external.iter().enumerate() {
-                fast_lookup.insert(ext.clone(), (idx as u32, cp.origin_buckets[idx]));
-            }
-            for (idx, mask) in cp.bucket_masks.iter().enumerate() {
-                if cp.parent[idx] == idx as u32 && mask.is_cross_bucket() {
-                    state.cross_bucket_users.insert(idx as u32);
-                }
-            }
-            for r in cp.identified_roots {
-                state.identified_roots.insert(r);
-            }
-            state.u32_to_external = cp.u32_to_external;
-            state.origin_buckets = cp.origin_buckets;
-            state.parent = cp.parent;
-            state.bucket_masks = cp.bucket_masks;
+            start_seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
         }
 
         // Replay remaining log chunks strictly (`P1-11`: fail loudly on missing chunk or dangling ref!)
@@ -501,65 +595,7 @@ impl ProjectIdentityGraph {
                 ));
             };
             let entries = decode_mutation_chunk(&bytes)?;
-            for entry in entries {
-                match entry {
-                    MutationEntry::Intern {
-                        uid,
-                        origin_bucket,
-                        distinct_id,
-                    } => {
-                        let cur_len = state.u32_to_external.len();
-                        if (uid as usize) > cur_len {
-                            return Err(IdentityError::CorruptedRecord(
-                                "non-contiguous intern uid gap in mutation log",
-                            ));
-                        }
-                        if (uid as usize) == cur_len {
-                            state.u32_to_external.push(distinct_id.clone());
-                            state.origin_buckets.push(origin_bucket);
-                            state.parent.push(uid);
-                            state.bucket_masks.push(BucketMask::single(origin_bucket));
-                        } else {
-                            state.u32_to_external[uid as usize] = distinct_id.clone();
-                            state.origin_buckets[uid as usize] = origin_bucket;
-                            state.bucket_masks[uid as usize].insert(origin_bucket);
-                        }
-                        if state.bucket_masks[uid as usize].is_cross_bucket() {
-                            state.cross_bucket_users.insert(uid);
-                        }
-                        fast_lookup.insert(distinct_id, (uid, origin_bucket));
-                    }
-                    MutationEntry::ExtraBucket { uid, bucket_id } => {
-                        if (uid as usize) >= state.bucket_masks.len() {
-                            return Err(IdentityError::CorruptedRecord(
-                                "dangling uid reference in ExtraBucket log entry",
-                            ));
-                        }
-                        state.bucket_masks[uid as usize].insert(bucket_id);
-                        let root = state.find_root_mut(uid);
-                        state.bucket_masks[root as usize].insert(bucket_id);
-                        if state.bucket_masks[root as usize].is_cross_bucket() {
-                            state.cross_bucket_users.insert(root);
-                        }
-                    }
-                    MutationEntry::Alias {
-                        anon_u32,
-                        user_u32,
-                        anon_bucket,
-                        user_bucket,
-                    } => {
-                        if (anon_u32 as usize) >= state.parent.len()
-                            || (user_u32 as usize) >= state.parent.len()
-                        {
-                            return Err(IdentityError::CorruptedRecord(
-                                "dangling uid reference in Alias log entry",
-                            ));
-                        }
-                        // Apply deterministically; ignore conflict only if historical duplicate alias was logged
-                        let _ = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket);
-                    }
-                }
-            }
+            apply_mutation_entries(&mut state, &fast_lookup, entries)?;
         }
 
         let initial_snap = state.compress_all_and_build_snapshot();
@@ -567,15 +603,152 @@ impl ProjectIdentityGraph {
         Ok(Arc::new(Self {
             project_id,
             object_store,
+            read_only: false,
             fast_lookup,
             state: RwLock::new(state),
             snapshot_cache: RwLock::new(Some(initial_snap)),
             snapshot_dirty: AtomicBool::new(false),
             next_chunk_seq: AtomicU64::new(chunk_count),
             last_checkpoint_seq: AtomicU64::new(start_seq),
+            mutation_epoch: AtomicU64::new(0),
+            flushed_epoch: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
             db: tokio::sync::Mutex::new(Some(db)),
         }))
+    }
+
+    /// Opens a read-only `ProjectIdentityGraph` backed by `slatedb::DbReader` (never fencing active writers).
+    pub async fn open_read_only(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Arc<Self>> {
+        let mut state = GraphState::new();
+        let initial_snap = state.compress_all_and_build_snapshot();
+        let graph = Arc::new(Self {
+            project_id: project_id.into(),
+            object_store,
+            read_only: true,
+            fast_lookup: DashMap::new(),
+            state: RwLock::new(state),
+            snapshot_cache: RwLock::new(Some(initial_snap)),
+            snapshot_dirty: AtomicBool::new(false),
+            next_chunk_seq: AtomicU64::new(0),
+            last_checkpoint_seq: AtomicU64::new(0),
+            mutation_epoch: AtomicU64::new(0),
+            flushed_epoch: AtomicU64::new(0),
+            pending_mutations: Mutex::new(Vec::new()),
+            db: tokio::sync::Mutex::new(None),
+        });
+        graph.refresh().await?;
+        Ok(graph)
+    }
+
+    /// Incrementally refreshes a read-only `ProjectIdentityGraph` from SlateDB using `DbReader`.
+    /// Returns `Ok(true)` if new identity mutations were loaded, or `Ok(false)` if unchanged or writable.
+    pub async fn refresh(&self) -> Result<bool> {
+        if !self.read_only {
+            return Ok(false);
+        }
+        let _refresh_guard = self.db.lock().await;
+
+        let db_path = ObjectPath::from(format!("identity/{}", self.project_id));
+        let reader = match DbReader::open(
+            db_path.clone(),
+            self.object_store.clone(),
+            None,
+            DbReaderOptions::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(
+                SlateDBError::LatestManifestMissing
+                | SlateDBError::ManifestMissing(_)
+                | SlateDBError::EmptyManifest
+                | SlateDBError::InvalidDBState,
+            ) => return Ok(false),
+            Err(SlateDBError::ManifestVersionExists) => {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                match DbReader::open(
+                    db_path,
+                    self.object_store.clone(),
+                    None,
+                    DbReaderOptions::default(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(
+                        SlateDBError::LatestManifestMissing
+                        | SlateDBError::ManifestMissing(_)
+                        | SlateDBError::EmptyManifest
+                        | SlateDBError::InvalidDBState,
+                    ) => return Ok(false),
+                    Err(e) => return Err(IdentityError::SlateDb(e)),
+                }
+            }
+            Err(e) => return Err(IdentityError::SlateDb(e)),
+        };
+
+        let res: Result<bool> = async {
+            let chunk_count = match reader.get(META_CHUNK_COUNT_KEY).await? {
+                Some(b) if b.len() >= 8 => {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&b[0..8]);
+                    u64::from_le_bytes(arr)
+                }
+                Some(_) => {
+                    return Err(IdentityError::CorruptedRecord(
+                        "truncated meta/chunk_count value",
+                    ))
+                }
+                None => return Ok(false),
+            };
+
+            let mut cur_seq = self.next_chunk_seq.load(Ordering::Acquire);
+            if chunk_count <= cur_seq {
+                return Ok(false);
+            }
+
+            let mut cp_to_restore: Option<IdentityCheckpoint> = None;
+            if let Some(cp_bytes) = reader.get(META_CHECKPOINT_KEY).await? {
+                let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
+                    .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
+                if cp.next_chunk_seq > cur_seq {
+                    cur_seq = cp.next_chunk_seq;
+                    cp_to_restore = Some(cp);
+                }
+            }
+
+            let mut decoded_chunks = Vec::with_capacity((chunk_count - cur_seq) as usize);
+            for seq in cur_seq..chunk_count {
+                let chunk_key = format!("log/chunk_{seq:012}");
+                let Some(bytes) = reader.get(chunk_key.as_bytes()).await? else {
+                    return Err(IdentityError::CorruptedRecord(
+                        "missing identity mutation log chunk",
+                    ));
+                };
+                decoded_chunks.push(decode_mutation_chunk(&bytes)?);
+            }
+
+            {
+                let mut state = self.state.write();
+                if let Some(cp) = cp_to_restore {
+                    let cp_seq = restore_checkpoint(&mut state, &self.fast_lookup, cp)?;
+                    self.last_checkpoint_seq.store(cp_seq, Ordering::Release);
+                }
+                for entries in decoded_chunks {
+                    apply_mutation_entries(&mut state, &self.fast_lookup, entries)?;
+                }
+            }
+            self.next_chunk_seq.store(chunk_count, Ordering::Release);
+            self.snapshot_dirty.store(true, Ordering::Release);
+            Ok(true)
+        }
+        .await;
+
+        let _ = reader.close().await;
+        res
     }
 
     pub fn project_id(&self) -> &str {
@@ -584,6 +757,10 @@ impl ProjectIdentityGraph {
 
     pub fn user_count(&self) -> usize {
         self.state.read().u32_to_external.len()
+    }
+
+    pub fn has_pending_mutations(&self) -> bool {
+        self.mutation_epoch.load(Ordering::Acquire) > self.flushed_epoch.load(Ordering::Acquire)
     }
 
     /// Lock-free hot path lookup + monotonic `u32` allocation on miss (`P1-11` ordered mutation push).
@@ -616,11 +793,15 @@ impl ProjectIdentityGraph {
         state.bucket_masks.push(mask);
 
         // Push to `pending_mutations` BEFORE publishing in `fast_lookup` or releasing `state` (`P1-11`)!
-        self.pending_mutations.lock().push(MutationEntry::Intern {
-            uid,
-            origin_bucket: bucket_id,
-            distinct_id: distinct_id.to_string(),
-        });
+        {
+            let mut pending = self.pending_mutations.lock();
+            pending.push(MutationEntry::Intern {
+                uid,
+                origin_bucket: bucket_id,
+                distinct_id: distinct_id.to_string(),
+            });
+            self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.fast_lookup
             .insert(distinct_id.to_string(), (uid, bucket_id));
         self.snapshot_dirty.store(true, Ordering::Release);
@@ -647,9 +828,11 @@ impl ProjectIdentityGraph {
             state.cross_bucket_users.insert(root);
         }
         if added_raw || added_root {
-            self.pending_mutations
-                .lock()
-                .push(MutationEntry::ExtraBucket { uid, bucket_id });
+            {
+                let mut pending = self.pending_mutations.lock();
+                pending.push(MutationEntry::ExtraBucket { uid, bucket_id });
+                self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+            }
             self.snapshot_dirty.store(true, Ordering::Release);
         }
     }
@@ -668,12 +851,16 @@ impl ProjectIdentityGraph {
 
         let mut state = self.state.write();
         let canonical_root = state.apply_alias(anon_u32, user_u32, anon_bucket, user_bucket)?;
-        self.pending_mutations.lock().push(MutationEntry::Alias {
-            anon_u32,
-            user_u32,
-            anon_bucket,
-            user_bucket,
-        });
+        {
+            let mut pending = self.pending_mutations.lock();
+            pending.push(MutationEntry::Alias {
+                anon_u32,
+                user_u32,
+                anon_bucket,
+                user_bucket,
+            });
+            self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.snapshot_dirty.store(true, Ordering::Release);
         Ok(canonical_root)
     }
@@ -754,25 +941,38 @@ impl ProjectIdentityGraph {
                 return snap.clone();
             }
         }
-        let snap = self.state.write().compress_all_and_build_snapshot();
-        *cache_guard = Some(snap.clone());
         self.snapshot_dirty.store(false, Ordering::Release);
+        let snap = self.state.read().build_snapshot_ref();
+        *cache_guard = Some(snap.clone());
         snap
     }
 
     /// Flushes all staged intern & alias records durably to SlateDB on `object_store` (`P1-09`).
     ///
-    /// Retains `pending_mutations` and `next_chunk_seq` unchanged if the write or flush fails,
-    /// so retries never drop records or create chunk gaps.
+    /// Uses epoch-based group-commit coalescing so concurrent callers share a single SlateDB flush,
+    /// and retains `pending_mutations` and `next_chunk_seq` unchanged if the write or flush fails.
     pub async fn flush(&self) -> Result<()> {
-        let mut db_guard = self.db.lock().await;
+        if self.read_only {
+            return Ok(());
+        }
+        let target_epoch = self.mutation_epoch.load(Ordering::Acquire);
+        if self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
+            return Ok(());
+        }
 
-        let staged: Vec<MutationEntry> = {
+        let mut db_guard = self.db.lock().await;
+        if self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
+            return Ok(());
+        }
+
+        let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
             let guard = self.pending_mutations.lock();
             if guard.is_empty() {
+                let ep = self.mutation_epoch.load(Ordering::Acquire);
+                self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
                 return Ok(());
             }
-            guard.clone()
+            (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
         };
         let flushed_len = staged.len();
 
@@ -840,11 +1040,15 @@ impl ProjectIdentityGraph {
             self.last_checkpoint_seq.store(new_seq, Ordering::Release);
         }
         self.pending_mutations.lock().drain(..flushed_len);
+        self.flushed_epoch.fetch_max(batch_epoch, Ordering::AcqRel);
         Ok(())
     }
 
     /// Flushes pending mutations and cleanly closes the underlying SlateDB handle.
     pub async fn close(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         self.flush().await?;
         let mut db_guard = self.db.lock().await;
         if let Some(db) = db_guard.take() {
@@ -857,6 +1061,7 @@ impl ProjectIdentityGraph {
 /// Multi-tenant registry managing `ProjectIdentityGraph` instances over shared object storage.
 pub struct IdentityRouter {
     object_store: Arc<dyn ObjectStore>,
+    read_only: bool,
     graphs: DashMap<String, Arc<ProjectIdentityGraph>>,
     init_lock: tokio::sync::Mutex<()>,
 }
@@ -865,9 +1070,23 @@ impl IdentityRouter {
     pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             object_store,
+            read_only: false,
             graphs: DashMap::new(),
             init_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub fn new_read_only(object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            object_store,
+            read_only: true,
+            graphs: DashMap::new(),
+            init_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub async fn get_or_open(&self, project_id: &str) -> Result<Arc<ProjectIdentityGraph>> {
@@ -878,10 +1097,26 @@ impl IdentityRouter {
         if let Some(g) = self.graphs.get(project_id) {
             return Ok(g.clone());
         }
-        let g =
-            ProjectIdentityGraph::open(project_id.to_string(), self.object_store.clone()).await?;
+        let g = if self.read_only {
+            ProjectIdentityGraph::open_read_only(project_id.to_string(), self.object_store.clone())
+                .await?
+        } else {
+            ProjectIdentityGraph::open(project_id.to_string(), self.object_store.clone()).await?
+        };
         self.graphs.insert(project_id.to_string(), g.clone());
         Ok(g)
+    }
+
+    pub async fn refresh_all(&self) -> Result<usize> {
+        let graphs: Vec<Arc<ProjectIdentityGraph>> =
+            self.graphs.iter().map(|e| e.value().clone()).collect();
+        let mut updated = 0usize;
+        for g in graphs {
+            if g.refresh().await? {
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub async fn flush_all(&self) -> Result<()> {

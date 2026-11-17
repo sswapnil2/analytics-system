@@ -1,4 +1,5 @@
 pub mod dictionary;
+pub mod encrypted_store;
 pub mod engine;
 pub mod error;
 pub mod manifest;
@@ -12,6 +13,10 @@ use arrow_array::cast::AsArray;
 use arrow_array::Array as ArrowArray;
 
 pub use dictionary::{ProjectDictSnapshot, ProjectDictionary, MAX_DICTIONARY_ENTRIES};
+pub use encrypted_store::{
+    make_key_id, parse_byok_master_key, parse_or_derive_master_key, seal_ephemeral_blob,
+    unseal_ephemeral_blob, ByokEncryptionStatus, EncryptedObjectStore,
+};
 pub use engine::{
     event_uuid_fingerprint, route_bucket, ProjectStorage, StorageConfig, StorageEngine,
     DEFAULT_NUM_BUCKETS,
@@ -28,7 +33,10 @@ pub use segment::{
     SessionHeader, TierBColumnEntry, VortexSegmentReader, MAX_INVERTED_INDEX_CARDINALITY,
     MAX_TIER_B_KEYS,
 };
-pub use store_factory::{build_from_url, build_object_store, DurableLocalObjectStore};
+pub use store_factory::{
+    allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
+    validate_object_store_connection, validate_outbound_url_ssrf, DurableLocalObjectStore,
+};
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 
 /// Zero-copy string extractor supporting Arrow `Utf8`, `LargeUtf8`, and `Utf8View` arrays returned by Vortex.

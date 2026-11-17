@@ -99,8 +99,9 @@ impl QueryEngine {
         disk_cache_bytes: usize,
         catalogs: Arc<CatalogRegistry>,
     ) -> Result<Arc<Self>> {
-        let cache = SegmentBlockCache::open(
+        let cache = SegmentBlockCache::open_with_store(
             storage.segment_reader().clone(),
+            Some(storage.encrypted_store().clone()),
             memory_cache_bytes,
             disk_cache_dir,
             disk_cache_bytes,

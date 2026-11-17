@@ -8,6 +8,7 @@ import {
   LineChart,
   Filter,
   LayoutDashboard,
+  Lock,
   LogOut,
   Monitor,
   Moon,
@@ -38,6 +39,7 @@ import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
 import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
 import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
+import { ByokCommercialPanel } from "./components/ByokCommercialPanel";
 
 type WorkspaceId =
   | "dashboards"
@@ -48,7 +50,8 @@ type WorkspaceId =
   | "replays"
   | "cohorts"
   | "experiments"
-  | "events";
+  | "events"
+  | "security";
 
 interface NavItem {
   id: WorkspaceId;
@@ -80,6 +83,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
+      { id: "security", label: "Enterprise and security", icon: Lock },
     ],
   },
 ];
@@ -582,6 +586,9 @@ export const App: React.FC = () => {
                       setRefreshToken((n) => n + 1);
                     }}
                   />
+                )}
+                {activeTab === "security" && (
+                  <ByokCommercialPanel projectId={activePid} />
                 )}
               </>
             )}

@@ -447,6 +447,93 @@ export interface BatchImportResponse {
   server_ts_ms: number;
 }
 
+export interface ByokEncryptionStatus {
+  enabled: boolean;
+  algorithm: string;
+  active_key_id: string | null;
+  key_fingerprint: string | null;
+  keyring_size: number;
+  encrypted_objects_count: number;
+  ops_encrypted: number;
+  ops_decrypted: number;
+}
+
+export interface LicenseStatus {
+  edition: string;
+  health: string;
+  is_commercial: boolean;
+  in_grace_period: boolean;
+  customer_org: string | null;
+  license_id: string | null;
+  expires_at_ms: number | null;
+  grace_ends_at_ms: number | null;
+  features: string[];
+  encryption: ByokEncryptionStatus;
+}
+
+export interface SystemKeyringRecord {
+  key_id: string;
+  salt_hex: string;
+  is_active: boolean;
+  created_at_ms: number;
+}
+
+export interface EncryptionStatusResponse {
+  status: ByokEncryptionStatus;
+  keyring: SystemKeyringRecord[];
+  has_durable_kek: boolean;
+}
+
+export interface EnterpriseAuditRecord {
+  id: string;
+  actor: string;
+  action: string;
+  resource: string;
+  details_json: Record<string, unknown>;
+  created_at_ms: number;
+}
+
+export interface ByokCredentialItem {
+  id: string;
+  project_id: string;
+  category: "llm" | "storage" | "webhook" | string;
+  provider: string;
+  label: string;
+  key_prefix_masked: string;
+  config_json: Record<string, unknown>;
+  status: string;
+  last_verified_at_ms: number | null;
+  updated_at_ms: number;
+}
+
+export interface UpsertByokRequest {
+  category: string;
+  provider: string;
+  label?: string;
+  secret: string;
+  config_json?: Record<string, unknown>;
+}
+
+export interface TestByokResponse {
+  verified: boolean;
+  category: string;
+  provider: string;
+  details: string;
+  verified_at_ms: number;
+}
+
+export interface CopilotResponse {
+  provider: string;
+  model: string;
+  answer_markdown: string;
+  root_cause_step: string | null;
+  dropoff_rate_pct: number | null;
+  cited_sessions: string[];
+  metrics_summary: Record<string, unknown>;
+  mode: string;
+  exec_time_ms: number;
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAdminToken();
   const authHeaders: Record<string, string> = token
@@ -755,6 +842,88 @@ export const api = {
   ) =>
     fetchText(
       `/v1/projects/${projectId}/export?format=${format}&limit=${limit}`,
+    ),
+
+  getLicense: () => fetchJson<LicenseStatus>("/v1/license"),
+
+  activateLicense: (opts: { license_key: string }) =>
+    fetchJson<LicenseStatus>("/v1/license", {
+      method: "POST",
+      body: JSON.stringify(opts),
+    }),
+
+  deactivateLicense: () =>
+    fetchJson<LicenseStatus>("/v1/license", { method: "DELETE" }),
+
+  getEncryptionStatus: () =>
+    fetchJson<EncryptionStatusResponse>("/v1/system/encryption"),
+
+  rotateEncryptionKey: (body: {
+    secret?: string;
+    disable_new_writes?: boolean;
+  }) =>
+    fetchJson<EncryptionStatusResponse>("/v1/system/encryption/rotate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  listAuditLogs: (limit = 100) =>
+    fetchJson<EnterpriseAuditRecord[]>(`/v1/audit-logs?limit=${limit}`),
+
+  listByokCredentials: (projectId: string) =>
+    fetchJson<ByokCredentialItem[]>(
+      `/v1/projects/${encodeURIComponent(projectId)}/byok`,
+    ),
+
+  upsertByokCredential: (projectId: string, body: UpsertByokRequest) =>
+    fetchJson<ByokCredentialItem>(
+      `/v1/projects/${encodeURIComponent(projectId)}/byok`,
+      {
+        method: "PUT",
+        body: JSON.stringify(body),
+      },
+    ),
+
+  deleteByokCredential: (projectId: string, category: string) =>
+    fetchJson<{ status: string; category: string }>(
+      `/v1/projects/${encodeURIComponent(projectId)}/byok/${encodeURIComponent(category)}`,
+      { method: "DELETE" },
+    ),
+
+  verifyByokCredential: (projectId: string, category: string) =>
+    fetchJson<TestByokResponse>(
+      `/v1/projects/${encodeURIComponent(projectId)}/byok-verify`,
+      {
+        method: "POST",
+        body: JSON.stringify({ category }),
+      },
+    ),
+
+  exportWarehouse: (
+    projectId: string,
+    opts?: { limit?: number; start_ts_ms?: number; end_ts_ms?: number },
+  ) =>
+    fetchJson<{
+      status: string;
+      destination_url: string;
+      object_key: string;
+      events_exported: number;
+      bytes_written: number;
+    }>(
+      `/v1/projects/${encodeURIComponent(projectId)}/export/warehouse`,
+      {
+        method: "POST",
+        body: JSON.stringify(opts ?? {}),
+      },
+    ),
+
+  askByokCopilot: (projectId: string, prompt: string) =>
+    fetchJson<CopilotResponse>(
+      `/v1/projects/${encodeURIComponent(projectId)}/ai/copilot`,
+      {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      },
     ),
 
   callMcp: (method: string, params: unknown = {}) =>

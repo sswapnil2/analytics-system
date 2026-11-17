@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{header, HeaderValue, Method};
-use axum::response::Html;
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use pulse_control::{
@@ -18,14 +18,70 @@ use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
 use pulse_storage::{build_object_store, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS};
 use tokio::sync::{oneshot, watch};
+use tower_http::compression::predicate::{NotForContentType, Predicate};
+use tower_http::compression::{CompressionLayer, DefaultPredicate};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeader;
 use tracing::info;
 
 pub use seeder::{seed_indian_fintech_dataset, SeedSummary};
 
+/// Horizontal scaling role for a `pulse-node` process (`--role` / `PULSE_NODE_ROLE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    #[default]
+    All,
+    Ingest,
+    Query,
+    Compactor,
+}
+
+impl NodeRole {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "ingest" => Some(Self::Ingest),
+            "query" => Some(Self::Query),
+            "compactor" => Some(Self::Compactor),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Ingest => "ingest",
+            Self::Query => "query",
+            Self::Compactor => "compactor",
+        }
+    }
+
+    #[inline]
+    pub fn serves_ingest(&self) -> bool {
+        matches!(self, Self::All | Self::Ingest)
+    }
+
+    #[inline]
+    pub fn serves_query_and_admin(&self) -> bool {
+        matches!(self, Self::All | Self::Query)
+    }
+
+    #[inline]
+    pub fn runs_l0_flusher(&self) -> bool {
+        matches!(self, Self::All | Self::Ingest)
+    }
+
+    #[inline]
+    pub fn runs_compactor(&self) -> bool {
+        matches!(self, Self::All | Self::Compactor)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
+    pub role: NodeRole,
     pub http_addr: SocketAddr,
     pub quic_addr: Option<SocketAddr>,
     pub data_dir: PathBuf,
@@ -81,7 +137,13 @@ impl Default for NodeConfig {
                 ]
             });
 
+        let role = std::env::var("PULSE_NODE_ROLE")
+            .ok()
+            .and_then(|s| NodeRole::parse(&s))
+            .unwrap_or(NodeRole::All);
+
         Self {
+            role,
             http_addr: SocketAddr::new(host, port),
             quic_addr,
             data_dir,
@@ -128,8 +190,11 @@ impl RunningNode {
             let _ = tx.send(());
         }
         let _ = self.http_task.await;
-        let _ = self.storage.flush_all_projects().await;
-        let _ = self.storage.identity_router().close_all().await;
+        self.qengine.cache().close().await;
+        if !self.storage.identity_router().is_read_only() {
+            let _ = self.storage.flush_all_projects().await;
+            let _ = self.storage.identity_router().close_all().await;
+        }
     }
 }
 
@@ -158,12 +223,17 @@ fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
         ])
 }
 
-/// Boots the unified single-binary Pulse Analytics Node.
+/// Boots the Pulse Analytics Node (`All`, `Ingest`, `Query`, or `Compactor` role).
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
 
-    let object_store = build_object_store(&config.data_dir)?;
-    let identity_router = Arc::new(IdentityRouter::new(object_store.clone()));
+    let raw_store = build_object_store(&config.data_dir)?;
+    let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
+    let identity_router = Arc::new(if config.role.serves_ingest() {
+        IdentityRouter::new(enc_store.as_object_store())
+    } else {
+        IdentityRouter::new_read_only(enc_store.as_object_store())
+    });
 
     let storage_cfg = StorageConfig {
         num_buckets: config.num_buckets,
@@ -171,14 +241,18 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         l0_flush_max_age: Duration::from_secs(60),
         compaction_min_segments: 4,
     };
-    let storage = StorageEngine::new(storage_cfg, object_store, identity_router);
+    let storage = StorageEngine::new_with_encrypted(storage_cfg, enc_store, identity_router);
 
     let catalogs = CatalogRegistry::new();
     let foyer_dir = config.data_dir.join("foyer_cache");
+    let disk_cache_dir = config
+        .role
+        .serves_query_and_admin()
+        .then_some(foyer_dir.as_path());
     let qengine = QueryEngine::new(
         storage.clone(),
         128 * 1024 * 1024,
-        Some(&foyer_dir),
+        disk_cache_dir,
         512 * 1024 * 1024,
         catalogs,
     )
@@ -209,7 +283,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     let ingest = IngestService::new(storage.clone(), control.clone());
     control.attach_ingest(ingest.clone()).await;
 
-    if config.auto_seed {
+    if config.auto_seed && config.role.serves_ingest() {
         let ps = storage
             .get_or_open_project(&config.default_project_id)
             .await?;
@@ -219,58 +293,147 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         }
     }
 
-    let (shutdown_bg_tx, shutdown_bg_rx) = watch::channel(false);
-    let _bg_handle = storage.spawn_background_maintenance(shutdown_bg_rx);
+    let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
+    let _bg_handle = if config.role == NodeRole::All {
+        storage.spawn_background_maintenance(shutdown_bg_rx)
+    } else {
+        let bg_storage = storage.clone();
+        let bg_control = control.clone();
+        let role = config.role;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        match role {
+                            NodeRole::All => {}
+                            NodeRole::Ingest => {
+                                let _ = bg_storage.identity_router().flush_all().await;
+                                for p in bg_storage.open_projects() {
+                                    for b in 0..p.config().num_buckets {
+                                        let bid = b as u8;
+                                        if p.should_flush_bucket(bid) {
+                                            let _ = p.flush_bucket(bid).await;
+                                        }
+                                    }
+                                }
+                                let _ = bg_control.reload_caches_from_db().await;
+                            }
+                            NodeRole::Compactor => {
+                                let _ = bg_storage.refresh_all_manifests().await;
+                                let _ = bg_storage.compact_all_projects().await;
+                            }
+                            NodeRole::Query => {
+                                let _ = bg_storage.refresh_all_manifests().await;
+                            }
+                        }
+                    }
+                    changed = shutdown_bg_rx.changed() => {
+                        if changed.is_err() || *shutdown_bg_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
 
-    let quic = if let Some(qaddr) = config.quic_addr {
-        match spawn_quic_listener(qaddr, ingest.clone()) {
-            Ok(h) => {
-                info!(quic_udp = %h.local_addr, "Pulse QUIC UDP edge gateway listening");
-                Some(h)
+    let quic = if config.role.serves_ingest() {
+        if let Some(qaddr) = config.quic_addr {
+            match spawn_quic_listener(qaddr, ingest.clone()) {
+                Ok(h) => {
+                    info!(quic_udp = %h.local_addr, "Pulse QUIC UDP edge gateway listening");
+                    Some(h)
+                }
+                Err(e) => {
+                    tracing::warn!("QUIC listener bind skipped ({qaddr}): {e}");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("QUIC listener bind skipped ({qaddr}): {e}");
-                None
-            }
+        } else {
+            None
         }
     } else {
         None
     };
 
     // Public SDK routes (permissive CORS) vs Protected Admin/Query routes (restricted CORS + Bearer auth, `P0-01`)
-    let public_router = Router::new()
-        .merge(build_ingest_router(ingest.clone()))
-        .merge(build_public_flag_router(control.clone()))
-        .layer(CorsLayer::permissive());
-
-    let admin_router = build_admin_control_router(control.clone())
-        .layer(build_admin_cors_layer(&config.allowed_origins));
-
-    let api_router = Router::new()
-        .merge(public_router)
-        .merge(admin_router)
-        .route("/healthz", get(|| async { "ok" }));
+    let mut api_router = Router::new().route("/healthz", get(|| async { "ok" }));
+    if config.role.serves_ingest() {
+        let ingest_public = Router::new()
+            .merge(build_ingest_router(ingest.clone()))
+            .merge(build_public_flag_router(control.clone()))
+            .layer(CorsLayer::permissive());
+        api_router = api_router.merge(ingest_public);
+    } else if config.role.serves_query_and_admin() {
+        let flag_public = build_public_flag_router(control.clone()).layer(CorsLayer::permissive());
+        api_router = api_router.merge(flag_public);
+    }
+    if config.role.serves_query_and_admin() {
+        let admin_router = build_admin_control_router(control.clone())
+            .layer(build_admin_cors_layer(&config.allowed_origins));
+        api_router = api_router.merge(admin_router);
+    }
 
     let index_file = config.web_dist_dir.join("index.html");
-    let app = if index_file.exists() {
-        let serve_dir =
-            ServeDir::new(&config.web_dist_dir).not_found_service(ServeFile::new(index_file));
-        api_router.fallback_service(serve_dir)
+    let app = if config.role.serves_query_and_admin() {
+        let spa_router = if index_file.exists() {
+            let serve_dir =
+                ServeDir::new(&config.web_dist_dir).not_found_service(ServeFile::new(index_file));
+            // ponytail: everything in dist except index.html is under content-hashed assets/, so
+            // non-HTML can be cached forever. Add a path check if un-hashed files land in dist/.
+            let cached_dir = SetResponseHeader::overriding(
+                serve_dir,
+                header::CACHE_CONTROL,
+                |res: &axum::http::Response<_>| {
+                    let html = res
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+                    Some(HeaderValue::from_static(if html {
+                        "no-cache"
+                    } else {
+                        "public, max-age=31536000, immutable"
+                    }))
+                },
+            );
+            Router::new().fallback_service(cached_dir)
+        } else {
+            Router::new().fallback(get(|| async {
+                Html(
+                    "<!doctype html><html><head><title>Pulse Analytics</title></head>\
+                     <body style='background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:2rem'>\
+                     <h1>Pulse Analytics Node Running</h1>\
+                     <p>API &amp; Query Engine online. Run <code>npm --prefix web run build</code> to bundle Analytics Studio.</p>\
+                     </body></html>",
+                )
+            }))
+        };
+        let spa_router = spa_router.layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.uri().path().starts_with("/v1/") {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                next.run(req).await
+            },
+        ));
+        api_router.fallback_service(spa_router)
     } else {
-        api_router.fallback(get(|| async {
-            Html(
-                "<!doctype html><html><head><title>Pulse Analytics</title></head>\
-                 <body style='background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:2rem'>\
-                 <h1>Pulse Analytics Node Running</h1>\
-                 <p>API &amp; Query Engine online. Run <code>npm --prefix web run build</code> to bundle Analytics Studio.</p>\
-                 </body></html>",
-            )
-        }))
+        api_router
     };
+    // gzip/br for the web app and JSON. Replay frames are served by byte range, and
+    // compressing a range response would corrupt it, so they stay as they are.
+    let app = app.layer(CompressionLayer::new().compress_when(
+        DefaultPredicate::new().and(NotForContentType::const_new("application/x-pulse-frame")),
+    ));
 
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
     let bound_http_addr = listener.local_addr()?;
-    info!(http = %bound_http_addr, "Pulse Analytics unified HTTP/2 + Studio server listening");
+    info!(
+        role = config.role.as_str(),
+        http = %bound_http_addr,
+        "Pulse Analytics HTTP/2 server listening"
+    );
 
     let (shutdown_http_tx, shutdown_http_rx) = oneshot::channel::<()>();
     let http_task = tokio::spawn(async move {
@@ -328,6 +491,7 @@ mod tests {
 
         // 1. Spin up `pulse-node` on ephemeral loopback ports with random first-boot credentials and `--seed` enabled
         let node = start_pulse_node(NodeConfig {
+            role: NodeRole::All,
             http_addr: "127.0.0.1:0".parse().unwrap(),
             quic_addr: None,
             data_dir: tmp_dir.path().join("node_data"),
@@ -615,5 +779,206 @@ mod tests {
         );
 
         node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ha_02_split_ingest_and_query_nodes_share_storage_without_fencing() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let shared_data_dir = tmp_dir.path().join("shared_cluster_data");
+        let admin_token = "sk_root_ha_split_test_token".to_string();
+
+        let ingest_node = start_pulse_node(NodeConfig {
+            role: NodeRole::Ingest,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: shared_data_dir.clone(),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_ha_split".to_string(),
+            default_api_key: String::new(),
+            admin_token: Some(admin_token.clone()),
+            allowed_origins: vec!["http://127.0.0.1:8080".to_string()],
+            auto_seed: false,
+            num_buckets: 8,
+        })
+        .await
+        .expect("start ingest node");
+
+        let query_node = start_pulse_node(NodeConfig {
+            role: NodeRole::Query,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: shared_data_dir.clone(),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_ha_split".to_string(),
+            default_api_key: String::new(),
+            admin_token: Some(admin_token.clone()),
+            allowed_origins: vec!["http://127.0.0.1:8080".to_string()],
+            auto_seed: false,
+            num_buckets: 8,
+        })
+        .await
+        .expect("start query node");
+
+        let ingest_key = ingest_node
+            .bootstrap_credentials
+            .generated_ingest_key
+            .clone()
+            .expect("generated ingest key on first boot");
+        let ingest_url = format!("http://{}", ingest_node.http_addr);
+        let query_url = format!("http://{}", query_node.http_addr);
+        let http = reqwest::Client::new();
+
+        // 1. Verify strict role router isolation
+        let ingest_status = http
+            .get(format!("{ingest_url}/v1/status"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ingest_status.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let query_ingest = http
+            .post(format!("{query_url}/v1/ingest"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({ "events": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(query_ingest.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // 2. Open project on Query node BEFORE any data is ingested (read-only SlateDB must not error or fence)
+        let pre_status: Value = http
+            .get(format!("{query_url}/v1/status"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pre_status["l1_rows"].as_u64(), Some(0));
+
+        // 3. Send events + /v1/identify to Ingest node
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let pre_login = http
+            .post(format!("{ingest_url}/v1/ingest"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "events": [
+                    {
+                        "distinct_id": "anon_ha_01",
+                        "event_name": "App_Open",
+                        "client_event_ts_ms": now_ms - 5_000
+                    },
+                    {
+                        "distinct_id": "anon_ha_01",
+                        "event_name": "KYC_PAN_Submitted",
+                        "client_event_ts_ms": now_ms - 3_000
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pre_login.status(), reqwest::StatusCode::OK);
+
+        let identify = http
+            .post(format!("{ingest_url}/v1/identify"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "anon_id": "anon_ha_01",
+                "user_id": "user_ha_01"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(identify.status(), reqwest::StatusCode::OK);
+
+        let post_login = http
+            .post(format!("{ingest_url}/v1/ingest"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "events": [
+                    {
+                        "distinct_id": "user_ha_01",
+                        "event_name": "First_Disbursal_Success",
+                        "client_event_ts_ms": now_ms - 1_000
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_login.status(), reqwest::StatusCode::OK);
+
+        // 4. Flush Ingest node and refresh Query node manifests + read-only identity graph
+        ingest_node.storage.flush_all_projects().await.unwrap();
+        query_node.storage.refresh_all_manifests().await.unwrap();
+
+        let post_status: Value = http
+            .get(format!("{query_url}/v1/status"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(post_status["l1_rows"].as_u64(), Some(3));
+        assert_eq!(post_status["interned_users"].as_u64(), Some(2));
+
+        // 5. Query stitched 3-step funnel on Query node
+        let funnel_resp = http
+            .post(format!("{query_url}/v1/query"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "kind": "funnel",
+                "query": {
+                    "time_range": {
+                        "start_ts_ms": now_ms - 60_000,
+                        "end_ts_ms": now_ms + 60_000
+                    },
+                    "steps": [
+                        { "event_name": "App_Open" },
+                        { "event_name": "KYC_PAN_Submitted" },
+                        { "event_name": "First_Disbursal_Success" }
+                    ],
+                    "order_mode": "LooseOrder",
+                    "conversion_window_ms": 86_400_000
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(funnel_resp.status(), reqwest::StatusCode::OK);
+        let funnel_json: Value = funnel_resp.json().await.unwrap();
+        let steps = funnel_json["overall_steps"]
+            .as_array()
+            .expect("overall_steps");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["entered_users"].as_u64(), Some(1));
+        assert_eq!(steps[2]["entered_users"].as_u64(), Some(1));
+
+        // 6. Verify Ingest node writer was NOT fenced by Query node
+        let post_query_ingest = http
+            .post(format!("{ingest_url}/v1/ingest"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "events": [
+                    {
+                        "distinct_id": "user_ha_02",
+                        "event_name": "App_Open",
+                        "client_event_ts_ms": now_ms
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_query_ingest.status(), reqwest::StatusCode::OK);
+        ingest_node.storage.flush_all_projects().await.unwrap();
+
+        query_node.shutdown().await;
+        ingest_node.shutdown().await;
     }
 }

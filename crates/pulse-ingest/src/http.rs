@@ -104,6 +104,19 @@ impl From<IngestError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let IngestError::Storage(pulse_storage::StorageError::L0Backpressure { .. }) = &self.0 {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "l0_backpressure",
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(body),
+            )
+                .into_response();
+        }
         let status = match &self.0 {
             IngestError::Unauthorized => StatusCode::UNAUTHORIZED,
             IngestError::Wire(_)
