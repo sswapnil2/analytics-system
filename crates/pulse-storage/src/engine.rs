@@ -581,6 +581,9 @@ impl ProjectStorage {
                 Ok(committed) => {
                     let arc = Arc::new(committed);
                     *self.manifest.write() = arc.clone();
+                    // ponytail: one LIST per commit; batch every N commits if LIST cost shows up.
+                    // Best effort: a failed GC only leaves extra epoch files behind.
+                    let _ = self.manifest_store.gc_old_epochs().await;
                     return Ok(Some(arc));
                 }
                 Err(StorageError::ManifestConflict) if attempt < 7 => {
@@ -1108,5 +1111,61 @@ impl StorageEngine {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod manifest_retention_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn recovery_and_reads_survive_manifest_gc() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let router = IdentityRouter::new(store.clone());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            ..StorageConfig::default()
+        };
+        let ps = ProjectStorage::open_and_recover("p", cfg.clone(), store.clone(), &router)
+            .await
+            .unwrap();
+        for i in 0..20i64 {
+            let ts = 1_790_000_000_000 + i * 1_000;
+            let ev = WireEvent {
+                event_uuid: WireEvent::deterministic_uuid("u", "s", "e", ts, i as u64),
+                routing_seed: "u".into(),
+                distinct_id: "u".into(),
+                session_id: "s".into(),
+                event_name: "e".into(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: 0,
+                props: vec![],
+                replay_offset_kb: 0,
+            };
+            ps.append_bucket_events(0, vec![(ev, 1)]).await.unwrap();
+            ps.flush_bucket(0).await.unwrap();
+        }
+        let epoch = ps.snapshot().epoch();
+        assert!(epoch >= 20);
+        drop(ps);
+
+        let ms = ManifestStore::new("p", store.clone()).with_retention(2, Duration::ZERO);
+        assert!(ms.gc_old_epochs().await.unwrap() as u64 >= epoch - 2);
+
+        // Crash recovery reads only the newest epoch and sees every flushed row.
+        let reopened = ProjectStorage::open_and_recover("p", cfg, store, &router)
+            .await
+            .unwrap();
+        let snap = reopened.snapshot();
+        assert_eq!(snap.epoch(), epoch);
+        assert_eq!(snap.manifest.total_l1_rows(), 20);
+        let reader = VortexSegmentReader::new(reopened.object_store.clone());
+        let mut rows = 0;
+        for seg in snap.manifest.active_segments.values().flatten() {
+            rows += reader.read_all_rows(seg).await.unwrap().len();
+        }
+        assert_eq!(rows, 20);
     }
 }

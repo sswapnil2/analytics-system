@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::NaiveDate;
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{Error as OsError, ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{Error as OsError, ObjectMeta, ObjectStore, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 
 use crate::dictionary::ProjectDictSnapshot;
@@ -105,10 +106,22 @@ impl Manifest {
     }
 }
 
+/// Number of newest manifest epochs always kept on disk.
+pub const MANIFEST_RETAIN_EPOCHS: u64 = 16;
+/// Minimum age before an epoch outside the retained window may be deleted, covering a reader that
+/// listed the prefix and is about to fetch what was then the newest epoch.
+pub const MANIFEST_GC_GRACE: Duration = Duration::from_secs(300);
+
 /// Atomic MVCC Manifest store backed by conditional `PutMode::Create` writes on `ObjectStore`.
+///
+/// Old epoch files are never read back: `load_latest` (startup recovery, CAS retry, query-node refresh)
+/// only fetches the newest epoch, and in-flight `StorageSnapshot`s hold their `Manifest` in memory.
+/// So everything outside the newest `retain_epochs` (and older than `gc_grace`) is garbage.
 pub struct ManifestStore {
     project_id: String,
     object_store: Arc<dyn ObjectStore>,
+    retain_epochs: u64,
+    gc_grace: Duration,
 }
 
 impl ManifestStore {
@@ -116,7 +129,56 @@ impl ManifestStore {
         Self {
             project_id: project_id.into(),
             object_store,
+            retain_epochs: MANIFEST_RETAIN_EPOCHS,
+            gc_grace: MANIFEST_GC_GRACE,
         }
+    }
+
+    pub fn with_retention(mut self, retain_epochs: u64, gc_grace: Duration) -> Self {
+        self.retain_epochs = retain_epochs.max(1);
+        self.gc_grace = gc_grace;
+        self
+    }
+
+    fn prefix(&self) -> ObjectPath {
+        ObjectPath::from(format!("manifests/{}/", self.project_id))
+    }
+
+    /// Lists `(epoch, meta)` for every manifest file, oldest first.
+    async fn list_epochs(&self) -> Result<Vec<(u64, ObjectMeta)>> {
+        let metas: Vec<_> = self
+            .object_store
+            .list(Some(&self.prefix()))
+            .try_collect()
+            .await?;
+        let mut out: Vec<(u64, ObjectMeta)> = metas
+            .into_iter()
+            .filter_map(|m| parse_epoch_from_path(m.location.as_ref()).map(|ep| (ep, m)))
+            .collect();
+        out.sort_unstable_by_key(|(ep, _)| *ep);
+        Ok(out)
+    }
+
+    /// Deletes manifest epochs outside the newest `retain_epochs` once older than `gc_grace`.
+    ///
+    /// Deletes oldest-first and stops at the first epoch it keeps or fails to delete, so the deleted
+    /// epochs always form a prefix; `commit_next` relies on that to detect stale writers.
+    pub async fn gc_old_epochs(&self) -> Result<usize> {
+        let epochs = self.list_epochs().await?;
+        let Some(latest) = epochs.last().map(|(ep, _)| *ep) else {
+            return Ok(0);
+        };
+        let grace = chrono::Duration::from_std(self.gc_grace).unwrap_or(chrono::Duration::MAX);
+        let now = chrono::Utc::now();
+        let mut deleted = 0usize;
+        for (ep, meta) in epochs {
+            if ep + self.retain_epochs > latest || now - meta.last_modified < grace {
+                break;
+            }
+            self.object_store.delete(&meta.location).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     fn epoch_path(&self, epoch: u64) -> ObjectPath {
@@ -127,21 +189,10 @@ impl ManifestStore {
     }
 
     pub async fn load_latest(&self) -> Result<Manifest> {
-        let prefix = ObjectPath::from(format!("manifests/{}/", self.project_id));
-        let metas: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
-        let mut max_epoch: Option<(u64, ObjectPath)> = None;
-        for m in metas {
-            if let Some(ep) = parse_epoch_from_path(m.location.as_ref()) {
-                if max_epoch.as_ref().is_none_or(|(cur, _)| ep > *cur) {
-                    max_epoch = Some((ep, m.location));
-                }
-            }
-        }
-
-        let Some((_, path)) = max_epoch else {
+        let Some((_, meta)) = self.list_epochs().await?.pop() else {
             return Ok(Manifest::default());
         };
-        let bytes = self.object_store.get(&path).await?.bytes().await?;
+        let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
         let wire: ManifestWire = serde_json::from_slice(&bytes)?;
         Ok(Manifest::from_wire(wire))
     }
@@ -161,7 +212,22 @@ impl ManifestStore {
             .put_opts(&path, PutPayload::from_bytes(Bytes::from(payload)), opts)
             .await
         {
-            Ok(_) => Ok(next),
+            Ok(_) => {
+                // A writer more than `retain_epochs` behind would find its next epoch slot already
+                // garbage-collected and `Create` would succeed, hiding its commit under newer epochs.
+                // Its predecessor is then gone too (GC deletes a prefix), so treat that as a conflict.
+                if next.epoch > 1 {
+                    if let Err(OsError::NotFound { .. }) = self
+                        .object_store
+                        .head(&self.epoch_path(next.epoch - 1))
+                        .await
+                    {
+                        let _ = self.object_store.delete(&path).await;
+                        return Err(StorageError::ManifestConflict);
+                    }
+                }
+                Ok(next)
+            }
             Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
                 Err(StorageError::ManifestConflict)
             }
@@ -285,5 +351,60 @@ impl StorageSnapshot {
 impl Drop for StorageSnapshot {
     fn drop(&mut self) {
         self.tracker.unpin_all(&self.pinned_paths);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    async fn epoch_files(store: &Arc<dyn ObjectStore>) -> Vec<u64> {
+        let metas: Vec<_> = store.list(None).try_collect().await.unwrap();
+        let mut eps: Vec<u64> = metas
+            .iter()
+            .filter_map(|m| parse_epoch_from_path(m.location.as_ref()))
+            .collect();
+        eps.sort_unstable();
+        eps
+    }
+
+    #[tokio::test]
+    async fn old_epochs_are_garbage_collected_and_latest_still_loads() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ms = ManifestStore::new("p", store.clone()).with_retention(4, Duration::ZERO);
+
+        let mut cur = Manifest::default();
+        for i in 0..40u64 {
+            cur.committed_wal_seq.insert(0, i);
+            cur = ms.commit_next(cur).await.unwrap();
+        }
+        assert_eq!(epoch_files(&store).await.len(), 40);
+
+        // Grace period protects young files even outside the retained window.
+        let guarded =
+            ManifestStore::new("p", store.clone()).with_retention(4, Duration::from_secs(3600));
+        assert_eq!(guarded.gc_old_epochs().await.unwrap(), 0);
+
+        assert_eq!(ms.gc_old_epochs().await.unwrap(), 36);
+        assert_eq!(epoch_files(&store).await, vec![37, 38, 39, 40]);
+
+        let latest = ms.load_latest().await.unwrap();
+        assert_eq!(latest.epoch, 40);
+        assert_eq!(latest.committed_wal_seq.get(&0), Some(&39));
+
+        // A stale writer whose next slot was collected must conflict, not silently "commit".
+        let stale = Manifest {
+            epoch: 9,
+            ..Manifest::default()
+        };
+        assert!(matches!(
+            ms.commit_next(stale).await,
+            Err(StorageError::ManifestConflict)
+        ));
+        assert_eq!(epoch_files(&store).await, vec![37, 38, 39, 40]);
+
+        // The live writer keeps committing normally.
+        assert_eq!(ms.commit_next(latest).await.unwrap().epoch, 41);
     }
 }
