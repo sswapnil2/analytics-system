@@ -175,7 +175,7 @@ export function useSavedReport(
     const params = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
     const id = params.get("report");
     const range = params.get("range");
-    if (range && /^(today|yesterday|\d+|custom:\d{4}-\d\d-\d\d:\d{4}-\d\d-\d\d)$/.test(range)) setRange(range as RangeSel);
+    if (range && /^(today|yesterday|\d+|custom:(\d{4}-\d\d-\d\d:\d{4}-\d\d-\d\d|\d+-\d+))$/.test(range)) setRange(range as RangeSel);
     if (!id) return;
     let live = true;
     api

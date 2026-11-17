@@ -12,7 +12,8 @@ import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
 /**
  * A date range choice: "today", "yesterday", a number of days ("7", "14"…),
- * or "custom:YYYY-MM-DD:YYYY-MM-DD" (inclusive local dates).
+ * or "custom:<startMs>-<endMs>" (end exclusive). The older day-only form
+ * "custom:YYYY-MM-DD:YYYY-MM-DD" (inclusive local dates) still parses, since saved links use it.
  */
 export type RangeSel = string;
 
@@ -34,15 +35,32 @@ const addDays = (ms: number, n: number) => {
 };
 const parseDay = (d: string) => new Date(`${d}T00:00:00`).getTime();
 const fmtDay = (ms: number) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+const fmtDayTime = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const isMidnight = (ms: number) => new Date(ms).setHours(0, 0, 0, 0) === ms;
+
+/** The span of a "custom:" choice, in either encoding; null if malformed. */
+function customRange(sel: RangeSel): TimeRange | null {
+  const ms = /^custom:(\d+)-(\d+)$/.exec(sel);
+  if (ms) return { start_ts_ms: Number(ms[1]), end_ts_ms: Number(ms[2]) };
+  const day = /^custom:(\d{4}-\d\d-\d\d):(\d{4}-\d\d-\d\d)$/.exec(sel);
+  if (day) return { start_ts_ms: parseDay(day[1]), end_ts_ms: addDays(parseDay(day[2]), 1) };
+  return null;
+}
+
+/** ["3 Nov", "15 Nov"] for whole days (end shown inclusive), else with times. */
+function customEnds(r: TimeRange): [string, string] {
+  if (isMidnight(r.start_ts_ms) && isMidnight(r.end_ts_ms))
+    return [fmtDay(r.start_ts_ms), fmtDay(addDays(r.end_ts_ms, -1))];
+  return [fmtDayTime(r.start_ts_ms), fmtDayTime(r.end_ts_ms)];
+}
 
 export function rangeFor(sel: RangeSel): TimeRange {
   const now = Date.now();
   if (sel === "today") return { start_ts_ms: startOfToday(), end_ts_ms: now + 3_600_000 };
   if (sel === "yesterday") return { start_ts_ms: addDays(startOfToday(), -1), end_ts_ms: startOfToday() };
-  if (sel.startsWith("custom:")) {
-    const [, from, to] = sel.split(":");
-    return { start_ts_ms: parseDay(from), end_ts_ms: addDays(parseDay(to), 1) };
-  }
+  const c = customRange(sel);
+  if (c) return c;
   return { start_ts_ms: now - Number(sel) * DAY_MS, end_ts_ms: now + 3_600_000 };
 }
 
@@ -56,34 +74,37 @@ function rangeDays(sel: RangeSel): number {
 export function rangeLabel(sel: RangeSel): string {
   if (sel === "today") return "Today";
   if (sel === "yesterday") return "Yesterday";
-  if (sel.startsWith("custom:")) {
-    const [, from, to] = sel.split(":");
-    return `${fmtDay(parseDay(from))} – ${fmtDay(parseDay(to))}`;
-  }
+  const c = customRange(sel);
+  if (c) return customEnds(c).join(" – ");
   return `Last ${sel} days`;
 }
 
 /** For sentences: "in the last 14 days", "today", "between 3 Nov and 15 Nov". */
 export function rangePhrase(sel: RangeSel): string {
   if (sel === "today" || sel === "yesterday") return sel;
-  if (sel.startsWith("custom:")) {
-    const [, from, to] = sel.split(":");
-    return `between ${fmtDay(parseDay(from))} and ${fmtDay(parseDay(to))}`;
+  const c = customRange(sel);
+  if (c) {
+    const [a, b] = customEnds(c);
+    return `between ${a} and ${b}`;
   }
   return `in the last ${sel} days`;
 }
 
-const iso = (ms: number) => {
+/** Local "YYYY-MM-DDTHH:mm", the value format of <input type="datetime-local">. */
+const localInput = (ms: number) => {
   const d = new Date(ms);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 };
+// Parsed as local time because there is no zone suffix.
+const parseLocal = (v: string) => new Date(v).getTime();
 
 /** Date preset bar with a Custom from/to popover. */
 export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) => void }> = ({ value, onChange }) => {
   const [open, setOpen] = useState(false);
   const r = rangeFor(value);
-  const [from, setFrom] = useState(iso(r.start_ts_ms));
-  const [to, setTo] = useState(iso(Math.min(Date.now(), r.end_ts_ms - 1)));
+  const [from, setFrom] = useState(localInput(r.start_ts_ms));
+  const [to, setTo] = useState(localInput(Math.min(Date.now(), r.end_ts_ms)));
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -99,7 +120,7 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
   const custom = value.startsWith("custom:");
   const seg = (on: boolean) =>
     `whitespace-nowrap rounded-md px-2.5 py-1.5 font-medium ${on ? "bg-brand text-on-brand" : "text-ink-2 hover:bg-hover"}`;
-  const valid = from && to && from <= to;
+  const valid = from && to && parseLocal(from) < parseLocal(to);
   return (
     <div className="relative max-w-full" ref={ref}>
       <div role="group" aria-label="Date range" className="no-scrollbar flex max-w-full overflow-x-auto rounded-lg border border-line bg-panel p-0.5 text-[0.8125rem]">
@@ -111,8 +132,8 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
         <button type="button" aria-pressed={custom} aria-expanded={open} onClick={() => {
             // Start the picker from the range on screen, not the one when the bar mounted.
             if (!open) {
-              setFrom(iso(r.start_ts_ms));
-              setTo(iso(Math.min(Date.now(), r.end_ts_ms - 1)));
+              setFrom(localInput(r.start_ts_ms));
+              setTo(localInput(Math.min(Date.now(), r.end_ts_ms)));
             }
             setOpen((v) => !v);
           }} className={seg(custom)}>
@@ -125,21 +146,21 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
           onSubmit={(e) => {
             e.preventDefault();
             if (!valid) return;
-            onChange(`custom:${from}:${to}`);
+            onChange(`custom:${parseLocal(from)}-${parseLocal(to)}`);
             setOpen(false);
           }}
         >
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid gap-3">
             <label className="flex flex-col gap-1.5">
               <span className={fieldLabel}>From</span>
-              <input type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} className={field} />
+              <input type="datetime-local" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} className={field} />
             </label>
             <label className="flex flex-col gap-1.5">
               <span className={fieldLabel}>To</span>
-              <input type="date" value={to} min={from || undefined} max={iso(Date.now())} onChange={(e) => setTo(e.target.value)} className={field} />
+              <input type="datetime-local" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} className={field} />
             </label>
           </div>
-          {!valid && <p className="text-[0.8125rem] text-danger">Pick a start date on or before the end date.</p>}
+          {!valid && <p className="text-[0.8125rem] text-danger">Pick a start before the end.</p>}
           <div className="flex justify-end gap-2">
             <button type="button" className={btn.ghost} onClick={() => setOpen(false)}>
               Cancel
