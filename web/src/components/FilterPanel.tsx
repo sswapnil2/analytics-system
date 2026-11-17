@@ -78,27 +78,29 @@ export function useCohortNames(projectId: string) {
   return cohorts;
 }
 
-/** Most common values of `prop` on `anchorEvent` over the last 30 days, for suggestions. */
+/** Most common values of `prop` on `anchorEvent` over the last 30 days, busiest first. */
+export async function topValues(projectId: string, anchorEvent: string, prop: string, limit = 50): Promise<string[]> {
+  const end = Date.now();
+  const res = await api.queryInsights(projectId, {
+    time_range: { start_ts_ms: end - 30 * 86_400_000, end_ts_ms: end },
+    interval: "day",
+    series: [{ label: "A", event_name: anchorEvent, metric: { type: "totals" }, filters: [] }],
+    breakdown_by: [prop],
+  });
+  return res.series
+    .filter((s) => s.breakdown_key && s.breakdown_key !== "(none)")
+    .sort((a, b) => (b.overall_value ?? 0) - (a.overall_value ?? 0))
+    .slice(0, limit)
+    .map((s) => s.breakdown_key);
+}
+
 function useTopValues(projectId: string, anchorEvent: string, prop: string) {
   const [values, setValues] = useState<string[]>([]);
   useEffect(() => {
     if (!prop || !anchorEvent) return setValues([]);
     let alive = true;
-    const end = Date.now();
-    api
-      .queryInsights(projectId, {
-        time_range: { start_ts_ms: end - 30 * 86_400_000, end_ts_ms: end },
-        interval: "day",
-        series: [{ label: "A", event_name: anchorEvent, metric: { type: "totals" }, filters: [] }],
-        breakdown_by: [prop],
-      })
-      .then((res) => {
-        if (!alive) return;
-        const rows = res.series
-          .filter((s) => s.breakdown_key && s.breakdown_key !== "(none)")
-          .sort((a, b) => (b.overall_value ?? 0) - (a.overall_value ?? 0));
-        setValues(rows.slice(0, 50).map((s) => s.breakdown_key));
-      })
+    topValues(projectId, anchorEvent, prop)
+      .then((v) => alive && setValues(v))
       .catch(() => alive && setValues([]));
     return () => {
       alive = false;

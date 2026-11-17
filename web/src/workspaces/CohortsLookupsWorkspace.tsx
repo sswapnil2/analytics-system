@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { CheckCircle2, Download, Upload, Users } from "lucide-react";
+import { CheckCircle2, Download, Plus, Upload, Users, X } from "lucide-react";
 import { api } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { UserProfilesDpdpPanel } from "../components/UserProfilesDpdpPanel";
@@ -14,6 +14,40 @@ interface Props {
 }
 
 type Feedback = { kind: "ok" | "error"; text: string } | null;
+
+/** One line of the cohort builder. `days` 0 means any time. */
+interface Cond {
+  type: "did" | "didnt" | "prop";
+  event: string;
+  minCount: number;
+  days: number;
+  prop: string;
+  value: string;
+}
+const DAY_CHOICES: [number, string][] = [[0, "ever"], [7, "in the last 7 days"], [30, "in the last 30 days"], [90, "in the last 90 days"]];
+
+function condDef(c: Cond) {
+  const now = Date.now();
+  const time_range = c.days ? { start_ts_ms: now - c.days * 86_400_000, end_ts_ms: now } : null;
+  if (c.type === "did") return { kind: "performed_event", event_name: c.event, min_count: c.minCount, time_range, where_clauses: [] };
+  if (c.type === "didnt") return { kind: "not_performed_event", event_name: c.event, time_range };
+  return { kind: "property_match", predicate: { prop_name: c.prop, filter: { op: "eq", val: c.value.trim() } }, time_range };
+}
+
+function condText(c: Cond) {
+  // ponytail: windows are fixed dates when saved (TimeRange has no rolling form); add one to the engine if cohorts must roll.
+  const when = c.days ? ` in the ${c.days} days to ${new Date().toLocaleDateString()}` : "";
+  if (c.type === "did") return `did ${humanizeEvent(c.event)} ${c.minCount}+ times${when}`;
+  if (c.type === "didnt") return `didn't do ${humanizeEvent(c.event)}${when}`;
+  return `${humanizeEvent(c.prop)} is ${c.value.trim()}`;
+}
+
+/** The saved definition: one condition as is, several joined with and/or. */
+export function cohortDefinition(conds: Cond[], match: "and" | "or") {
+  const ok = conds.filter((c) => (c.type === "prop" ? c.prop && c.value.trim() : c.event));
+  if (ok.length === 0) return null;
+  return ok.length === 1 ? condDef(ok[0]) : { kind: match, clauses: ok.map(condDef) };
+}
 
 const FeedbackLine: React.FC<{ feedback: Feedback }> = ({ feedback }) => {
   if (!feedback) return null;
@@ -54,8 +88,12 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   const { canEdit, canAdmin } = useAccess();
   const cleanEvents = availableEvents.filter((e) => !e.startsWith("$"));
   const [cohortName, setCohortName] = useState<string>("");
-  const [cohortEvent, setCohortEvent] = useState<string>(() => cleanEvents[0] ?? "");
-  const [minCount, setMinCount] = useState<number>(2);
+  const newCond = (event = cleanEvents[0] ?? ""): Cond => ({ type: "did", event, minCount: 1, days: 30, prop: availableProps[0] ?? "", value: "" });
+  const [conds, setConds] = useState<Cond[]>(() => [{ ...newCond(), minCount: 2, days: 0 }]);
+  const [match, setMatch] = useState<"and" | "or">("and");
+  const setCond = (i: number, patch: Partial<Cond>) => setConds((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const definition = cohortDefinition(conds, match);
+  const defKey = JSON.stringify(definition);
   const [preview, setPreview] = useState<{ count: number; us: number } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -71,8 +109,8 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   const [customSql, setCustomSql] = useState<string>("");
 
   useEffect(() => {
-    const clean = availableEvents.filter((e) => !e.startsWith("$"));
-    if (clean.length > 0) setCohortEvent((prev) => prev || clean[0]);
+    const first = availableEvents.find((e) => !e.startsWith("$"));
+    if (first) setConds((cs) => cs.map((c) => (c.event ? c : { ...c, event: first })));
   }, [availableEvents]);
 
   useEffect(() => {
@@ -138,16 +176,11 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   }, [loadAll]);
 
   const runPreview = useCallback(async () => {
-    if (!cohortEvent) {
+    const def = defKey === "null" ? null : JSON.parse(defKey);
+    if (!def) {
       setPreview(null);
       return;
     }
-    const def = {
-      kind: "performed_event",
-      event_name: cohortEvent,
-      min_count: minCount,
-      where_clauses: [],
-    };
     setPreviewLoading(true);
     setPreviewError(null);
     try {
@@ -158,7 +191,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
     } finally {
       setPreviewLoading(false);
     }
-  }, [projectId, cohortEvent, minCount]);
+  }, [projectId, defKey]);
 
   useEffect(() => {
     void runPreview();
@@ -167,15 +200,12 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   const saveCohort = () =>
     withFeedback(setCohortFeedback, setSavingCohort, `Saved "${cohortName.trim()}".`, async () => {
       if (!cohortName.trim()) throw new Error("Give the cohort a name.");
+      if (!definition) throw new Error("Add at least one condition.");
+      const text = conds.map(condText).join(match === "and" ? ", and " : ", or ");
       await api.createCohort(projectId, {
         name: cohortName.trim(),
-        description: `Did ${humanizeEvent(cohortEvent)} at least ${minCount} times`,
-        definition: {
-          kind: "performed_event",
-          event_name: cohortEvent,
-          min_count: minCount,
-          where_clauses: [],
-        },
+        description: text.charAt(0).toUpperCase() + text.slice(1),
+        definition,
       });
       await loadAll();
       onCatalogChanged();
@@ -204,9 +234,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
       onCatalogChanged();
     });
 
-  const eventOptions = Array.from(
-    new Set([...availableEvents.filter((e) => !e.startsWith("$")), cohortEvent].filter(Boolean)),
-  );
+  const eventOptions = Array.from(new Set([...cleanEvents, ...conds.map((c) => c.event)].filter(Boolean)));
 
   return (
     <div>
@@ -237,39 +265,91 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               />
             </div>
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_auto]">
-              <div className="space-y-1">
-                <label htmlFor="cohort-event" className={fieldLabel}>
-                  Users who did
-                </label>
-                <select
-                  id="cohort-event"
-                  value={cohortEvent}
-                  onChange={(e) => setCohortEvent(e.target.value)}
-                  className={`${field} w-full`}
-                >
-                  {eventOptions.map((ev) => (
-                    <option key={ev} value={ev}>
-                      {humanizeEvent(ev)}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-1">
-                <label htmlFor="cohort-min" className={fieldLabel}>
-                  At least (times)
-                </label>
-                <input
-                  id="cohort-min"
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={minCount}
-                  onChange={(e) => setMinCount(Math.max(1, Number(e.target.value) || 1))}
-                  className={`${field} tabular w-full sm:w-24`}
-                />
-              </div>
-            </div>
+            <fieldset className="space-y-2">
+              <legend className={`${fieldLabel} mb-1 flex items-center gap-1.5`}>
+                Users who match
+                {conds.length > 1 ? (
+                  <select aria-label="Match" value={match} onChange={(e) => setMatch(e.target.value as "and" | "or")} className={`${field} py-0.5`}>
+                    <option value="and">all</option>
+                    <option value="or">any</option>
+                  </select>
+                ) : null}
+                {conds.length > 1 && "of these"}
+              </legend>
+              <ul className="space-y-2">
+                {conds.map((c, i) => (
+                  <li key={i} className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-sunken p-2">
+                    <select aria-label="Condition" value={c.type} onChange={(e) => setCond(i, { type: e.target.value as Cond["type"] })} className={`${field} py-1`}>
+                      <option value="did">Did</option>
+                      <option value="didnt">Didn't do</option>
+                      <option value="prop">Has property</option>
+                    </select>
+                    {c.type === "prop" ? (
+                      <>
+                        <select aria-label="Property" value={c.prop} onChange={(e) => setCond(i, { prop: e.target.value })} className={`${field} min-w-0 flex-1 py-1`}>
+                          {availableProps.map((p) => (
+                            <option key={p} value={p}>
+                              {humanizeEvent(p)}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="text-sm text-muted">is</span>
+                        <input aria-label="Value" value={c.value} onChange={(e) => setCond(i, { value: e.target.value })} placeholder="value" className={`${field} w-28 py-1`} />
+                      </>
+                    ) : (
+                      <>
+                        <select aria-label="Event" value={c.event} onChange={(e) => setCond(i, { event: e.target.value })} className={`${field} min-w-0 flex-1 py-1`}>
+                          {eventOptions.map((ev) => (
+                            <option key={ev} value={ev}>
+                              {humanizeEvent(ev)}
+                            </option>
+                          ))}
+                        </select>
+                        {c.type === "did" && (
+                          <label className="flex items-center gap-1 text-sm text-muted">
+                            <input
+                              aria-label="At least (times)"
+                              type="number"
+                              min={1}
+                              max={50}
+                              value={c.minCount}
+                              onChange={(e) => setCond(i, { minCount: Math.max(1, Number(e.target.value) || 1) })}
+                              className={`${field} tabular w-16 py-1`}
+                            />
+                            + times
+                          </label>
+                        )}
+                        <select aria-label="When" value={c.days} onChange={(e) => setCond(i, { days: Number(e.target.value) })} className={`${field} py-1`}>
+                          {DAY_CHOICES.map(([d, l]) => (
+                            <option key={d} value={d}>
+                              {l}
+                            </option>
+                          ))}
+                        </select>
+                      </>
+                    )}
+                    {conds.length > 1 && (
+                      <button
+                        type="button"
+                        aria-label="Remove condition"
+                        onClick={() => setConds((cs) => cs.filter((_, j) => j !== i))}
+                        className="rounded p-1 text-muted hover:bg-hover hover:text-ink"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                onClick={() => setConds((cs) => [...cs, newCond()])}
+                className="inline-flex items-center gap-1 text-sm font-medium text-brand hover:underline"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Add condition
+              </button>
+            </fieldset>
 
             <div className="flex min-h-[44px] items-center rounded-lg border border-line bg-sunken px-3.5 py-2.5">
               {previewError ? (
@@ -306,7 +386,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               <EmptyState
                 icon={Users}
                 title="No saved cohorts yet"
-                body="Pick an event and a minimum count above, then save the group to reuse it in other reports."
+                body="Describe the users above, then save the group to reuse it in the Filter panel of any report."
               />
             ) : (
               <div className="space-y-2">

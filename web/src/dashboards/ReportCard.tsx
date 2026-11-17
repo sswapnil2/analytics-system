@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
+  FlowsResult,
   FunnelResult,
   InsightsResult,
   RetentionResult,
@@ -190,7 +191,8 @@ const SERIES_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn)
 type CardResult =
   | { kind: "funnel"; data: FunnelResult }
   | { kind: "insights"; data: InsightsResult }
-  | { kind: "retention"; data: RetentionResult };
+  | { kind: "retention"; data: RetentionResult }
+  | { kind: "flows"; data: FlowsResult };
 
 /** Runs a saved report with the dashboard's date range and draws a compact version of it. */
 export const ReportCardBody: React.FC<{
@@ -223,7 +225,7 @@ export const ReportCardBody: React.FC<{
       } else if (report.report_kind === "retention") {
         set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body) });
       } else {
-        set(setError)("Journeys can't be shown on a dashboard yet. Open it in Journeys.");
+        set(setResult)({ kind: "flows", data: await api.queryFlows(projectId, body) });
       }
     } catch (err) {
       set(setError)(errorMessage(err));
@@ -257,7 +259,10 @@ export const ReportCardBody: React.FC<{
   }
   return (
     <div className={loading ? "opacity-60 transition-opacity" : undefined} aria-busy={loading}>
-      {result.kind === "funnel" && <FunnelMini data={result.data} />}
+      {result.kind === "funnel" && (
+        <FunnelMini data={result.data} splitBy={(report.query_json as { breakdown_by?: string | null }).breakdown_by ?? null} />
+      )}
+      {result.kind === "flows" && <FlowsMini data={result.data} />}
       {result.kind === "insights" && <TrendMini data={result.data} />}
       {result.kind === "retention" && <RetentionMini data={result.data} />}
     </div>
@@ -271,7 +276,7 @@ const Headline: React.FC<{ value: string; children?: React.ReactNode }> = ({ val
   </p>
 );
 
-const FunnelMini: React.FC<{ data: FunnelResult }> = ({ data }) => {
+const FunnelMini: React.FC<{ data: FunnelResult; splitBy: string | null }> = ({ data, splitBy }) => {
   const steps = data.overall_steps;
   if (steps.length === 0 || steps[0].entered_users === 0) {
     return <p className="py-6 text-sm text-muted">No users entered this funnel in the selected dates.</p>;
@@ -312,6 +317,68 @@ const FunnelMini: React.FC<{ data: FunnelResult }> = ({ data }) => {
           Biggest drop: {formatCount(lostBefore(worst))} users between {humanizeEvent(steps[worst - 1].event_name)} and {humanizeEvent(steps[worst].event_name)}.
         </p>
       )}
+      {splitBy && data.breakdowns.length > 0 && <SplitMini splitBy={splitBy} groups={data.breakdowns} />}
+    </div>
+  );
+};
+
+/** A split funnel's segments on a card: conversion per segment, biggest segments first. */
+const SplitMini: React.FC<{ splitBy: string; groups: FunnelResult["breakdowns"] }> = ({ splitBy, groups }) => {
+  const rows = groups
+    .map((g) => {
+      const started = g.steps[0]?.entered_users ?? 0;
+      const done = g.steps[g.steps.length - 1]?.entered_users ?? 0;
+      return { name: g.breakdown_value || "(none)", started, rate: started ? (done / started) * 100 : 0 };
+    })
+    .filter((r) => r.started > 0)
+    .sort((a, b) => b.started - a.started)
+    .slice(0, 5);
+  const best = Math.max(...rows.map((r) => r.rate), 1);
+  return (
+    <div className="border-t border-line pt-2.5">
+      <p className="mb-1.5 text-xs text-muted">By {humanizeEvent(splitBy)}</p>
+      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3.5rem] items-center gap-x-2.5 gap-y-1 text-[0.8125rem]">
+        {rows.map((r) => (
+          <React.Fragment key={r.name}>
+            <span className="truncate" title={`${r.name}: ${formatCount(r.started)} started`}>
+              {r.name}
+            </span>
+            <span className="h-2 overflow-hidden rounded-[3px] bg-sunken" aria-hidden="true">
+              <span className="block h-2 bg-brand" style={{ width: `${(r.rate / best) * 100}%` }} />
+            </span>
+            <span className="tabular text-right">{r.rate.toFixed(1)}%</span>
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+/** A journey on a card: where users went right after the anchor event. */
+const FlowsMini: React.FC<{ data: FlowsResult }> = ({ data }) => {
+  const anchor = data.nodes.find((n) => n.step_offset === 0);
+  const next = data.nodes.filter((n) => Math.abs(n.step_offset) === 1).sort((a, b) => b.user_count - a.user_count).slice(0, 5);
+  if (!anchor || next.length === 0) return <p className="py-6 text-sm text-muted">No journeys in the selected dates.</p>;
+  const total = next.reduce((s, n) => s + n.user_count, 0) || 1;
+  const name = (e: string) => (e === "$Drop_Off" ? "No further events" : e === "$Other" ? "Other events" : humanizeEvent(e));
+  const before = next[0].step_offset < 0;
+  return (
+    <div className="space-y-2.5">
+      <Headline value={formatCount(anchor.user_count)}>
+        <span className="text-sm text-muted">users did {humanizeEvent(anchor.event_name)}</span>
+      </Headline>
+      <p className="text-xs text-muted">{before ? "What they did just before" : "What they did next"}</p>
+      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3rem] items-center gap-x-2.5 gap-y-1 text-[0.8125rem]">
+        {next.map((n) => (
+          <React.Fragment key={n.id}>
+            <span className="truncate">{name(n.event_name)}</span>
+            <span className="h-2 overflow-hidden rounded-[3px] bg-sunken" aria-hidden="true">
+              <span className={`block h-2 ${n.event_name === "$Drop_Off" ? "bg-danger" : "bg-brand"}`} style={{ width: `${(n.user_count / total) * 100}%` }} />
+            </span>
+            <span className="tabular text-right">{Math.round((n.user_count / total) * 100)}%</span>
+          </React.Fragment>
+        ))}
+      </div>
     </div>
   );
 };

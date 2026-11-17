@@ -415,6 +415,9 @@ pub struct PulseClient {
     tap_history: Mutex<VecDeque<TapPoint>>,
     timed_events: Mutex<HashMap<String, i64>>,
     flag_cache: RwLock<FlagCache>,
+    /// `flag_key:variant` pairs already reported as `$experiment_started`.
+    /// ponytail: per process, so one exposure per app launch; persist it if launches inflate counts.
+    exposures_sent: Mutex<HashSet<String>>,
     replay_offset_kb: AtomicU32,
     seq_counter: AtomicU32,
     shutdown_flag: Arc<AtomicBool>,
@@ -474,6 +477,7 @@ impl PulseClient {
             tap_history: Mutex::new(VecDeque::with_capacity(16)),
             timed_events: Mutex::new(HashMap::new()),
             flag_cache: RwLock::new(FlagCache::default()),
+            exposures_sent: Mutex::new(HashSet::new()),
             replay_offset_kb: AtomicU32::new(0),
             seq_counter: AtomicU32::new(1),
             shutdown_flag: shutdown_flag.clone(),
@@ -869,6 +873,24 @@ impl PulseClient {
             rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
             &did,
         ))
+    }
+
+    /// Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
+    /// (`flag_key`, `variant`) once, which is what experiment results count.
+    pub async fn get_variant(
+        &self,
+        flag_key: String,
+        track_exposure: bool,
+    ) -> Result<Option<String>, SdkError> {
+        let variant = self.evaluate_flag(flag_key.clone()).await?;
+        if let (true, Some(v)) = (track_exposure, variant.as_ref()) {
+            if !self.is_opted_out() && self.exposures_sent.lock().insert(format!("{flag_key}:{v}"))
+            {
+                let props = serde_json::json!({ "flag_key": flag_key, "variant": v }).to_string();
+                self.track("$experiment_started".to_string(), props)?;
+            }
+        }
+        Ok(variant)
     }
 
     pub async fn refresh_flags(&self) -> Result<(), SdkError> {
@@ -1680,5 +1702,56 @@ mod tests {
         assert!(reopened.is_opted_out());
         reopened.opt_in().unwrap();
         assert!(!reopened.is_opted_out());
+    }
+
+    #[tokio::test]
+    async fn get_variant_reports_one_exposure_per_flag_and_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(SdkConfig {
+            endpoint_url: "http://127.0.0.1:9".to_string(),
+            api_key: "pk_test".to_string(),
+            storage_dir: dir.path().to_string_lossy().to_string(),
+            flush_batch_size: 1000,
+            flush_interval_ms: 0,
+        })
+        .unwrap();
+        client.flag_cache.write().rules.insert(
+            "checkout".into(),
+            EdgeRule {
+                key: "checkout".into(),
+                enabled: true,
+                rollout_bps: 10_000,
+                cohort_members: None,
+                variants: vec![EdgeVariant {
+                    key: "b".into(),
+                    weight_bps: 10_000,
+                }],
+            },
+        );
+        let exposures = || {
+            client
+                .event_ring
+                .lock()
+                .iter()
+                .filter(|e| e.event_name == "$experiment_started")
+                .count()
+        };
+        assert_eq!(
+            client
+                .get_variant("checkout".into(), false)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(exposures(), 0);
+        client.get_variant("checkout".into(), true).await.unwrap();
+        client.get_variant("checkout".into(), true).await.unwrap();
+        assert_eq!(exposures(), 1);
+        assert_eq!(
+            client.get_variant("missing".into(), true).await.unwrap(),
+            None
+        );
+        assert_eq!(exposures(), 1);
     }
 }

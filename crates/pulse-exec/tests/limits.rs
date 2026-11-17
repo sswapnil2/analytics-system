@@ -1217,3 +1217,76 @@ async fn pr10_flows_hides_system_events_unless_anchored() {
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn any_event_counts_a_return_through_any_app_event_but_not_system_events() {
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 50_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let ingest = IngestService::new(storage.clone(), InMemoryGovernance::new());
+    let qengine = QueryEngine::new(
+        storage.clone(),
+        16 * 1024 * 1024,
+        None,
+        0,
+        CatalogRegistry::new(),
+    )
+    .await
+    .unwrap();
+
+    let day = 86_400_000i64;
+    let ts = 1_762_000_000_000i64 - (1_762_000_000_000i64 % day);
+    // a: back on day 1 with a different event; b: back on day 1 only via a system event; c: never back.
+    let batch = vec![
+        ev(1, "a", "s1", "Signup", ts + 1_000, Vec::new()),
+        ev(2, "a", "s2", "Search", ts + day + 1_000, Vec::new()),
+        ev(3, "b", "s3", "Signup", ts + 2_000, Vec::new()),
+        ev(
+            4,
+            "b",
+            "s4",
+            "$experiment_started",
+            ts + day + 2_000,
+            Vec::new(),
+        ),
+        ev(5, "c", "s5", "Signup", ts + 3_000, Vec::new()),
+    ];
+    ingest
+        .ingest_for_project("proj_any", WireBatch::new(batch), ts + 2 * day)
+        .await
+        .unwrap();
+
+    let res = qengine
+        .query_retention(
+            "proj_any",
+            &RetentionQuery {
+                time_range: TimeRange {
+                    start_ts_ms: ts,
+                    end_ts_ms: ts + day,
+                },
+                start_event: "Signup".into(),
+                return_event: pulse_exec::ANY_EVENT.into(),
+                mode: RetentionMode::NDay,
+                unit: TimeInterval::Day,
+                num_periods: 2,
+                global_filter: GlobalFilter::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let row = &res.cohorts[0];
+    assert_eq!(row.cohort_size, 3);
+    assert_eq!(
+        row.retained_counts[1], 1,
+        "only `a` came back through an app event"
+    );
+}
