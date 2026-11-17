@@ -1285,6 +1285,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             get(handle_list_experiments).post(handle_create_experiment),
         )
         .route(
+            "/v1/projects/:id/experiments/:exp_id",
+            patch(handle_patch_experiment),
+        )
+        .route(
             "/v1/projects/:id/experiments/:exp_id/results",
             get(handle_experiment_results_scoped),
         )
@@ -2903,6 +2907,10 @@ struct PatchFlagReq {
     enabled: Option<bool>,
     rollout_pct: Option<f64>,
     description: Option<String>,
+    /// A cohort id to target, or `""` to target everyone again.
+    targeting_cohort_id: Option<String>,
+    /// Replaces the variant split (e.g. shipping the winner at 10000 bps).
+    variants: Option<Vec<VariantAllocation>>,
 }
 
 async fn handle_patch_flag(
@@ -2931,6 +2939,28 @@ async fn handle_patch_flag(
     }
     if let Some(desc) = req.description {
         found.description = desc;
+    }
+    if let Some(coh_id) = req.targeting_cohort_id {
+        if coh_id.is_empty() {
+            found.targeting_cohort_id = None;
+        } else {
+            let cohorts = ctrl.meta.list_cohorts(&id).await.map_err(CtrlError::meta)?;
+            if !cohorts.iter().any(|c| c.id == coh_id) {
+                return Err(CtrlError::bad(format!(
+                    "targeting_cohort_id '{coh_id}' does not exist in project '{id}'"
+                )));
+            }
+            found.targeting_cohort_id = Some(coh_id);
+        }
+    }
+    if let Some(variants) = req.variants {
+        let weight_sum: u64 = variants.iter().map(|v| v.weight_bps as u64).sum();
+        if variants.is_empty() || weight_sum != 10_000 {
+            return Err(CtrlError::bad(format!(
+                "variant weight_bps must sum to 10000, got {weight_sum}"
+            )));
+        }
+        found.variants = variants;
     }
     found.updated_at_ms = Utc::now().timestamp_millis();
     ctrl.meta
@@ -3039,6 +3069,46 @@ async fn handle_create_experiment(
         guardrail_metrics: req.guardrail_metrics,
         created_at_ms: now,
     };
+    ctrl.meta
+        .upsert_experiment(&exp)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(exp))
+}
+
+#[derive(Deserialize)]
+struct PatchExpReq {
+    status: Option<String>,
+    end_ts_ms: Option<i64>,
+}
+
+/// Stop, pause or resume an experiment. Shipping a winner is a flag patch plus `status: "concluded"`.
+async fn handle_patch_experiment(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, exp_id)): AxumPath<(String, String)>,
+    Json(req): Json<PatchExpReq>,
+) -> ApiRes<Experiment> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let Some(mut exp) = ctrl
+        .meta
+        .get_experiment(&id, &exp_id)
+        .await
+        .map_err(CtrlError::meta)?
+    else {
+        return Err(CtrlError::not_found("experiment not found"));
+    };
+    if let Some(status) = req.status {
+        if !matches!(status.as_str(), "running" | "paused" | "concluded") {
+            return Err(CtrlError::bad(
+                "status must be one of running, paused, concluded",
+            ));
+        }
+        exp.status = status;
+    }
+    if let Some(end) = req.end_ts_ms {
+        exp.end_ts_ms = end;
+    }
     ctrl.meta
         .upsert_experiment(&exp)
         .await

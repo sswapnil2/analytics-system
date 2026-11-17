@@ -1464,6 +1464,11 @@ impl MetaStore {
         Ok(rows)
     }
 
+    pub async fn rename_project(&self, id: &str, name: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(self, "UPDATE projects SET name = ? WHERE id = ?", name, id);
+        Ok(())
+    }
+
     pub async fn rename_org(&self, id: &str, name: &str) -> Result<(), MetaError> {
         let _ = db_exec!(self, "UPDATE orgs SET name = ? WHERE id = ?", name, id);
         Ok(())

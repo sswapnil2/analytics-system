@@ -438,6 +438,9 @@ struct SignupReq {
     setup_code: Option<String>,
     #[serde(default)]
     org_name: Option<String>,
+    /// First account only: renames the default project.
+    #[serde(default)]
+    project_name: Option<String>,
 }
 
 async fn handle_signup(
@@ -490,7 +493,29 @@ async fn handle_signup(
         .await?;
 
     if verified {
-        ctrl.assign_org(&user.id, org).await?;
+        let first_owner = matches!(org, SignupOrg::Default);
+        let (org_id, role) = ctrl.assign_org(&user.id, org).await?;
+        // The node's first owner names the default organisation and project it takes over.
+        if first_owner && role == Role::Owner {
+            let clean = |s: &Option<String>| {
+                s.as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(|n| n.chars().take(80).collect::<String>())
+            };
+            if let Some(name) = clean(&req.org_name) {
+                ctrl.meta
+                    .rename_org(&org_id, &name)
+                    .await
+                    .map_err(CtrlError::meta)?;
+            }
+            if let Some(name) = clean(&req.project_name) {
+                ctrl.meta
+                    .rename_project(&ctrl.default_project_id, &name)
+                    .await
+                    .map_err(CtrlError::meta)?;
+            }
+        }
         let user = ctrl
             .meta
             .get_user_by_id(&user.id)

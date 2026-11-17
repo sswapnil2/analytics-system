@@ -281,9 +281,29 @@ uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_evaluate_flag(void*_Nonnull
 uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_flush(void*_Nonnull ptr
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_GET_VARIANT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_GET_VARIANT
+uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_get_variant(void*_Nonnull ptr, RustBuffer flag_key, int8_t track_exposure
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_IDENTIFY
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_IDENTIFY
 void uniffi_pulse_sdk_core_fn_method_pulseclient_identify(void*_Nonnull ptr, RustBuffer user_id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_IS_OPTED_OUT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_IS_OPTED_OUT
+int8_t uniffi_pulse_sdk_core_fn_method_pulseclient_is_opted_out(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_OPT_IN
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_OPT_IN
+void uniffi_pulse_sdk_core_fn_method_pulseclient_opt_in(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_OPT_OUT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_OPT_OUT
+void uniffi_pulse_sdk_core_fn_method_pulseclient_opt_out(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_QUEUED_PACKET_COUNT
@@ -306,6 +326,11 @@ void uniffi_pulse_sdk_core_fn_method_pulseclient_record_wireframe_snapshot(void*
 uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_refresh_flags(void*_Nonnull ptr
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_REGISTER_SUPER_PROPS
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_REGISTER_SUPER_PROPS
+void uniffi_pulse_sdk_core_fn_method_pulseclient_register_super_props(void*_Nonnull ptr, RustBuffer props_json, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_RESET
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_RESET
 void uniffi_pulse_sdk_core_fn_method_pulseclient_reset(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -316,14 +341,29 @@ void uniffi_pulse_sdk_core_fn_method_pulseclient_reset(void*_Nonnull ptr, RustCa
 RustBuffer uniffi_pulse_sdk_core_fn_method_pulseclient_session_id(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SET_USER_PROPERTIES
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SET_USER_PROPERTIES
+void uniffi_pulse_sdk_core_fn_method_pulseclient_set_user_properties(void*_Nonnull ptr, RustBuffer props_json, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SHUTDOWN
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_SHUTDOWN
 uint64_t uniffi_pulse_sdk_core_fn_method_pulseclient_shutdown(void*_Nonnull ptr
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TIME_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TIME_EVENT
+void uniffi_pulse_sdk_core_fn_method_pulseclient_time_event(void*_Nonnull ptr, RustBuffer event_name, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TRACK
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TRACK
 void uniffi_pulse_sdk_core_fn_method_pulseclient_track(void*_Nonnull ptr, RustBuffer event_name, RustBuffer props_json, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TRACK_REVENUE
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_FN_METHOD_PULSECLIENT_TRACK_REVENUE
+void uniffi_pulse_sdk_core_fn_method_pulseclient_track_revenue(void*_Nonnull ptr, double amount, RustBuffer currency, RustBuffer product_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_PULSE_SDK_CORE_RUSTBUFFER_ALLOC
@@ -624,9 +664,33 @@ uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_flush(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_GET_VARIANT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_GET_VARIANT
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_get_variant(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_IDENTIFY
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_IDENTIFY
 uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_identify(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_IS_OPTED_OUT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_IS_OPTED_OUT
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_is_opted_out(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_OPT_IN
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_OPT_IN
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_in(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_OPT_OUT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_OPT_OUT
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_out(void
     
 );
 #endif
@@ -654,6 +718,12 @@ uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_REGISTER_SUPER_PROPS
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_REGISTER_SUPER_PROPS
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_RESET
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_RESET
 uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_reset(void
@@ -666,15 +736,33 @@ uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_SET_USER_PROPERTIES
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_SET_USER_PROPERTIES
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_set_user_properties(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_SHUTDOWN
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_SHUTDOWN
 uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_shutdown(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TIME_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TIME_EVENT
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_time_event(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TRACK
 #define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TRACK
 uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_track(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TRACK_REVENUE
+#define UNIFFI_FFIDEF_UNIFFI_PULSE_SDK_CORE_CHECKSUM_METHOD_PULSECLIENT_TRACK_REVENUE
+uint16_t uniffi_pulse_sdk_core_checksum_method_pulseclient_track_revenue(void
     
 );
 #endif

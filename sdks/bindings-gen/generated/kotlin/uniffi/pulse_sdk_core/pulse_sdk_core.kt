@@ -747,6 +747,22 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -778,7 +794,15 @@ internal interface UniffiLib : Library {
     ): Long
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_flush(`ptr`: Pointer,
     ): Long
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_get_variant(`ptr`: Pointer,`flagKey`: RustBuffer.ByValue,`trackExposure`: Byte,
+    ): Long
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_identify(`ptr`: Pointer,`userId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_is_opted_out(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_opt_in(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_opt_out(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_queued_packet_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
@@ -788,13 +812,21 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_refresh_flags(`ptr`: Pointer,
     ): Long
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_register_super_props(`ptr`: Pointer,`propsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_session_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_set_user_properties(`ptr`: Pointer,`propsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_shutdown(`ptr`: Pointer,
     ): Long
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_time_event(`ptr`: Pointer,`eventName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_pulse_sdk_core_fn_method_pulseclient_track(`ptr`: Pointer,`eventName`: RustBuffer.ByValue,`propsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_pulse_sdk_core_fn_method_pulseclient_track_revenue(`ptr`: Pointer,`amount`: Double,`currency`: RustBuffer.ByValue,`productId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun ffi_pulse_sdk_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -914,7 +946,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_flush(
     ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_get_variant(
+    ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_identify(
+    ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_is_opted_out(
+    ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_in(
+    ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_out(
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_queued_packet_count(
     ): Short
@@ -924,13 +964,21 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags(
     ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props(
+    ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_reset(
     ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id(
     ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_set_user_properties(
+    ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_shutdown(
     ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_time_event(
+    ): Short
     fun uniffi_pulse_sdk_core_checksum_method_pulseclient_track(
+    ): Short
+    fun uniffi_pulse_sdk_core_checksum_method_pulseclient_track_revenue(
     ): Short
     fun uniffi_pulse_sdk_core_checksum_constructor_pulseclient_new(
     ): Short
@@ -960,7 +1008,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_flush() != 13927.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_get_variant() != 25430.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_identify() != 25556.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_is_opted_out() != 21728.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_in() != 13246.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_opt_out() != 37774.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_queued_packet_count() != 36553.toShort()) {
@@ -975,16 +1035,28 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props() != 56505.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_set_user_properties() != 36905.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_shutdown() != 37508.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_time_event() != 4717.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_track() != 33488.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_track_revenue() != 3198.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_constructor_pulseclient_new() != 53018.toShort()) {
@@ -1166,6 +1238,29 @@ public object FfiConverterLong: FfiConverter<Long, Long> {
 
     override fun write(value: Long, buf: ByteBuffer) {
         buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterDouble: FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Double {
+        return buf.getDouble()
+    }
+
+    override fun lower(value: Double): Double {
+        return value
+    }
+
+    override fun allocationSize(value: Double) = 8UL
+
+    override fun write(value: Double, buf: ByteBuffer) {
+        buf.putDouble(value)
     }
 }
 
@@ -1430,9 +1525,21 @@ public interface PulseClientInterface {
     suspend fun `flush`(): kotlin.UInt
     
     /**
+     * Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
+     * (`flag_key`, `variant`) once, which is what experiment results count.
+     */
+    suspend fun `getVariant`(`flagKey`: kotlin.String, `trackExposure`: kotlin.Boolean): kotlin.String?
+    
+    /**
      * Identifies a logged-in user, preserving `routing_seed` (`device_install_id`) and queueing retroactive `alias`.
      */
     fun `identify`(`userId`: kotlin.String)
+    
+    fun `isOptedOut`(): kotlin.Boolean
+    
+    fun `optIn`()
+    
+    fun `optOut`()
     
     fun `queuedPacketCount`(): kotlin.UInt
     
@@ -1448,6 +1555,8 @@ public interface PulseClientInterface {
     
     suspend fun `refreshFlags`()
     
+    fun `registerSuperProps`(`propsJson`: kotlin.String)
+    
     /**
      * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
@@ -1456,12 +1565,18 @@ public interface PulseClientInterface {
     
     fun `sessionId`(): kotlin.String
     
+    fun `setUserProperties`(`propsJson`: kotlin.String)
+    
     suspend fun `shutdown`()
+    
+    fun `timeEvent`(`eventName`: kotlin.String)
     
     /**
      * Tracks an analytical event with a JSON object of properties.
      */
     fun `track`(`eventName`: kotlin.String, `propsJson`: kotlin.String)
+    
+    fun `trackRevenue`(`amount`: kotlin.Double, `currency`: kotlin.String, `productId`: kotlin.String?)
     
     companion object
 }
@@ -1620,6 +1735,31 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
+     * Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
+     * (`flag_key`, `variant`) once, which is what experiment results count.
+     */
+    @Throws(SdkException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `getVariant`(`flagKey`: kotlin.String, `trackExposure`: kotlin.Boolean) : kotlin.String? {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_get_variant(
+                thisPtr,
+                FfiConverterString.lower(`flagKey`),FfiConverterBoolean.lower(`trackExposure`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_pulse_sdk_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_pulse_sdk_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_pulse_sdk_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalString.lift(it) },
+        // Error FFI converter
+        SdkException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Identifies a logged-in user, preserving `routing_seed` (`device_install_id`) and queueing retroactive `alias`.
      */
     @Throws(SdkException::class)override fun `identify`(`userId`: kotlin.String)
@@ -1628,6 +1768,42 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
     uniffiRustCallWithError(SdkException) { _status ->
     UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_identify(
         it, FfiConverterString.lower(`userId`),_status)
+}
+    }
+    
+    
+
+    override fun `isOptedOut`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_is_opted_out(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(SdkException::class)override fun `optIn`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_opt_in(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    @Throws(SdkException::class)override fun `optOut`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_opt_out(
+        it, _status)
 }
     }
     
@@ -1699,6 +1875,18 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
     }
 
     
+    @Throws(SdkException::class)override fun `registerSuperProps`(`propsJson`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_register_super_props(
+        it, FfiConverterString.lower(`propsJson`),_status)
+}
+    }
+    
+    
+
+    
     /**
      * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
@@ -1727,6 +1915,18 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
     
 
     
+    @Throws(SdkException::class)override fun `setUserProperties`(`propsJson`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_set_user_properties(
+        it, FfiConverterString.lower(`propsJson`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(SdkException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `shutdown`() {
@@ -1749,6 +1949,18 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
     }
 
     
+    @Throws(SdkException::class)override fun `timeEvent`(`eventName`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_time_event(
+        it, FfiConverterString.lower(`eventName`),_status)
+}
+    }
+    
+    
+
+    
     /**
      * Tracks an analytical event with a JSON object of properties.
      */
@@ -1758,6 +1970,18 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
     uniffiRustCallWithError(SdkException) { _status ->
     UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_track(
         it, FfiConverterString.lower(`eventName`),FfiConverterString.lower(`propsJson`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(SdkException::class)override fun `trackRevenue`(`amount`: kotlin.Double, `currency`: kotlin.String, `productId`: kotlin.String?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SdkException) { _status ->
+    UniffiLib.INSTANCE.uniffi_pulse_sdk_core_fn_method_pulseclient_track_revenue(
+        it, FfiConverterDouble.lower(`amount`),FfiConverterString.lower(`currency`),FfiConverterOptionalString.lower(`productId`),_status)
 }
     }
     

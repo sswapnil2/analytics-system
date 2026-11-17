@@ -24,6 +24,7 @@ interface Props {
   projectId: string;
   availableEvents: string[];
   availableProps: string[];
+  numericProps: string[];
   refreshToken: number;
 }
 
@@ -52,6 +53,7 @@ const METRIC_OPTIONS: [string, string][] = [
   ["p99", "p99"],
 ];
 const PROP_METRICS = ["sum", "avg", "p50", "p90", "p99"];
+const CURRENCIES = ["USD", "EUR", "GBP", "INR", "JPY", "AUD", "CAD", "SGD", "BRL"];
 
 /** Inverse of buildMetricSpec, for opening a saved report. */
 function metricKindOf(m: { type?: string; quantile?: number } | undefined): string {
@@ -131,12 +133,20 @@ export const InsightsWorkspace: React.FC<Props> = ({
   projectId,
   availableEvents,
   availableProps,
+  numericProps,
   refreshToken,
 }) => {
   const [series, setSeries] = useState<SeriesDraft[]>(() =>
-    defaultSeriesFromCatalog(availableEvents, availableProps),
+    defaultSeriesFromCatalog(availableEvents, numericProps),
   );
   const [formula, setFormula] = useState<string>("");
+  const [currency, setCurrency] = useState<string>("");
+  // Currency only dresses property sums/averages; counts of users stay plain numbers.
+  const money = currency && series.every((s) => PROP_METRICS.includes(s.metricKind));
+  const fmt = (v: number | null | undefined, digits = 2) =>
+    money && v !== null && v !== undefined && Number.isFinite(v)
+      ? v.toLocaleString(undefined, { style: "currency", currency, maximumFractionDigits: digits > 0 ? 2 : 0 })
+      : formatValue(v, digits);
   const [breakdown, setBreakdown] = useState<string>("");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
@@ -149,9 +159,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
   useEffect(() => {
     setSeries((prev) =>
-      prev.length > 0 ? prev : defaultSeriesFromCatalog(availableEvents, availableProps),
+      prev.length > 0 ? prev : defaultSeriesFromCatalog(availableEvents, numericProps),
     );
-  }, [availableEvents, availableProps]);
+  }, [availableEvents, numericProps]);
 
   const buildQuery = useCallback(
     () => ({
@@ -166,8 +176,10 @@ export const InsightsWorkspace: React.FC<Props> = ({
       compare_previous_period: comparePrev,
       formula: formula.trim() ? formula.trim() : null,
       global_filter: toGlobalFilter(filter),
+      // Display only; the engine ignores it.
+      display_currency: currency || undefined,
     }),
-    [series, formula, breakdown, comparePrev, filter],
+    [series, formula, breakdown, comparePrev, filter, currency],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -178,7 +190,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
       const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
         breakdown_by?: string[]; compare_previous_period?: boolean; formula?: string | null };
       if (s.series?.length)
-        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? availableProps[0] ?? "" })));
+        setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? numericProps[0] ?? "" })));
+      setCurrency((q as { display_currency?: string }).display_currency ?? "");
       setBreakdown(s.breakdown_by?.[0] ?? "");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
@@ -321,7 +334,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   label: String.fromCharCode(65 + series.length),
                   eventName: eventOptions[0] ?? "",
                   metricKind: "uniques",
-                  propName: availableProps[0] ?? "",
+                  propName: numericProps[0] ?? "",
                 },
               ])
             }
@@ -362,7 +375,12 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 <span className={fieldLabel}>Measure</span>
                 <select
                   value={s.metricKind}
-                  onChange={(e) => updateSeries(idx, { metricKind: e.target.value })}
+                  onChange={(e) =>
+                    updateSeries(idx, {
+                      metricKind: e.target.value,
+                      propName: numericProps.includes(s.propName) ? s.propName : numericProps[0] ?? s.propName,
+                    })
+                  }
                   className={field}
                 >
                   {METRIC_OPTIONS.map(([value, text]) => (
@@ -380,9 +398,25 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     onChange={(e) => updateSeries(idx, { propName: e.target.value })}
                     className={field}
                   >
-                    {Array.from(new Set([s.propName, ...availableProps].filter(Boolean))).map((p) => (
+                    {Array.from(new Set([s.propName, ...numericProps].filter(Boolean))).map((p) => (
                       <option key={p} value={p}>
-                        {p}
+                        {humanizeEvent(p)}
+                      </option>
+                    ))}
+                  </select>
+                  {numericProps.length === 0 && (
+                    <span className="text-xs text-muted">No number properties have arrived yet. Send one, like revenue: 499.</span>
+                  )}
+                </label>
+              )}
+              {PROP_METRICS.includes(s.metricKind) && idx === 0 && (
+                <label className="flex flex-col gap-1">
+                  <span className={fieldLabel}>Show values as</span>
+                  <select value={currency} onChange={(e) => setCurrency(e.target.value)} className={field}>
+                    <option value="">Plain number</option>
+                    {CURRENCIES.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
                       </option>
                     ))}
                   </select>
@@ -496,7 +530,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     {s.breakdown_key && <span className="text-muted">, {s.breakdown_key}</span>}
                   </p>
                   <p className="tabular text-[2.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
-                    {formatValue(s.overall_value)}
+                    {fmt(s.overall_value)}
                   </p>
                   {change !== null && Number.isFinite(change) && (
                     <p className={`text-sm font-semibold ${change >= 0 ? "text-ok" : "text-danger"}`}>
@@ -516,7 +550,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   <span className="h-0.5 w-3 rounded" style={{ backgroundColor: color(idx) }} aria-hidden="true" />
                   <span className="font-medium text-ink-2">{seriesName(s)}</span>
                   {s.breakdown_key && <span className="text-muted">{s.breakdown_key}</span>}
-                  <span className="tabular text-muted">{formatValue(s.overall_value)}</span>
+                  <span className="tabular text-muted">{fmt(s.overall_value)}</span>
                 </li>
               ))}
             </ul>
@@ -557,7 +591,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                         fontSize={11}
                         className="tabular"
                       >
-                        {formatValue(maxY * frac, maxY >= 10 ? 0 : 1)}
+                        {fmt(maxY * frac, maxY >= 10 ? 0 : 1)}
                       </text>
                     </g>
                   );
@@ -612,7 +646,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                         p.value === null ? null : (
                           <circle key={p.bucket_ts_ms} cx={xAt(i)} cy={yAt(p.value)} r={2.5} fill={c}>
                             <title>
-                              {`${seriesName(s)}${s.breakdown_key ? `, ${s.breakdown_key}` : ""}: ${formatValue(
+                              {`${seriesName(s)}${s.breakdown_key ? `, ${s.breakdown_key}` : ""}: ${fmt(
                                 p.value,
                               )} on ${formatDay(p.bucket_ts_ms)}`}
                             </title>
@@ -658,7 +692,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                         <span className="min-w-0 flex-1 truncate text-ink-2">
                           {s.breakdown_key || seriesName(s)}
                         </span>
-                        <span className="tabular font-semibold text-ink">{formatValue(s.points[hoverIdx]?.value ?? null)}</span>
+                        <span className="tabular font-semibold text-ink">{fmt(s.points[hoverIdx]?.value ?? null)}</span>
                       </li>
                     ))}
                   </ul>
@@ -672,7 +706,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       {result && tableRows.length > 0 && (
         <Panel
           title="By segment"
-          meta="Last 7 days"
+          meta={`Overall is ${rangePhrase(range)}; daily columns show the last ${Math.min(7, tableBuckets.length)} days`}
           actions={
             <button type="button" onClick={exportCsv} className={btn.secondary}>
               <Download className="h-4 w-4" /> Export CSV
@@ -703,11 +737,11 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     </td>
                     <td className="whitespace-nowrap py-2 pr-4 text-ink-2">{row.breakdown_key || "All users"}</td>
                     <td className="tabular py-2 pl-3 text-right font-semibold text-ink">
-                      {formatValue(row.overall_value)}
+                      {fmt(row.overall_value)}
                     </td>
                     {row.points.slice(-7).map((pt) => (
                       <td key={pt.bucket_ts_ms} className="tabular px-2 py-2 text-right text-ink-2">
-                        {formatValue(pt.value, 1)}
+                        {fmt(pt.value, 1)}
                       </td>
                     ))}
                   </tr>

@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
+import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
+import { fromGlobalFilter } from "../components/FilterPanel";
 import { GitBranch, RefreshCw } from "lucide-react";
 import { api, FlowsResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
@@ -65,6 +67,21 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const buildQuery = useCallback(
+    () => ({ anchor_event: anchorEvent, direction, steps, global_filter: toGlobalFilter(filter) }),
+    [anchorEvent, direction, steps, filter],
+  );
+  const openError = useSavedReport(
+    projectId,
+    (q) => {
+      const s = q as { anchor_event?: string; direction?: "forward" | "reverse"; steps?: number; global_filter?: unknown };
+      if (s.anchor_event) setAnchorEvent(s.anchor_event);
+      if (s.direction) setDirection(s.direction);
+      if (s.steps) setSteps(s.steps);
+      setFilter(fromGlobalFilter(s.global_filter));
+    },
+    setRange,
+  );
 
   const runFlows = useCallback(async () => {
     if (!anchorEvent) {
@@ -75,20 +92,14 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFlows(projectId, {
-        time_range: rangeFor(range),
-        anchor_event: anchorEvent,
-        direction,
-        steps,
-        global_filter: toGlobalFilter(filter),
-      });
+      const res = await api.queryFlows(projectId, { time_range: rangeFor(range), ...buildQuery() });
       if (id === reqId.current) setResult(res);
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, anchorEvent, direction, steps, range, filter]);
+  }, [projectId, anchorEvent, buildQuery, range]);
 
   useEffect(() => {
     void runFlows();
@@ -221,6 +232,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
         actions={
           <>
           <RangePresets value={range} onChange={setRange} />
+          <SaveToDashboard projectId={projectId} kind="flows" defaultName={pageTitle} query={buildQuery} />
           <button type="button" onClick={() => void runFlows()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
             <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
           </button>
@@ -305,6 +317,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
         </>}
       >
 
+      {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={error} onRetry={() => void runFlows()} />}
 
       <Panel

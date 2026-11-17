@@ -537,7 +537,12 @@ impl QueryEngine {
             }
             // Recorded sessions by session-id hash, the same check funnels use for drop-off replays.
             let recorded = if query.only_with_replay {
-                Some(self.storage.replay_store().recorded_hashes_for_project(project_id).await)
+                Some(
+                    self.storage
+                        .replay_store()
+                        .recorded_hashes_for_project(project_id)
+                        .await,
+                )
             } else {
                 None
             };

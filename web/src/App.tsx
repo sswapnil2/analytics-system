@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   Copy,
@@ -156,6 +156,7 @@ export const App: React.FC = () => {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
   const [availableProps, setAvailableProps] = useState<string[]>([]);
+  const [numericProps, setNumericProps] = useState<string[]>([]);
   const [catalogLoaded, setCatalogLoaded] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState<number>(0);
@@ -165,6 +166,7 @@ export const App: React.FC = () => {
   const [quickstartOpen, setQuickstartOpen] = useState(false);
   const [quickstartDismissed, setQuickstartDismissed] = useState(false);
   const [copiedQuickstart, setCopiedQuickstart] = useState(false);
+  const [quickstartTab, setQuickstartTab] = useState("Web");
   const [mintedIngestKey, setMintedIngestKey] = useState<string>("");
   const [mintingKey, setMintingKey] = useState(false);
 
@@ -179,7 +181,10 @@ export const App: React.FC = () => {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  // Only say a session "ended" if this tab had one; a leftover token from another install just signs out.
+  const hadSession = useRef(false);
   const signOut = useCallback((reason?: string) => {
+    hadSession.current = false;
     setStoredAdminToken("");
     setStatus(null);
     setUser(null);
@@ -189,6 +194,10 @@ export const App: React.FC = () => {
     window.history.replaceState(null, "", "#/signin");
     setAuthRoute(parseAuthHash());
   }, []);
+  const sessionEnded = useCallback(
+    () => signOut(hadSession.current ? "Your session ended. Sign in again to continue." : undefined),
+    [signOut],
+  );
 
   const handleSignedIn = useCallback(() => {
     // An invite can sign a different account in over an existing one: drop the old account's state.
@@ -214,12 +223,13 @@ export const App: React.FC = () => {
   const loadStatus = useCallback(async () => {
     try {
       const s = await api.getStatus(projectId || undefined);
+      hadSession.current = true;
       setStatus(s);
       if (!projectId && s.active_project_id) setProjectId(s.active_project_id);
     } catch (err) {
-      if (err instanceof ApiAuthError && err.status === 401) signOut("Your session ended. Sign in again to continue.");
+      if (err instanceof ApiAuthError && err.status === 401) sessionEnded();
     }
-  }, [projectId, signOut]);
+  }, [projectId, sessionEnded]);
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
@@ -243,12 +253,16 @@ export const App: React.FC = () => {
         for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
       setAvailableEvents(Array.from(evNames));
       setAvailableProps(Array.from(propNames).sort());
+      // Numbers as seen at ingest, plus calculated properties (usually arithmetic).
+      setNumericProps(
+        [...lex.properties.filter((p) => /int|float/.test(p.inferred_types)).map((p) => p.name), ...ext.custom_properties.map((c) => c.name)].sort(),
+      );
       setCatalogLoaded(true);
     } catch (err) {
-      if (err instanceof ApiAuthError && err.status === 401) signOut("Your session ended. Sign in again to continue.");
+      if (err instanceof ApiAuthError && err.status === 401) sessionEnded();
       else setCatalogError(errorMessage(err));
     }
-  }, [projectId, signOut]);
+  }, [projectId, sessionEnded]);
 
   // Poll status only while signed in and the tab is visible.
   useEffect(() => {
@@ -362,14 +376,37 @@ export const App: React.FC = () => {
   const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
   const sampleEvent = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
   const sampleProp = availableProps[0] ?? "plan";
-  const curlSnippet = `curl -X POST "${origin}/v1/ingest" \\
+  const keyText = mintedIngestKey || "<PASTE_OR_GENERATE_INGEST_KEY>";
+  const quickstartSnippets: Record<string, string> = {
+    Web: `npm install @pulse-analytics/ts-web
+
+import { PulseWebClient } from "@pulse-analytics/ts-web";
+
+const pulse = new PulseWebClient({ endpointUrl: "${origin}", apiKey: "${keyText}" });
+pulse.identify("user_1");
+pulse.track("${sampleEvent}", { ${sampleProp}: "pro" });`,
+    Android: `// Kotlin, with the generated bindings (see docs/mobile-core.md)
+val pulse = PulseClient(SdkConfig(
+    endpointUrl = "${origin}", apiKey = "${keyText}",
+    storageDir = context.filesDir.path, flushBatchSize = 50u, flushIntervalMs = 10_000u))
+pulse.identify("user_1")
+pulse.track("${sampleEvent}", """{"${sampleProp}": "pro"}""")`,
+    iOS: `// Swift, with the generated bindings (see docs/mobile-core.md)
+let pulse = try PulseClient(config: SdkConfig(
+    endpointUrl: "${origin}", apiKey: "${keyText}",
+    storageDir: NSTemporaryDirectory(), flushBatchSize: 50, flushIntervalMs: 10_000))
+try pulse.identify(userId: "user_1")
+try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro"}"#)`,
+    HTTP: `curl -X POST "${origin}/v1/ingest" \\
   -H "Content-Type: application/json" \\
-  -H "x-pulse-key: ${mintedIngestKey || "<PASTE_OR_GENERATE_INGEST_KEY>"}" \\
+  -H "x-pulse-key: ${keyText}" \\
   -d '{
     "event": "${sampleEvent}",
     "userId": "user_1",
     "properties": { "${sampleProp}": "pro" }
-  }'`;
+  }'`,
+  };
+  const curlSnippet = quickstartSnippets[quickstartTab];
 
   const mintQuickstartKey = async () => {
     if (!activePid) return;
@@ -634,9 +671,25 @@ export const App: React.FC = () => {
                 </div>
               }
             >
-              <p className="mb-3 text-sm text-ink-2">
-                Accepts Segment, top-level arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
-              </p>
+              <div role="tablist" aria-label="Platform" className="mb-3 flex gap-1">
+                {Object.keys(quickstartSnippets).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    role="tab"
+                    aria-selected={quickstartTab === t}
+                    onClick={() => setQuickstartTab(t)}
+                    className={`rounded-md px-2.5 py-1 text-sm font-medium ${quickstartTab === t ? "bg-sunken text-ink" : "text-muted hover:text-ink"}`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+              {quickstartTab === "HTTP" && (
+                <p className="mb-3 text-sm text-ink-2">
+                  Accepts Segment, top-level arrays, or Pulse native JSON batches at <code className="font-mono">/v1/ingest</code>.
+                </p>
+              )}
               <div className="relative rounded-lg border border-line bg-sunken p-3.5">
                 <button
                   type="button"
@@ -693,6 +746,7 @@ export const App: React.FC = () => {
                     projectId={activePid}
                     availableEvents={availableEvents}
                     availableProps={availableProps}
+                    numericProps={numericProps}
                     refreshToken={refreshToken}
                   />
                 )}

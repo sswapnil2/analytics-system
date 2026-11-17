@@ -593,3 +593,44 @@ async fn each_signup_gets_its_own_org_and_cannot_see_others() {
         .iter()
         .any(|p| p["id"] == acme.as_str()));
 }
+
+#[tokio::test]
+async fn first_owner_names_the_default_org_and_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _ctrl, meta) = setup_app(tmp.path()).await;
+    let (s, owner, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/signup",
+        None,
+        Some(json!({"email": "ada@example.com", "password": "correct horse battery", "setup_code": ROOT,
+                    "org_name": " ShopNest ", "project_name": "ShopNest App"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{owner}");
+    assert_eq!(
+        meta.get_org_name("org_default").await.unwrap().as_deref(),
+        Some("ShopNest")
+    );
+    assert_eq!(
+        meta.get_project("proj_alpha").await.unwrap().unwrap().name,
+        "ShopNest App"
+    );
+
+    // A later sign-up into the default org can't rename it.
+    let mut cfg = auth_cfg(&["example.com"], "http://127.0.0.1:1/unused");
+    cfg.allow_new_orgs = false;
+    _ctrl.set_auth_config(cfg);
+    let _ = send(
+        &app,
+        "POST",
+        "/v1/auth/signup",
+        None,
+        Some(json!({"email": "bob@example.com", "password": "correct horse battery", "project_name": "Hijack"})),
+    )
+    .await;
+    assert_eq!(
+        meta.get_project("proj_alpha").await.unwrap().unwrap().name,
+        "ShopNest App"
+    );
+}

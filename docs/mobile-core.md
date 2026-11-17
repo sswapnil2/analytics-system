@@ -24,6 +24,7 @@ opt_out()   opt_in()   is_opted_out() -> bool
 record_wireframe_snapshot(width, height, nodes: [SdkWireNode])
 record_touch(x, y, target_is_interactive, ts_ms) -> String
 async evaluate_flag(flag_key) -> String?    async refresh_flags()
+async get_variant(flag_key, track_exposure) -> String?   // track_exposure sends $experiment_started once
 async flush() -> u32                        async shutdown()
 clear_backoff_for_retry()
 ```
@@ -32,6 +33,9 @@ Properties are passed as a JSON object string. Errors come back as `SdkError` (`
 `SdkWireNode.kind` is one of `screen`, `container`, `button`, `masked_input`, `text`,
 `image_placeholder`, `error_banner`; labels are replaced with `████` unless `unmasked = true`
 (and never for `masked_input`).
+
+Experiment results count users who sent `$experiment_started` with `flag_key` and `variant`
+properties: call `get_variant(key, true)` where the user first sees the variant.
 
 In Swift and Kotlin the names are camel-cased (`registerSuperProps`, `recordWireframeSnapshot`, …).
 
