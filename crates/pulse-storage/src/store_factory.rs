@@ -305,6 +305,51 @@ pub fn check_resolved_addrs(
     Ok(addrs)
 }
 
+/// DNS resolver that re-checks every address at connect time, so a customer endpoint can't pass
+/// validation and then rebind to an internal IP.
+struct SsrfCheckingResolver;
+
+impl reqwest::dns::Resolve for SsrfCheckingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let addrs = check_resolved_addrs(&host, addrs)?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// object_store HTTP connector for customer stores: SSRF-checked DNS, no redirect following.
+#[derive(Debug)]
+struct SsrfGuardedConnector;
+
+impl object_store::client::HttpConnector for SsrfGuardedConnector {
+    fn connect(
+        &self,
+        _options: &object_store::ClientOptions,
+    ) -> OsResult<object_store::client::HttpClient> {
+        let allow_priv = allow_private_endpoints();
+        // Mirrors object_store's defaults (30s/5s timeouts, compression off for Content-Length).
+        // ponytail: per-store ClientOptions are ignored; nothing sets them for customer stores.
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(!allow_priv)
+            // ponytail: no egress proxy support; the proxy host would be what gets resolved.
+            .no_proxy();
+        if !allow_priv {
+            builder = builder.dns_resolver(Arc::new(SsrfCheckingResolver));
+        }
+        let client = builder.build().map_err(|e| object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(e),
+        })?;
+        Ok(object_store::client::HttpClient::new(client))
+    }
+}
+
 /// Builds a customer BYOC object store (S3-compatible, or named `memory://` in private test mode).
 /// Explicitly refuses `file://` URLs and enforces SSRF validation on custom endpoints (`M1`).
 pub fn build_customer_object_store(
@@ -328,9 +373,25 @@ pub fn build_customer_object_store(
             let bucket = parsed.host_str().ok_or_else(|| {
                 StorageError::Corrupted("s3:// URL missing bucket host".to_string())
             })?;
+            let region = region
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("ap-south-1");
+            // The region is spliced into `https://s3.{region}.amazonaws.com`; anything beyond
+            // [a-z0-9-] (e.g. `x@10.0.0.5:8443/`) would send signed requests to another host.
+            if region.len() > 32
+                || !region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(StorageError::Corrupted(format!(
+                    "invalid S3 region '{region}'"
+                )));
+            }
             let mut builder = AmazonS3Builder::new()
                 .with_bucket_name(bucket)
-                .with_region(region.unwrap_or("ap-south-1"));
+                .with_region(region)
+                .with_http_connector(SsrfGuardedConnector);
             if let Some(ak) = access_key.filter(|s| !s.trim().is_empty()) {
                 builder = builder.with_access_key_id(ak);
             }
@@ -419,5 +480,27 @@ mod ssrf_tests {
     fn unresolvable_host_fails_closed() {
         assert!(validate_outbound_url_ssrf("https://nonexistent.invalid/hook").is_err());
         assert!(check_resolved_addrs("h", Vec::new()).is_err());
+    }
+
+    #[test]
+    fn s3_region_must_be_plain() {
+        let build = |r| build_customer_object_store("s3://bkt", None, None, Some(r), None);
+        assert!(build("x@10.0.0.5:8443/").is_err());
+        assert!(build("us-east-1.evil.com").is_err());
+        assert!(build("eu-west-2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn s3_resolver_rejects_internal_hosts() {
+        use reqwest::dns::Resolve;
+        let name = |h: &str| h.parse::<reqwest::dns::Name>().unwrap();
+        assert!(SsrfCheckingResolver
+            .resolve(name("localhost"))
+            .await
+            .is_err());
+        assert!(SsrfCheckingResolver
+            .resolve(name("nonexistent.invalid"))
+            .await
+            .is_err());
     }
 }
