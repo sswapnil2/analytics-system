@@ -1217,3 +1217,134 @@ async fn pr10_flows_hides_system_events_unless_anchored() {
 
     id_router.close_all().await.unwrap();
 }
+
+async fn budget_engine() -> (
+    Arc<StorageEngine>,
+    Arc<IngestService>,
+    Arc<QueryEngine>,
+    Arc<IdentityRouter>,
+) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 500_000,
+            l0_flush_max_age: Duration::from_secs(600),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let ingest = IngestService::new(storage.clone(), InMemoryGovernance::new());
+    let qengine = QueryEngine::new(
+        storage.clone(),
+        16 * 1024 * 1024,
+        None,
+        0,
+        CatalogRegistry::new(),
+    )
+    .await
+    .unwrap();
+    (storage, ingest, qengine, id_router)
+}
+
+fn two_step_funnel(range: TimeRange) -> FunnelQuery {
+    let step = |name: &str| FunnelStepSpec {
+        event_name: name.into(),
+        filters: Vec::new(),
+        first_time_ever: false,
+    };
+    FunnelQuery {
+        time_range: range,
+        steps: vec![step("A"), step("B")],
+        order_mode: FunnelOrderMode::LooseOrder,
+        conversion_window_ms: 7 * 86_400_000,
+        exclusions: Vec::new(),
+        hold_constant_props: Vec::new(),
+        breakdown_by: None,
+        global_filter: GlobalFilter::default(),
+    }
+}
+
+/// The deadline used to be a `tokio::time::timeout`, which can't fire while rayon work runs inside
+/// `block_in_place`; a funnel over one bot-like user (O(n²)) ran to completion whatever the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_deadline_interrupts_cpu_bound_funnel() {
+    let (_storage, ingest, qengine, id_router) = budget_engine().await;
+    let ts = 1_762_000_000_000i64;
+    const N: i64 = 120_000;
+    // One "B" before every "A", so B exists but never follows: each A scans to the end of the window.
+    let mut events = vec![ev(0, "bot", "s1", "B", ts - 10, Vec::new())];
+    events.extend((0..N).map(|i| ev(i as u64 + 1, "bot", "s1", "A", ts + i, Vec::new())));
+    for (n, chunk) in events.chunks(20_000).enumerate() {
+        ingest
+            .ingest_for_project(
+                "proj_cpu",
+                WireBatch::new(chunk.to_vec()),
+                ts + N + n as i64,
+            )
+            .await
+            .unwrap();
+    }
+    let range = TimeRange {
+        start_ts_ms: ts - 1_000,
+        end_ts_ms: ts + N + 1_000,
+    };
+
+    qengine.set_query_timeout(Duration::from_millis(150));
+    let started = std::time::Instant::now();
+    let res = qengine
+        .query_funnel("proj_cpu", &two_step_funnel(range))
+        .await;
+    let took = started.elapsed();
+    assert!(
+        matches!(res, Err(ExecError::QueryTimeout(150))),
+        "expected QueryTimeout(150), got {res:?}"
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "query ran {took:?} past its deadline"
+    );
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_row_limit_rejects_oversized_scan() {
+    let (storage, ingest, qengine, id_router) = budget_engine().await;
+    let ts = 1_762_000_000_000i64;
+    let events: Vec<_> = (0..500)
+        .map(|i| ev(i, &format!("u{i}"), "s", "A", ts + i as i64, Vec::new()))
+        .collect();
+    ingest
+        .ingest_for_project("proj_rows", WireBatch::new(events), ts + 1_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+    let range = TimeRange {
+        start_ts_ms: ts - 1_000,
+        end_ts_ms: ts + 1_000,
+    };
+
+    assert!(qengine
+        .query_funnel("proj_rows", &two_step_funnel(range))
+        .await
+        .is_ok());
+    qengine.set_max_rows(100);
+    let res = qengine
+        .query_funnel("proj_rows", &two_step_funnel(range))
+        .await;
+    assert!(
+        matches!(
+            res,
+            Err(ExecError::QueryTooLarge {
+                rows: 500,
+                limit: 100
+            })
+        ),
+        "expected QueryTooLarge, got {res:?}"
+    );
+
+    id_router.close_all().await.unwrap();
+}

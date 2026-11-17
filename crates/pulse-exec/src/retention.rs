@@ -98,7 +98,7 @@ impl RetentionEngine {
         // 1. Track each canonical user's earliest qualifying `start_event` inside `query.time_range`
         // 2. Track exact `RoaringBitmap` of users performing `return_event` in every timezone-aligned calendar bucket (`P2-09d`)
         let (first_start_ts, return_by_bucket): (HashMap<u32, i64>, BTreeMap<i64, RoaringBitmap>) =
-            crate::scanner::run_rayon_compute(|| {
+            crate::scanner::run_rayon_compute(|stop| {
                 chunks
                     .par_iter()
                     .map(|chunk| {
@@ -108,6 +108,9 @@ impl RetentionEngine {
                         let mut tz_cache: Option<(i64, i64)> = None;
 
                         for r in 0..chunk.len() {
+                            if !stop.live_every(r) {
+                                break;
+                            }
                             let ts = ta.event_ts_ms[r];
                             if !scan_range.contains(ts) {
                                 continue;

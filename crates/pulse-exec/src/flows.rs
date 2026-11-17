@@ -82,13 +82,16 @@ impl FlowsEngine {
 
         // Parallelize per-chunk event filtering, then assemble user timelines in chunk order with resource bounds (`P3-02`).
         let chunk_batches: Vec<Vec<(u32, i64, u16, bool)>> =
-            crate::scanner::run_rayon_compute(|| {
+            crate::scanner::run_rayon_compute(|stop| {
                 chunks
                     .par_iter()
                     .map(|chunk| {
                         let ta = &chunk.tier_a;
                         let mut local = Vec::new();
                         for r in 0..chunk.len() {
+                            if !stop.live_every(r) {
+                                break;
+                            }
                             let ts = ta.event_ts_ms[r];
                             if !query.time_range.contains(ts) {
                                 continue;
@@ -173,10 +176,13 @@ impl FlowsEngine {
 
         // Parallel per-user chronological sort, zero-allocation consecutive-event collapsing, and path construction (`Section 6`, `P3-02`).
         let user_paths: Vec<(u32, Vec<(i32, FlowToken)>)> =
-            crate::scanner::run_rayon_compute(|| {
+            crate::scanner::run_rayon_compute(|stop| {
                 timelines
                     .into_par_iter()
                     .filter_map(|(uid, mut evs)| {
+                        if !stop.live() {
+                            return None;
+                        }
                         evs.sort_by_key(|(ts, eid, _)| (*ts, *eid));
 
                         let mut collapsed: Vec<(FlowToken, bool)> = Vec::with_capacity(evs.len());

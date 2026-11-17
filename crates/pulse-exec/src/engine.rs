@@ -87,6 +87,8 @@ pub struct QueryEngine {
     cache: Arc<SegmentBlockCache>,
     catalogs: Arc<CatalogRegistry>,
     query_timeout_ms: AtomicU64,
+    max_rows: AtomicU64,
+    admission: crate::budget::Admission,
     last_query_latency_us: AtomicU64,
     queries_executed: AtomicU64,
 }
@@ -120,6 +122,14 @@ impl QueryEngine {
             cache,
             catalogs,
             query_timeout_ms: AtomicU64::new(timeout_ms),
+            max_rows: AtomicU64::new(
+                std::env::var("PULSE_QUERY_MAX_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(crate::budget::DEFAULT_MAX_ROWS),
+            ),
+            admission: crate::budget::Admission::from_env(),
             last_query_latency_us: AtomicU64::new(0),
             queries_executed: AtomicU64::new(0),
         }))
@@ -134,14 +144,34 @@ impl QueryEngine {
         Duration::from_millis(self.query_timeout_ms.load(Ordering::Relaxed))
     }
 
-    async fn with_deadline<T, F>(&self, fut: F) -> Result<T>
+    /// Rows one query may scan before it fails with `QueryTooLarge`.
+    pub fn set_max_rows(&self, rows: u64) {
+        self.max_rows.store(rows.max(1), Ordering::Relaxed);
+    }
+
+    /// Admits the query (per-project and node-wide caps), then runs it under its deadline and row
+    /// budget. Nested calls (a cohort inside a funnel) reuse the outer query's slot and budget.
+    async fn with_deadline<T, F>(&self, project_id: &str, fut: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
     {
+        if crate::budget::current().is_some() {
+            return fut.await;
+        }
         let timeout_ms = self.query_timeout_ms.load(Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+        let timeout = Duration::from_millis(timeout_ms);
+        // Queue for at most one deadline's worth; past that, tell the caller to back off.
+        let _permits = self.admission.acquire(project_id, timeout).await?;
+        let ctx = Arc::new(crate::budget::QueryCtx::new(
+            timeout,
+            self.max_rows.load(Ordering::Relaxed),
+        ));
+        let out = tokio::time::timeout(timeout, crate::budget::scope(ctx.clone(), fut))
             .await
-            .map_err(|_| ExecError::QueryTimeout(timeout_ms))?
+            .map_err(|_| ExecError::QueryTimeout(timeout_ms))?;
+        // Compute loops stop early once the deadline passes and return partial results; discard them.
+        ctx.check()?;
+        out
     }
 
     pub fn storage(&self) -> &Arc<StorageEngine> {
@@ -196,7 +226,7 @@ impl QueryEngine {
         project_id: &str,
         query: &InsightsQuery,
     ) -> Result<InsightsResult> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
@@ -220,7 +250,7 @@ impl QueryEngine {
         project_id: &str,
         query: &FunnelQuery,
     ) -> Result<FunnelResult> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
@@ -253,7 +283,7 @@ impl QueryEngine {
         project_id: &str,
         query: &RetentionQuery,
     ) -> Result<RetentionResult> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
@@ -273,7 +303,7 @@ impl QueryEngine {
     }
 
     pub async fn query_flows(&self, project_id: &str, query: &FlowsQuery) -> Result<FlowsResult> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
@@ -297,7 +327,7 @@ impl QueryEngine {
         def: &BehavioralCohortDef,
         default_range: Option<TimeRange>,
     ) -> Result<(u64, u64)> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let t0 = Instant::now();
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
@@ -325,7 +355,7 @@ impl QueryEngine {
         project_id: &str,
         cohort_id: &str,
     ) -> Result<Vec<String>> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let cat = self.catalogs.for_project(project_id);
             let Some(def_ref) = cat.saved_cohorts.get(cohort_id) else {
                 return Ok(Vec::new());
@@ -354,7 +384,7 @@ impl QueryEngine {
         project_id: &str,
         cohort_id: &str,
     ) -> Result<Vec<(u32, String)>> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let cat = self.catalogs.for_project(project_id);
             let Some(def_ref) = cat.saved_cohorts.get(cohort_id) else {
                 return Ok(Vec::new());
@@ -399,7 +429,7 @@ impl QueryEngine {
         limit: usize,
         mask_ids: bool,
     ) -> Result<Vec<ExportedEventRow>> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let ps = self.storage.get_or_open_project(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
@@ -500,7 +530,7 @@ impl QueryEngine {
         project_id: &str,
         query: &SessionSearchQuery,
     ) -> Result<SessionSearchResult> {
-        self.with_deadline(async {
+        self.with_deadline(project_id, async {
             let t0 = Instant::now();
             if let Some(tr) = query.time_range {
                 if tr.start_ts_ms > tr.end_ts_ms {
@@ -537,7 +567,12 @@ impl QueryEngine {
             }
             // Recorded sessions by session-id hash, the same check funnels use for drop-off replays.
             let recorded = if query.only_with_replay {
-                Some(self.storage.replay_store().recorded_hashes_for_project(project_id).await)
+                Some(
+                    self.storage
+                        .replay_store()
+                        .recorded_hashes_for_project(project_id)
+                        .await,
+                )
             } else {
                 None
             };

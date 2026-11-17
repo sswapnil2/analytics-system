@@ -325,7 +325,7 @@ impl FunnelEngine {
         // Every shard uses a local breakdown interner + deterministic 64-bit hold hash (`0 == HOLD_MISSING`),
         // with zero cross-thread `Mutex` contention.
         let shard_outputs: Vec<(ShardSummary, Vec<String>, Vec<UserEvent>)> =
-            crate::scanner::run_rayon_compute(|| {
+            crate::scanner::run_rayon_compute(|stop| {
                 bucket_groups
                     .par_iter()
                     .map(|(_bucket_id, b_chunks)| {
@@ -341,6 +341,9 @@ impl FunnelEngine {
                             let n = ta.len();
 
                             for r in 0..n {
+                                if !stop.live_every(r) {
+                                    break;
+                                }
                                 let ts = ta.event_ts_ms[r];
                                 if ts < effective_min_ts || ts > effective_max_ts {
                                     continue;
@@ -482,6 +485,7 @@ impl FunnelEngine {
                             first_time_mask,
                             has_hold,
                             has_breakdown,
+                            stop,
                         );
                         (summary, shard_bdown_names, cross_events)
                     })
@@ -530,6 +534,7 @@ impl FunnelEngine {
                 first_time_mask,
                 has_hold,
                 has_breakdown,
+                &crate::budget::Stop::current(),
             );
             final_summary.merge_remapped(cross_summary, k, None);
         }
@@ -629,6 +634,7 @@ fn evaluate_sorted_user_stream(
     first_time_mask: u16,
     has_hold: bool,
     has_breakdown: bool,
+    stop: &crate::budget::Stop,
 ) -> ShardSummary {
     let mut summary = ShardSummary::new(k);
     if events.is_empty() {
@@ -658,7 +664,12 @@ fn evaluate_sorted_user_stream(
     }
 
     let mut start = 0usize;
+    let mut users = 0usize;
     while start < events.len() {
+        if !stop.live_every(users) {
+            break;
+        }
+        users += 1;
         let uid = events[start].canon_uid;
         let mut end = start + 1;
         while end < events.len() && events[end].canon_uid == uid {
@@ -687,6 +698,7 @@ fn evaluate_sorted_user_stream(
             &active_excl_at_step,
             exclusions,
             has_hold,
+            stop,
         ) {
             summary.record(outcome, k, has_breakdown);
         }
@@ -707,6 +719,7 @@ fn evaluate_single_user(
     active_excl_at_step: &[u16; 16],
     exclusions: &[(usize, usize)],
     has_hold: bool,
+    stop: &crate::budget::Stop,
 ) -> Option<UserFunnelOutcome> {
     let mut best: Option<UserFunnelOutcome> = None;
 
@@ -714,6 +727,10 @@ fn evaluate_single_user(
         FunnelOrderMode::LooseOrder | FunnelOrderMode::StrictOrder => {
             let is_strict = mode == FunnelOrderMode::StrictOrder;
             for i in 0..events.len() {
+                // A single bot with millions of events is O(n²) here; stay interruptible.
+                if !stop.live_every(i) {
+                    break;
+                }
                 let e0 = events[i];
                 if (e0.step_mask & 1) == 0 || !query_range.contains(e0.ts_ms) {
                     continue;
@@ -762,6 +779,10 @@ fn evaluate_single_user(
         FunnelOrderMode::AnyOrder => {
             let full_mask: u16 = ((1u32 << k) - 1) as u16;
             for i in 0..events.len() {
+                // A single bot with millions of events is O(n²) here; stay interruptible.
+                if !stop.live_every(i) {
+                    break;
+                }
                 let e0 = events[i];
                 if (e0.step_mask & full_mask) == 0 || !query_range.contains(e0.ts_ms) {
                     continue;

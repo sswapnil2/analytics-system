@@ -517,7 +517,7 @@ async fn evaluate_single_series(
             interval
         };
 
-        crate::scanner::run_rayon_compute(|| {
+        crate::scanner::run_rayon_compute(|stop| {
             chunks
                 .par_iter()
                 .zip(row_masks.par_iter())
@@ -526,6 +526,9 @@ async fn evaluate_single_series(
                     let mut tz_cache: Option<(i64, i64)> = None;
 
                     for r in 0..chunk.len() {
+                        if !stop.live_every(r) {
+                            break;
+                        }
                         if let Some(rm) = row_mask {
                             if !rm.contains(r as u32) {
                                 continue;

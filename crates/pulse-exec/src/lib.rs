@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod budget;
 pub mod cache;
 pub mod catalog;
 pub mod engine;

@@ -34,6 +34,13 @@ pub enum ExecError {
 
     #[error("query execution exceeded deadline of {0}ms")]
     QueryTimeout(u64),
+
+    #[error("query would scan {rows} rows, over the {limit}-row limit; narrow the time range or add filters")]
+    QueryTooLarge { rows: u64, limit: u64 },
+
+    /// No query slot freed up in time; `"project"` or `"node"` says which cap was hit.
+    #[error("too many queries running for this {0}; retry shortly")]
+    Overloaded(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, ExecError>;
@@ -41,16 +48,20 @@ pub type Result<T> = std::result::Result<T, ExecError>;
 /// Runs CPU-intensive Rayon parallel reductions off the async cooperative scheduler
 /// when executing on a multi-threaded Tokio runtime, preventing ingest I/O starvation.
 #[inline]
+///
+/// `f` gets the query's [`Stop`](crate::budget::Stop): a `tokio::time::timeout` can't fire while
+/// this blocks, so the loops inside check it and bail out; the engine then reports `QueryTimeout`.
 pub fn run_rayon_compute<F, R>(f: F) -> R
 where
-    F: FnOnce() -> R,
+    F: FnOnce(&crate::budget::Stop) -> R,
 {
+    let stop = crate::budget::Stop::current();
     if tokio::runtime::Handle::try_current()
         .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
     {
-        tokio::task::block_in_place(f)
+        tokio::task::block_in_place(|| f(&stop))
     } else {
-        f()
+        f(&stop)
     }
 }
 
@@ -252,6 +263,17 @@ pub async fn load_project_chunks_with_id(
             true
         })
         .collect();
+
+    // Charge the query's row budget before loading anything: every segment below is materialized in RAM.
+    if let Some(ctx) = crate::budget::current() {
+        ctx.check()?;
+        ctx.charge_rows(
+            filtered_segments
+                .iter()
+                .map(|s| u64::from(s.footer.row_count))
+                .sum(),
+        )?;
+    }
 
     let base_props_vec: Vec<String> = base_props_needed.into_iter().collect();
     let final_props_vec: Vec<String> = final_props_set.into_iter().collect();
@@ -719,13 +741,16 @@ fn evaluate_cohort_bounded<'a>(
                 }))
                 .await?;
 
-                let counts: HashMap<u32, u32> = run_rayon_compute(|| {
+                let counts: HashMap<u32, u32> = run_rayon_compute(|stop| {
                     chunks
                         .par_iter()
                         .zip(row_masks.par_iter())
                         .map(|(chunk, row_mask)| {
                             let mut local: HashMap<u32, u32> = HashMap::new();
                             for i in 0..chunk.len() {
+                                if !stop.live_every(i) {
+                                    break;
+                                }
                                 if let Some(rm) = row_mask {
                                     if !rm.contains(i as u32) {
                                         continue;
@@ -786,12 +811,15 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let mut universe = run_rayon_compute(|| {
+                let mut universe = run_rayon_compute(|stop| {
                     all_chunks
                         .par_iter()
                         .map(|chunk| {
                             let mut local = RoaringBitmap::new();
                             for i in 0..chunk.len() {
+                                if !stop.live_every(i) {
+                                    break;
+                                }
                                 if eff_range
                                     .is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
                                 {
@@ -841,12 +869,15 @@ fn evaluate_cohort_bounded<'a>(
                     Some(id_snap),
                 )
                 .await?;
-                let out = run_rayon_compute(|| {
+                let out = run_rayon_compute(|stop| {
                     chunks
                         .par_iter()
                         .map(|chunk| {
                             let mut local = RoaringBitmap::new();
                             for i in 0..chunk.len() {
+                                if !stop.live_every(i) {
+                                    break;
+                                }
                                 if eff_range
                                     .is_none_or(|tr| tr.contains(chunk.tier_a.event_ts_ms[i]))
                                     && row_matches_predicates(
