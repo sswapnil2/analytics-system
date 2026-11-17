@@ -74,6 +74,7 @@ summary::-webkit-details-marker{display:none}summary{list-style:none}
 <a href="#privacy" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Privacy</a>
 <a href="#demo" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Demo</a>
 <a href="#selfhost" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Self-host</a>
+<a href="#performance" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Performance</a>
 <a href="#agent" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Agent setup</a>
 <a href="#editions" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Editions</a>
 <a href="https://github.com/sswapnil2/analytics-system#readme" style="color: #A1A1AA; text-decoration: none; padding: 12px 0">Docs</a>
@@ -209,8 +210,8 @@ Apache-2.0 · Rust · one binary
 <!-- DEMO VIDEO -->
 <section id="demo" aria-labelledby="demo-h" style="max-width: 1240px; margin: 0 auto; padding: 120px 24px 0; display: flex; flex-direction: column; gap: 28px">
 <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
-<h2 id="demo-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">See it in action.<br><span style="color: #71717A">40 seconds, real Studio.</span></h2>
-<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 420px">From a funnel drop-off to the session replays of the users who left, then journeys, retention and trends. Recorded on the seeded demo dataset.</p>
+<h2 id="demo-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">See it in action.<br><span style="color: #71717A">45 seconds, real Studio.</span></h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 420px">From a shared dashboard into a funnel drop-off, then the session replays of the users who left, journeys and retention. Recorded on the seeded demo dataset.</p>
 </div>
 <div style="border: 1px solid #26262C; border-radius: 16px; overflow: hidden; background: #0E0E11; box-shadow: 0 30px 120px -40px rgba(200,240,74,0.18)">
 <video id="pl-demo" src="demo.mp4" poster="demo-poster.jpg" muted loop playsinline controls preload="metadata" width="1440" height="900" style="display: block; width: 100%; height: auto; aspect-ratio: 1440 / 900" aria-label="Pulse Studio walkthrough: funnel, session replay, journeys, retention and trends"></video>
@@ -436,6 +437,66 @@ pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
 </div>
 </section>
 
+<!-- PERFORMANCE & COST -->
+<section id="performance" aria-labelledby="perf-h" style="max-width: 1240px; margin: 0 auto; padding: 0 24px 120px; display: flex; flex-direction: column; gap: 28px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
+<h2 id="perf-h" style="margin: 0; font-weight: 600; font-size: clamp(32px, 4vw, 50px); line-height: 1.04; letter-spacing: -0.045em; color: #FFFFFF">Fast on a laptop.<br><span style="color: #71717A">Cheap at scale.</span></h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6; color: #A1A1AA; max-width: 440px">Measured with the repo's own benchmark (<code style="font-family: 'Geist Mono', monospace; font-size: 14px; color: #D4D4D8">scripts/bench_scale.sh 1m</code>): 1M events from 25k users on one Apple M2 Pro laptop, release build. Run it on your hardware.</p>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px">
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">Ingest</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">249k<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ev/s</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">Events written per second, one node</span>
+</div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">5-step funnel</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">14.5<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ms</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">Warm cache, p50 · 145 ms cold</span>
+</div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">14-day retention</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">7.0<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ms</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">p50 across 25k users</span>
+</div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">Journeys</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">63<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ms</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">5-step paths, p50</span>
+</div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">16 queries at once</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">100<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ms</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">Mixed workload, p50</span>
+</div>
+<div style="min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 22px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #8A8A93">Query while ingesting</span>
+<span style="font-family: 'Geist Mono', monospace; font-size: 34px; font-weight: 500; letter-spacing: -0.03em; color: #FFFFFF">198<span style="font-size: 16px; color: #C8F04A; margin-left: 4px">ms</span></span>
+<span style="font-size: 13px; line-height: 1.5; color: #A1A1AA">p50 · ingest stays at 5.9 ms</span>
+</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px">
+<div style="flex: 1 1 340px; min-width: 0; border: 1px solid #1F1F25; border-radius: 16px; background: #0E0E11; padding: 24px; display: flex; flex-direction: column; gap: 18px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.025em">Estimate your cost</h3>
+<label style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #A1A1AA">Events per month <output id="pc-ev-out" style="font-family: 'Geist Mono', monospace; font-size: 22px; color: #FFFFFF"></output>
+<input id="pc-ev" type="range" min="6" max="10" step="0.1" value="8" style="accent-color: #C8F04A; width: 100%; min-height: 32px"></label>
+<label style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #A1A1AA">Keep data for (months)<input id="pc-ret" type="number" min="1" max="120" value="12" inputmode="numeric" style="width: 100%; min-height: 44px; box-sizing: border-box; padding: 0 12px; border-radius: 10px; border: 1px solid #2A2A30; background: #111114; color: #EDEDEF; font: 500 15px Geist Mono, monospace"></label>
+<label style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #A1A1AA">Your server, $ per month<input id="pc-vm" type="number" min="0" step="1" value="40" inputmode="decimal" style="width: 100%; min-height: 44px; box-sizing: border-box; padding: 0 12px; border-radius: 10px; border: 1px solid #2A2A30; background: #111114; color: #EDEDEF; font: 500 15px Geist Mono, monospace"></label>
+<label style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #A1A1AA">Object storage, $ per GB-month<input id="pc-gb" type="number" min="0" step="0.001" value="0.023" inputmode="decimal" style="width: 100%; min-height: 44px; box-sizing: border-box; padding: 0 12px; border-radius: 10px; border: 1px solid #2A2A30; background: #111114; color: #EDEDEF; font: 500 15px Geist Mono, monospace"></label>
+</div>
+<div style="flex: 1.2 1 400px; min-width: 0; border: 1px solid #2A3A10; border-radius: 16px; background: linear-gradient(180deg, rgba(200,240,74,0.06), #0E0E11 60%); padding: 24px; display: flex; flex-direction: column; gap: 6px">
+<span style="font-size: 13px; color: #A1A1AA">Estimated monthly cost</span>
+<span id="pc-total" style="font-family: 'Geist Mono', monospace; font-size: clamp(40px, 6vw, 60px); font-weight: 500; letter-spacing: -0.04em; color: #FFFFFF; line-height: 1.1"></span>
+<span style="font-size: 14px; color: #A1A1AA; margin-bottom: 10px">No per-event fees, no seat limits.</span>
+<div style="display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1C1C21; font-size: 14.5px"><span style="color: #A1A1AA">Stored after the retention window</span><span id="pc-size" style="font-family: 'Geist Mono', monospace; color: #EDEDEF; text-align: right"></span></div>
+<div style="display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1C1C21; font-size: 14.5px"><span style="color: #A1A1AA">Storage cost</span><span id="pc-store" style="font-family: 'Geist Mono', monospace; color: #EDEDEF; text-align: right"></span></div>
+<div style="display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1C1C21; font-size: 14.5px"><span style="color: #A1A1AA">Average ingest rate</span><span id="pc-rate" style="font-family: 'Geist Mono', monospace; color: #EDEDEF; text-align: right"></span></div>
+<div style="display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1C1C21; font-size: 14.5px"><span style="color: #A1A1AA">Share of one node's measured ingest</span><span id="pc-head" style="font-family: 'Geist Mono', monospace; color: #EDEDEF; text-align: right"></span></div>
+<p style="margin: 14px 0 0; font-size: 12.5px; line-height: 1.6; color: #8A8A93">Assumes ~100 bytes per event on disk (compressed columnar segments, measured on the demo dataset) and S3 Standard list pricing; edit the server and storage prices for your setup. Session replays and backups are extra.</p>
+</div>
+</div>
+</section>
+
 <!-- AGENT SETUP -->
 <section id="agent" aria-labelledby="agent-h" style="max-width: 1240px; margin: 0 auto; padding: 0 24px 120px; display: flex; flex-direction: column; gap: 28px">
 <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px">
@@ -565,6 +626,26 @@ pulse.track(<span style="color: #F4C38B">"KYC_PAN_Submitted"</span>);</pre>
 </footer>
 
 </div>
+<script>
+// Cost estimate: events/month x retention x ~100 B/event, plus the server you choose.
+(function(){
+  var $=function(i){return document.getElementById(i)}, BYTES=100, NODE_EPS=249044;
+  var fmtN=function(n){return n>=1e9?(n/1e9).toFixed(n<1e10?1:0).replace(/\.0$/,'')+'B':n>=1e6?(n/1e6).toFixed(n<1e7?1:0).replace(/\.0$/,'')+'M':Math.round(n).toLocaleString()};
+  var money=function(n){return '$'+(n<10?n.toFixed(2):Math.round(n).toLocaleString())};
+  function calc(){
+    var ev=Math.pow(10,+$('pc-ev').value), ret=Math.max(1,+$('pc-ret').value||1), vm=Math.max(0,+$('pc-vm').value||0), gb=Math.max(0,+$('pc-gb').value||0);
+    var size=ev*ret*BYTES/1e9, store=size*gb, eps=ev/(30*86400);
+    $('pc-ev-out').textContent=fmtN(ev);
+    $('pc-size').textContent=size<1?(size*1000).toFixed(0)+' MB':size<1000?size.toFixed(size<10?1:0)+' GB':(size/1000).toFixed(1)+' TB';
+    $('pc-store').textContent=money(store)+' / mo';
+    $('pc-rate').textContent=(eps<10?eps.toFixed(1):Math.round(eps).toLocaleString())+' ev/s';
+    var h=eps/NODE_EPS*100; $('pc-head').textContent=(h<0.1?'<0.1':h.toFixed(h<10?1:0))+'%';
+    $('pc-total').textContent=money(vm+store);
+  }
+  ['pc-ev','pc-ret','pc-vm','pc-gb'].forEach(function(i){$(i).addEventListener('input',calc)});
+  calc();
+})();
+</script>
 <script>
 // Autoplay the demo only while it is on screen, and never under reduced motion.
 (function(){

@@ -10,6 +10,7 @@
  * picked a theme explicitly (data-theme on <html>).
  */
 :root {
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgb(94%2C104%2C98)' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme: light;
   --canvas: 243 244 240; /* stone */
   --panel: 255 255 255;
@@ -41,6 +42,7 @@
 /* Dark values are repeated in the media query below; CSS cannot share them. */
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgb(150%2C163%2C157)' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --canvas: 15 21 19;
   --panel: 22 29 26;
   --sunken: 18 24 22;
@@ -71,6 +73,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
+    --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='rgb(150%2C163%2C157)' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     --canvas: 15 21 19;
     --panel: 22 29 26;
     --sunken: 18 24 22;
@@ -104,6 +107,20 @@ body {
   color: rgb(var(--ink));
   font-family: "Instrument Sans Variable", system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Dropdowns: one arrow, inset from the right edge, with long options cut off before it
+   instead of running under it. Native arrows sat flush against the border. */
+select {
+  appearance: none;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 0.625rem center;
+  background-size: 1rem;
+  padding-right: 2.25rem !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 /* Figures line up in tables and stat rows. */
