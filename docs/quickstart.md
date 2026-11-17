@@ -89,7 +89,7 @@ curl -X POST http://127.0.0.1:8080/v1/ingest \
   -d '{"event": "Signed_Up", "userId": "usr_1", "properties": {"plan": "pro"}}'
 ```
 
-`/v1/ingest` also accepts Segment `{"batch": [...]}`, Mixpanel-style top-level arrays and Pulse
+`/v1/ingest` also accepts Segment `{"batch": [...]}`, top-level arrays and Pulse
 `{"events": [...]}` batches. New events are queryable straight away; `POST /v1/admin/flush` forces
 in-memory rows to disk segments.
 

@@ -36,7 +36,7 @@ Browser calls to admin routes are limited to `PULSE_CORS_ORIGINS`; ingest and fl
 
 | Method | Path | Body |
 |---|---|---|
-| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array (Mixpanel style). Up to 64 MB. |
+| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array. Up to 64 MB. |
 | POST | `/v1/identify` | `{"anon_id", "user_id", "user_properties"?, "operations"?}`: merges an anonymous id into a user |
 | POST | `/v1/engage` | User-profile operations (`$set` and friends), one object, an array, or `{"profiles": [...]}` / `{"batch": [...]}` |
 | POST | `/v1/groups` | Group-profile operations |
