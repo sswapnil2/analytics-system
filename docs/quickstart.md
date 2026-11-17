@@ -36,6 +36,7 @@ Open <http://127.0.0.1:8080> for the Studio. Sign in with the admin token, or cr
 | `--web-dir <path>` | `PULSE_WEB_DIST_DIR` | `./web/dist` | Built Studio files |
 | `--project-id <id>` | `PULSE_DEFAULT_PROJECT` | `proj_default` (`proj_fintech_in` with `--seed`) | Project used when a request names none |
 | `--seed` / `--no-seed` | `PULSE_SEED=1` | off | Load the demo dataset into an empty default project |
+| `--role <role>` | `PULSE_NODE_ROLE` | `all` | `all`, `ingest` (ingest routes + flushing), `query` (admin, query and MCP routes) or `compactor` |
 | `--quic-addr <ip:port>` / `--no-quic` | `PULSE_QUIC_ADDR` | off | Optional QUIC/UDP ingest listener |
 | | `PULSE_ADMIN_TOKEN` | random each start | Root admin bearer token |
 | | `PULSE_CORS_ORIGINS` | the node's own origin + `:5173` | Comma-separated browser origins allowed on admin/query routes |

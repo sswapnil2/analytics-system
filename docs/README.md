@@ -9,7 +9,7 @@ for AI agents.
 | [Quickstart](quickstart.md) | Build and run `pulse-node`, get the admin token and an ingest key, send a first event |
 | [Web SDK](web-sdk.md) | `sdks/ts-web`: tracking, identify, user properties, flags, replay |
 | [Mobile core (beta)](mobile-core.md) | `crates/pulse-sdk-core`: the Rust core with UniFFI Swift/Kotlin bindings |
-| [REST API](rest-api.md) | Every `/v1/...` route, grouped by auth type |
+| [REST API](rest-api.md) | The open-source `/v1/...` routes, grouped by auth type |
 | [MCP for agents](mcp.md) | `POST /v1/mcp`: tools, protocol support, and config for Claude Code, Claude Desktop, Cursor, OpenAI Codex / Responses API, Gemini CLI and Antigravity |
 | [Claude Code plugin](../integrations/claude-code-plugin/README.md) | Installable plugin that wires up the MCP server and adds analysis skills |
 

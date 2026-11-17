@@ -14,6 +14,7 @@ Responses API, Gemini CLI and Google Antigravity are covered below.
   the client's requested version if it is one of these, otherwise answers with `2025-11-25`.
 - **Methods:** `initialize`, `ping`, `tools/list`, `tools/call`. Notifications (such as
   `notifications/initialized`) are accepted with `202`.
+- **Node role:** served by nodes running with `--role all` (the default) or `--role query`.
 - **Capabilities:** tools only (no resources, prompts or sampling).
 - **Auth:** a static bearer token. Pulse has no OAuth, so clients that only accept OAuth-protected
   remote servers (for example ChatGPT connectors) cannot connect directly.
