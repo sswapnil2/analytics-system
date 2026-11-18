@@ -1,0 +1,19 @@
+PASS  loose funnel 7d step counts: got [100, 80, 50, 30, 20], expected [100, 80, 50, 30, 20]
+PASS  loose funnel 14d last step: got 25, expected 25
+INFO  strict funnel: [100, 80, 50, 30, 20]
+PASS  funnel by plan: got {'free': [50, 40, 25, 15, 10], 'premium': [50, 40, 25, 15, 10]}, expected {'premium': [50, 40, 25, 15, 10], 'free': [50, 40, 25, 15, 10]}
+PASS  Payment Completed total events: got 30.0, expected 30
+PASS  Payment Completed uniques (sum of daily): got 30.0, expected 30
+PASS  Product Viewed total events (after dedup): got 90.0, expected 90
+INFO  Product Viewed daily-uniques sum: 80.0 (80 if anon merged; anon views are 1 min earlier same day)
+PASS  coupon != SAVE10 incl. missing/null: got 20.0, expected 20
+INFO  coupon is_set count (10 SAVE10 + 5 explicit null): 10.0
+INFO  sum(amount) expected 30*499=14970 (3 sent as strings): 14970.0
+INFO  TZ Probe non-zero buckets (expect 2026-11-13 in IST): [{"bucket_ts_ms": 1794508200000, "value": 10.0}]
+INFO  2027 future event queryable: 1.0
+INFO  breakdown utm_source: {"snapshot_epoch": 16, "exec_time_us": 1955, "buckets_ts_ms": [1792866600000, 1792953000000, 1793039400000, 1793125800000, 1793212200000, 1793298600000, 1793385000000, 1793471400000, 1793557800000, 1793644200000, 1793730600000, 1793817000000, 1793903400000, 1793989800000, 1794076200000, 1794162600000, 1794249000000, 1794335400000, 1794421800000, 1794508200000, 1794594600000, 1794681000000, 1794767
+PASS  retention cohort size: got 100, expected 100
+PASS  retention day1 returners: got 40, expected 40
+PASS  retention day7 returners (cohorts with 7 days elapsed): got 20, expected 20
+
+10/10 checks passed
