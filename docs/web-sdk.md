@@ -1,9 +1,10 @@
 # Web SDK (`sdks/ts-web`)
 
-A zero-dependency TypeScript client (`PulseWebClient`) for browsers. It batches events, persists identity,
-session and super properties in `localStorage` (the event queue itself is in memory, so events not yet
-sent are lost if the page closes before the next flush or `visibilitychange` send), evaluates feature flags locally, and can record privacy-masked
-DOM wireframes for session replay.
+A zero-dependency TypeScript client (`PulseWebClient`) for browsers. It batches events and persists identity,
+session, super properties and the unsent event queue in `localStorage`, so events tracked offline or
+just before the tab closes are sent by the next page load (they keep their ids, so ones that already
+arrived are deduplicated). It also captures uncaught errors, evaluates feature flags locally, and can
+record privacy-masked DOM wireframes for session replay.
 
 ## Install
 
@@ -42,6 +43,9 @@ Ingest routes allow any origin (permissive CORS), so the app can live on a diffe
 | `autocapture` | off | `true` or `{ pageviews, clicks, forms, allowSelectors, blockSelectors }` |
 | `enableWireframeReplay`, `replaySampleRate`, `replayTriggerEvents` | off | Session replay and when to record |
 | `maskSelectors` / `blockSelectors` / `unmaskSelectors` | | Replay privacy controls (text is masked by default) |
+| `captureErrors` | `true` | `window` errors and unhandled promise rejections become `$error` events (message and script path, no query string) |
+| `captureNetwork` | same as `enableWireframeReplay` | Every `fetch`/XHR call (method, URL without query string, status, duration) goes on the replay timeline; calls to Pulse itself are skipped |
+| `debug` | `false` | Logs each tracked event and each send result, including events the server rejected |
 
 ## Track and identify
 
@@ -83,9 +87,9 @@ or `getVariant(key, { trackExposure: true })`; repeat exposures of the same vari
 
 Replay records wireframes (element boxes and masked labels), not pixels or HTML. Current limits to know:
 
-- Nothing is recorded until you call `pulse.captureDomWireframeSnapshot()`. Call it after load and after each screen change.
+- With `enableWireframeReplay`, a snapshot is taken on load and whenever the DOM changes (at most once a second). `captureDomWireframeSnapshot()` is still available for a manual snapshot.
 - Text is masked to `████` unless an element (or its ancestor) has `data-pulse-unmask` or matches `unmaskSelectors`. Inputs and `contenteditable` content stay masked regardless.
-- Errors and network calls are not captured automatically: call `recordConsoleError(message)` and `recordNetworkBreadcrumb(...)` yourself.
+- Errors and network calls are captured automatically (see `captureErrors` / `captureNetwork`). `recordConsoleError(message)` and `recordNetworkBreadcrumb(...)` remain for errors you catch yourself.
 - Autocapture pageviews follow `history.pushState`, `replaceState` and `popstate`, and send one `$pageview` per new path + query string (hash changes and same-URL `replaceState` calls are not pages).
 - `$current_url` includes the query string; strip sensitive parameters with `beforeSend`.
 
