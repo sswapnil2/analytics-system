@@ -13,7 +13,7 @@ This follows one company from discovering Pulse to using it daily. Friction poin
 - The FAQ answers the licensing question directly.
 
 **Friction**
-- **F-1 No hosted demo.** "Explore the product" scrolls to a video. A PM can't click around without compiling Rust for 15 minutes. PostHog, Mixpanel and Amplitude all offer a sandbox or a free cloud tier.
+- **F-1 No hosted demo.** "Explore the product" scrolls to a video. A PM can't click around without compiling Rust for 15 minutes. The established analytics tools all offer a sandbox or a free cloud tier.
 - **F-2 "Deploy Pulse" leads to a build-from-source doc.** There are no releases, Docker image or one-click deploy (VERIFIED: `gh release list` is empty; CODE: no Dockerfile or Helm chart).
 - **F-3 The site overstates the product:**
   - "Split any chart by event, user or group properties" and "Targeted rollouts… rules on user properties": the Studio offers no user-property split and no filter at all (VERIFIED, UI).
@@ -28,7 +28,7 @@ This follows one company from discovering Pulse to using it daily. Friction poin
 
 **Would I trust it with company analytics after Stage A?** I'd be interested but not convinced. I'd need a demo and a deployable artifact before spending engineering time.
 
-**Why choose Pulse over PostHog or Mixpanel?** Simpler self-hosting than PostHog (no ClickHouse or Kafka), and data sovereignty plus replay masking that Mixpanel can't offer. Those are the only two reasons, and both are real.
+**Why choose Pulse over the established tools?** Simpler self-hosting than the open-source suites (no ClickHouse or Kafka), and data sovereignty plus replay masking that hosted SaaS tools can't offer. Those are the only two reasons, and both are real.
 
 **Missing before I'd try it:** a hosted demo, a Docker one-liner, a supported-platforms matrix (web, iOS, Android, server SDKs), a data-retention and backup story, and a "known limitations" page.
 
@@ -51,7 +51,7 @@ This follows one company from discovering Pulse to using it daily. Friction poin
 | Web SDK | 1–2 days: vendor the SDK from the repo, wire SPA route tracking by hand, call replay snapshots by hand, add error and network hooks | 1–2 hours |
 | Server-side events | 0.5 day with raw HTTP (no server SDK) | 1–2 hours |
 | Mobile | **Blocked:** no iOS or Android package; stale UniFFI bindings (docs/mobile-core.md:56-60) | 1–2 hours each |
-| Migration backfill from Segment or Mixpanel | Risky: `sentAt` time shift (F-12); Segment `identify` breaks batches (F-11) | Supported importers |
+| Migration backfill from another analytics tool | Risky: `sentAt` time shift (F-12); `identify` records in exports break batches (F-11) | Supported importers |
 
 **Friction**
 - **F-7 SDK not packaged.** "The SDK is not published to npm yet" (docs/web-sdk.md:9). ESM only, no CDN snippet, and `dist/` isn't committed.

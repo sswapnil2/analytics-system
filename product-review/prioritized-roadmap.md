@@ -30,7 +30,7 @@
 
 - **Problem:** No report in the UI can be filtered or segmented by user property or cohort. This fails about 4 of the 10 core PM questions.
 - **Persona:** PM, AN.
-- **Impact:** This is the gap between "demo" and "tool". It's the first thing compared against Mixpanel.
+- **Impact:** This is the gap between "demo" and "tool". It's the first thing compared against established tools.
 - **Solution:**
   - A shared `FilterBar` (property · operator · value, AND/OR, "in cohort / not in cohort") on Funnels, Trends, Retention and Journeys;
   - per-step "+ where" on funnels;

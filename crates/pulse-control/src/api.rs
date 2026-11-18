@@ -3742,7 +3742,7 @@ async fn handle_import_events(
         .to_ascii_lowercase();
 
     let first_non_ws = body.iter().copied().find(|b| !b.is_ascii_whitespace());
-    // NDJSON (Segment/Mixpanel exports) also starts with `{`, so a `{` body that
+    // NDJSON (the usual analytics export format) also starts with `{`, so a `{` body that
     // isn't one JSON value is read line by line.
     let line_based = ctype.contains("csv")
         || ctype.contains("ndjson")

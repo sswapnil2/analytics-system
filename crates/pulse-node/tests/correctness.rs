@@ -716,7 +716,7 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["accepted"].as_u64(), Some(1), "{r}");
 
-    // P0-5: NDJSON exports (Segment/Mixpanel) import, labelled or not, and dedup on re-run.
+    // P0-5: NDJSON exports import, labelled or not, and dedup on re-run.
     let ndjson = format!(
         "{}\n{}\n",
         json!({"event": "Ndjson Probe", "userId": "nd1", "timestamp": t, "messageId": "nd-1"}),
