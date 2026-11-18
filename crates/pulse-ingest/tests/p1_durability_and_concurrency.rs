@@ -867,3 +867,66 @@ async fn ha_01_ingest_does_not_block_on_slow_l1_segment_flush_and_enforces_l0_ba
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn ingest_rate_limit_is_per_project_and_returns_429_with_retry_after() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::rate_limit::RateLimiter;
+    use pulse_ingest::{build_ingest_router, IngestError};
+    use tower::ServiceExt;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 10_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_a", "proj_rl_a");
+    gov.register_api_key("pk_a2", "proj_rl_a"); // same tenant, second key
+    gov.register_api_key("pk_b", "proj_rl_b");
+    // 10 events/s, burst 10.
+    let ingest = IngestService::with_rate_limit(storage, gov, RateLimiter::new(10.0, 1.0));
+    let ts = 1_762_000_000_000i64;
+    let batch = |n: u8| {
+        WireBatch::new(
+            (0..n)
+                .map(|i| make_event(i, "s", &format!("u{i}"), ts + i64::from(i)))
+                .collect(),
+        )
+        .encode_binary(1)
+        .unwrap()
+    };
+
+    assert!(ingest.ingest_raw("pk_a", None, &batch(8)).await.is_ok());
+    // 2 left: a 5-event batch is still admitted and overdraws to -3.
+    assert!(ingest.ingest_raw("pk_a2", None, &batch(5)).await.is_ok());
+    // Both keys share the tenant's quota.
+    assert!(matches!(
+        ingest.ingest_raw("pk_a", None, &batch(1)).await,
+        Err(IngestError::RateLimited {
+            retry_after_secs: 1
+        })
+    ));
+    // Another tenant is unaffected.
+    assert!(ingest.ingest_raw("pk_b", None, &batch(3)).await.is_ok());
+
+    let resp = build_ingest_router(ingest.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_a")
+                .body(Body::from(batch(1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.headers()["retry-after"], "1");
+}

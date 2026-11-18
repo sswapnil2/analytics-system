@@ -44,6 +44,9 @@ pub enum IngestError {
 
     #[error("quic transport error: {0}")]
     Quic(String),
+
+    #[error("ingest rate limit exceeded for this project; retry in {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -139,10 +142,23 @@ pub struct IngestService {
     seeded_projects: DashMap<String, bool>,
     dict_registry: Arc<DictionaryRegistry>,
     metrics: IngestMetrics,
+    rate_limit: crate::rate_limit::RateLimiter,
 }
 
 impl IngestService {
     pub fn new(storage: Arc<StorageEngine>, governance: Arc<dyn GovernanceProvider>) -> Arc<Self> {
+        Self::with_rate_limit(
+            storage,
+            governance,
+            crate::rate_limit::RateLimiter::from_env(),
+        )
+    }
+
+    pub fn with_rate_limit(
+        storage: Arc<StorageEngine>,
+        governance: Arc<dyn GovernanceProvider>,
+        rate_limit: crate::rate_limit::RateLimiter,
+    ) -> Arc<Self> {
         Arc::new(Self {
             storage,
             governance,
@@ -150,7 +166,15 @@ impl IngestService {
             seeded_projects: DashMap::new(),
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
+            rate_limit,
         })
+    }
+
+    /// Charges a request from the public SDK endpoints against its project's rate limit.
+    fn charge(&self, project_id: &str, units: u64) -> Result<()> {
+        self.rate_limit
+            .charge(project_id, units)
+            .map_err(|retry_after_secs| IngestError::RateLimited { retry_after_secs })
     }
 
     pub fn storage(&self) -> &Arc<StorageEngine> {
@@ -197,6 +221,7 @@ impl IngestService {
             .await
             .ok_or(IngestError::Unauthorized)?;
         let batch = WireBatch::decode_auto(body, content_type, &self.dict_registry)?;
+        self.charge(&project_id, batch.events.len() as u64)?;
         self.ingest_for_project(&project_id, batch, Utc::now().timestamp_millis())
             .await
     }
@@ -416,6 +441,7 @@ impl IngestService {
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
+        self.charge(&project_id, 1)?;
         self.identify_for_project(&project_id, req).await
     }
 
@@ -473,6 +499,7 @@ impl IngestService {
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
+        self.charge(&project_id, 1)?;
         let val: serde_json::Value = serde_json::from_slice(body)?;
         let updated = self.engage_for_project(&project_id, val).await?;
         Ok(serde_json::json!({
@@ -558,6 +585,7 @@ impl IngestService {
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
+        self.charge(&project_id, 1)?;
         let val: serde_json::Value = serde_json::from_slice(body)?;
         let updated = self.group_engage_for_project(&project_id, val).await?;
         Ok(serde_json::json!({
@@ -613,6 +641,7 @@ impl IngestService {
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
+        self.charge(&project_id, 1)?;
         self.ingest_replay_for_project(&project_id, content_type, body)
             .await
     }

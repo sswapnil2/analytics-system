@@ -105,6 +105,22 @@ impl From<IngestError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let IngestError::RateLimited { retry_after_secs } = &self.0 {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "rate_limited",
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after_secs.to_string(),
+                )],
+                Json(body),
+            )
+                .into_response();
+        }
         if let IngestError::Storage(pulse_storage::StorageError::L0Backpressure { .. }) = &self.0 {
             let body = serde_json::json!({
                 "status": "error",
