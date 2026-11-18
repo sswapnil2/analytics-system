@@ -58,7 +58,7 @@ Each issue gives the same five things:
 - **What:** Refreshing the page loses the report. You can't paste a link to a report you haven't saved.
 - **Where:** All workspaces (VERIFIED: the URL stays `#/funnels`).
 - **Why it matters:** PMs share links in Slack all day.
-- **Expected:** Every change updates a URL query, as Mixpanel and Amplitude do.
+- **Expected:** Every change updates a URL query, as established analytics tools do.
 - **Fix:** Serialize the query into the hash with a compact encoding.
 
 ### U-06 Retention granularity is locked to days, at most 13 (S2)

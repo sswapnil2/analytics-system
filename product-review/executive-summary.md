@@ -16,12 +16,12 @@ Pulse has a correct, fast analytics engine and one genuinely differentiated work
 
 The engine is ahead of the product. That is a fixable problem, and a much better one than the reverse.
 
-**Overall maturity: early beta, roughly a strong v0.3.** The backend semantics are about where Mixpanel was around 2016. The PM-facing surface is behind that.
+**Overall maturity: early beta, roughly a strong v0.3.** The backend semantics are about where the established hosted tools were around 2016. The PM-facing surface is behind that.
 
 ## What Pulse does exceptionally well
 
 1. **The counting engine is correct.** On a known 386-event dataset with traps (duplicates, out-of-order events, late conversions, anonymous-then-identified users, nulls, mixed types, a half-hour time zone), every funnel, retention and uniques check matched the hand count: 10/10, stable across a restart and a flush. Identity merges apply retroactively. Few young analytics tools pass this.
-2. **Drop-off → replay → root cause in two clicks.** On the seeded demo, "See who dropped and why" opened 15 masked sessions. Each had a wireframe replay and a "What happened" list: `POST /api/v2/kyc/nsdl-pan-verify` 504 ×2, a 4-tap rage tap, a dead tap. That answers "why did they abandon?" faster than Mixpanel or Amplitude, which need a separate replay product and context switching. PostHog has the parts but not this tight linkage by default.
+2. **Drop-off → replay → root cause in two clicks.** On the seeded demo, "See who dropped and why" opened 15 masked sessions. Each had a wireframe replay and a "What happened" list: `POST /api/v2/kyc/nsdl-pan-verify` 504 ×2, a 4-tap rage tap, a dead tap. That answers "why did they abandon?" faster than hosted tools that need a separate replay product and context switching. Open-source suites have the parts but not this tight linkage by default.
 3. **Privacy by architecture.** Replay masks on the device, records layout rather than pixels, and the data never leaves your infrastructure. Combined with erasure, an audit log and opt-out APIs, this is a real story for regulated industries (fintech, health, India's DPDP Act).
 4. **Operational simplicity, as designed.** One Rust binary, local disk or S3, no ClickHouse/Kafka/ZooKeeper. Queries on about 105k events ran in 13–23 ms locally. The cost model is believable.
 5. **Plain-language reports.** The funnel headline "25.9% of users who did App Open went on to First Disbursal Success within 7 days. The biggest drop is between KYC PAN Submitted and UPI Autopay Mandate Approved" is better copy than any of the incumbents' defaults.
@@ -67,8 +67,8 @@ The engine is ahead of the product. That is a fixable problem, and a much better
 
 ## Biggest competitive threats
 
-- **PostHog** already offers self-hosting, open source, analytics + replay + flags + experiments + SQL, and an AI assistant. Pulse's answer has to be "simpler to operate and more private." That needs a Docker image and a one-command deploy to be true in practice.
-- **Mixpanel's** free tier and the self-serve UX of Mixpanel and Amplitude. A PM will compare filter and segment UX in the first ten minutes, and Pulse loses that comparison today.
+- **Open-source analytics suites** already offer self-hosting, open source, analytics + replay + flags + experiments + SQL, and an AI assistant. Pulse's answer has to be "simpler to operate and more private." That needs a Docker image and a one-command deploy to be true in practice.
+- **Hosted analytics tools'** free tiers and self-serve UX. A PM will compare filter and segment UX in the first ten minutes, and Pulse loses that comparison today.
 - **Warehouse-native tools.** Teams that already have Snowflake or BigQuery may skip a new data store entirely. Pulse's raw export is capped at 50,000 rows with no cursor.
 
 ## Scores (1–10)
@@ -129,7 +129,7 @@ A filter and segment bar on every report (event properties, user properties and 
 None of these matter until a PM can filter a funnel. Every one of them makes the surface wider while the core remains unfinished.
 
 **7. Pulse's strongest competitive positioning**
-"Self-hosted, privacy-first product analytics for regulated apps. Find the drop-off, watch the masked session, see the failing call, in one binary you run." Lead with fintech and health teams under data-localization rules who can't send replay data to a US SaaS. Don't position against Amplitude on analytical breadth.
+"Self-hosted, privacy-first product analytics for regulated apps. Find the drop-off, watch the masked session, see the failing call, in one binary you run." Lead with fintech and health teams under data-localization rules who can't send replay data to a US SaaS. Don't position against the hosted tools on analytical breadth.
 
 **8. What must happen before Pulse is ready for paying customers**
 - All P0 items in [prioritized-roadmap.md](prioritized-roadmap.md) are closed.

@@ -17,7 +17,7 @@ Status key:
 | B-1 | User-property filters and breakdowns use only the 1,000 most recently updated profiles after a restart | `user.tier=gold` returned 100 before the restart and **0 after**; breakdown showed `(none)` 200 (test-results). db.rs:1225, api.rs:732 | Any customer above 1,000 users gets wrong segment numbers silently |
 | B-2 | Profile search misses users outside the latest 1,000 | `search=p0005` returned `[]` | Support and PM can't look up users |
 | B-3 | Profile conflict ordering: older profiles overwrite newer ones on load; an anonymous profile isn't merged on identify | CODE: api.rs:743-746, catalog.rs:606 | Wrong current user properties |
-| B-4 | Import applies clock-skew correction, so a backfill with `sentAt` is restamped to "now" | Nov 2 event stored as Nov 18 | Corrupts migrations from Segment, Mixpanel or Amplitude |
+| B-4 | Import applies clock-skew correction, so a backfill with `sentAt` is restamped to "now" | Nov 2 event stored as Nov 18 | Corrupts migrations from other analytics tools |
 | B-5 | Equality coercion differs between code paths | `amount eq 499` → 30, `eq "499.0"` → 28 | The same filter gives different answers |
 | B-6 | `sessions` metric for events without `session_id` | 40 sessions for 60 events on separate days | Session counts meaningless for server events |
 | B-7 | Retries without id or timestamp double-count | Two identical posts were both accepted | Inflated counts from naive server integrations |
