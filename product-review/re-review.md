@@ -1,143 +1,125 @@
-VERDICT: NOT SATISFIED
+VERDICT: SATISFIED
 
-# Pulse re-review (18 Nov 2026)
+# Pulse re-review, round 2 (18 Nov 2026)
 
 **Reviewer:** the product lead who wrote the original review in this folder.
-**Build reviewed:** `feat/product-improvements` checkout, content identical to `main` @ `81ad43e`.
-**Out of scope:** P0-3 (npm, Docker, release binaries), at the owner's request. It doesn't count against this verdict.
+
+**Build reviewed:** `main` @ `2a2387b` (PR 22). Out of scope: P0-3 (npm, Docker, release binaries), at the owner's request.
 
 ## How I tested
 
-I built `pulse-node` (release) and `web/dist`, then ran two nodes with `--no-quic` and fresh data dirs:
+I used the release `pulse-node` from this tree and a fresh `web/dist`. I ran two nodes with `--no-quic` and new data dirs:
 
-- **:18121** started with no seed. I acted as a new non-fintech SaaS customer:
-  - signed up with the setup code;
-  - created "Acme SaaS" in `America/New_York`;
-  - sent 391 events I generated myself (120 current users, 50 previous-period users) with known answers;
-  - set 120 profiles;
-  - restarted the node once mid-way.
-- **:18122** started with `--seed` (the demo).
+- **:18121**, with no seed: a new SaaS customer. Same 391 known-answer events, 120 profiles, one restart.
+- **:18122**, with `--seed`: the demo.
 
-I checked the API with scripts. I checked the Studio in the built-in browser at phone width (415 px):
-
-- Dashboards landing;
-- the first-run panel;
-- the funnel builder with "+ where", compare, the drop-off drawer and save as cohort;
-- Trends with a cohort split and annotations;
-- Retention with compare;
-- the Users list and detail;
-- Settings (projects with a time-zone picker, Rotate);
-- sign out and sign in again.
-
-I didn't edit any source files.
-
-The engine work is excellent. Every number I sent came back exact:
-
-- the funnel was 120/84/48/24;
-- a step filter gave 120/36/36/24;
-- the previous period was 50/25/0/0;
-- `user.company_size` split 24/96, both live and after a restart;
-- a filter plus that split gave 12/48;
-- the cohort split was 24/96;
-- the full drop-off list at step 1 was exactly 36 users;
-- erasure, then a re-signup, gave 120 → 119 → 120 with the old events still hidden;
-- JSON import run twice gave `accepted 0, deduped 5`, including after a restart;
-- the MCP typo now errors with "Did you mean 'Plan_Upgraded'?".
-
-Most of my P0 and P1 list is closed. Three defects remain, each in a core journey from my review. Each one either gives a PM silently wrong data or breaks a documented path.
+I checked the Studio in the built-in browser. I drove it with page scripts where the pane was hidden, then read the rendered page. I checked the API with scripts. I didn't edit any source files.
 
 ## Blocking items
 
-### 1. P1-1: report and dashboard links lose the project, so reloading or sharing shows the wrong project's numbers
+None. All three blockers from round 1 are fixed, and the fixes hold up under the cases around them.
 
-- **What I did:**
-  1. On :18121 (projects "Default Project" and "Acme SaaS"), I switched to Acme SaaS.
-  2. I built the funnel Signed_Up → Project_Created (where template is kanban) → Invite_Sent → Plan_Upgraded over 7D. The Studio showed 120 → 36 → 36 → 24 (20.0%), which is correct.
-  3. I reloaded the page. The URL `#/funnels?q=…&range=7` was unchanged.
-  4. I also created a dashboard in Acme SaaS and opened `#/dashboards/<id>` in a fresh load.
-- **What I saw:**
-  - After the reload, the project switcher was back on "Default Project". The same report ran there with no warning: "0.0% of users… Signed Up 1". The network log shows the queries going to `/v1/projects/proj_default/query/funnel`.
-  - The dashboard link showed "Couldn't open this dashboard: dashboard '…' not found".
-  - The URL holds the query but not the project. The selection isn't kept in storage either, so `App.tsx` falls back to `status.active_project_id`.
-  - Every install has at least two projects, because the default project always exists. So a pasted link or a reload of any report outside the default project shows the wrong data, and "Share" on any non-default dashboard is a dead link.
-- **What would satisfy me:**
-  - Report and dashboard URLs carry the project (for example `#/p/<project_id>/funnels?q=…`, or `&project=`).
-  - Opening such a link selects that project, or says the user can't access it.
-  - The last-used project survives a reload.
-  - A test covers it: reload on a non-default project gives the same numbers, and a pasted dashboard link opens.
+### 1. P1-1: project lost on reload or shared link. Resolved.
 
-### 2. P1-3: "Save these users as a cohort" saves a different set of users than the drawer shows
+- **Pasted report link:**
+  - I opened `#/funnels?q=…&range=7&p=<acme>` with the remembered project cleared, so it behaved like a different browser.
+  - It opened Acme SaaS and showed the correct report: 120 → 36 → 36 → 24, 20.0%.
+  - Reloading gave the same result.
+- **Dashboard link:**
+  - `#/dashboards/<acme dashboard>?p=<acme>` opens the dashboard after a reload.
+  - The Share popover's link includes `?p=`.
+- **Links without `p=`:**
+  - `#/trends` opened the remembered project (`pulse_project`).
+  - The Studio added `p=` to the URL.
+- **Switching project by hand:**
+  - It drops the old `q=` and sets `p=` to the new project.
+  - No stale report runs on the wrong project.
+- **Project you can't open:** `p=proj_doesnotexist` falls back to the default project with "That project isn't available to you, so Pulse opened your default project."
 
-- **What I did:**
-  1. On the step-filtered funnel above, I opened "See who dropped and why" at step 1. The drawer read "84 users didn't reach Project Created" and "Download all 84".
-  2. I clicked "Save these users as a cohort".
-- **What I saw:**
-  - The cohort saved as "Did Signed Up, not Project Created" with **37 users** (checked with MCP `list_cohorts`).
-  - It is rebuilt as "performed A AND not performed B in range". That drops the step's `where` condition, and in general also the conversion window and order mode.
-  - The CSV list from `/query/funnel/dropped` is exact. The cohort isn't, and it then feeds every filter and split, so a PM silently analyses or messages the wrong users.
-  - My original acceptance criterion was "the saved cohort size equals the dropped count".
-- **What would satisfy me:**
-  - The saved cohort holds exactly the dropped users: a static cohort from the dropped bitmap, or a definition that carries the step filters, window and order.
-  - A test asserts the cohort size equals `dropped_users` for a funnel with a step filter.
+### 2. P1-3: saved drop-off cohort didn't match the drop-off count. Resolved.
 
-### 3. P0-5: NDJSON import, the format Segment and Mixpanel exports use, is rejected
+- **Studio:**
+  - On the step-filtered funnel, the drawer read "84 users didn't reach Project Created".
+  - "Save these users as a cohort" saved a fixed list with `users: 84` (checked with MCP `list_cohorts`).
+  - In round 1 the same flow saved 37.
+- **Cohort matches the download, user for user:**
+  - Through the API, the member lists of `from-funnel-dropped?step=1` and `?step=3` equal the `/query/funnel/dropped` CSV exactly (84 of 84, 12 of 12).
+- **Cohort counts match in every report:**
+  - As a filter it gives 84 in Trends, 84 → 47 in a Funnel and 84 starting users in Retention.
+  - As a split it gives 84 in cohort and 36 not in cohort.
+  - All of these were unchanged after a restart.
+- **Demo:**
+  - Android step filter: 1,642 dropped, 1,642 in the cohort, and 1,642 uniques when it's used as a filter.
+  - Out-of-range steps (0, 9) get a clear 400.
+- **Cohorts page:** it lists fixed-list cohorts with their description and Export CSV.
 
-- **What I did:** I POSTed 5 NDJSON lines to `/v1/projects/:id/import` with `Content-Type: application/x-ndjson`, then again with `text/plain`.
-- **What I saw:**
-  - Both returned `400 "json payload error: trailing characters at line 2 column 1"`.
-  - The same body with `Content-Type: text/csv` was accepted.
-  - The JSON-array form works, keeps the original timestamps (stored on 29 Oct although `sentAt` was now) and dedups durably.
-  - In `handle_import` (`crates/pulse-control/src/api.rs`, around line 3640), a body that starts with `{` goes to the single-JSON decoder unless the content type contains `csv`. So the NDJSON branch can't be reached for real NDJSON.
-  - `docs/rest-api.md` promises "JSON, NDJSON or CSV". The migration path from my Stage B fails on the first try with a misleading error.
-- **What would satisfy me:**
-  - NDJSON is detected by content type (`ndjson` or `jsonl`), or by more than one top-level object.
-  - A `correctness.rs` case imports NDJSON twice: the first run is accepted and the second is fully deduped.
+### 3. P0-5: NDJSON import rejected. Resolved.
+
+- **Accepted formats:** NDJSON is accepted as `application/x-ndjson`, `text/plain` and `application/jsonl`.
+- **Repeat imports:** a repeat of the same ids is fully deduped, across formats and after a restart.
+- **Partial success:** NDJSON with a missing name and a non-JSON line stores the valid lines and reports `rejected` with the line numbers.
+- **Other bodies:** a single JSON object, a JSON array, a Segment `{batch}` and CSV still import.
+- **Timestamps:** a backfill with `sentAt` = now stays on 29 Oct.
+
+## Regression check
+
+I re-ran my round-1 SaaS journey. Every result matched round 1:
+
+| Check | Result |
+|---|---|
+| Funnel | 120/84/48/24 |
+| Step filter | 120/36/36/24 |
+| Previous period | 50/25/0/0 |
+| `user.*` split, live and after restart | 24/96 |
+| `user.*` filter plus split | 12/48 |
+| Cohort split | 24/96 |
+| Full drop-off CSV | 36 |
+| Key rotation | old key 401 |
+| Erase, then re-signup | 120 → 119 → 120 |
+| Invalid time zone | 400 |
+| MCP "Did you mean" | errors as expected |
+| Demo Overview dashboard | present |
 
 ## Status of the original findings
 
-### P0
+### Resolved
 
-| ID | Status | Evidence |
-|---|---|---|
-| P0-1 User properties at any scale | **Resolved** | `user.company_size` split exact live and after a restart; filter plus split exact; `?search=` matches ids and any property across all profiles; offset paging works; Segment `identify` traits show on the user (`seat_count`). The 100k-profile case is covered only by the 1,200-profile `correctness.rs`. |
-| P0-2 Filter bar and cohorts in reports | **Resolved** | Filter panel with properties and "Users in cohort"; per-step "+ where" (120/36/36/24); `user.*` in every Split by; cohort split in Trends (24/96). Cohort split in Funnels and Retention isn't offered (non-blocking). |
-| P0-3 Installable artifacts | Excluded | Out of scope. Note: the first-run panel tells users to `npm install @pulse-analytics/ts-web`, which isn't published yet. |
-| P0-4 Web SDK defaults | **Resolved (unit-test evidence)** | `npm --prefix sdks/ts-web test`: 8/8 pass, covering pushState/replaceState pageviews, a persisted queue across reload, error and fetch capture without query strings, and snapshots. Not run in a real SPA. |
-| P0-5 Ingest and import integrity | **Partially** | Done: partial batches (`rejected: [{index:1,…}]`, the rest stored); Segment `page` → `$pageview`; `identify` in a batch; invalid time zone refused with a helpful 400; import keeps history; durable import dedup across restart. **Open:** NDJSON import (blocker 3). Also no `PATCH /projects/:id` to fix a project's time zone (non-blocking). |
-| P0-6 Correctness release gate | **Resolved** (not re-run by me) | `crates/pulse-node/tests/correctness.rs` is in the workspace tests. My black-box results agree with it on every overlapping check. |
-| P0-7 Erasure on every node | **Resolved (single node verified)** | Erasing u003 changed Signed_Up from 120 to 119 and Project_Created from 84 to 83. A later re-signup is counted (120) while the old events stay hidden, including after a restart and in imported history before the erasure time. The erasure log is shown in Users. Split-role mode is covered only by `ha_02`. |
+- **P0-1** user properties at scale.
+- **P0-2** filter bar and cohorts.
+- **P0-4** web SDK defaults, on unit-test evidence.
+- **P0-5** ingest and import integrity.
+- **P0-6** correctness gate.
+- **P0-7** erasure, verified on a single node.
+- **P1-1** URL state, landing and starter dashboard.
+- **P1-2** time granularity and longer retention.
+- **P1-3** drop-off users to a cohort and to export.
+- **P1-4** Users page.
+- **P1-5** annotations and compare-to.
+- **P1-6** projects and keys, without the environment tag.
+- **P1-7** MCP.
 
-### P1
+### Partially resolved
 
-| ID | Status | Evidence |
-|---|---|---|
-| P1-1 URL state, Dashboards landing, starter board | **Partially (blocker 1)** | The query in the URL survives a reload and a project switch; sign-in lands on Dashboards; the demo has the "Overview" board (funnel 25.9%, DAU, D7 36%). But links lose the project. Funnels with no saved report still auto-pick steps; on the demo it opens "Quick Grocery Browse → …" (non-blocking). |
-| P1-2 Granularity, longer retention | **Resolved** | Trends: Hour (170 buckets), Day, Week, Month. Retention: Day/Week/Month with 7/14/30 periods. Weekly retention API OK. |
-| P1-3 Drop-off users → cohort and export | **Partially (blocker 2)** | "Download all 84" and `/query/funnel/dropped` are exact (36 of 36). The drawer shows a per-user timeline for users without a recording, including masked demo ids. The saved cohort is wrong under step filters. Retention cell drill-down isn't built, and the site claim was removed (acceptable). |
-| P1-4 Users page | **Resolved** | A top-level Users page with project-specific columns, search, Previous/Next, readable properties, a day-grouped timeline, "Erase this user" and the erasure log. |
-| P1-5 Release impact | **Resolved** | Annotation "v2.3 released" created, listed by range, and drawn on Trends. Funnel compare: "0.0% of 50 users (+20.0 pts now)" with "was 50 / was 0.0%" per step. Retention compare draws a second dashed curve with its range. I didn't check experiment creation. |
-| P1-6 Projects, environments, keys | **Resolved, except environments** | Settings has Projects with an IANA time-zone picker (aliases such as `Asia/Calcutta` are accepted) and Rotate on each key. A revoked key gets an immediate 401 and the new key works. An environment tag isn't built (non-blocking). |
-| P1-7 Reliable MCP | **Resolved, mostly** | 9 tools. A typo gives `isError` with "Did you mean"; a bad metric errors; `start_ts_ms`/`end_ts_ms` and `compare_previous_period` are advertised; `get_user`, `list_property_values` (`user.company_size`), `list_cohorts` and `query_flows` return correct data; output is compact. Property filters still aren't in the tool schemas, only `breakdown_by` (non-blocking). |
-| P1-8 Docs and site truthfulness | **Partially** | The quickstart, web-sdk queue and Ingest semantics are fixed, and FEATURE_GAP was removed. Still untrue: NDJSON import (blocker 3) and the npm install line in the first-run panel (tied to the excluded P0-3). |
+- **P1-8** docs. The first-run panel still shows `npm install @pulse-analytics/ts-web`. That package belongs to the excluded P0-3, and it can be published once artifacts ship.
 
-### Notable P2/P3 and usability items
+### Excluded
 
-These are non-blocking.
+- **P0-3** installable artifacts.
 
-- **Not fixed:**
-  - Funnel exclusion is still fixed "between steps 2 and 3" (U-09).
-  - Conversion windows are still only 1h/1d/7d/14d (U-19).
-- **Partially fixed:**
-  - The first-run panel now has Web, Android, iOS and HTTP snippets, and it disappears within 5 s of the first event.
-  - There's still no "first event received, build your first funnel" confirmation (U-18).
-- **Polish:**
-  - The drawer and Users timelines show times in the browser's zone, not the project's.
-  - The demo project is still named "Default Project" (F-22).
-  - The seed writes events up to about 5 h in the future, so the drawer showed "Left 19 Nov 00:04" on 18 Nov.
-- **Fixed in the last pass:**
-  - Sign out and sign in again lands on Dashboards.
-  - No sideways scroll at phone width on the pages I opened.
+### Follow-ups from round 1
 
-## What would flip the verdict
+These are still non-blocking:
 
-Fix the three blocking items above, each with its test. Everything else on my P0/P1 list is closed or reduced to non-blocking follow-ups. On those three fixes, I'd move Pulse to a one-team pilot.
+- Funnel exclusion is fixed "between steps 2 and 3".
+- Conversion windows are coarse.
+- Funnels with no saved report still pick their own steps.
+- There's no "first event received" confirmation.
+- Timelines show times in the browser's time zone, not the project's.
+- The demo project is named "Default Project".
+- The seed writes events a few hours in the future.
+- There's no cohort split in Funnels or Retention.
+- There are no environments.
+- MCP doesn't advertise filters.
+- There's no `PATCH` to change a project's time zone.
+
+I'm ready to run a one-team pilot.
