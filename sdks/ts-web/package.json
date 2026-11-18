@@ -1,6 +1,7 @@
 {
   "name": "@pulse-analytics/ts-web",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "Zero-dependency Web & React Native compatible SDK + Privacy-First DOM Wireframe Diff Collector for Pulse Analytics",
   "type": "module",
   "main": "./dist/index.js",
