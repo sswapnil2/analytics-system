@@ -8,6 +8,7 @@ for AI agents.
 |---|---|
 | [Set up with an agent](agent-setup.md) | One prompt for Claude Code, Codex, Cursor or Gemini CLI that installs Pulse, instruments your app and connects MCP |
 | [Quickstart](quickstart.md) | Build and run `pulse-node`, get the admin token and an ingest key, send a first event |
+| [Self-hosting in the cloud](self-hosting-cloud.md) | Cheapest hosts, domain, systemd + Caddy HTTPS, firewall, storage and backups |
 | [Web SDK](web-sdk.md) | `sdks/ts-web`: tracking, identify, user properties, flags, replay |
 | [Mobile core (beta)](mobile-core.md) | `crates/pulse-sdk-core`: the Rust core with UniFFI Swift/Kotlin bindings |
 | [REST API](rest-api.md) | The open-source `/v1/...` routes, grouped by auth type |
