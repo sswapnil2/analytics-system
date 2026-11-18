@@ -5,8 +5,8 @@ pub mod event;
 pub mod replay;
 
 pub use batch::{
-    decode_zstd_bounded, DictionaryRegistry, WireBatch, BATCH_MAGIC, DEFAULT_DICT_ID,
-    FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
+    decode_zstd_bounded, DictionaryRegistry, RejectedEvent, WireBatch, BATCH_MAGIC,
+    DEFAULT_DICT_ID, FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
 pub use bucketing::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
 pub use error::{sanitize_json_error_message, Result, WireError};

@@ -77,8 +77,8 @@ On first boot of a data directory the node creates an ingest key for the default
 Generated the public ingest key for client SDKs: pk_live_…
 ```
 
-Keys are stored hashed, so a missed log line cannot be recovered, and the Studio has no screen for
-keys yet. Create a new one with the API instead (the response's `plaintext_key` is shown only this once):
+Keys are stored hashed, so a missed log line cannot be recovered. Create a new one in the Studio
+(Settings → API keys), or with the API (the response's `plaintext_key` is shown only this once):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/v1/projects/proj_fintech_in/api-keys \

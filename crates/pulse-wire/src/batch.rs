@@ -113,11 +113,24 @@ impl DictionaryRegistry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireBatch {
     pub events: Vec<WireEvent>,
+    /// Items of a JSON batch that failed validation; the valid ones are still in `events`.
+    #[serde(skip)]
+    pub rejected: Vec<RejectedEvent>,
+}
+
+/// One invalid item of a JSON batch: its position in the request and why it was refused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RejectedEvent {
+    pub index: usize,
+    pub error: String,
 }
 
 impl WireBatch {
     pub fn new(events: Vec<WireEvent>) -> Self {
-        Self { events }
+        Self {
+            events,
+            rejected: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -142,34 +155,21 @@ impl WireBatch {
             ));
         }
         let val: serde_json::Value = serde_json::from_slice(bytes)?;
-        let events: Vec<WireEvent> = match val {
-            serde_json::Value::Array(arr) => arr
-                .into_iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    WireEvent::deserialize(item)
-                        .map_err(|e| WireError::InvalidPayload(format!("event at index {i}: {e}")))
-                })
-                .collect::<Result<Vec<_>>>()?,
+        let items: Vec<serde_json::Value> = match val {
+            serde_json::Value::Array(arr) => arr,
             serde_json::Value::Object(mut map) => {
                 if let Some(ev_val) = map.remove("events").or_else(|| map.remove("batch")) {
-                    let arr = ev_val.as_array().ok_or_else(|| {
-                        WireError::InvalidPayload(
+                    match ev_val {
+                        serde_json::Value::Array(arr) => arr,
+                        _ => return Err(WireError::InvalidPayload(
                             "expected \"events\" or \"batch\" to be a JSON array of event objects"
                                 .to_string(),
-                        )
-                    })?;
-                    arr.iter()
-                        .enumerate()
-                        .map(|(i, item)| {
-                            WireEvent::deserialize(item).map_err(|e| {
-                                WireError::InvalidPayload(format!("event at index {i}: {e}"))
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?
+                        )),
+                    }
                 } else {
-                    vec![WireEvent::deserialize(serde_json::Value::Object(map))
-                        .map_err(|e| WireError::InvalidPayload(e.to_string()))?]
+                    let ev = WireEvent::deserialize(serde_json::Value::Object(map))
+                        .map_err(|e| WireError::InvalidPayload(e.to_string()))?;
+                    return Ok(Self::new(vec![ev]));
                 }
             }
             _ => {
@@ -179,12 +179,32 @@ impl WireBatch {
                 ));
             }
         };
-        if events.len() > MAX_BATCH_EVENTS {
+        if items.len() > MAX_BATCH_EVENTS {
             return Err(WireError::ResourceLimitExceeded(
                 "json batch event count exceeds limit",
             ));
         }
-        Ok(Self { events })
+        // Partial success: one malformed event must not cost the caller the rest of the batch.
+        let mut events = Vec::with_capacity(items.len());
+        let mut rejected = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            match WireEvent::deserialize(item) {
+                Ok(ev) => events.push(ev),
+                Err(e) => rejected.push(RejectedEvent {
+                    index,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        if events.is_empty() {
+            if let Some(first) = rejected.first() {
+                return Err(WireError::InvalidPayload(format!(
+                    "event at index {}: {}",
+                    first.index, first.error
+                )));
+            }
+        }
+        Ok(Self { events, rejected })
     }
 
     /// Encodes the batch into Pulse's `PLSB` columnar binary layout compressed with raw Zstd (`flags = 0x01`).
@@ -574,7 +594,7 @@ impl WireBatch {
             });
         }
 
-        Ok(Self { events })
+        Ok(Self::new(events))
     }
 }
 

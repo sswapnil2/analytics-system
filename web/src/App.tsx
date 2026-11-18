@@ -251,6 +251,8 @@ export const App: React.FC = () => {
       for (const cp of ext.custom_properties) propNames.add(cp.name);
       for (const lt of ext.lookup_tables)
         for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
+      // Profile properties ($set / identify traits) filter and split every report as user.<key>.
+      for (const k of ext.user_properties ?? []) propNames.add(`user.${k}`);
       setAvailableEvents(Array.from(evNames));
       setAvailableProps(Array.from(propNames).sort());
       // Numbers as seen at ingest, plus calculated properties (usually arithmetic).

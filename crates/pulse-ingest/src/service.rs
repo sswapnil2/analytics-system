@@ -55,6 +55,9 @@ pub struct IngestResponse {
     pub deduped: usize,
     pub dropped: usize,
     pub server_ts_ms: i64,
+    /// Events of the request that were refused, by index; the rest were processed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<pulse_wire::RejectedEvent>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -204,7 +207,7 @@ impl IngestService {
     pub async fn ingest_for_project(
         &self,
         project_id: &str,
-        batch: WireBatch,
+        mut batch: WireBatch,
         server_now_ms: i64,
     ) -> Result<IngestResponse> {
         let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
@@ -220,6 +223,7 @@ impl IngestService {
         let mut accepted = 0usize;
         let mut deduped = 0usize;
         let mut dropped = 0usize;
+        let rejected = std::mem::take(&mut batch.rejected);
 
         type PropTypeList = Vec<(String, &'static str)>;
         let mut by_bucket: BTreeMap<u8, Vec<(WireEvent, u32, u64)>> = BTreeMap::new();
@@ -407,6 +411,7 @@ impl IngestService {
             deduped,
             dropped,
             server_ts_ms: server_now_ms,
+            rejected,
         })
     }
 
@@ -447,6 +452,9 @@ impl IngestService {
         let canonical_uid = id_graph
             .alias_durable(&req.anon_id, &req.user_id, anon_bucket, user_bucket)
             .await?;
+        self.governance
+            .on_identify(project_id, &req.anon_id, &req.user_id, canonical_uid)
+            .await;
 
         if let Some(up) = req.user_properties {
             let payload = serde_json::json!({ "$set": up });

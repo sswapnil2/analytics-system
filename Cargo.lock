@@ -4061,6 +4061,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "constant_time_eq",
  "dashmap",
  "hex",

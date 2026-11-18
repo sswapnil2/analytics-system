@@ -122,6 +122,33 @@ macro_rules! db_map_all {
     }};
 }
 
+macro_rules! profile_from_row {
+    ($r:ident) => {{
+        let pstr: String = $r.get("props_json");
+        let props: BTreeMap<String, Value> = serde_json::from_str(&pstr).unwrap_or_default();
+        UserProfileRecord {
+            project_id: $r.get("project_id"),
+            distinct_id: $r.get("distinct_id"),
+            canonical_uid: $r.get::<i64, _>("canonical_uid").max(0) as u32,
+            props,
+            total_revenue: $r.get("total_revenue"),
+            updated_at_ms: $r.get("updated_at_ms"),
+        }
+    }};
+}
+
+/// Escapes `LIKE` wildcards so user search text matches literally (paired with `ESCAPE '\\'`).
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 macro_rules! db_map_opt {
     ($store:expr, $sql:expr, |$row:ident| $body:block $(, $arg:expr)* $(,)?) => {{
         match $store {
@@ -1707,33 +1734,116 @@ impl MetaStore {
         Ok(rec)
     }
 
+    /// Newest-first page of a project's profiles, optionally filtered by a case-insensitive
+    /// substring of the distinct id or any property value. Search runs in the database so it
+    /// covers every profile, not just a loaded window.
     pub async fn list_user_profiles(
         &self,
         project_id: &str,
+        search: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<UserProfileRecord>, MetaError> {
-        let lim = (limit.clamp(1, 1000)) as i64;
+        let lim = limit.clamp(1, 1000) as i64;
+        let off = offset.min(i64::MAX as usize) as i64;
+        let pattern = match search.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => format!("%{}%", escape_like(&s.to_lowercase())),
+            None => "%".to_string(),
+        };
         let rows = db_map_all!(
             self,
             "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
-             FROM user_profiles WHERE project_id = ? ORDER BY updated_at_ms DESC LIMIT ?",
-            |r| {
-                let pstr: String = r.get("props_json");
-                let props: BTreeMap<String, Value> =
-                    serde_json::from_str(&pstr).unwrap_or_default();
-                UserProfileRecord {
-                    project_id: r.get("project_id"),
-                    distinct_id: r.get("distinct_id"),
-                    canonical_uid: r.get::<i64, _>("canonical_uid").max(0) as u32,
-                    props,
-                    total_revenue: r.get("total_revenue"),
-                    updated_at_ms: r.get("updated_at_ms"),
-                }
-            },
+             FROM user_profiles
+             WHERE project_id = ? AND (LOWER(distinct_id) LIKE ? ESCAPE '\\' OR LOWER(props_json) LIKE ? ESCAPE '\\')
+             ORDER BY updated_at_ms DESC, distinct_id ASC LIMIT ? OFFSET ?",
+            |r| { profile_from_row!(r) },
             project_id,
+            &pattern,
+            &pattern,
             lim,
+            off,
         );
         Ok(rows)
+    }
+
+    /// Every profile updated at or after `since_ms`, oldest first, so applying them in order
+    /// leaves the newest value of each property. `since_ms = 0` loads the whole project.
+    pub async fn list_user_profiles_updated_since(
+        &self,
+        project_id: &str,
+        since_ms: i64,
+    ) -> Result<Vec<UserProfileRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? AND updated_at_ms >= ?
+             ORDER BY updated_at_ms ASC, distinct_id ASC",
+            |r| { profile_from_row!(r) },
+            project_id,
+            since_ms,
+        );
+        Ok(rows)
+    }
+
+    /// All rows (anonymous and identified ids) that belong to one canonical user, oldest first.
+    pub async fn list_user_profiles_for_canonical(
+        &self,
+        project_id: &str,
+        canonical_uid: u32,
+    ) -> Result<Vec<UserProfileRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? AND canonical_uid = ?
+             ORDER BY updated_at_ms ASC, distinct_id ASC",
+            |r| { profile_from_row!(r) },
+            project_id,
+            canonical_uid as i64,
+        );
+        Ok(rows)
+    }
+
+    /// Points the given distinct ids' rows at `canonical_uid` after an identity merge.
+    pub async fn rekey_user_profiles(
+        &self,
+        project_id: &str,
+        distinct_ids: &[&str],
+        canonical_uid: u32,
+    ) -> Result<u64, MetaError> {
+        let mut n = 0u64;
+        for did in distinct_ids {
+            n += db_exec!(
+                self,
+                "UPDATE user_profiles SET canonical_uid = ? WHERE project_id = ? AND distinct_id = ?",
+                canonical_uid as i64,
+                project_id,
+                *did,
+            );
+        }
+        Ok(n)
+    }
+
+    /// `(profiles, paying profiles, total revenue)` over every profile in the project.
+    pub async fn user_revenue_summary(
+        &self,
+        project_id: &str,
+    ) -> Result<(u64, u64, f64), MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT COUNT(*) AS n,
+                    COALESCE(SUM(CASE WHEN total_revenue > 0 THEN 1 ELSE 0 END), 0) AS paying,
+                    COALESCE(SUM(CASE WHEN total_revenue > 0 THEN total_revenue ELSE 0 END), 0.0) AS total
+             FROM user_profiles WHERE project_id = ?",
+            |r| {
+                (
+                    r.get::<i64, _>("n").max(0) as u64,
+                    r.get::<i64, _>("paying").max(0) as u64,
+                    r.get::<f64, _>("total"),
+                )
+            },
+            project_id,
+        );
+        Ok(row.unwrap_or((0, 0, 0.0)))
     }
 
     pub async fn delete_user_profiles_for_ids(

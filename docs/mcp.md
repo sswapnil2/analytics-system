@@ -19,7 +19,10 @@ Responses API, Gemini CLI and Google Antigravity are covered below.
 - **Auth:** a static bearer token. Pulse has no OAuth, so clients that only accept OAuth-protected
   remote servers (for example ChatGPT connectors) cannot connect directly.
 - **Errors:** an unknown tool or method is a JSON-RPC error; a tool that fails (bad arguments, query
-  error) returns a normal result with `isError: true` and the message as text.
+  error) returns a normal result with `isError: true` and the message as text. An event name the
+  project has never seen is such an error, with the closest real name ("unknown event 'Payment
+  Complete'. Did you mean 'Payment Completed'?"), so an agent never reads a typo as "zero". The
+  same goes for an unknown `metric`, `order_mode` or `mode`.
 
 ## Auth and project scope
 
@@ -46,7 +49,10 @@ Tokens minted at startup change on every restart unless `PULSE_ADMIN_TOKEN` is s
 | `query_retention` | `start_event`, `return_event` (both required), `mode`: `n_day` (default) / `unbounded` / `frequency_stickiness`, `num_periods` (default 7), `days` (default 14) | Daily cohort retention matrix |
 | `inspect_frustrated_sessions` | `event_name`, `only_rage_tap` (default `true`), `only_dead_tap` (default `false`), `only_errors` (default `false`), `limit` (default 10) | Sessions with rage taps, dead taps or errors, and whether each has a replay |
 
-All query tools also accept `start_ts_ms` and `end_ts_ms` (epoch ms) in place of `days` (1–365).
+All query tools also accept `start_ts_ms` and `end_ts_ms` (epoch ms) in place of `days` (1–365); both
+are advertised in each tool's `inputSchema`. `days` counts whole days ending today in the project's
+time zone. `query_insights` also takes `compare_previous_period: true` (week-over-week and similar).
+Results come back as compact JSON text plus the same object in `structuredContent`.
 For full control, `query_insights` accepts a complete Insights query body (with `series`) and
 `query_funnel` accepts step objects (`[{"event_name": ...}]` plus `time_range`, `conversion_window_ms`),
 the same shapes as the [REST query routes](rest-api.md#queries-bearer-token).

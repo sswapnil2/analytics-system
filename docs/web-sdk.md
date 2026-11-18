@@ -1,7 +1,8 @@
 # Web SDK (`sdks/ts-web`)
 
-A zero-dependency TypeScript client (`PulseWebClient`) for browsers. It batches events, persists its
-queue and identity in `localStorage`, evaluates feature flags locally, and can record privacy-masked
+A zero-dependency TypeScript client (`PulseWebClient`) for browsers. It batches events, persists identity,
+session and super properties in `localStorage` (the event queue itself is in memory, so events not yet
+sent are lost if the page closes before the next flush or `visibilitychange` send), evaluates feature flags locally, and can record privacy-masked
 DOM wireframes for session replay.
 
 ## Install
@@ -23,7 +24,7 @@ import { PulseWebClient } from "@pulse-analytics/ts-web";
 const pulse = new PulseWebClient({
   endpointUrl: "http://127.0.0.1:8080", // your node
   apiKey: "pk_live_…",                  // an ingest key, never an sk_ key
-  autocapture: true,                     // pageviews (popstate), clicks, form submits
+  autocapture: true,                     // pageviews (incl. SPA pushState/replaceState), clicks, form submits
   enableWireframeReplay: true,
 });
 ```
@@ -85,7 +86,7 @@ Replay records wireframes (element boxes and masked labels), not pixels or HTML.
 - Nothing is recorded until you call `pulse.captureDomWireframeSnapshot()`. Call it after load and after each screen change.
 - Text is masked to `████` unless an element (or its ancestor) has `data-pulse-unmask` or matches `unmaskSelectors`. Inputs and `contenteditable` content stay masked regardless.
 - Errors and network calls are not captured automatically: call `recordConsoleError(message)` and `recordNetworkBreadcrumb(...)` yourself.
-- Autocapture pageviews listen to `popstate` only, so single-page-app `pushState` navigations need a manual `track`.
+- Autocapture pageviews follow `history.pushState`, `replaceState` and `popstate`, and send one `$pageview` per new path + query string (hash changes and same-URL `replaceState` calls are not pages).
 - `$current_url` includes the query string; strip sensitive parameters with `beforeSend`.
 
 Controls: `startSessionRecording()`, `stopSessionRecording()`, `pauseSessionRecording()`,

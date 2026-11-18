@@ -96,8 +96,15 @@ function formatValue(v: number | null | undefined, digits = 2): string {
   return v.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
-function formatDay(ts: number): string {
-  return new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+type Interval = "hour" | "day" | "week" | "month";
+const INTERVAL_NOUN: Record<Interval, string> = { hour: "hour", day: "day", week: "week", month: "month" };
+
+/** Label for one chart bucket at the report's granularity (weeks are labelled by their Monday). */
+function formatBucket(ts: number, interval: Interval = "day"): string {
+  const d = new Date(ts);
+  if (interval === "hour") return d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric" });
+  if (interval === "month") return d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 /** 1, 2, 5 x 10^n ceiling so axis ticks land on round numbers. */
@@ -148,6 +155,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       ? v.toLocaleString(undefined, { style: "currency", currency, maximumFractionDigits: digits > 0 ? 2 : 0 })
       : formatValue(v, digits);
   const [breakdown, setBreakdown] = useState<string>("");
+  const [interval, setInterval_] = useState<Interval>("day");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -165,7 +173,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
   const buildQuery = useCallback(
     () => ({
-      interval: "day",
+      interval,
       series: series.map((s) => ({
         label: s.label,
         event_name: s.eventName,
@@ -179,7 +187,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       // Display only; the engine ignores it.
       display_currency: currency || undefined,
     }),
-    [series, formula, breakdown, comparePrev, filter, currency],
+    [interval, series, formula, breakdown, comparePrev, filter, currency],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -193,6 +201,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
         setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? numericProps[0] ?? "" })));
       setCurrency((q as { display_currency?: string }).display_currency ?? "");
       setBreakdown(s.breakdown_by?.[0] ?? "");
+      const iv = (q as { interval?: string }).interval;
+      setInterval_(iv === "hour" || iv === "week" || iv === "month" ? iv : "day");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
@@ -447,6 +457,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
             />
           </label>
           <label className="flex flex-col gap-1">
+            <span className={fieldLabel}>Group by</span>
+            <select value={interval} onChange={(e) => setInterval_(e.target.value as Interval)} className={field}>
+              <option value="hour">Hour</option>
+              <option value="day">Day</option>
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Break down by</span>
             <select value={breakdown} onChange={(e) => setBreakdown(e.target.value)} className={field}>
               <option value="">No breakdown</option>
@@ -648,7 +667,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                             <title>
                               {`${seriesName(s)}${s.breakdown_key ? `, ${s.breakdown_key}` : ""}: ${fmt(
                                 p.value,
-                              )} on ${formatDay(p.bucket_ts_ms)}`}
+                              )} on ${formatBucket(p.bucket_ts_ms, interval)}`}
                             </title>
                           </circle>
                         ),
@@ -667,7 +686,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                       fill="rgb(var(--muted))"
                       fontSize={11}
                     >
-                      {formatDay(ts)}
+                      {formatBucket(ts, interval)}
                     </text>
                   ),
                 )}
@@ -682,7 +701,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   }
                 >
                   <p className="mb-1.5 font-semibold text-ink">
-                    {new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}
+                    {interval === "day"
+                      ? new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })
+                      : formatBucket(buckets[hoverIdx], interval)}
                     {hoverIdx === n - 1 && <span className="font-normal text-muted"> (so far)</span>}
                   </p>
                   <ul className="space-y-1">
@@ -706,7 +727,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       {result && tableRows.length > 0 && (
         <Panel
           title="By segment"
-          meta={`Overall is ${rangePhrase(range)}; daily columns show the last ${Math.min(7, tableBuckets.length)} days`}
+          meta={`Overall is ${rangePhrase(range)}; columns show the last ${Math.min(7, tableBuckets.length)} ${INTERVAL_NOUN[interval]}${Math.min(7, tableBuckets.length) === 1 ? "" : "s"}`}
           actions={
             <button type="button" onClick={exportCsv} className={btn.secondary}>
               <Download className="h-4 w-4" /> Export CSV
@@ -722,7 +743,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   <SortHeader label="Overall" align="right" active={sort.key === "overall"} desc={sort.desc} onClick={() => sort.toggle("overall")} />
                   {tableBuckets.map((ts) => (
                     <th key={ts} className="sticky top-0 z-10 whitespace-nowrap bg-panel px-2 py-2 text-right font-medium">
-                      {formatDay(ts)}
+                      {formatBucket(ts, interval)}
                     </th>
                   ))}
                 </tr>

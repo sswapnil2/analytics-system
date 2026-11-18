@@ -347,6 +347,11 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                             }
                             NodeRole::Query => {
                                 let _ = bg_storage.refresh_all_manifests().await;
+                                // Keys, erasures, profiles, cohorts and time zones are written
+                                // by whichever node took the admin call; pick them up here.
+                                if let Err(e) = bg_control.reload_caches_from_db().await {
+                                    tracing::warn!(error = %e, "query node failed to reload control state");
+                                }
                             }
                         }
                     }
@@ -1035,6 +1040,50 @@ mod tests {
             .unwrap();
         assert_eq!(post_query_ingest.status(), reqwest::StatusCode::OK);
         ingest_node.storage.flush_all_projects().await.unwrap();
+
+        // 7. A profile written through the ingest node reaches the query node's catalog on its
+        //    background reload (B-11: query nodes used to never reload profiles or erasures).
+        let engage = http
+            .post(format!("{ingest_url}/v1/engage"))
+            .header("x-pulse-key", &ingest_key)
+            .json(&json!({ "distinct_id": "user_ha_01", "$set": { "plan": "gold" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(engage.status(), reqwest::StatusCode::OK);
+        let gold_users = || async {
+            let v: Value = http
+                .post(format!("{query_url}/v1/query"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "kind": "insights",
+                    "query": {
+                        "time_range": { "start_ts_ms": now_ms - 60_000, "end_ts_ms": now_ms + 60_000 },
+                        "interval": "day",
+                        "series": [{ "label": "A", "event_name": "App_Open", "metric": "uniques",
+                            "filters": [{ "prop_name": "user.plan", "filter": { "op": "eq", "val": "gold" } }] }]
+                    }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v["series"][0]["overall_value"].as_f64().unwrap_or(0.0)
+        };
+        let mut seen = 0.0;
+        for _ in 0..30 {
+            seen = gold_users().await;
+            if seen == 1.0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(
+            seen, 1.0,
+            "query node never picked up the profile written via ingest"
+        );
 
         query_node.shutdown().await;
         ingest_node.shutdown().await;

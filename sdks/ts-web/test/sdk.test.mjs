@@ -318,3 +318,32 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
 
   sdk.shutdown();
 });
+
+test("SPA navigations: pushState/replaceState emit one $pageview per new path, and teardown restores history", async () => {
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  const location = { href: "https://app.example.com/", pathname: "/", search: "" };
+  const history = {
+    pushState(_s, _t, url) { const u = new URL(url, "https://app.example.com"); location.pathname = u.pathname; location.search = u.search; },
+    replaceState(_s, _t, url) { if (url) this.pushState(_s, _t, url); },
+  };
+  const origPush = history.pushState;
+  globalThis.window = { innerWidth: 1, innerHeight: 1, location, history, addEventListener: () => {}, removeEventListener: () => {} };
+  globalThis.document = { visibilityState: "visible", title: "t", referrer: "", documentElement: { hasAttribute: () => false }, body: { querySelectorAll: () => [] } };
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}), headers: { get: () => null } });
+
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://127.0.0.1:1",
+    apiKey: "pk_test",
+    flushIntervalMs: 0,
+    autocapture: { pageviews: true, clicks: false, forms: false },
+  });
+  assert.equal(sdk.getQueuedEventCount(), 1, "initial pageview");
+  window.history.pushState({}, "", "/pricing");
+  assert.equal(sdk.getQueuedEventCount(), 2, "pushState to a new path");
+  window.history.replaceState({ scroll: 10 }, "");
+  assert.equal(sdk.getQueuedEventCount(), 2, "same-URL replaceState is not a page");
+  window.history.pushState({}, "", "/pricing?plan=pro");
+  assert.equal(sdk.getQueuedEventCount(), 3, "query change is a new page");
+  sdk.shutdown();
+  assert.equal(window.history.pushState, origPush, "history restored on teardown");
+});

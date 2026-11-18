@@ -392,12 +392,10 @@ pub async fn run_byok_copilot(
         || prompt_lower.contains("ltv")
         || prompt_lower.contains("pay")
     {
-        let profiles = meta
-            .list_user_profiles(project_id, 1000)
+        let (_, paying, total_rev) = meta
+            .user_revenue_summary(project_id)
             .await
-            .unwrap_or_default();
-        let paying = profiles.iter().filter(|p| p.total_revenue > 0.0).count();
-        let total_rev: f64 = profiles.iter().map(|p| p.total_revenue).sum();
+            .unwrap_or((0, 0, 0.0));
         metrics_map.insert(
             "revenue".to_string(),
             json!({ "total_revenue": total_rev, "paying_users": paying }),

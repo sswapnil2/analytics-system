@@ -283,6 +283,7 @@ export class PulseWebClient {
   private boundAutocaptureClickListener: ((ev: MouseEvent) => void) | null = null;
   private boundAutocaptureSubmitListener: ((ev: Event) => void) | null = null;
   private boundPopstateListener: (() => void) | null = null;
+  private restoreHistory: (() => void) | null = null;
   private boundVisibilityListener: (() => void) | null = null;
 
   constructor(cfg: PulseWebConfig) {
@@ -391,7 +392,14 @@ export class PulseWebClient {
     const cfg: AutocaptureConfig =
       opt === true ? { pageviews: true, clicks: true, forms: true } : opt;
 
+    // One `$pageview` per distinct path + query; hash changes and same-URL replaceState
+    // calls (scroll restoration, state updates) are not new pages.
+    let lastPage: string | null = null;
     const emitPageview = () => {
+      const loc = window.location;
+      const page = loc ? `${loc.pathname ?? ""}${loc.search ?? ""}` : "";
+      if (page === lastPage) return;
+      lastPage = page;
       this.captureUrlAttribution();
       this.track("$pageview", collectDefaultContext());
     };
@@ -400,6 +408,26 @@ export class PulseWebClient {
       emitPageview();
       this.boundPopstateListener = emitPageview;
       window.addEventListener("popstate", this.boundPopstateListener);
+      // Single-page apps navigate with history.pushState/replaceState, which fire no event.
+      const hist = window.history;
+      if (hist && typeof hist.pushState === "function") {
+        const origPush = hist.pushState;
+        const origReplace = hist.replaceState;
+        hist.pushState = function (this: History, ...args: Parameters<History["pushState"]>) {
+          const r = origPush.apply(this, args);
+          emitPageview();
+          return r;
+        };
+        hist.replaceState = function (this: History, ...args: Parameters<History["replaceState"]>) {
+          const r = origReplace.apply(this, args);
+          emitPageview();
+          return r;
+        };
+        this.restoreHistory = () => {
+          hist.pushState = origPush;
+          hist.replaceState = origReplace;
+        };
+      }
     }
 
     const matchesFilter = (el: HTMLElement | null): boolean => {
@@ -1303,6 +1331,8 @@ export class PulseWebClient {
         window.removeEventListener("submit", this.boundAutocaptureSubmitListener);
         this.boundAutocaptureSubmitListener = null;
       }
+      this.restoreHistory?.();
+      this.restoreHistory = null;
       if (this.boundPopstateListener) {
         window.removeEventListener("popstate", this.boundPopstateListener);
         this.boundPopstateListener = null;

@@ -1,4 +1,6 @@
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Offset, TimeZone, Timelike, Utc,
+};
 use chrono_tz::Tz;
 use pulse_wire::PropValue;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -115,7 +117,13 @@ impl TimeInterval {
     /// - `Month`: 1st of the calendar month `00:00:00.000` in `tz`
     pub fn align_floor_tz(self, ts_ms: i64, tz: Tz) -> i64 {
         if matches!(self, TimeInterval::Hour) {
-            return ts_ms.div_euclid(3_600_000) * 3_600_000;
+            // Floor on the local clock: zones such as Asia/Kolkata (+5:30) start hours at :30 UTC.
+            let Some(utc_dt) = DateTime::<Utc>::from_timestamp_millis(ts_ms) else {
+                return ts_ms.div_euclid(3_600_000) * 3_600_000;
+            };
+            let offset_ms =
+                i64::from(utc_dt.with_timezone(&tz).offset().fix().local_minus_utc()) * 1_000;
+            return (ts_ms + offset_ms).div_euclid(3_600_000) * 3_600_000 - offset_ms;
         }
         let Some(utc_dt) = DateTime::<Utc>::from_timestamp_millis(ts_ms) else {
             let step = self.step_ms();
@@ -781,4 +789,40 @@ pub struct SessionSearchResult {
     pub total_sessions_inspected: usize,
     pub sessions_pruned_by_bloom: usize,
     pub sessions: Vec<SessionSummaryItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn hour_buckets_follow_the_local_clock() {
+        // 20:10 UTC = 01:40 IST, so the IST hour starts at 01:00 IST = 19:30 UTC.
+        let ist: Tz = "Asia/Kolkata".parse().unwrap();
+        let h = TimeInterval::Hour;
+        assert_eq!(
+            h.align_floor_tz(utc(2026, 11, 12, 20, 10), ist),
+            utc(2026, 11, 12, 19, 30)
+        );
+        assert_eq!(
+            h.align_floor_tz(utc(2026, 11, 12, 20, 10), chrono_tz::UTC),
+            utc(2026, 11, 12, 20, 0)
+        );
+
+        // Across a DST change every hour is still one contiguous, aligned bucket.
+        let ny: Tz = "America/New_York".parse().unwrap();
+        let mut b = h.align_floor_tz(utc(2026, 11, 1, 4, 0), ny);
+        for _ in 0..6 {
+            let next = h.next_bucket_tz(b, ny).unwrap();
+            assert_eq!(next - b, 3_600_000);
+            assert_eq!(h.align_floor_tz(next + 1, ny), next);
+            b = next;
+        }
+    }
 }

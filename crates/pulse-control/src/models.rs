@@ -373,6 +373,9 @@ pub struct CustomSchemaBundle {
     pub custom_events: Vec<CustomEventDef>,
     pub custom_properties: Vec<CustomPropertyDef>,
     pub lookup_tables: Vec<LookupTableSummary>,
+    /// User profile property keys, queryable as `user.<key>` in filters and breakdowns.
+    #[serde(default)]
+    pub user_properties: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

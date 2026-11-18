@@ -588,6 +588,9 @@ pub async fn precompute_segment_row_mask(
                 let inv = cache.get_inverted_index(meta).await?;
                 inv.get_bool(pk, *b).cloned().unwrap_or_default()
             }
+            // The row filter compares numeric-looking strings by value ("499" == "499.0" == 499);
+            // the index only knows exact strings, so it would drop matches. Let rows decide.
+            PropValue::Str(s) if s.trim().parse::<f64>().is_ok() => continue,
             PropValue::Str(s) => {
                 if !entry.str_indexed_complete || entry.has_i64 || entry.has_f64 || entry.has_bool {
                     continue;

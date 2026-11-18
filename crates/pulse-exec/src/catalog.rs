@@ -623,6 +623,13 @@ impl VirtualCatalog {
         self.deleted_uids.read().clone()
     }
 
+    /// Sorted user profile property keys (without the `user.` prefix).
+    pub fn user_prop_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.user_prop_keys.read().iter().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub fn has_user_prop(&self, prop_name: &str) -> bool {
         let key = prop_name.strip_prefix("user.").unwrap_or(prop_name);
         self.user_prop_keys.read().contains(key)

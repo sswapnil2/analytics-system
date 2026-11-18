@@ -873,6 +873,8 @@ export const api = {
         row_count: number;
         sample_columns: string[];
       }>;
+      /** Profile property keys; use them as `user.<key>` in filters and splits. */
+      user_properties?: string[];
     }>(`/v1/projects/${encodeURIComponent(projectId)}/schema-extensions`),
 
   uploadLookupTable: (
