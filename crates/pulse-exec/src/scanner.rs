@@ -649,7 +649,8 @@ pub fn validate_cohort_acyclic(
         match node {
             BehavioralCohortDef::PerformedEvent { .. }
             | BehavioralCohortDef::NotPerformedEvent { .. }
-            | BehavioralCohortDef::PropertyMatch { .. } => Ok(()),
+            | BehavioralCohortDef::PropertyMatch { .. }
+            | BehavioralCohortDef::Users { .. } => Ok(()),
             BehavioralCohortDef::CohortRef { cohort_id } => {
                 if !visited.insert(cohort_id.clone()) {
                     return Err(ExecError::InvalidQuery(format!(
@@ -916,6 +917,9 @@ fn evaluate_cohort_bounded<'a>(
                         })
                 });
                 Ok(out)
+            }
+            BehavioralCohortDef::Users { canonical_uids } => {
+                Ok(canonical_uids.iter().map(|u| id_snap.resolve(*u)).collect())
             }
             BehavioralCohortDef::CohortRef { cohort_id } => {
                 let mut next_visited = visited;

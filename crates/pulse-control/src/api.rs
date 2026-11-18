@@ -1333,6 +1333,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_preview_cohort),
         )
         .route(
+            "/v1/projects/:id/cohorts/from-funnel-dropped",
+            post(handle_cohort_from_funnel_dropped),
+        )
+        .route(
             "/v1/projects/:id/cohorts/:cohort_id/export",
             get(handle_export_cohort),
         )
@@ -2446,6 +2450,53 @@ async fn handle_create_cohort(
         name: req.name,
         description: req.description,
         definition: req.definition,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .upsert_cohort(&rec)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.refresh_project_virtual_catalog(&id)
+        .await
+        .map_err(CtrlError::internal)?;
+    Ok(Json(rec))
+}
+
+#[derive(Deserialize)]
+struct CohortFromDroppedReq {
+    name: String,
+    #[serde(default)]
+    description: String,
+    query: FunnelQuery,
+}
+
+/// Saves exactly the users the drop-off list shows (`?step=N`), with every step
+/// filter, window and order applied, as a fixed cohort.
+async fn handle_cohort_from_funnel_dropped(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+    Json(req): Json<CohortFromDroppedReq>,
+) -> ApiRes<CohortRecord> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let step = params
+        .get("step")
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
+    let uids = ctrl
+        .qengine
+        .query_funnel_dropped_uids(&id, &req.query, step)
+        .await
+        .map_err(CtrlError::exec)?;
+    let rec = CohortRecord {
+        id: format!("coh_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id.clone(),
+        name: req.name,
+        description: req.description,
+        definition: BehavioralCohortDef::Users {
+            canonical_uids: uids.iter().collect(),
+        },
         created_at_ms: Utc::now().timestamp_millis(),
     };
     ctrl.meta
@@ -3637,9 +3688,17 @@ async fn handle_import_events(
         .to_ascii_lowercase();
 
     let first_non_ws = body.iter().copied().find(|b| !b.is_ascii_whitespace());
-    let batch = if ctype.contains("csv")
+    // NDJSON (Segment/Mixpanel exports) also starts with `{`, so a `{` body that
+    // isn't one JSON value is read line by line.
+    let line_based = ctype.contains("csv")
+        || ctype.contains("ndjson")
+        || ctype.contains("jsonl")
+        || ctype.contains("ldjson")
+        || ctype.contains("text/plain")
         || (first_non_ws != Some(b'{') && first_non_ws != Some(b'['))
-    {
+        || (first_non_ws == Some(b'{')
+            && serde_json::from_slice::<serde::de::IgnoredAny>(&body).is_err());
+    let batch = if line_based {
         let text = std::str::from_utf8(&body)
             .map_err(|_| CtrlError::bad("CSV/NDJSON import must be valid UTF-8"))?;
         let trimmed = text.trim();

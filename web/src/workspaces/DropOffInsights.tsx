@@ -98,19 +98,14 @@ export const WhyTheyLeft: React.FC<{
     setSaving(true);
     try {
       const range = query.time_range;
-      const cohortRef = query.global_filter?.cohort;
-      await api.createCohort(projectId, {
+      // The server saves the exact drop-off list (step filters, window and order included).
+      await api.cohortFromFunnelDropped(
+        projectId,
+        query,
+        step,
         name,
-        description: `Did ${humanizeEvent(fromEvent)} but not ${humanizeEvent(toEvent)} between ${new Date(range.start_ts_ms).toLocaleDateString()} and ${new Date(range.end_ts_ms).toLocaleDateString()}`,
-        definition: {
-          kind: "and",
-          clauses: [
-            { kind: "performed_event", event_name: fromEvent, min_count: 1, time_range: range, where_clauses: query.global_filter?.predicates ?? [] },
-            { kind: "not_performed_event", event_name: toEvent, time_range: range },
-            ...(cohortRef ? [{ kind: "cohort_ref", cohort_id: cohortRef.cohort_id }] : []),
-          ],
-        },
-      });
+        `Dropped off between ${humanizeEvent(fromEvent)} and ${humanizeEvent(toEvent)}, ${new Date(range.start_ts_ms).toLocaleDateString()} – ${new Date(range.end_ts_ms).toLocaleDateString()}. A fixed list saved ${new Date().toLocaleDateString()}.`,
+      );
       setSaved(`Saved "${name}". Use it from the Filter panel on any report.`);
     } catch (err) {
       setSaved(`Couldn't save the cohort: ${errorMessage(err)}`);

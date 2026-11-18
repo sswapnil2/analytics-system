@@ -893,6 +893,13 @@ export const api = {
       },
     ),
 
+  /** Saves exactly the users who didn't reach `step` as a fixed cohort. */
+  cohortFromFunnelDropped: (projectId: string, query: unknown, step: number, name: string, description: string) =>
+    fetchJson<{ id: string }>(
+      `/v1/projects/${encodeURIComponent(projectId)}/cohorts/from-funnel-dropped?step=${step}`,
+      { method: "POST", body: JSON.stringify({ name, description, query }) },
+    ),
+
   createCohort: (projectId: string, body: { name: string; description: string; definition: unknown }) =>
     fetchJson(`/v1/projects/${encodeURIComponent(projectId)}/cohorts`, {
       method: "POST",
