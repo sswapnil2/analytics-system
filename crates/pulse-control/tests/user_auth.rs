@@ -245,6 +245,11 @@ async fn signup_policy_first_user_then_domain_allowlist() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Links go to the owner-only outbox; none may reach the log.
+    assert!(
+        !log.text().contains("/#/"),
+        "an account link leaked into the log"
+    );
 }
 
 #[tokio::test]
@@ -592,6 +597,11 @@ async fn each_signup_gets_its_own_org_and_cannot_see_others() {
         .unwrap()
         .iter()
         .any(|p| p["id"] == acme.as_str()));
+    // Links go to the owner-only outbox; none may reach the log.
+    assert!(
+        !log.text().contains("/#/"),
+        "an account link leaked into the log"
+    );
 }
 
 #[tokio::test]
