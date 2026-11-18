@@ -780,7 +780,13 @@ async fn invoke_tool(
                     "id": c.id,
                     "name": c.name,
                     "description": c.description,
-                    "definition": c.definition,
+                    // A fixed list would be every uid; describe it instead.
+                    "definition": match &c.definition {
+                        pulse_exec::BehavioralCohortDef::Users { canonical_uids } => {
+                            json!({"kind": "users", "fixed_list_of": canonical_uids.len()})
+                        }
+                        d => json!(d),
+                    },
                     "users": size,
                 }));
             }

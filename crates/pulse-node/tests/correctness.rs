@@ -270,7 +270,7 @@ async fn check_answers(api: &Api, phase: &str) {
                 "/v1/projects/{}/query/funnel/dropped?step=2&format=json",
                 api.pid
             ),
-            q,
+            q.clone(),
         )
         .await;
     assert_eq!(st, 200, "{dropped}");
@@ -283,6 +283,42 @@ async fn check_answers(api: &Api, phase: &str) {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 30, "{phase}: dropped before step 3: {dropped}");
+
+    // P1-3: "Save these users as a cohort" holds exactly the drop-off list, step filters
+    // included. Only premium views count for step 2, so free viewers drop too.
+    let mut qf = q.clone();
+    qf["steps"][1]["filters"] =
+        json!([{"prop_name": "plan", "filter": {"op": "eq", "val": "premium"}}]);
+    let path = |p: &str| format!("/v1/projects/{}{p}", api.pid);
+    let (st, dropped) = api
+        .admin(
+            &path("/query/funnel/dropped?step=1&format=json"),
+            qf.clone(),
+        )
+        .await;
+    assert_eq!(st, 200, "{dropped}");
+    let n_dropped = dropped["users"].as_array().unwrap().len();
+    assert!(n_dropped > 20, "{phase}: step filter applies: {n_dropped}");
+    let (st, coh) = api
+        .admin(
+            &path("/cohorts/from-funnel-dropped?step=1"),
+            json!({"name": format!("dropped {phase}"), "query": qf}),
+        )
+        .await;
+    assert_eq!(st, 200, "{coh}");
+    let listed = api.mcp("list_cohorts", json!({})).await;
+    let size = listed["cohorts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == coh["id"])
+        .map(|c| c["users"].as_u64())
+        .unwrap_or_else(|| panic!("{phase}: cohort listed: {listed}"));
+    assert_eq!(
+        size,
+        Some(n_dropped as u64),
+        "{phase}: cohort = drop-off list"
+    );
     let f14 = api.funnel(14, json!({})).await;
     assert_eq!(
         entered(&f14["overall_steps"])[4],
@@ -648,6 +684,40 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
     let (st, r) = api.admin(&import_path, legacy_import()).await;
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["accepted"].as_u64(), Some(1), "{r}");
+
+    // P0-5: NDJSON exports (Segment/Mixpanel) import, labelled or not, and dedup on re-run.
+    let ndjson = format!(
+        "{}\n{}\n",
+        json!({"event": "Ndjson Probe", "userId": "nd1", "timestamp": t, "messageId": "nd-1"}),
+        json!({"event": "Ndjson Probe", "userId": "nd2", "timestamp": t, "messageId": "nd-2"}),
+    );
+    for (ctype, accepted, deduped) in [
+        ("application/x-ndjson", 2, 0),
+        ("application/json", 0, 2),
+        ("text/plain", 0, 2),
+    ] {
+        let r = api
+            .http
+            .post(format!("{}{import_path}", api.base))
+            .bearer_auth(ADMIN)
+            .header("content-type", ctype)
+            .body(ndjson.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "NDJSON as {ctype}");
+        let r: Value = r.json().await.unwrap();
+        assert_eq!(
+            r["accepted"].as_u64(),
+            Some(accepted),
+            "NDJSON as {ctype}: {r}"
+        );
+        assert_eq!(
+            r["deduped"].as_u64(),
+            Some(deduped),
+            "NDJSON as {ctype}: {r}"
+        );
+    }
 
     // B-12: erasure hides what the person did before it, not what they do after signing up
     // again with the same id. er2 is a control that is never erased.

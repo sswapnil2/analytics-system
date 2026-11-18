@@ -314,6 +314,12 @@ pub enum BehavioralCohortDef {
     CohortRef {
         cohort_id: String,
     },
+    /// A fixed list of users, e.g. everyone who dropped off at a funnel step when it
+    /// was saved. Ids are canonical uids, re-resolved on use in case users merged since.
+    // ponytail: stored inline in the cohort row; a bitmap blob if lists pass ~1M users.
+    Users {
+        canonical_uids: Vec<u32>,
+    },
     And {
         clauses: Vec<BehavioralCohortDef>,
     },

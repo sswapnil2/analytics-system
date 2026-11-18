@@ -823,7 +823,9 @@ const AddReportPanel: React.FC<{
 const SharePopover: React.FC<{ dashboardId: string; onClose: () => void }> = ({ dashboardId, onClose }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
-  const link = `${window.location.origin}${window.location.pathname}#/dashboards/${encodeURIComponent(dashboardId)}`;
+  // The app keeps the project in the URL (`p=`); the link must carry it to open the right one.
+  const pid = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("p");
+  const link = `${window.location.origin}${window.location.pathname}#/dashboards/${encodeURIComponent(dashboardId)}${pid ? `?p=${encodeURIComponent(pid)}` : ""}`;
 
   useEffect(() => {
     ref.current?.querySelector<HTMLElement>("input")?.focus();

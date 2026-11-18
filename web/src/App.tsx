@@ -45,6 +45,7 @@ import { ProfilePage } from "./account/ProfilePage";
 import { SettingsPage } from "./account/SettingsPage";
 import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
 import { errorMessage, formatCount, isNotFound } from "./lib/format";
+import { projectFromHash as projectInHash, withProject } from "./lib/projectUrl";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
 import { FlowsWorkspace } from "./workspaces/FlowsWorkspace";
@@ -123,6 +124,19 @@ function tabFromHash(): WorkspaceId {
 
 type ThemePref = "system" | "light" | "dark";
 const THEME_KEY = "pulse_theme";
+const PROJECT_KEY = "pulse_project";
+
+const projectFromHash = () => projectInHash(window.location.hash);
+
+/** The link's project, else the one this browser last used. */
+function initialProject(): string {
+  if (projectFromHash()) return projectFromHash();
+  try {
+    return window.localStorage.getItem(PROJECT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 function readTheme(): ThemePref {
   try {
@@ -154,7 +168,7 @@ export const App: React.FC = () => {
   const [authRoute, setAuthRoute] = useState(parseAuthHash);
   const [signInReason, setSignInReason] = useState<string | undefined>();
   const [activeTab, setActiveTab] = useState<WorkspaceId>(tabFromHash);
-  const [projectId, setProjectId] = useState<string>("");
+  const [projectId, setProjectId] = useState<string>(initialProject);
   const [status, setStatus] = useState<NodeStatus | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [availableEvents, setAvailableEvents] = useState<string[]>([]);
@@ -175,14 +189,34 @@ export const App: React.FC = () => {
 
   useEffect(() => applyTheme(theme), [theme]);
 
+  // Reports pick their defaults from the catalog, so wait for the new project's.
+  // `fresh`: picked by hand, so drop the report built for the old project from the URL.
+  const switchProject = useCallback((id: string, fresh = false) => {
+    if (fresh) {
+      const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+      const params = new URLSearchParams(search);
+      params.delete("q");
+      params.delete("report");
+      params.set("p", id);
+      window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+    }
+    setProjectId(id);
+    setCatalogLoaded(false);
+    setAvailableEvents([]);
+    setAvailableProps([]);
+    setRefreshToken((n) => n + 1);
+  }, []);
+
   useEffect(() => {
     const onHash = () => {
       setActiveTab(tabFromHash());
       setAuthRoute(parseAuthHash());
+      const p = projectFromHash();
+      if (p) setProjectId((cur) => (cur === p ? cur : (switchProject(p), p)));
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, []);
+  }, [switchProject]);
 
   // Only say a session "ended" if this tab had one; a leftover token from another install just signs out.
   const hadSession = useRef(false);
@@ -206,7 +240,7 @@ export const App: React.FC = () => {
     // An invite can sign a different account in over an existing one: drop the old account's state.
     setUser(null);
     setStatus(null);
-    setProjectId("");
+    setProjectId(initialProject());
     setSignInReason(undefined);
     setSignedIn(true);
     setRefreshToken((n) => n + 1);
@@ -231,8 +265,13 @@ export const App: React.FC = () => {
       if (!projectId && s.active_project_id) setProjectId(s.active_project_id);
     } catch (err) {
       if (err instanceof ApiAuthError && err.status === 401) sessionEnded();
+      // A link or remembered project this account can't open (deleted, other org).
+      else if (projectId && ((err instanceof ApiAuthError && err.status === 403) || isNotFound(err))) {
+        switchProject("");
+        setNotice("That project isn't available to you, so Pulse opened your default project.");
+      }
     }
-  }, [projectId, sessionEnded]);
+  }, [projectId, sessionEnded, switchProject]);
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
@@ -302,6 +341,30 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (waitingForFirstEvents) void loadCatalog();
   }, [waitingForFirstEvents, totalEvents, loadCatalog]);
+
+  // Every Studio URL carries its project (`p=`), so reloads and shared links open the
+  // same project; the last one used is remembered for bare URLs.
+  const urlPid = projectId || status?.active_project_id || "";
+  useEffect(() => {
+    if (!signedIn || !urlPid) return;
+    try {
+      window.localStorage.setItem(PROJECT_KEY, urlPid);
+    } catch {
+      // Private mode: links still carry the project.
+    }
+    const sync = () => {
+      const next = withProject(window.location.hash, urlPid, ALL_IDS);
+      if (next) window.history.replaceState(null, "", next);
+    };
+    sync();
+    // In-app navigation drops `p`; put it back. A link with another `p` is a switch,
+    // which the route listener above handles.
+    const fill = () => {
+      if (!projectFromHash()) sync();
+    };
+    window.addEventListener("hashchange", fill);
+    return () => window.removeEventListener("hashchange", fill);
+  }, [signedIn, urlPid]);
 
   const go = (id: WorkspaceId) => {
     window.location.hash = `/${id}`;
@@ -521,14 +584,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
           <span className="text-xs text-muted">Project</span>
           <select
             value={activePid}
-            onChange={(e) => {
-              setProjectId(e.target.value);
-              // Reports pick their defaults from the catalog, so wait for the new project's.
-              setCatalogLoaded(false);
-              setAvailableEvents([]);
-              setAvailableProps([]);
-              setRefreshToken((n) => n + 1);
-            }}
+            onChange={(e) => switchProject(e.target.value, true)}
             className="w-full truncate bg-transparent text-sm font-semibold text-ink focus:outline-none"
             disabled={projects.length === 0}
           >
@@ -720,13 +776,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                 projectId={activePid}
                 projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
                 projects={projects}
-                onProjectCreated={(id) => {
-                  setProjectId(id);
-                  setCatalogLoaded(false);
-                  setAvailableEvents([]);
-                  setAvailableProps([]);
-                  setRefreshToken((n) => n + 1);
-                }}
+                onProjectCreated={(id) => switchProject(id, true)}
               />
             ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
               <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />

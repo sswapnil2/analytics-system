@@ -10,6 +10,7 @@ use pulse_storage::{
     SessionHeader, StorageEngine, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
 use pulse_wire::{mask_user_identifier, PropValue};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use crate::ast::{
@@ -286,31 +287,43 @@ impl QueryEngine {
         query: &FunnelQuery,
         step: usize,
     ) -> Result<Vec<String>> {
+        let uids = self
+            .query_funnel_dropped_uids(project_id, query, step)
+            .await?;
+        let id_graph = self
+            .storage
+            .identity_router()
+            .get_or_open(project_id)
+            .await?;
+        Ok(uids
+            .iter()
+            .map(|u| {
+                id_graph
+                    .external_id(u)
+                    .unwrap_or_else(|| format!("uid_{u}"))
+            })
+            .collect())
+    }
+
+    /// Canonical uids of everyone who did step `step - 1` but not `step`.
+    pub async fn query_funnel_dropped_uids(
+        &self,
+        project_id: &str,
+        query: &FunnelQuery,
+        step: usize,
+    ) -> Result<RoaringBitmap> {
         if step == 0 || step >= query.steps.len() {
             return Err(ExecError::InvalidQuery(format!(
                 "step must be between 1 and {} (the step users didn't reach)",
                 query.steps.len().saturating_sub(1)
             )));
         }
-        let res = self.query_funnel(project_id, query).await?;
-        let id_graph = self
-            .storage
-            .identity_router()
-            .get_or_open(project_id)
-            .await?;
-        Ok(res
-            .dropped_uids_by_step
-            .get(step)
-            .map(|bm| {
-                bm.iter()
-                    .map(|u| {
-                        id_graph
-                            .external_id(u)
-                            .unwrap_or_else(|| format!("uid_{u}"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        let mut res = self.query_funnel(project_id, query).await?;
+        Ok(if step < res.dropped_uids_by_step.len() {
+            res.dropped_uids_by_step.swap_remove(step)
+        } else {
+            RoaringBitmap::new()
+        })
     }
 
     pub async fn query_retention(

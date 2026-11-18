@@ -237,3 +237,18 @@ Branch `feat/product-improvements`, based on `origin/main` @ `66a0a07`. IDs refe
   - Funnels: an empty comparison period gets one line instead of "was 0%" on each step.
   - Settings tables: their scroll wrapper is `relative`, so the screen-reader header no longer widens the page on phones.
 - **Tests:** `correctness.rs`: user detail by `?uid=` returns the same user and events (fails without the change). The rest were checked in the Studio (see test-results).
+
+## E-26 Product re-review blockers
+
+The product leader re-reviewed `main` after PR 17 (`product-review/re-review.md`, NOT SATISFIED) with three blockers.
+
+- **P1-1 links lose the project.** Every Studio URL now carries `p=<project>`, and the last project is remembered in the browser (`pulse_project`). Dashboard "Share" links include it. Picking a project by hand drops the old project's report from the URL. A link to a project the account can't open falls back to the default project and says so.
+  - Files: `web/src/App.tsx`, `web/src/lib/projectUrl.ts` (new), `web/src/dashboards/DashboardsWorkspace.tsx`.
+  - Tests: `web/src/lib/projectUrl.test.ts` (`npm --prefix web test`).
+- **P1-3 saved drop-off cohort ≠ drop-off list.** New cohort clause `{"kind": "users", "canonical_uids": […]}` (a fixed list, re-resolved through the identity graph on use). `POST /v1/projects/:id/cohorts/from-funnel-dropped?step=N` saves the same bitmap the CSV uses, so step filters, window and order all apply. The drawer uses it. MCP `list_cohorts` summarises a fixed list instead of returning every uid.
+  - Files: `pulse-exec/src/{ast.rs,scanner.rs,engine.rs}`, `pulse-control/src/{api.rs,mcp.rs}`, `web/src/workspaces/DropOffInsights.tsx`, `web/src/api/client.ts`.
+  - Tests: `correctness.rs` adds a step-filtered funnel, and asserts that the saved cohort's size equals the drop-off count.
+- **P0-5 NDJSON import rejected.** `/import` reads the body line by line when the content type says NDJSON/JSON Lines/plain text, or when a `{` body isn't a single JSON value.
+  - Files: `pulse-control/src/api.rs`.
+  - Tests: `correctness.rs` imports the same NDJSON as `application/x-ndjson` (2 accepted), then `application/json` and `text/plain` (2 deduped each). It fails without the change.
+- **Checked in the Studio** (release build, two projects): reload, bare URL, Share link in a clean browser, an unknown project, a pasted link to another project, and saving a cohort from a step-filtered funnel (90 = "Download all 90").
