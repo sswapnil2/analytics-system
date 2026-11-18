@@ -197,9 +197,13 @@ async fn p2_02_and_p2_09f_flag_cohort_targeting_and_sub_24h_experiment_window() 
         .await
         .unwrap();
     assert_eq!(bundle_resp.status(), StatusCode::OK);
-    let bundle: EdgeFlagBundle =
-        serde_json::from_slice(&to_bytes(bundle_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let bundle_bytes = to_bytes(bundle_resp.into_body(), usize::MAX).await.unwrap();
+    // The bundle is public with a browser-safe key: it must not list customers' user ids.
+    assert!(
+        !String::from_utf8_lossy(&bundle_bytes).contains("beta_tester"),
+        "raw cohort member id leaked into the public flag bundle"
+    );
+    let bundle: EdgeFlagBundle = serde_json::from_slice(&bundle_bytes).unwrap();
     let rule = bundle
         .flags
         .iter()

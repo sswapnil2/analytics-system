@@ -24,15 +24,42 @@ pub fn flag_variant_slot(flag_key: &str, distinct_id: &str, total_weight: u32) -
     (xxh3_64(&buf) % u64::from(total_weight)) as u32
 }
 
+/// How a cohort member travels in the public flag bundle: lowercase 16-hex
+/// `xxh3_64("cohort:{cohort_id}:{distinct_id}")`. The bundle is readable with a browser-safe key,
+/// so it must not list customers' user ids; a client can still check its own id.
+pub fn cohort_member_hash(cohort_id: &str, distinct_id: &str) -> String {
+    let mut buf = Vec::with_capacity(7 + cohort_id.len() + 1 + distinct_id.len());
+    buf.extend_from_slice(b"cohort:");
+    buf.extend_from_slice(cohort_id.as_bytes());
+    buf.push(b':');
+    buf.extend_from_slice(distinct_id.as_bytes());
+    format!("{:016x}", xxh3_64(&buf))
+}
+
+/// A cohort-targeted flag's audience: `member_hashes` from [`cohort_member_hash`], sorted.
+#[derive(Debug, Clone, Copy)]
+pub struct CohortGate<'a> {
+    pub cohort_id: &'a str,
+    pub member_hashes: &'a [String],
+}
+
+impl CohortGate<'_> {
+    pub fn contains(&self, distinct_id: &str) -> bool {
+        let h = cohort_member_hash(self.cohort_id, distinct_id);
+        self.member_hashes
+            .binary_search_by(|cand| cand.as_str().cmp(&h))
+            .is_ok()
+    }
+}
+
 /// Evaluates a feature flag rule deterministically across Control Plane and SDKs (`P2-02`, `P2-03`).
 ///
-/// If `cohort_members` is `Some(sorted_allowlist)`, the flag ONLY matches users whose `distinct_id`
-/// appears in `sorted_allowlist` (`P2-02`).
+/// With `cohort: Some(gate)`, the flag only matches users in the gate (`P2-02`).
 pub fn evaluate_flag_rule<'a, I>(
     flag_key: &str,
     enabled: bool,
     rollout_bps: u32,
-    cohort_members: Option<&[String]>,
+    cohort: Option<CohortGate<'_>>,
     variants: I,
     distinct_id: &str,
 ) -> Option<String>
@@ -42,12 +69,8 @@ where
     if !enabled || rollout_bps == 0 {
         return None;
     }
-    if let Some(allowlist) = cohort_members {
-        let is_member = allowlist
-            .binary_search_by(|cand| cand.as_str().cmp(distinct_id))
-            .is_ok()
-            || allowlist.iter().any(|cand| cand == distinct_id);
-        if !is_member {
+    if let Some(gate) = cohort {
+        if !gate.contains(distinct_id) {
             return None;
         }
     }
@@ -75,4 +98,32 @@ where
         }
     }
     vec_vars.last().map(|(k, _)| (*k).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cohort_gate_matches_hashed_members_only() {
+        // Pinned: sdks/ts-web/test/sdk.test.mjs asserts the same bytes from the web SDK.
+        assert_eq!(
+            cohort_member_hash("coh_beta", "beta_user_1"),
+            "4270f71e9f59a803"
+        );
+        let mut hashes: Vec<String> = ["beta_user_1", "beta_user_2"]
+            .iter()
+            .map(|id| cohort_member_hash("coh_beta", id))
+            .collect();
+        hashes.sort();
+        let gate = CohortGate {
+            cohort_id: "coh_beta",
+            member_hashes: &hashes,
+        };
+        let eval = |id| evaluate_flag_rule("f", true, 10_000, Some(gate), [], id);
+        assert_eq!(eval("beta_user_1").as_deref(), Some("on"));
+        assert_eq!(eval("someone_else"), None);
+        // Salted by cohort: the same user's hash differs per cohort.
+        assert_ne!(cohort_member_hash("coh_other", "beta_user_1"), hashes[0]);
+    }
 }

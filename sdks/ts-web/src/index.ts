@@ -7,9 +7,9 @@
  * allowlisted via `data-pulse-unmask` (inputs and contenteditable remain masked unconditionally).
  */
 
-import { flagRolloutSlot, flagVariantSlot, xxh3_64 } from "./xxh3.js";
+import { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 } from "./xxh3.js";
 
-export { flagRolloutSlot, flagVariantSlot, xxh3_64 };
+export { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 };
 
 export type PropPrimitive = string | number | boolean | null;
 export type EventProperties = Record<string, PropPrimitive>;
@@ -99,7 +99,8 @@ export interface EdgeFlagRule {
   enabled: boolean;
   rollout_bps: number;
   targeting_cohort_id?: string;
-  cohort_members?: string[];
+  /** Sorted `cohortMemberHash(targeting_cohort_id, distinctId)` of the cohort's members. */
+  cohort_member_hashes?: string[];
   variants: Array<{ key: string; weight_bps: number; payload?: unknown }>;
 }
 
@@ -144,8 +145,10 @@ export function maskPiiText(raw: string, explicitlyUnmasked = false): string {
 
 export function evaluateEdgeFlag(rule: EdgeFlagRule, distinctId: string): string | null {
   if (!rule.enabled || rule.rollout_bps <= 0) return null;
-  if (Array.isArray(rule.cohort_members)) {
-    if (!rule.cohort_members.includes(distinctId)) {
+  // A targeted rule with no hashes matches no one (fail closed).
+  if (rule.targeting_cohort_id) {
+    const hashes = rule.cohort_member_hashes ?? [];
+    if (!hashes.includes(cohortMemberHash(rule.targeting_cohort_id, distinctId))) {
       return null;
     }
   }

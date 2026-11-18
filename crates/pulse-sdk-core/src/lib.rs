@@ -374,7 +374,9 @@ struct EdgeRule {
     enabled: bool,
     rollout_bps: u32,
     #[serde(default)]
-    cohort_members: Option<Vec<String>>,
+    targeting_cohort_id: Option<String>,
+    #[serde(default)]
+    cohort_member_hashes: Option<Vec<String>>,
     variants: Vec<EdgeVariant>,
 }
 
@@ -865,11 +867,19 @@ impl PulseClient {
         let Some(rule) = cache.rules.get(&flag_key) else {
             return Ok(None);
         };
+        // A targeted rule with no hashes matches no one (fail closed).
+        let gate = rule
+            .targeting_cohort_id
+            .as_deref()
+            .map(|cohort_id| pulse_wire::CohortGate {
+                cohort_id,
+                member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
+            });
         Ok(evaluate_flag_rule(
             &rule.key,
             rule.enabled,
             rule.rollout_bps,
-            rule.cohort_members.as_deref(),
+            gate,
             rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
             &did,
         ))
@@ -1721,7 +1731,8 @@ mod tests {
                 key: "checkout".into(),
                 enabled: true,
                 rollout_bps: 10_000,
-                cohort_members: None,
+                targeting_cohort_id: None,
+                cohort_member_hashes: None,
                 variants: vec![EdgeVariant {
                     key: "b".into(),
                     weight_bps: 10_000,
