@@ -9,10 +9,14 @@ Branch `feat/product-improvements` (origin/main `66a0a07` + this work). macOS, A
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass (0 warnings) |
 | `cargo test --workspace --locked` | **pass**: all suites; 0 failures |
-| `cargo test -p pulse-node --test correctness` | pass in about 2 s (new release gate, see below) |
+| `cargo test -p pulse-node --test correctness` | pass in about 3 s (release gate, see below) |
 | `cargo test -p pulse-node --lib ha_02` | pass. **Fails** with the query-node reload removed (verified) |
+| `cargo test -p pulse-node --lib gate4` | pass (seeded demo, full node; now asserts the 9 MCP tool names) |
 | `cargo test -p pulse-exec --lib hour_buckets` | pass (IST and DST hour floors) |
-| `npm --prefix sdks/ts-web test` | 6/6 pass (new: SPA pushState pageviews) |
+| `cargo test -p pulse-ingest --lib compaction_drops` | pass. **Fails** with the compaction erasure filter removed (verified) |
+| `cargo test -p pulse-storage --lib erased` | pass |
+| `npm --prefix sdks/ts-web test` | 8/8 pass |
+| `cargo build -p pulse-node --release --locked` | pass |
 | `npm --prefix web run build` (tsc + Vite) | pass |
 
 ## Correctness gate: before and after
@@ -37,6 +41,13 @@ Branch `feat/product-improvements` (origin/main `66a0a07` + this work). macOS, A
 | Later `$set` wins | B-3 | pass | pass |
 | `search=p0005` | B-2 | `[]` | found |
 | Import with past `sentAt` keeps its date | B-4 | 0 on Nov 2 | 1 on Nov 2 |
+| Erased id that signs up again is counted; old events stay hidden | B-12 | 1 (re-signup hidden) | 2 |
+| Same import re-run after a restart | I-18 | accepted again | `accepted: 0, deduped: 1` |
+| Full drop-off list before step 3 | P1-3 | no endpoint | exactly 30 users |
+| MCP `list_property_values`, `get_user`, `query_flows`, `list_cohorts` | P1-7 | not available | exact values |
+| Annotations create / list by range / delete | P1-5 | not available | pass |
+
+The rows below the B-4 line were added in the second pass; their "before" column is what the old code does, not a soft-assert run.
 
 Every check is run twice: on the live node, and again after a restart (reading from disk segments).
 

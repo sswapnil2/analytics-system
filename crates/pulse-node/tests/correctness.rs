@@ -217,6 +217,24 @@ impl Api {
         assert_eq!(st, 200, "insights: {v}");
         v
     }
+    /// Calls an MCP tool and returns its parsed JSON text; panics on an MCP error.
+    async fn mcp(&self, tool: &str, args: Value) -> Value {
+        let v: Value = self
+            .http
+            .post(format!("{}/v1/mcp", self.base))
+            .bearer_auth(ADMIN)
+            .header("x-pulse-project", &self.pid)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": tool, "arguments": args}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_ne!(v["result"]["isError"], json!(true), "{tool}: {v}");
+        serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
     async fn total(&self, event: &str, metric: Value, filters: Value) -> f64 {
         let v = self
             .insight(event, metric, json!({"filters": filters}), json!({}))
@@ -242,6 +260,29 @@ async fn check_answers(api: &Api, phase: &str) {
         [100, 80, 50, 30, 20],
         "{phase}: funnel 7d"
     );
+    // P1-3: the full drop-off list has exactly the users the funnel counts as lost.
+    let q = json!({"time_range": Api::tr(),
+        "steps": STEPS.iter().map(|s| json!({"event_name": s})).collect::<Vec<_>>(),
+        "conversion_window_ms": 7 * D, "order_mode": "loose_order"});
+    let (st, dropped) = api
+        .admin(
+            &format!(
+                "/v1/projects/{}/query/funnel/dropped?step=2&format=json",
+                api.pid
+            ),
+            q,
+        )
+        .await;
+    assert_eq!(st, 200, "{dropped}");
+    let mut ids: Vec<&str> = dropped["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 30, "{phase}: dropped before step 3: {dropped}");
     let f14 = api.funnel(14, json!({})).await;
     assert_eq!(
         entered(&f14["overall_steps"])[4],
@@ -416,6 +457,68 @@ async fn check_answers(api: &Api, phase: &str) {
         Some(1.0),
         "{phase}: import with sentAt not restamped"
     );
+
+    // M-7: MCP tools an agent needs to answer follow-ups.
+    let range = json!({"start_ts_ms": ms(2026, 10, 25, 0, 0), "end_ts_ms": ms(2026, 11, 25, 0, 0)});
+    let mut a = json!({"property": "user.tier", "event_name": "Login"});
+    a.as_object_mut()
+        .unwrap()
+        .extend(range.as_object().unwrap().clone());
+    let vals = api.mcp("list_property_values", a).await;
+    let got: Vec<(String, f64)> = vals["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v["value"].as_str().unwrap().to_string(),
+                v["events"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("basic".into(), 1099.0),
+            ("gold".into(), 100.0),
+            ("platinum".into(), 1.0)
+        ],
+        "{phase}: list_property_values"
+    );
+    let user = api.mcp("get_user", json!({"distinct_id": "p0700"})).await;
+    assert_eq!(
+        user["properties"]["tier"],
+        json!("basic"),
+        "{phase}: {user}"
+    );
+    assert_eq!(
+        user["properties"]["referrer"],
+        json!("podcast"),
+        "{phase}: {user}"
+    );
+    assert_eq!(
+        user["recent_events"].as_array().map(|e| e.len()),
+        Some(1),
+        "{phase}: {user}"
+    );
+    let mut a = json!({"anchor_event": "User Signed Up", "steps": 2});
+    a.as_object_mut()
+        .unwrap()
+        .extend(range.as_object().unwrap().clone());
+    let flows = api.mcp("query_flows", a).await;
+    assert!(
+        flows.to_string().contains("Product Viewed"),
+        "{phase}: flows after signup include Product Viewed: {flows}"
+    );
+    let cohorts = api.mcp("list_cohorts", json!({})).await;
+    assert!(cohorts["cohorts"].is_array(), "{phase}: {cohorts}");
+
+    // B-12: er1's pre-erasure event is hidden; their event after signing up again counts.
+    assert_eq!(
+        api.total("Erase Probe", json!("totals"), json!([])).await,
+        2.0,
+        "{phase}: erased history hidden, re-signup and control counted"
+    );
 }
 
 fn nonzero_buckets(v: &Value) -> Vec<i64> {
@@ -463,6 +566,8 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
             .unwrap_or_else(|| panic!("no key in {created}"))
             .to_string(),
     };
+
+    let import_path = format!("/v1/projects/{}/import", api.pid);
 
     // Ingest the fixture and link anonymous browsing to the users.
     let (st, res) = api
@@ -520,11 +625,36 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
     assert_eq!(st, 200, "{r}");
 
     // B-4: a backfill whose sentAt is also in the past keeps its timestamp.
+    let (st, r) = api.admin(&import_path, legacy_import()).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["accepted"].as_u64(), Some(1), "{r}");
+
+    // B-12: erasure hides what the person did before it, not what they do after signing up
+    // again with the same id. er2 is a control that is never erased.
     let (st, r) = api
-        .admin(
-            &format!("/v1/projects/{}/import", api.pid),
-            json!({"events": [{"event": "Legacy Purchase", "userId": "u001",
-                "timestamp": ms(2026, 11, 2, 12, 0), "sentAt": ms(2026, 11, 2, 12, 0) + 1000}]}),
+        .ingest(
+            "/v1/ingest",
+            json!({"events": [
+                {"event": "Erase Probe", "userId": "er1", "timestamp": t},
+                {"event": "Erase Probe", "userId": "er2", "timestamp": t},
+            ]}),
+        )
+        .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = api.admin("/v1/admin/flush", json!({})).await;
+    assert_eq!(st, 200, "flush: {r}");
+    let del = http
+        .delete(format!("{base}/v1/projects/{}/users/er1", api.pid))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 200);
+    let resignup = Utc::now().timestamp_millis() + 1;
+    let (st, r) = api
+        .ingest(
+            "/v1/ingest",
+            json!({"events": [{"event": "Erase Probe", "userId": "er1", "timestamp": resignup}]}),
         )
         .await;
     assert_eq!(st, 200, "{r}");
@@ -585,6 +715,51 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
     let msg = mcp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(msg.contains("Payment Completed"), "{msg}");
 
+    // P1-5: annotations are stored, listed by range, and deleted.
+    let (st, ann) = api
+        .admin(
+            &format!("/v1/projects/{}/annotations", api.pid),
+            json!({"ts_ms": ms(2026, 11, 10, 12, 0), "text": "v2.3 released"}),
+        )
+        .await;
+    assert_eq!(st, 200, "{ann}");
+    let list = |start: i64, end: i64| {
+        let http = http.clone();
+        let url = format!(
+            "{base}/v1/projects/{}/annotations?start_ts_ms={start}&end_ts_ms={end}",
+            api.pid
+        );
+        async move {
+            let v: Value = http
+                .get(url)
+                .bearer_auth(ADMIN)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v.as_array().unwrap().len()
+        }
+    };
+    assert_eq!(list(ms(2026, 11, 9, 0, 0), ms(2026, 11, 11, 0, 0)).await, 1);
+    assert_eq!(
+        list(ms(2026, 11, 11, 0, 0), ms(2026, 11, 12, 0, 0)).await,
+        0
+    );
+    let del = http
+        .delete(format!(
+            "{base}/v1/projects/{}/annotations/{}",
+            api.pid,
+            ann["id"].as_str().unwrap()
+        ))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 200);
+    assert_eq!(list(ms(2026, 11, 9, 0, 0), ms(2026, 11, 11, 0, 0)).await, 0);
+
     check_answers(&api, "live").await;
 
     // Restart on the same data: everything must still hold from disk.
@@ -595,5 +770,26 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
         ..api
     };
     check_answers(&api, "after restart").await;
+
+    // I-18: re-running the same backfill adds nothing, even after a restart cleared the
+    // in-memory dedup window.
+    let (st, r) = api.admin(&import_path, legacy_import()).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(
+        r["accepted"].as_u64(),
+        Some(0),
+        "re-import after restart: {r}"
+    );
+    assert_eq!(
+        r["deduped"].as_u64(),
+        Some(1),
+        "re-import after restart: {r}"
+    );
+    check_answers(&api, "after re-import").await;
     node.shutdown().await;
+}
+
+fn legacy_import() -> Value {
+    json!({"events": [{"event": "Legacy Purchase", "userId": "u001",
+        "timestamp": ms(2026, 11, 2, 12, 0), "sentAt": ms(2026, 11, 2, 12, 0) + 1000}]})
 }

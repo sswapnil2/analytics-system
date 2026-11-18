@@ -440,4 +440,78 @@ mod tests {
         quic.endpoint.close(0u32.into(), b"shutdown");
         id_router.close_all().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn compaction_drops_erased_rows_and_keeps_later_ones() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store,
+            id_router.clone(),
+        );
+        let service = IngestService::new(storage.clone(), InMemoryGovernance::new());
+        let ev = |n: u8, who: &str, ts: i64| WireEvent {
+            event_uuid: [n; 16],
+            routing_seed: who.into(),
+            distinct_id: who.into(),
+            session_id: format!("s_{who}"),
+            event_name: "Probe".into(),
+            client_event_ts_ms: ts,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        let t0 = 1_762_000_000_000;
+        let erased_at = t0 + 10_000;
+        // Two flushes on the same day → two segments in one partition.
+        for (n, who, ts) in [(1, "gone", t0), (2, "kept", t0)] {
+            service
+                .ingest_for_project("p", WireBatch::new(vec![ev(n, who, ts)]), ts)
+                .await
+                .unwrap();
+            storage.flush_all_projects().await.unwrap();
+        }
+        service
+            .ingest_for_project("p", WireBatch::new(vec![ev(3, "gone", erased_at + 1)]), t0)
+            .await
+            .unwrap();
+        storage.flush_all_projects().await.unwrap();
+
+        let gone = id_router
+            .get_or_open("p")
+            .await
+            .unwrap()
+            .lookup_raw("gone")
+            .unwrap();
+        storage.set_erased("p", [(gone, erased_at)].into_iter().collect());
+        assert!(storage.compact_all_with_min_segments(2).await.unwrap() > 0);
+
+        let ps = storage.get_or_open_project("p").await.unwrap();
+        let snap = ps.snapshot();
+        let mut rows = Vec::new();
+        for segs in snap.manifest.active_segments.values() {
+            for seg in segs {
+                rows.extend(storage.segment_reader().read_all_rows(seg).await.unwrap());
+            }
+        }
+        let mut got: Vec<(u32, i64)> = rows
+            .iter()
+            .map(|r| (r.uid_internal, r.event_ts_ms))
+            .collect();
+        got.sort();
+        assert!(
+            !got.contains(&(gone, t0)),
+            "erased row still on disk: {got:?}"
+        );
+        assert!(
+            got.contains(&(gone, erased_at + 1)),
+            "event after re-signup dropped: {got:?}"
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+        id_router.close_all().await.unwrap();
+    }
 }

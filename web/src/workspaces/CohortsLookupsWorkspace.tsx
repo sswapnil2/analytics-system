@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, Download, Plus, Upload, Users, X } from "lucide-react";
 import { api } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
-import { UserProfilesDpdpPanel } from "../components/UserProfilesDpdpPanel";
 import { useAccess } from "../auth/access";
 import { downloadTextFile, errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
@@ -539,7 +538,6 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
         </div>
       </div>
 
-      <UserProfilesDpdpPanel projectId={projectId} />
     </div>
   );
 };

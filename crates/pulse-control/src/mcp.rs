@@ -1,8 +1,8 @@
 use chrono::Utc;
 use pulse_exec::{
-    FunnelOrderMode, FunnelQuery, FunnelStepSpec, GlobalFilter, InsightsMetric, InsightsQuery,
-    InsightsSeriesSpec, QueryEngine, RetentionMode, RetentionQuery, SessionSearchQuery,
-    TimeInterval, TimeRange,
+    FlowDirection, FlowsQuery, FunnelOrderMode, FunnelQuery, FunnelStepSpec, GlobalFilter,
+    InsightsMetric, InsightsQuery, InsightsSeriesSpec, QueryEngine, RetentionMode, RetentionQuery,
+    SessionSearchQuery, TimeInterval, TimeRange,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -163,6 +163,56 @@ pub async fn handle_mcp_request(
                                 "limit": { "type": "integer", "default": 10 }
                             }
                         }
+                    },
+                    {
+                        "name": "query_flows",
+                        "description": "Shows the most common paths users take after (or before) an event: for each step, the top next events and how many users went there. Use it for 'what do people do after signing up' or 'what leads to checkout'.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "anchor_event": { "type": "string", "description": "Exact event name the paths start from (or end at, with direction reverse)." },
+                                "direction": { "type": "string", "enum": ["forward", "reverse"], "default": "forward", "description": "forward: what happens after the anchor; reverse: what happens before it." },
+                                "steps": { "type": "integer", "default": 3, "description": "How many steps to follow, 1 to 6." },
+                                "top_n_per_step": { "type": "integer", "default": 5, "description": "Events kept per step; the rest are grouped." },
+                                "days": { "type": "integer", "default": 14, "description": "Look back this many days, ending today in the project's time zone. Ignored when start_ts_ms and end_ts_ms are given." },
+                                "start_ts_ms": { "type": "integer", "description": "Absolute range start, Unix epoch milliseconds (inclusive)." },
+                                "end_ts_ms": { "type": "integer", "description": "Absolute range end, Unix epoch milliseconds (exclusive)." }
+                            },
+                            "required": ["anchor_event"]
+                        }
+                    },
+                    {
+                        "name": "get_user",
+                        "description": "Looks up one user by distinct id: their profile properties and their most recent events (newest first). Use it to explain what a specific user did.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "distinct_id": { "type": "string", "description": "The user's id as sent in events or identify." },
+                                "limit": { "type": "integer", "default": 50, "description": "Most recent events to return, up to 200." }
+                            },
+                            "required": ["distinct_id"]
+                        }
+                    },
+                    {
+                        "name": "list_property_values",
+                        "description": "Lists the most common values of a property, with event counts. Call it before filtering or splitting so you use values that exist, e.g. the exact plan names.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "property": { "type": "string", "description": "Event property, or user property as 'user.<name>'." },
+                                "event_name": { "type": "string", "description": "Only count this event. Default: all events." },
+                                "limit": { "type": "integer", "default": 20, "description": "Values to return, up to 100." },
+                                "days": { "type": "integer", "default": 14, "description": "Look back this many days, ending today in the project's time zone. Ignored when start_ts_ms and end_ts_ms are given." },
+                                "start_ts_ms": { "type": "integer", "description": "Absolute range start, Unix epoch milliseconds (inclusive)." },
+                                "end_ts_ms": { "type": "integer", "description": "Absolute range end, Unix epoch milliseconds (exclusive)." }
+                            },
+                            "required": ["property"]
+                        }
+                    },
+                    {
+                        "name": "list_cohorts",
+                        "description": "Lists the saved cohorts (named groups of users) with their definitions and current size.",
+                        "inputSchema": { "type": "object", "properties": {} }
                     }
                 ]
             }),
@@ -567,6 +617,174 @@ async fn invoke_tool(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "query_flows" => {
+            let anchor_event = args
+                .get("anchor_event")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "missing required 'anchor_event'".to_string())?
+                .to_string();
+            let direction = pick(
+                args,
+                "direction",
+                FlowDirection::Forward,
+                &[
+                    ("forward", FlowDirection::Forward),
+                    ("reverse", FlowDirection::Reverse),
+                ],
+            )?;
+            let known = known_event_names(project_id, meta, qengine).await?;
+            check_event_names([anchor_event.as_str()], &known)?;
+            let q = FlowsQuery {
+                time_range: range,
+                anchor_event,
+                direction,
+                steps: args
+                    .get("steps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3)
+                    .clamp(1, 6) as usize,
+                top_n_per_step: Some(
+                    args.get("top_n_per_step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(5)
+                        .clamp(1, 20) as usize,
+                ),
+                global_filter: GlobalFilter::default(),
+            };
+            let res = qengine
+                .query_flows(project_id, &q)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "get_user" => {
+            let distinct_id = args
+                .get("distinct_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "missing required 'distinct_id'".to_string())?;
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            let profile = meta
+                .get_user_profile(project_id, distinct_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let id_graph = qengine
+                .storage()
+                .identity_router()
+                .get_or_open(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let canon = id_graph
+                .lookup_canonical(distinct_id)
+                .or_else(|| {
+                    id_graph
+                        .lookup_raw(distinct_id)
+                        .map(|u| id_graph.snapshot().resolve(u))
+                })
+                .or_else(|| profile.as_ref().map(|p| p.canonical_uid));
+            let Some(canon) = canon else {
+                return Err(format!(
+                    "no user with distinct_id '{distinct_id}' in this project"
+                ));
+            };
+            let events = qengine
+                .export_events(project_id, None, Some(canon), limit, true)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Every id merged into this user contributes; the newest value of each key wins.
+            let rows = meta
+                .list_user_profiles_for_canonical(project_id, canon)
+                .await
+                .map_err(|e| e.to_string())?;
+            let merged = crate::api::merge_profile_rows(rows).remove(&canon);
+            Ok(json!({
+                "distinct_id": distinct_id,
+                "properties": merged.as_ref().map(|p| &p.props),
+                "total_revenue": merged.as_ref().map(|p| p.total_revenue),
+                "recent_events": events,
+            }))
+        }
+        "list_property_values" => {
+            let property = args
+                .get("property")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "missing required 'property'".to_string())?
+                .to_string();
+            let event_name = args
+                .get("event_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(pulse_exec::ANY_EVENT)
+                .to_string();
+            let known = known_event_names(project_id, meta, qengine).await?;
+            check_event_names([event_name.as_str()], &known)?;
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20)
+                .clamp(1, 100) as usize;
+            let q = InsightsQuery {
+                time_range: range,
+                interval: TimeInterval::Day,
+                series: vec![InsightsSeriesSpec {
+                    label: "A".to_string(),
+                    event_name,
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                }],
+                breakdown_by: vec![property.clone()],
+                global_filter: GlobalFilter::default(),
+                compare_previous_period: false,
+                formula: None,
+            };
+            let res = qengine
+                .query_insights(project_id, &q)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut values: Vec<(String, f64)> = res
+                .series
+                .into_iter()
+                .map(|s| (s.breakdown_key, s.overall_value.unwrap_or(0.0)))
+                .filter(|(_, n)| *n > 0.0)
+                .collect();
+            values.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let total = values.len();
+            values.truncate(limit);
+            Ok(json!({
+                "property": property,
+                "distinct_values": total,
+                "values": values.into_iter().map(|(v, n)| json!({"value": v, "events": n})).collect::<Vec<_>>(),
+            }))
+        }
+        "list_cohorts" => {
+            let cohorts = meta
+                .list_cohorts(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::with_capacity(cohorts.len());
+            for c in cohorts {
+                let size = qengine
+                    .evaluate_saved_cohort_uids(project_id, &c.id)
+                    .await
+                    .map(|v| v.len())
+                    .ok();
+                out.push(json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "description": c.description,
+                    "definition": c.definition,
+                    "users": size,
+                }));
+            }
+            Ok(json!({ "cohorts": out }))
         }
         other => Err(format!("unknown MCP tool: {other}")),
     }

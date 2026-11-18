@@ -18,6 +18,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::dictionary::ProjectDictionary;
 use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
+use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
 use crate::manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
 use crate::mem_bucket::{
@@ -93,6 +94,7 @@ pub struct ProjectStorage {
     pending_gc: Mutex<Vec<String>>,
     session_flags: Cache<u64, u16>,
     recovered_uuid_fps: Mutex<Vec<(u8, u64)>>,
+    erased: RwLock<Arc<ErasedUids>>,
 }
 
 impl Drop for ProjectStorage {
@@ -203,6 +205,7 @@ impl ProjectStorage {
                 .time_to_idle(Duration::from_secs(3600))
                 .build(),
             recovered_uuid_fps: Mutex::new(Vec::new()),
+            erased: RwLock::new(Arc::new(ErasedUids::default())),
         });
 
         if !identity_router.is_read_only() {
@@ -755,6 +758,11 @@ impl ProjectStorage {
                 let mut rows = reader.read_all_rows(seg).await?;
                 merged_rows.append(&mut rows);
             }
+            // Erased users' rows are dropped for good here, not just hidden at query time.
+            let erased = self.erased_snapshot();
+            if !erased.is_empty() {
+                merged_rows.retain(|r| !erased.hides(r.uid_internal, r.event_ts_ms));
+            }
 
             let compacted_id = format!("seg_cmp_{}", Uuid::new_v4().simple());
             let Some(new_meta) = write_vortex_segment(
@@ -849,6 +857,15 @@ impl ProjectStorage {
         Ok(deleted)
     }
 
+    /// Erasure tombstones used by queries and compaction.
+    pub fn erased_snapshot(&self) -> Arc<ErasedUids> {
+        self.erased.read().clone()
+    }
+
+    pub fn set_erased(&self, erased: Arc<ErasedUids>) {
+        *self.erased.write() = erased;
+    }
+
     /// Removes in-memory L0 events belonging to erased UIDs, returning `(purged_rows, session_ids)` (`Gap 4`).
     pub fn purge_user_l0(&self, uids: &RoaringBitmap) -> (u64, Vec<String>) {
         let mut total_purged = 0u64;
@@ -913,6 +930,7 @@ pub struct StorageEngine {
     segment_reader: Arc<VortexSegmentReader>,
     replay_store: Arc<ReplayStore>,
     projects: DashMap<String, Arc<ProjectStorage>>,
+    erased: DashMap<String, Arc<ErasedUids>>,
     open_lock: AsyncMutex<()>,
 }
 
@@ -942,6 +960,7 @@ impl StorageEngine {
             segment_reader,
             replay_store,
             projects: DashMap::new(),
+            erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
         })
     }
@@ -1012,7 +1031,27 @@ impl StorageEngine {
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
+        // After the insert, so a concurrent `set_erased` is seen by one side or the other.
+        if let Some(e) = self.erased.get(project_id) {
+            ps.set_erased(e.clone());
+        }
         Ok(ps)
+    }
+
+    /// Sets a project's erasure tombstones without opening its storage; applied on open.
+    pub fn set_erased(&self, project_id: &str, erased: ErasedUids) {
+        let erased = Arc::new(erased);
+        self.erased.insert(project_id.to_string(), erased.clone());
+        if let Some(p) = self.projects.get(project_id) {
+            p.set_erased(erased);
+        }
+    }
+
+    pub fn erased_snapshot(&self, project_id: &str) -> Arc<ErasedUids> {
+        self.erased
+            .get(project_id)
+            .map(|e| e.clone())
+            .unwrap_or_default()
     }
 
     pub async fn append_replay_chunk(&self, chunk: &ReplayChunk) -> Result<ReplayAppendResult> {

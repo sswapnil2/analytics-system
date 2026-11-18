@@ -1,11 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
+import { useAccess } from "../auth/access";
 import { typicalOrder } from "../lib/eventOrder";
 import { FunnelQueryBody, UserTimeline, WhyTheyLeft } from "./DropOffInsights";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
-import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
+import {
+  CompareControl,
+  CompareSel,
+  compareLabel,
+  compareRangeFor,
+  RangePresets,
+  RangeSel,
+  rangeFor,
+  rangePhrase,
+} from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -38,6 +48,19 @@ interface Props {
 
 type OrderMode = "loose_order" | "strict_order" | "any_order";
 
+/** One "where" condition on a single funnel step (e.g. Product Viewed where category = shoes). */
+type StepWhere = { prop: string; op: "eq" | "neq" | "contains"; value: string };
+
+const stepWhereToFilters = (w: StepWhere | null | undefined) =>
+  w && w.prop && w.value.trim() ? [{ prop_name: w.prop, filter: { op: w.op, val: w.value.trim() } }] : [];
+
+function stepWhereFromFilters(filters: unknown): StepWhere | null {
+  const f = Array.isArray(filters) ? (filters[0] as { prop_name?: string; filter?: { op?: string; val?: unknown } }) : null;
+  if (!f?.prop_name || !f.filter) return null;
+  const op = f.filter.op === "neq" || f.filter.op === "contains" ? f.filter.op : "eq";
+  return { prop: f.prop_name, op, value: String(f.filter.val ?? "") };
+}
+
 const WINDOWS: { hours: number; label: string }[] = [
   { hours: 1, label: "1 hour" },
   { hours: 24, label: "1 day" },
@@ -46,6 +69,7 @@ const WINDOWS: { hours: number; label: string }[] = [
 ];
 
 const pct = (v: number) => `${v.toFixed(1)}%`;
+const delta = (pts: number) => `${pts >= 0 ? "+" : "−"}${Math.abs(pts).toFixed(1)} pts now`;
 
 function defaultStepsFromCatalog(events: string[]): string[] {
   const clean = events.filter((e) => !e.startsWith("$"));
@@ -61,13 +85,17 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   refreshToken,
 }) => {
   const [steps, setSteps] = useState<string[]>(() => defaultStepsFromCatalog(availableEvents));
+  // Indexed like `steps`; a missing entry means no condition on that step.
+  const [stepWhere, setStepWhere] = useState<(StepWhere | null)[]>([]);
   const [orderMode, setOrderMode] = useState<OrderMode>("loose_order");
   const [windowHours, setWindowHours] = useState<number>(168);
   const [excludeEvent, setExcludeEvent] = useState<string>("");
   const [holdConstant, setHoldConstant] = useState<string>("");
   const [breakdownBy, setBreakdownBy] = useState<string>("");
   const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
+  const [compare, setCompare] = useState<CompareSel>("");
   const [result, setResult] = useState<FunnelResult | null>(null);
+  const [prevResult, setPrevResult] = useState<FunnelResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [drawerStep, setDrawerStep] = useState<number | null>(null);
@@ -98,7 +126,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
 
   const buildQuery = useCallback(
     () => ({
-      steps: steps.map((event_name) => ({ event_name, filters: [], first_time_ever: false })),
+      steps: steps.map((event_name, i) => ({ event_name, filters: stepWhereToFilters(stepWhere[i]), first_time_ever: false })),
       order_mode: orderMode,
       conversion_window_ms: windowHours * 3_600_000,
       exclusions: excludeEvent
@@ -107,8 +135,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       hold_constant_props: holdConstant ? [holdConstant] : [],
       breakdown_by: breakdownBy || null,
       global_filter: toGlobalFilter(filter),
+      // Studio-only: the comparison runs as a second query; the engine ignores this field.
+      compare_to: compare || undefined,
     }),
-    [steps, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy, filter],
+    [steps, stepWhere, orderMode, windowHours, excludeEvent, holdConstant, breakdownBy, filter, compare],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -116,17 +146,22 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const openError = useSavedReport(
     projectId,
     (q) => {
-      const s = q as { steps?: { event_name: string }[]; order_mode?: OrderMode; conversion_window_ms?: number;
-        exclusions?: { event_name: string }[]; hold_constant_props?: string[]; breakdown_by?: string | null };
-      if (s.steps?.length) setSteps(s.steps.map((x) => x.event_name));
+      const s = q as { steps?: { event_name: string; filters?: unknown }[]; order_mode?: OrderMode; conversion_window_ms?: number;
+        exclusions?: { event_name: string }[]; hold_constant_props?: string[]; breakdown_by?: string | null; compare_to?: string };
+      if (s.steps?.length) {
+        setSteps(s.steps.map((x) => x.event_name));
+        setStepWhere(s.steps.map((x) => stepWhereFromFilters(x.filters)));
+      }
       if (s.order_mode) setOrderMode(s.order_mode);
       if (s.conversion_window_ms) setWindowHours(s.conversion_window_ms / 3_600_000);
       setExcludeEvent(s.exclusions?.[0]?.event_name ?? "");
       setHoldConstant(s.hold_constant_props?.[0] ?? "");
       setBreakdownBy(s.breakdown_by ?? "");
+      setCompare(s.compare_to ?? "");
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
+    { query: buildQuery, range },
   );
 
   const runFunnel = useCallback(async () => {
@@ -138,14 +173,22 @@ export const FunnelsWorkspace: React.FC<Props> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFunnel(projectId, { time_range: rangeFor(range), ...buildQuery() });
-      if (id === reqId.current) setResult(res);
+      const main = rangeFor(range);
+      const cmp = compareRangeFor(main, compare);
+      const [res, prev] = await Promise.all([
+        api.queryFunnel(projectId, { time_range: main, ...buildQuery() }),
+        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery() }) : Promise.resolve(null),
+      ]);
+      if (id === reqId.current) {
+        setResult(res);
+        setPrevResult(prev);
+      }
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, range, steps.length]);
+  }, [projectId, buildQuery, range, steps.length, compare]);
 
   useEffect(() => {
     void runFunnel();
@@ -156,6 +199,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const drawerQuery = useMemo(() => ({ time_range: rangeFor(range), ...buildQuery() }) as FunnelQueryBody, [range, buildQuery]);
   const first = overall[0];
   const last = overall[overall.length - 1];
+  // Only a comparison of the same steps is meaningful.
+  const prevSteps = prevResult && prevResult.overall_steps.length === overall.length ? prevResult.overall_steps : [];
+  const prevFirst = prevSteps[0];
+  const prevLast = prevSteps[prevSteps.length - 1];
 
   // The step that loses the most users is the one worth investigating first.
   const biggestDrop = useMemo(() => {
@@ -237,7 +284,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({
               {steps.length > 2 && (
                 <button
                   type="button"
-                  onClick={() => setSteps(steps.filter((_, i) => i !== idx))}
+                  onClick={() => {
+                    setSteps(steps.filter((_, i) => i !== idx));
+                    setStepWhere(stepWhere.filter((_, i) => i !== idx));
+                  }}
                   className="rounded p-1 text-faint hover:bg-destructive-soft hover:text-destructive"
                   aria-label={`Remove step ${idx + 1}`}
                 >
@@ -245,6 +295,16 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                 </button>
               )}
               </span>
+              <StepWhereEditor
+                idx={idx}
+                value={stepWhere[idx] ?? null}
+                props={availableProps}
+                onChange={(w) => {
+                  const next = [...stepWhere];
+                  next[idx] = w;
+                  setStepWhere(next);
+                }}
+              />
             </li>
           ))}
           <li>
@@ -305,6 +365,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
               ))}
             </select>
           </label>
+          <CompareControl main={rangeFor(range)} value={compare} onChange={setCompare} />
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Split by</span>
             <select value={breakdownBy} onChange={(e) => setBreakdownBy(e.target.value)} className={field}>
@@ -326,10 +387,17 @@ export const FunnelsWorkspace: React.FC<Props> = ({
 
       {steps.length < 2 && !loading && (
         <Panel>
-          <EmptyState
-            title="No events in this project yet"
-            body="Send events to your project via the SDK or /v1/ingest to build a conversion funnel."
-          />
+          {eventOptions.length === 0 ? (
+            <EmptyState
+              title="No events in this project yet"
+              body="Send events to your project via the SDK or /v1/ingest to build a conversion funnel."
+            />
+          ) : (
+            <EmptyState
+              title="Pick the steps of a journey you care about"
+              body="Add at least two steps under Steps, in the order users take them, for example sign-up then first purchase."
+            />
+          )}
         </Panel>
       )}
 
@@ -354,6 +422,13 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                   {humanizeEvent(first.event_name)} went on to {humanizeEvent(last.event_name)} within{" "}
                   {WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}.
                 </p>
+                {prevLast && prevFirst && (
+                  <p className="text-[0.9375rem] text-ink-2">
+                    {compareLabel(rangeFor(range), compare)}:{" "}
+                    <span className="tabular">{pct(prevLast.conversion_from_start_pct)}</span> of{" "}
+                    {formatCount(prevFirst.entered_users)} users ({delta(last.conversion_from_start_pct - prevLast.conversion_from_start_pct)}).
+                  </p>
+                )}
                 {biggestDrop > 0 && (
                   <p className="text-[0.9375rem] text-ink-2">
                     The biggest drop is between {humanizeEvent(overall[biggestDrop - 1].event_name)} and{" "}
@@ -426,6 +501,11 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                           <span className="text-xs text-muted tabular">
                             {idx === 0 ? "100%" : `${pct(st.conversion_from_prev_pct)} of previous`}
                           </span>
+                          {prevSteps[idx] && (
+                            <span className="text-xs text-info tabular" title={compareLabel(rangeFor(range), compare)}>
+                              was {idx === 0 ? formatCount(prevSteps[idx].entered_users) : pct(prevSteps[idx].conversion_from_prev_pct)}
+                            </span>
+                          )}
                         </span>
                       </div>
                     </li>
@@ -542,6 +622,26 @@ const DropOffDrawer: React.FC<{
   const [selected, setSelected] = useState<DroppedSessionSample | null>(
     () => samples.find((d) => d.has_replay) ?? samples[0] ?? null,
   );
+  const { canAdmin } = useAccess();
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const downloadAll = async () => {
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      const csv = await api.exportFunnelDropped(projectId, query, step);
+      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `dropped-before-${toEvent}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setDownloadError(`Couldn't download the list: ${errorMessage(err)}`);
+    } finally {
+      setDownloading(false);
+    }
+  };
   const closeRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -596,7 +696,18 @@ const DropOffDrawer: React.FC<{
             <p className="mt-0.5 text-sm text-muted">
               They did {fromStep}, then stopped. Pick someone to see their recording or what they did.
             </p>
+            {downloadError && <p className="mt-1 text-sm text-danger">{downloadError}</p>}
           </div>
+          {canAdmin && (
+            <button
+              type="button"
+              className={`${btn.secondary} ml-auto`}
+              disabled={downloading || droppedCount === 0}
+              onClick={() => void downloadAll()}
+            >
+              <Download className="h-4 w-4" /> {downloading ? "Preparing…" : `Download all ${formatCount(droppedCount)}`}
+            </button>
+          )}
           <button ref={closeRef} type="button" onClick={onClose} className={btn.ghost} aria-label="Close drop-off details">
             <X className="h-5 w-5" />
           </button>
@@ -757,5 +868,69 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
         </table>
       </div>
     </div>
+  );
+};
+
+/** "+ where" on one funnel step: a single property condition, shown inline under the step. */
+const StepWhereEditor: React.FC<{
+  idx: number;
+  value: StepWhere | null;
+  props: string[];
+  onChange: (w: StepWhere | null) => void;
+}> = ({ idx, value, props, onChange }) => {
+  if (!value) {
+    return (
+      <button
+        type="button"
+        disabled={props.length === 0}
+        onClick={() => onChange({ prop: props[0] ?? "", op: "eq", value: "" })}
+        className="self-start rounded px-1.5 py-0.5 text-xs text-muted hover:bg-hover hover:text-ink disabled:opacity-50"
+        aria-label={`Add a condition to step ${idx + 1}`}
+      >
+        + where
+      </button>
+    );
+  }
+  return (
+    <span className="flex flex-wrap items-center gap-1 pl-1.5 text-xs">
+      <span className="text-faint">where</span>
+      <select
+        aria-label={`Step ${idx + 1} condition property`}
+        value={value.prop}
+        onChange={(e) => onChange({ ...value, prop: e.target.value })}
+        className={`${field} h-7 w-auto py-0 text-xs`}
+      >
+        {Array.from(new Set([value.prop, ...props])).filter(Boolean).map((p) => (
+          <option key={p} value={p}>
+            {humanizeEvent(p)}
+          </option>
+        ))}
+      </select>
+      <select
+        aria-label={`Step ${idx + 1} condition operator`}
+        value={value.op}
+        onChange={(e) => onChange({ ...value, op: e.target.value as StepWhere["op"] })}
+        className={`${field} h-7 w-auto py-0 text-xs`}
+      >
+        <option value="eq">is</option>
+        <option value="neq">is not</option>
+        <option value="contains">contains</option>
+      </select>
+      <input
+        aria-label={`Step ${idx + 1} condition value`}
+        value={value.value}
+        onChange={(e) => onChange({ ...value, value: e.target.value })}
+        placeholder="value"
+        className={`${field} h-7 w-24 py-0 text-xs`}
+      />
+      <button
+        type="button"
+        onClick={() => onChange(null)}
+        className="rounded p-1 text-faint hover:bg-hover hover:text-ink"
+        aria-label={`Remove the condition on step ${idx + 1}`}
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </span>
   );
 };

@@ -49,6 +49,7 @@ struct ShardSummary {
     breakdown_counts: HashMap<u32, Vec<u64>>,
     ttc_values: Vec<f64>,
     dropped_samples: Vec<(usize, UserEvent)>,
+    dropped_uids: Vec<roaring::RoaringBitmap>,
 }
 
 impl ShardSummary {
@@ -58,6 +59,7 @@ impl ShardSummary {
             breakdown_counts: HashMap::new(),
             ttc_values: Vec::new(),
             dropped_samples: Vec::new(),
+            dropped_uids: vec![roaring::RoaringBitmap::new(); k],
         }
     }
 
@@ -104,6 +106,7 @@ impl ShardSummary {
             }
         } else {
             let dropped_before = out.max_step + 1;
+            self.dropped_uids[dropped_before].insert(out.last_ev.canon_uid);
             Self::push_dropped_sample(&mut self.dropped_samples, dropped_before, out.last_ev);
         }
     }
@@ -125,6 +128,9 @@ impl ShardSummary {
             }
         }
         self.ttc_values.append(&mut other.ttc_values);
+        for (dst, src) in self.dropped_uids.iter_mut().zip(other.dropped_uids) {
+            *dst |= src;
+        }
         for (step_idx, ev) in other.dropped_samples {
             Self::push_dropped_sample(&mut self.dropped_samples, step_idx, ev);
         }
@@ -619,6 +625,7 @@ impl FunnelEngine {
             breakdowns,
             time_to_convert,
             dropped_sample_sessions,
+            dropped_uids_by_step: final_summary.dropped_uids,
         })
     }
 }

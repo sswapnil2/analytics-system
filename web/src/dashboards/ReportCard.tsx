@@ -487,3 +487,78 @@ const RetentionMini: React.FC<{ data: RetentionResult }> = ({ data }) => {
     </div>
   );
 };
+
+/**
+ * What a report is compared with: "" (nothing), "previous" (the same length right before the
+ * range), or a custom range in `RangeSel` form, e.g. the weeks before a release.
+ */
+export type CompareSel = string;
+
+export function compareRangeFor(main: TimeRange, sel: CompareSel): TimeRange | null {
+  if (!sel) return null;
+  if (sel === "previous") {
+    const len = main.end_ts_ms - main.start_ts_ms;
+    return { start_ts_ms: main.start_ts_ms - len, end_ts_ms: main.start_ts_ms };
+  }
+  return customRange(sel);
+}
+
+/** "3 Nov – 9 Nov" for the compared range. */
+export function compareLabel(main: TimeRange, sel: CompareSel): string {
+  const r = compareRangeFor(main, sel);
+  return r ? customEnds(r).join(" – ") : "";
+}
+
+const dayStr = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+/** "Compare to" picker: nothing, the previous period, or two dates. */
+export const CompareControl: React.FC<{ main: TimeRange; value: CompareSel; onChange: (v: CompareSel) => void }> = ({
+  main,
+  value,
+  onChange,
+}) => {
+  const custom = value.startsWith("custom:");
+  const cr = compareRangeFor(main, value);
+  const from = cr ? dayStr(cr.start_ts_ms) : dayStr(main.start_ts_ms - (main.end_ts_ms - main.start_ts_ms));
+  const to = cr ? dayStr(addDays(cr.end_ts_ms, -1)) : dayStr(addDays(main.start_ts_ms, -1));
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="flex flex-col gap-1">
+        <span className={fieldLabel}>Compare to</span>
+        <select
+          value={custom ? "custom" : value}
+          onChange={(e) =>
+            onChange(e.target.value === "custom" ? `custom:${from}:${to}` : e.target.value)
+          }
+          className={field}
+        >
+          <option value="">No comparison</option>
+          <option value="previous">Previous period</option>
+          <option value="custom">Specific dates (e.g. before a release)</option>
+        </select>
+      </label>
+      {custom && (
+        <div className="flex items-center gap-1.5">
+          <input
+            type="date"
+            aria-label="Compare from"
+            value={from}
+            onChange={(e) => e.target.value && onChange(`custom:${e.target.value}:${to}`)}
+            className={`${field} w-auto`}
+          />
+          <span className="text-xs text-muted">to</span>
+          <input
+            type="date"
+            aria-label="Compare to"
+            value={to}
+            onChange={(e) => e.target.value && onChange(`custom:${from}:${e.target.value}`)}
+            className={`${field} w-auto`}
+          />
+        </div>
+      )}
+    </div>
+  );
+};

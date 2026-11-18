@@ -120,3 +120,111 @@ Branch `feat/product-improvements`, based on `origin/main` @ `66a0a07`. IDs refe
 - **Change:** with pageview autocapture on, `history.pushState`/`replaceState` are wrapped and emit one `$pageview` per new path + query. `shutdown()` restores the originals.
 - **Files:** `sdks/ts-web/src/index.ts`.
 - **Tests:** a new SDK test: pushState to a new path → +1, same-URL replaceState → +0, query change → +1, and history is restored on shutdown.
+
+## E-13b SDK production defaults (P0-4 remainder)
+
+- **Change:** the queue persists to `localStorage` (capped, restored on load, in-flight events kept until acknowledged). `window.onerror` and `unhandledrejection` are captured (`captureErrors`, default on). Failed `fetch`/XHR calls are recorded as breadcrumbs with origin + path only (no query string, no bodies). Replay snapshots are taken automatically on DOM change (throttled to 1 s). `debug: true` logs what the SDK does.
+- **Files:** `sdks/ts-web/src/index.ts`, `docs/web-sdk.md`.
+- **Tests:** `sdks/ts-web/test/sdk.test.mjs` (8 tests): the queue survives a "reload", errors and failed requests are captured, and query strings are stripped.
+
+## E-13c Segment `identify` and `alias` inside batches
+
+- **Change:** batch items of type `identify` and `alias` are applied after the events are stored. `identify` with both ids merges them and applies `traits`; with one id it sets the traits; `alias` merges `previousId`. The response reports `profiles_updated`.
+- **Files:** `pulse-wire/src/batch.rs`, `pulse-ingest/src/service.rs`.
+- **Tests:** `correctness.rs`: a Segment `identify` in a batch links `seg_anon` to `seg_user`, and an event the anonymous id sends counts for a user with `segment_plan = pro`.
+
+## E-14 Durable dedup for imports (I-18)
+
+- **Change:** `/import` claims every event id in a metastore table (`import_seen`, migration 0009) before ingesting. Only ids not seen before go through. On an ingest failure the claims are released, so a retry isn't counted as a duplicate. Ids are kept for 30 days. Claiming first also makes two concurrent imports of the same file add each event once.
+- **Files:** `pulse-control/src/{api.rs,db.rs}`, `migrations/0009_erasure_time_import_dedup.sql`.
+- **Tests:** `correctness.rs`: re-importing the same file after a restart (which clears the in-memory window) gives `accepted: 0, deduped: 1`, and the count stays 1.
+
+## E-15 Time-scoped erasure, dropped at compaction (B-12)
+
+- **Change:**
+  - Tombstones carry `erased_at_ms` (migration 0009). Rows erased before the migration keep the old meaning (hidden for good).
+  - Tombstones moved from the query catalog to the storage layer (`ErasedUids`), so queries and the compactor use one set. The control plane sets them without opening a project's storage.
+  - Scanners hide an event only when its raw or canonical id was erased at or after the event's time, in L0 and L1 alike. Session search uses the session start.
+  - Compaction drops erased rows from the merged segment, so they leave disk. Compactor nodes now reload control state to get the tombstones.
+- **Files:** `pulse-storage/src/{erased.rs,engine.rs,lib.rs}`, `pulse-exec/src/{scanner.rs,engine.rs,catalog.rs}`, `pulse-control/src/{api.rs,db.rs}`, `pulse-node/src/lib.rs`.
+- **Tests:**
+  - `erased.rs` unit test.
+  - `pulse-ingest` `compaction_drops_erased_rows_and_keeps_later_ones` reads the compacted segment back: the erased row is gone and the post-erasure row is kept. It **fails** with the compaction filter removed (verified).
+  - `correctness.rs`: erase `er1`, then `er1` sends a new event. The total is 2 (control user + re-signup), live and after a restart. Without erasure it would be 3; with the old permanent tombstone, 1.
+
+## E-16 MCP tools for follow-up questions (P1-7)
+
+- **Change:** four new tools:
+  - `query_flows`: next or previous events per step.
+  - `get_user`: merged profile, revenue, recent events.
+  - `list_property_values`: top values with counts, so an agent filters on values that exist.
+  - `list_cohorts`: definitions and sizes.
+
+  Event names are validated with "Did you mean" like the other tools.
+- **Files:** `pulse-control/src/mcp.rs`, `docs/mcp.md`.
+- **Tests:** `correctness.rs`:
+  - `list_property_values(user.tier, Login)` is exactly basic 1,099, gold 100, platinum 1.
+  - `get_user(p0700)` shows the trait set while anonymous.
+  - `query_flows` after signup includes Product Viewed.
+
+## E-17 Report state in the URL, landing and starter dashboard (P1-1)
+
+- **Change:**
+  - Every report page keeps its query in the URL (`#/funnels?q=<base64url>&range=`) with `replaceState`, and restores it on load. A link or a reload opens the same report.
+  - Sign-in lands on Dashboards.
+  - The demo seed creates an "Overview" dashboard: onboarding funnel, daily active users, day-N retention and a note.
+- **Files:** `web/src/dashboards/SaveToDashboard.tsx` (shared `useSavedReport`), the four report workspaces, `web/src/App.tsx`, `pulse-node/src/seeder.rs`.
+
+## E-18 Funnel builder: per-step conditions and an honest empty state
+
+- **Change:**
+  - Each step has "+ where" (property is / is not / contains a value), sent as `FunnelStepSpec.filters` and restored from saved reports and URLs.
+  - With fewer than two steps the page says "Pick the steps of a journey you care about" instead of "No events in this project yet" (that message now only shows when the project really has no events).
+- **Files:** `web/src/workspaces/FunnelsWorkspace.tsx`.
+
+## E-19 Cohort as a Trends split
+
+- **Change:** "Break down by" in Trends lists saved cohorts ("In a cohort or not"), sent as `$cohort:<id>`. Results are labelled "In cohort" / "Not in cohort". Only the Trends engine supports cohort breakdowns, so the option is only offered there.
+- **Files:** `web/src/workspaces/InsightsWorkspace.tsx`.
+
+## E-20 Users page (P1-4)
+
+- **Change:** a top-level Users page:
+  - SQL search with Previous/Next pages.
+  - Columns picked from the project's own most common properties (no hardcoded `plan`/`utm_source`).
+  - Merged profile properties (all of a user's ids; the detail endpoint now merges them too).
+  - A readable timeline grouped by day, with event properties shown as text.
+  - "Play session" inline for recorded sessions.
+  - Erase with an explicit confirmation, the erasure log, and CSV export of every matching profile.
+
+  The old JSON panel inside Cohorts is removed.
+- **Files:** `web/src/workspaces/UsersWorkspace.tsx` (new), `web/src/App.tsx`, `web/src/workspaces/CohortsLookupsWorkspace.tsx`, `web/src/api/client.ts`, `pulse-control/src/api.rs`.
+
+## E-21 Full drop-off list (P1-3)
+
+- **Change:** the funnel engine records, per step, the users who stopped right before it, in a compressed bitmap (one insert per non-converting user). `POST /v1/projects/:id/query/funnel/dropped?step=N` returns them as CSV or JSON. It needs the admin role, like cohort export. The drop-off drawer has "Download all N" for admins.
+- **Files:** `pulse-exec/src/{funnel.rs,ast.rs,engine.rs}`, `pulse-control/src/{api.rs,api/accounts.rs}`, `web/src/workspaces/FunnelsWorkspace.tsx`.
+- **Tests:**
+  - `correctness.rs`: dropped before step 3 of the 100/80/50/30/20 funnel is exactly 30 distinct users.
+  - The route-guard unit test asserts admin.
+
+## E-22 Project creation and key rotation (P1-6)
+
+- **Change:** Settings has a Projects panel for admins: the list, and "Create project" with a time-zone picker (the browser's IANA zones, its own first). The new project's ingest key is shown once, and the app switches to the project. API keys have "Rotate": a new key with the same label and role, then the old one revoked, with a confirmation that says the old key stops at once.
+- **Files:** `web/src/account/SettingsPage.tsx`, `web/src/App.tsx`, `web/src/api/client.ts`.
+
+## E-23 Release impact: annotations and range comparison (P1-5)
+
+- **Change:**
+  - Annotations: a table (migration 0010) and `GET/POST/DELETE /v1/projects/:id/annotations`.
+  - Trends draws them as dashed markers with the text on hover, and lists them under the chart with an add form (members and above).
+  - Funnels and Retention have "Compare to": previous period, or specific dates (for example the weeks before a release).
+    - Funnels show the compared conversion in the headline ("+x pts now") and "was y%" per step.
+    - Retention draws the compared curve dashed in the second-series colour, with both values in the tooltip.
+  - The choice is saved with the report and the URL.
+- **Files:** `pulse-control/src/{api.rs,db.rs,models.rs}`, `migrations/0010_annotations.sql`, `web/src/components/Annotations.tsx` (new), `web/src/dashboards/ReportCard.tsx` (`CompareControl`), the Trends, Funnels and Retention workspaces.
+- **Tests:** `correctness.rs`: create, list by range (in and out), delete.
+
+## E-24 Site claims (P1-8)
+
+- **Change:** `site/index.html` no longer claims group-property splits (not supported) or retention cell drill-down (not built). It now describes range comparison, which ships.

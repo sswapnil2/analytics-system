@@ -42,6 +42,8 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         "/v1/projects/:id/export/warehouse",
         // Bulk download of users and their properties, like /export.
         "/v1/projects/:id/cohorts/:cohort_id/export",
+        // Every user who dropped off at a funnel step, as ids.
+        "/v1/projects/:id/query/funnel/dropped",
         "/v1/projects/:id/deletions",
         "/v1/org/invites",
         "/v1/org/invites/:invite_id",
@@ -981,6 +983,10 @@ mod tests {
         );
         assert_eq!(
             r(Method::DELETE, "/v1/projects/:id/users/:distinct_id"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/query/funnel/dropped"),
             Role::Admin
         );
         assert_eq!(r(Method::POST, "/v1/projects"), Role::Admin);

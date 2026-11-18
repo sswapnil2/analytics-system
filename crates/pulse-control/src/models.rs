@@ -191,6 +191,17 @@ pub struct SavedReport {
     pub updated_at_ms: i64,
 }
 
+/// A dated note on the project's timeline, drawn on report charts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    pub id: String,
+    pub project_id: String,
+    pub ts_ms: i64,
+    pub text: String,
+    pub created_by: Option<String>,
+    pub created_at_ms: i64,
+}
+
 pub const REPORT_KINDS: [&str; 4] = ["funnel", "insights", "retention", "flows"];
 
 /// One tile on a dashboard: a saved report or a markdown/text note.

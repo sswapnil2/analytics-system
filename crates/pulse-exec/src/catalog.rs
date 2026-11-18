@@ -19,7 +19,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pulse_identity::IdentitySnapshot;
 use pulse_storage::extract_arrow_str;
 use pulse_wire::PropValue;
-use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{BehavioralCohortDef, PropPredicate};
@@ -538,7 +537,7 @@ impl LookupTableDef {
     }
 }
 
-/// Per-project virtual schema catalog (Custom Events, Custom Properties, Lookup Tables, Saved Cohorts, User Profiles, Deleted UIDs, and IANA Timezone).
+/// Per-project virtual schema catalog (Custom Events, Custom Properties, Lookup Tables, Saved Cohorts, User Profiles, and IANA Timezone).
 pub struct VirtualCatalog {
     pub custom_events: DashMap<String, CustomEventDef>,
     pub custom_properties: DashMap<String, CustomPropertyDef>,
@@ -546,7 +545,6 @@ pub struct VirtualCatalog {
     pub saved_cohorts: DashMap<String, BehavioralCohortDef>,
     user_profiles: RwLock<HashMap<u32, HashMap<String, PropValue>>>,
     user_prop_keys: RwLock<HashSet<String>>,
-    deleted_uids: RwLock<RoaringBitmap>,
     timezone: RwLock<Tz>,
 }
 
@@ -559,7 +557,6 @@ impl Default for VirtualCatalog {
             saved_cohorts: DashMap::new(),
             user_profiles: RwLock::new(HashMap::new()),
             user_prop_keys: RwLock::new(HashSet::new()),
-            deleted_uids: RwLock::new(RoaringBitmap::new()),
             timezone: RwLock::new(chrono_tz::UTC),
         }
     }
@@ -608,19 +605,6 @@ impl VirtualCatalog {
 
     pub fn remove_user_profile(&self, canon_uid: u32) {
         self.user_profiles.write().remove(&canon_uid);
-    }
-
-    pub fn set_deleted_uids(&self, uids: RoaringBitmap) {
-        *self.deleted_uids.write() = uids;
-    }
-
-    pub fn mark_deleted_uids(&self, uids: &RoaringBitmap) {
-        let mut guard = self.deleted_uids.write();
-        *guard |= uids;
-    }
-
-    pub fn deleted_uids_snapshot(&self) -> RoaringBitmap {
-        self.deleted_uids.read().clone()
     }
 
     /// Sorted user profile property keys (without the `user.` prefix).

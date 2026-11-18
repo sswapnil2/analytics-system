@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { Check, Copy, KeyRound, Plus, UserPlus } from "lucide-react";
+import { Check, Copy, FolderPlus, KeyRound, Plus, RotateCw, UserPlus } from "lucide-react";
 import {
   api,
   ApiKeyRecord,
@@ -8,6 +8,7 @@ import {
   OrgInvite,
   OrgMember,
   outranks,
+  ProjectInfo,
   Role,
   roleAtLeast,
   ROLES,
@@ -70,11 +71,21 @@ const OneTimeValue: React.FC<{ title: string; value: string }> = ({ title, value
 /** Roles `me` may hand out. */
 const grantable = (me: Role) => ROLES.filter((r) => outranks(me, r));
 
-export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; projectName: string }> = ({
-  user,
-  projectId,
-  projectName,
-}) => {
+/** IANA zones from the browser, with the browser's own zone first. */
+function timeZones(): string[] {
+  const own = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const all = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [];
+  return Array.from(new Set([own, "UTC", ...all]));
+}
+
+export const SettingsPage: React.FC<{
+  user: AuthUser | null;
+  projectId: string;
+  projectName: string;
+  projects: ProjectInfo[];
+  /** Called with the new project's id after it is created, so the app can switch to it. */
+  onProjectCreated: (id: string) => void;
+}> = ({ user, projectId, projectName, projects, onProjectCreated }) => {
   const [org, setOrg] = useState<OrgInfo | null>(null);
   const [members, setMembers] = useState<OrgMember[] | null>(null);
   const [invites, setInvites] = useState<OrgInvite[]>([]);
@@ -88,6 +99,10 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
   const [inviting, setInviting] = useState(false);
   const [keyLabel, setKeyLabel] = useState("");
   const [creatingKey, setCreatingKey] = useState(false);
+  const [projName, setProjName] = useState("");
+  const [projTz, setProjTz] = useState(() => timeZones()[0]);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const zones = React.useMemo(timeZones, []);
 
   const me = org?.role;
   const isAdmin = roleAtLeast(me, "admin");
@@ -135,6 +150,33 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
       setInviteEmail("");
     });
     setInviting(false);
+  };
+
+  const createProject = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!projName.trim()) return setError("Name the project.");
+    setCreatingProject(true);
+    await act(async () => {
+      const res = await api.createProject({ name: projName.trim(), timezone: projTz });
+      setNotice({
+        title: `Created "${res.project.name}". Copy its ingest key now; it is shown only once.`,
+        value: res.api_key.plaintext_key,
+      });
+      setProjName("");
+      onProjectCreated(res.project.id);
+    });
+    setCreatingProject(false);
+  };
+
+  // A new key with the same label and role, then the old one revoked at once (the confirm says so).
+  const rotateKey = (k: ApiKeyRecord) => {
+    if (!window.confirm(`Rotate "${k.label}"? A new key is created and this one stops working right away. Update your apps with the new key.`))
+      return;
+    void act(async () => {
+      const created = await api.createApiKey(projectId, { label: k.label, role: k.role });
+      await api.revokeApiKey(projectId, k.id);
+      setNotice({ title: `New key for "${k.label}". Copy it now; it is shown only once.`, value: created.plaintext_key });
+    });
   };
 
   const createKey = async (e: React.FormEvent) => {
@@ -337,6 +379,45 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
         </Panel>
       )}
 
+      {isAdmin && (
+        <Panel title="Projects" meta={`${projects.length}`}>
+          <div className="space-y-4">
+            {projects.length > 0 && (
+              <ul className="divide-y divide-line text-sm">
+                {projects.map((p) => (
+                  <li key={p.id} className="flex flex-wrap items-baseline justify-between gap-2 py-2">
+                    <span className="font-medium text-ink">{p.name}</span>
+                    <span className="text-xs text-muted">
+                      {p.timezone} · <code className="font-mono">{p.id}</code>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <form onSubmit={(e) => void createProject(e)} className="flex flex-wrap items-end gap-2">
+              <label className="flex min-w-[12rem] flex-1 flex-col gap-1">
+                <span className={fieldLabel}>New project name</span>
+                <input value={projName} onChange={(e) => setProjName(e.target.value)} placeholder="Web app (production)" className={field} />
+              </label>
+              <label className="flex min-w-[12rem] flex-col gap-1">
+                <span className={fieldLabel}>Time zone (days and hours in reports)</span>
+                <select value={projTz} onChange={(e) => setProjTz(e.target.value)} className={field}>
+                  {zones.map((z) => (
+                    <option key={z} value={z}>
+                      {z.replace(/_/g, " ")}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button type="submit" disabled={creatingProject} className={btn.primary}>
+                <FolderPlus className="h-3.5 w-3.5" />
+                {creatingProject ? "Creating…" : "Create project"}
+              </button>
+            </form>
+          </div>
+        </Panel>
+      )}
+
       {isAdmin && projectId && (
         <Panel title="API keys" meta={projectName}>
           <div className="space-y-4">
@@ -377,6 +458,9 @@ export const SettingsPage: React.FC<{ user: AuthUser | null; projectId: string; 
                         <td className="py-2.5 pr-3 text-ink-2">{k.label}</td>
                         <td className="py-2.5 pr-3 text-xs text-muted">{formatTimestamp(k.created_at_ms)}</td>
                         <td className="py-2.5 text-right">
+                          <button type="button" onClick={() => rotateKey(k)} className={btn.ghost}>
+                            <RotateCw className="h-3.5 w-3.5" /> Rotate
+                          </button>
                           <button
                             type="button"
                             onClick={() => {

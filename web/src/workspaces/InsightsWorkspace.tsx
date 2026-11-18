@@ -3,6 +3,7 @@ import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
+import { AnnotationsList, useAnnotations } from "../components/Annotations";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
@@ -18,7 +19,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
-import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, useCohortNames } from "../components/FilterPanel";
 
 interface Props {
   projectId: string;
@@ -208,6 +209,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
+    { query: buildQuery, range },
   );
 
   const runQuery = useCallback(async () => {
@@ -220,7 +222,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
     setError(null);
     try {
       const res = await api.queryInsights(projectId, { time_range: rangeFor(range), ...buildQuery() });
-      if (id === reqId.current) setResult(res);
+      // A cohort split comes back as in_cohort / not_in_cohort; the summary names the cohort.
+      const cohortKey = (k: string) => (k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k);
+      if (id === reqId.current)
+        setResult({
+          ...res,
+          series: res.series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
+          previous_series: res.previous_series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
+        });
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
@@ -267,7 +276,17 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const displayedSeries = result
     ? (formula.trim() && result.formula_series.length > 0 ? result.formula_series : result.series).slice(0, 6)
     : [];
+  const shownRange = rangeFor(range);
+  const notes = useAnnotations(projectId, shownRange.start_ts_ms, shownRange.end_ts_ms);
   const buckets = result?.buckets_ts_ms ?? [];
+  // Bucket index each annotation falls in (the last bucket starting at or before it).
+  const noteMarks = notes.list
+    .map((a) => {
+      let i = -1;
+      for (let j = 0; j < buckets.length && buckets[j] <= a.ts_ms; j++) i = j;
+      return { a, i };
+    })
+    .filter((m) => m.i >= 0);
   const n = buckets.length;
   const maxY = niceCeil(
     Math.max(0, ...displayedSeries.flatMap((s) => s.points.map((p) => p.value ?? 0))),
@@ -281,7 +300,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const tableRows = result ? [...result.formula_series, ...result.series].slice(0, 18) : [];
   const tableBuckets = buckets.slice(-7);
 
-  const breakdownOptions = Array.from(new Set([...availableProps, breakdown].filter(Boolean)));
+  const cohortNames = useCohortNames(projectId);
+  const breakdownOptions = Array.from(
+    new Set([...availableProps, breakdown].filter((p) => p && !p.startsWith("$cohort:"))),
+  );
+  const cohortName = (dim: string) =>
+    cohortNames.find((c) => `$cohort:${c.id}` === dim)?.name ?? dim.slice("$cohort:".length);
+  const breakdownLabel = (dim: string) =>
+    dim.startsWith("$cohort:") ? `in cohort ${cohortName(dim)}` : dim.replace(/_/g, " ");
   const eventOptions = Array.from(
     new Set([...availableEvents.filter((e) => !e.startsWith("$")), ...series.map((s) => s.eventName)].filter(Boolean)),
   );
@@ -324,7 +350,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         summary={[
           `${series.length} metric${series.length === 1 ? "" : "s"}`,
           formula.trim() ? `formula ${formula.trim()}` : null,
-          breakdown ? `by ${breakdown.replace(/_/g, " ")}` : "no breakdown",
+          breakdown ? `by ${breakdownLabel(breakdown)}` : "no breakdown",
           describeFilter(filter),
         ]
           .filter(Boolean)
@@ -474,6 +500,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   {p.replace(/_/g, " ")}
                 </option>
               ))}
+              {cohortNames.length > 0 && (
+                <optgroup label="In a cohort or not">
+                  {cohortNames.map((c) => (
+                    <option key={c.id} value={`$cohort:${c.id}`}>
+                      {c.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </label>
           <div className="flex flex-wrap items-end justify-between gap-3">
@@ -676,6 +711,23 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   );
                 })}
 
+                {noteMarks.map(({ a, i }) => (
+                  <g key={a.id}>
+                    <line
+                      x1={xAt(i)}
+                      x2={xAt(i)}
+                      y1={PLOT.bottom - PLOT_H}
+                      y2={PLOT.bottom}
+                      stroke="rgb(var(--warn))"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                    <circle cx={xAt(i)} cy={PLOT.bottom - PLOT_H} r={4} fill="rgb(var(--warn))">
+                      <title>{`${new Date(a.ts_ms).toLocaleDateString()}: ${a.text}`}</title>
+                    </circle>
+                  </g>
+                ))}
+
                 {buckets.map((ts, idx) =>
                   idx % labelEvery !== 0 && idx !== n - 1 ? null : (
                     <text
@@ -722,6 +774,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
             </div>
           </>
         )}
+        <AnnotationsList projectId={projectId} annotations={notes.list} error={notes.error} onChanged={() => void notes.reload()} />
       </Panel>
 
       {result && tableRows.length > 0 && (

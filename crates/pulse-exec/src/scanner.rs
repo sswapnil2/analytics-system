@@ -229,7 +229,11 @@ pub async fn load_project_chunks_with_id(
     id_snap: Option<&IdentitySnapshot>,
 ) -> Result<Vec<DataChunk>> {
     let dict = ps.dictionary();
-    let deleted_uids = catalog.deleted_uids_snapshot();
+    let erased = ps.erased_snapshot();
+    // An event is hidden when its raw id or its canonical id was erased at or after its time.
+    let hidden = |u: u32, ts: i64| {
+        erased.hides(u, ts) || id_snap.is_some_and(|s| erased.hides(s.resolve(u), ts))
+    };
 
     // Expand requested properties to include dependencies of Custom Properties & Lookup Tables
     let mut base_props_needed: HashSet<String> = HashSet::new();
@@ -303,7 +307,8 @@ pub async fn load_project_chunks_with_id(
     let futs = filtered_segments.iter().map(|seg| {
         let base_props_ref = &base_props_vec;
         let final_props_ref = &final_props_vec;
-        let deleted_ref = &deleted_uids;
+        let erased_ref = &erased;
+        let hidden_ref = &hidden;
         async move {
             let mut tier_a = cache.get_tier_a(seg).await?;
             let orig_n = tier_a.len();
@@ -319,18 +324,11 @@ pub async fn load_project_chunks_with_id(
             }
 
             let mut seg_meta_opt = Some(seg.clone());
-            if !deleted_ref.is_empty()
-                && tier_a.uid_internal.iter().any(|&u| {
-                    deleted_ref.contains(u)
-                        || id_snap.is_some_and(|s| deleted_ref.contains(s.resolve(u)))
-                })
+            if !erased_ref.is_empty()
+                && (0..orig_n).any(|r| hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
             {
                 let keep_idx: Vec<usize> = (0..orig_n)
-                    .filter(|&r| {
-                        let u = tier_a.uid_internal[r];
-                        !(deleted_ref.contains(u)
-                            || id_snap.is_some_and(|s| deleted_ref.contains(s.resolve(u))))
-                    })
+                    .filter(|&r| !hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
                     .collect();
                 let mut f_uid = Vec::with_capacity(keep_idx.len());
                 let mut f_sh = Vec::with_capacity(keep_idx.len());
@@ -390,10 +388,7 @@ pub async fn load_project_chunks_with_id(
             .into_iter()
             .filter(|r| {
                 time_range.is_none_or(|tr| tr.contains(r.event_ts_ms))
-                    && (deleted_uids.is_empty()
-                        || !(deleted_uids.contains(r.uid_internal)
-                            || id_snap
-                                .is_some_and(|s| deleted_uids.contains(s.resolve(r.uid_internal)))))
+                    && (erased.is_empty() || !hidden(r.uid_internal, r.event_ts_ms))
             })
             .collect();
         if l0_rows.is_empty() {

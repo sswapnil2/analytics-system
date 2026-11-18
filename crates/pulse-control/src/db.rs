@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -12,9 +12,9 @@ use thiserror::Error;
 use crate::license::SystemLicenseRecord;
 use crate::models::DashboardCard;
 use crate::models::{
-    AlertRule, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard, DeletionAuditRecord,
-    EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
+    AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
+    DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
     SystemKeyringRecord, User, UserProfileRecord,
 };
 
@@ -1023,6 +1023,59 @@ impl MetaStore {
     }
 
     /// Returns `false` when no report with this id exists in the project.
+    pub async fn insert_annotation(&self, a: &Annotation) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "INSERT INTO annotations (id, project_id, ts_ms, text, created_by, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            a.id.as_str(),
+            a.project_id.as_str(),
+            a.ts_ms,
+            a.text.as_str(),
+            a.created_by.as_deref(),
+            a.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Annotations with `start_ms <= ts_ms < end_ms`, oldest first.
+    pub async fn list_annotations(
+        &self,
+        project_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Annotation>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, ts_ms, text, created_by, created_at_ms FROM annotations
+             WHERE project_id = ? AND ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms ASC LIMIT 500",
+            |r| {
+                Annotation {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    ts_ms: r.get("ts_ms"),
+                    text: r.get("text"),
+                    created_by: r.get("created_by"),
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            project_id,
+            start_ms,
+            end_ms,
+        );
+        Ok(rows)
+    }
+
+    pub async fn delete_annotation(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM annotations WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
     pub async fn delete_saved_report(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
         let affected = db_exec!(
             self,
@@ -1957,27 +2010,108 @@ impl MetaStore {
         &self,
         project_id: &str,
         uids: &[u32],
+        erased_at_ms: i64,
     ) -> Result<(), MetaError> {
         for &uid in uids {
-            let _ = db_exec!(
+            db_exec!(
                 self,
-                "INSERT INTO erased_uids (project_id, uid) VALUES (?, ?)
-                 ON CONFLICT(project_id, uid) DO NOTHING",
+                "INSERT INTO erased_uids (project_id, uid, erased_at_ms) VALUES (?, ?, ?)
+                 ON CONFLICT(project_id, uid) DO UPDATE SET erased_at_ms = excluded.erased_at_ms",
                 project_id,
                 uid as i64,
+                erased_at_ms,
             );
         }
         Ok(())
     }
 
-    pub async fn list_erased_uids(&self, project_id: &str) -> Result<Vec<u32>, MetaError> {
+    /// `(raw uid, erased at ms)` for every erased id in the project.
+    pub async fn list_erased_uids(&self, project_id: &str) -> Result<Vec<(u32, i64)>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT uid FROM erased_uids WHERE project_id = ?",
-            |r| { r.get::<i64, _>("uid").max(0) as u32 },
+            "SELECT uid, erased_at_ms FROM erased_uids WHERE project_id = ?",
+            |r| {
+                (
+                    r.get::<i64, _>("uid").max(0) as u32,
+                    r.get::<i64, _>("erased_at_ms"),
+                )
+            },
             project_id,
         );
         Ok(rows)
+    }
+
+    /// Records event ids taken in by an import and returns the ones not seen before. Claiming
+    /// first makes two concurrent imports of the same file add each event once.
+    pub async fn claim_import_uuids(
+        &self,
+        project_id: &str,
+        uuids: &[String],
+        now_ms: i64,
+    ) -> Result<HashSet<String>, MetaError> {
+        let mut fresh = HashSet::new();
+        for chunk in uuids.chunks(300) {
+            let mut sql = String::from(
+                "INSERT INTO import_seen (project_id, event_uuid, seen_at_ms) VALUES ",
+            );
+            for i in 0..chunk.len() {
+                sql.push_str(if i == 0 { "(?, ?, ?)" } else { ", (?, ?, ?)" });
+            }
+            sql.push_str(" ON CONFLICT(project_id, event_uuid) DO NOTHING RETURNING event_uuid");
+            let got: Vec<String> = match self {
+                MetaStore::Sqlite(pool) => {
+                    let mut q = sqlx::query(&sql);
+                    for u in chunk {
+                        q = q.bind(project_id).bind(u).bind(now_ms);
+                    }
+                    q.fetch_all(pool)
+                        .await?
+                        .into_iter()
+                        .map(|r| r.get::<String, _>("event_uuid"))
+                        .collect()
+                }
+                MetaStore::Postgres(pool) => {
+                    let pg_q = pg_rewrite(&sql);
+                    let mut q = sqlx::query(&pg_q);
+                    for u in chunk {
+                        q = q.bind(project_id).bind(u).bind(now_ms);
+                    }
+                    q.fetch_all(pool)
+                        .await?
+                        .into_iter()
+                        .map(|r| r.get::<String, _>("event_uuid"))
+                        .collect()
+                }
+            };
+            fresh.extend(got);
+        }
+        Ok(fresh)
+    }
+
+    /// Gives back claims for an import that failed, so a retry is not counted as a duplicate.
+    pub async fn release_import_uuids(
+        &self,
+        project_id: &str,
+        uuids: &[String],
+    ) -> Result<(), MetaError> {
+        for u in uuids {
+            db_exec!(
+                self,
+                "DELETE FROM import_seen WHERE project_id = ? AND event_uuid = ?",
+                project_id,
+                u.as_str(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Forgets import ids older than `before_ms`.
+    pub async fn prune_import_uuids(&self, before_ms: i64) -> Result<u64, MetaError> {
+        Ok(db_exec!(
+            self,
+            "DELETE FROM import_seen WHERE seen_at_ms < ?",
+            before_ms
+        ))
     }
 
     pub async fn upsert_alert_rule(&self, alert: &AlertRule) -> Result<(), MetaError> {

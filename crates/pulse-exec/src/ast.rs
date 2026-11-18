@@ -614,6 +614,10 @@ pub struct FunnelResult {
     pub breakdowns: Vec<FunnelBreakdownGroup>,
     pub time_to_convert: TimeToConvertStats,
     pub dropped_sample_sessions: Vec<DroppedSessionSample>,
+    /// Canonical uids that stopped right before step `i` (index 0 unused). Not sent to clients;
+    /// `QueryEngine::query_funnel_dropped_users` turns one step into an id list.
+    #[serde(skip)]
+    pub dropped_uids_by_step: Vec<roaring::RoaringBitmap>,
 }
 
 // ======================= RETENTION =======================

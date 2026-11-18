@@ -53,6 +53,7 @@ import { InsightsWorkspace } from "./workspaces/InsightsWorkspace";
 import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
 import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
+import { UsersWorkspace } from "./workspaces/UsersWorkspace";
 import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
 import { ByokCommercialPanel } from "./components/ByokCommercialPanel";
 import { AccessContext } from "./auth/access";
@@ -64,6 +65,7 @@ type WorkspaceId =
   | "journeys"
   | "retention"
   | "replays"
+  | "users"
   | "cohorts"
   | "experiments"
   | "events"
@@ -98,6 +100,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
     label: "Audience and shipping",
     items: [
+      { id: "users", label: "Users", icon: UserRound },
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
@@ -111,7 +114,7 @@ const ACCOUNT_IDS: WorkspaceId[] = ["profile", "settings"];
 const ALL_IDS = [...NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id)), ...ACCOUNT_IDS];
 // Report builders that default to the project's own events.
 const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
-const DEFAULT_TAB: WorkspaceId = "funnels";
+const DEFAULT_TAB: WorkspaceId = "dashboards";
 
 function tabFromHash(): WorkspaceId {
   const h = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
@@ -714,6 +717,14 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                 user={user}
                 projectId={activePid}
                 projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
+                projects={projects}
+                onProjectCreated={(id) => {
+                  setProjectId(id);
+                  setCatalogLoaded(false);
+                  setAvailableEvents([]);
+                  setAvailableProps([]);
+                  setRefreshToken((n) => n + 1);
+                }}
               />
             ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
               <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
@@ -783,6 +794,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                     refreshToken={refreshToken}
                   />
                 )}
+                {activeTab === "users" && <UsersWorkspace projectId={activePid} />}
                 {activeTab === "cohorts" && (
                   <CohortsLookupsWorkspace
                     projectId={activePid}

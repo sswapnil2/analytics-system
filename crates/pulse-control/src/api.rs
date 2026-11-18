@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -50,12 +50,13 @@ use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
-    unseal_byok_config_json, unseal_secret, AlertRule, ApiKeyRecord, ByokCredentialRecord,
-    ByokCredentialView, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard,
-    DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord, Experiment, ExperimentMetricSpec,
-    FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project, Role,
-    SavedReport, SystemKeyringRecord, UserProfileRecord, VariantAllocation, BYOK_CATEGORIES,
-    KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    unseal_byok_config_json, unseal_secret, AlertRule, Annotation, ApiKeyRecord,
+    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
+    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
+    LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
+    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -862,11 +863,9 @@ impl ControlPlaneService {
             .list_erased_uids(project_id)
             .await
             .map_err(|e| e.to_string())?;
-        let mut erased_bm = RoaringBitmap::new();
-        for u in erased {
-            erased_bm.insert(u);
-        }
-        cat.set_deleted_uids(erased_bm);
+        self.qengine
+            .storage()
+            .set_erased(project_id, erased.into_iter().collect());
 
         Ok(())
     }
@@ -957,13 +956,19 @@ impl ControlPlaneService {
             .map_err(CtrlError::meta)?;
 
         let uid_vec: Vec<u32> = uids_bm.iter().collect();
+        let erased_at_ms = Utc::now().timestamp_millis();
         self.meta
-            .insert_erased_uids(project_id, &uid_vec)
+            .insert_erased_uids(project_id, &uid_vec, erased_at_ms)
             .await
             .map_err(CtrlError::meta)?;
 
+        let storage = self.qengine.storage();
+        let mut erased = (*storage.erased_snapshot(project_id)).clone();
+        for &u in &uid_vec {
+            erased.insert(u, erased_at_ms);
+        }
+        storage.set_erased(project_id, erased);
         let cat = self.qengine.catalogs().for_project(project_id);
-        cat.mark_deleted_uids(&uids_bm);
         cat.remove_user_profile(canon_uid);
 
         let rec = DeletionAuditRecord {
@@ -989,7 +994,7 @@ const PROFILE_SYNC_OVERLAP_MS: i64 = 60_000;
 
 /// Merges profile rows (oldest first) into one record per canonical user: for each property
 /// the most recently written value wins, and revenue adds up across the user's ids.
-fn merge_profile_rows(
+pub(crate) fn merge_profile_rows(
     rows: Vec<UserProfileRecord>,
 ) -> std::collections::BTreeMap<u32, UserProfileRecord> {
     let mut out = std::collections::BTreeMap::<u32, UserProfileRecord>::new();
@@ -1281,6 +1286,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         )
         .route("/v1/projects/:id/query/funnel", post(handle_query_funnel))
         .route(
+            "/v1/projects/:id/query/funnel/dropped",
+            post(handle_query_funnel_dropped),
+        )
+        .route(
             "/v1/projects/:id/query/retention",
             post(handle_query_retention),
         )
@@ -1355,6 +1364,14 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/custom-properties",
             post(handle_create_custom_property),
+        )
+        .route(
+            "/v1/projects/:id/annotations",
+            get(handle_list_annotations).post(handle_create_annotation),
+        )
+        .route(
+            "/v1/projects/:id/annotations/:ann_id",
+            axum::routing::delete(handle_delete_annotation),
         )
         // Saved Reports & Dashboards
         .route(
@@ -1943,6 +1960,47 @@ async fn handle_query_funnel(
         .await
         .map_err(CtrlError::exec)?;
     Ok(Json(res))
+}
+
+/// Every user who dropped off before `?step=N` of the funnel in the body, as CSV
+/// (`distinct_id` per line) or JSON with `?format=json`.
+async fn handle_query_funnel_dropped(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, CtrlError> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FunnelQuery = parse_json_body("funnel query", &body)?;
+    let step = params
+        .get("step")
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
+    let users = ctrl
+        .qengine
+        .query_funnel_dropped_users(&id, &q, step)
+        .await
+        .map_err(CtrlError::exec)?;
+    if params.get("format").map(String::as_str) == Some("json") {
+        return Ok(Json(json!({ "step": step, "users": users })).into_response());
+    }
+    let mut csv = String::from("distinct_id\n");
+    for u in &users {
+        csv.push_str(&csv_escape(u));
+        csv.push('\n');
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"dropped_step_{step}.csv\""),
+            ),
+        ],
+        csv,
+    )
+        .into_response())
 }
 
 async fn handle_query_retention(
@@ -2686,6 +2744,82 @@ fn validate_description(raw: Option<String>) -> Result<Option<String>, CtrlError
     Ok(desc)
 }
 
+async fn handle_list_annotations(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiRes<Vec<Annotation>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let num = |k: &str| q.get(k).and_then(|s| s.parse::<i64>().ok());
+    let list = ctrl
+        .meta
+        .list_annotations(
+            &id,
+            num("start_ts_ms").unwrap_or(i64::MIN),
+            num("end_ts_ms").unwrap_or(i64::MAX),
+        )
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(list))
+}
+
+#[derive(Deserialize)]
+struct CreateAnnotationReq {
+    ts_ms: i64,
+    text: String,
+}
+
+async fn handle_create_annotation(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateAnnotationReq>,
+) -> ApiRes<Annotation> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let text = req.text.trim();
+    if text.is_empty() || text.chars().count() > 280 {
+        return Err(CtrlError::bad(
+            "annotation text must be 1 to 280 characters",
+        ));
+    }
+    if req.ts_ms <= 0 {
+        return Err(CtrlError::bad("ts_ms must be a Unix time in milliseconds"));
+    }
+    let a = Annotation {
+        id: format!("ann_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id,
+        ts_ms: req.ts_ms,
+        text: text.to_string(),
+        created_by: Some(ctrl.principal_label(&principal).await?),
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .insert_annotation(&a)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(a))
+}
+
+async fn handle_delete_annotation(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, ann_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_annotation(&id, &ann_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!(
+            "annotation '{ann_id}' not found"
+        )));
+    }
+    Ok(Json(json!({ "deleted": ann_id })))
+}
+
 async fn handle_list_reports(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -3413,6 +3547,18 @@ async fn handle_get_user_detail(
         }
     }
 
+    // Show what every id merged into this user set, not just this id's row.
+    let profile = if canon_uid > 0 {
+        let rows = ctrl
+            .meta
+            .list_user_profiles_for_canonical(&id, canon_uid)
+            .await
+            .map_err(CtrlError::meta)?;
+        merge_profile_rows(rows).remove(&canon_uid).or(profile)
+    } else {
+        profile
+    };
+
     Ok(Json(json!({
         "distinct_id": distinct_id,
         "distinct_id_masked": mask_user_identifier(&distinct_id),
@@ -3451,6 +3597,10 @@ async fn handle_list_deletions(
         .map_err(CtrlError::meta)?;
     Ok(Json(list))
 }
+
+/// How long `/import` remembers an event id. Re-importing the same file within this window adds
+/// nothing. ponytail: one global window; make it per project if someone backfills older reruns.
+const IMPORT_DEDUP_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 
 async fn handle_import_events(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3578,16 +3728,50 @@ async fn handle_import_events(
         ev.client_sent_ts_ms = 0;
     }
     let now_ms = Utc::now().timestamp_millis();
-    let res = ingest
-        .ingest_for_project(&id, batch, now_ms)
+
+    // Re-running a backfill must add nothing, long after the in-memory dedup window has passed.
+    // Claim every event id first; only ids not seen before go through.
+    let ids: Vec<String> = batch
+        .events
+        .iter()
+        .map(|e| Uuid::from_bytes(e.event_uuid).simple().to_string())
+        .collect();
+    let fresh = ctrl
+        .meta
+        .claim_import_uuids(&id, &ids, now_ms)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::meta)?;
+    let claimed: Vec<String> = fresh.iter().cloned().collect();
+    let mut taken = HashSet::new();
+    let before = batch.events.len();
+    let mut keep = ids
+        .iter()
+        .map(|u| fresh.contains(u) && taken.insert(u.clone()));
+    batch.events.retain(|_| keep.next().unwrap_or(false));
+    let import_dupes = before - batch.events.len();
+
+    let res = match ingest.ingest_for_project(&id, batch, now_ms).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(re) = ctrl.meta.release_import_uuids(&id, &claimed).await {
+                tracing::warn!(error = %re, "failed to release import ids after a failed import");
+            }
+            return Err(CtrlError::bad(e.to_string()));
+        }
+    };
     let _ = ctrl.qengine.storage().flush_all_projects().await;
+    if let Err(e) = ctrl
+        .meta
+        .prune_import_uuids(now_ms - IMPORT_DEDUP_RETENTION_MS)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to prune old import ids");
+    }
 
     Ok(Json(json!({
         "status": res.status,
         "accepted": res.accepted,
-        "deduped": res.deduped,
+        "deduped": res.deduped + import_dupes,
         "dropped": res.dropped,
         "server_ts_ms": res.server_ts_ms,
         "rejected": res.rejected,

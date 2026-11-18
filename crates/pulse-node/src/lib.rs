@@ -343,6 +343,10 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                             }
                             NodeRole::Compactor => {
                                 let _ = bg_storage.refresh_all_manifests().await;
+                                // Erasure tombstones decide which rows compaction drops.
+                                if let Err(e) = bg_control.reload_caches_from_db().await {
+                                    tracing::warn!(error = %e, "compactor failed to reload control state");
+                                }
                                 let _ = bg_storage.compact_all_projects().await;
                             }
                             NodeRole::Query => {
@@ -806,9 +810,25 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let tool_names: Vec<&str> = mcp_list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
         assert_eq!(
-            mcp_list["result"]["tools"].as_array().map(|a| a.len()),
-            Some(5)
+            tool_names,
+            [
+                "get_lexicon_schema",
+                "query_insights",
+                "query_funnel",
+                "query_retention",
+                "inspect_frustrated_sessions",
+                "query_flows",
+                "get_user",
+                "list_property_values",
+                "list_cohorts"
+            ]
         );
 
         let mcp_funnel: Value = http

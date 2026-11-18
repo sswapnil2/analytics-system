@@ -23,11 +23,11 @@ Each review finding was re-checked against `origin/main` @ `66a0a07` by reading 
 | B-9 | An invalid time zone is accepted, then silently treated as UTC | CONFIRMED | `create_project_in_org` stores any string (`api.rs:1562`). `VirtualCatalog::set_timezone` ignores parse failures. |
 | B-10 | Hourly buckets ignore the project time zone | CONFIRMED | `align_floor_tz` floors hours in UTC (`ast.rs:117`). That's wrong for zones with a half-hour offset (IST +5:30, NPT +5:45, ACST +9:30). |
 | B-11 | Query nodes never reload profiles, keys or erasures | CONFIRMED | Query role loop only calls `refresh_all_manifests` (`pulse-node/src/lib.rs`). Erased users stay visible and revoked keys stay valid on query nodes until restart. |
-| B-12 | Erased ids are tombstoned forever | CONFIRMED, **deferred** | Needs time-scoped tombstones plus a physical rewrite during compaction. That's a storage-format change; see remaining-gaps. |
+| B-12 | Erased ids are tombstoned forever | CONFIRMED, fixed (E-15) | Tombstones now carry the erasure time: events up to it are hidden and dropped at compaction; events after it (a re-signup with the same id) count. |
 | I-8 | One bad event fails the whole batch | CONFIRMED | `decode_json` uses `collect::<Result<Vec<_>>>()?`. |
 | I-11/12 | Segment `identify`/`page` | CONFIRMED | `type` is ignored. `identify` has no event name, so it fails the batch; `page` becomes an event named after its `name`. |
 | I-14 | No limits on name or value size | CONFIRMED | Nothing in the `WireEvent` deserializer checks sizes. |
-| I-18 | Dedup window is in memory, 15–30 min | CONFIRMED, **deferred** | A durable dedup index for at least 7 days is a storage feature. Recovered WAL fingerprints are already re-seeded on restart. |
+| I-18 | Dedup window is in memory, 15–30 min | CONFIRMED, fixed for `/import` (E-14) | `/import` keeps a 30-day durable id index in the metastore. Live `/v1/ingest` keeps the in-memory window (see remaining-gaps). |
 
 ## UI, SDK and docs (checked on the current tree)
 
