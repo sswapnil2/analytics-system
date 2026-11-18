@@ -1118,10 +1118,17 @@ export class PulseWebClient {
     window.addEventListener("click", this.boundClickListener);
   }
 
-  private recordFailureBackoff(): void {
+  /**
+   * Exponential backoff with full jitter (a uniform delay up to a cap that doubles per failure),
+   * so browsers don't all retry in lockstep after an outage. A `Retry-After` header is a floor.
+   */
+  private recordFailureBackoff(res?: Response): void {
     const exp = Math.min(6, this.consecutiveFailures);
     this.consecutiveFailures += 1;
-    this.backoffUntilMs = Date.now() + Math.min(60_000, 1_000 * Math.pow(2, exp));
+    const cap = Math.min(60_000, 1_000 * Math.pow(2, exp));
+    const retryAfterS = Number(res?.headers.get("retry-after") ?? NaN);
+    const floor = Number.isFinite(retryAfterS) ? Math.min(retryAfterS * 1000, 10 * 60_000) : 0;
+    this.backoffUntilMs = Date.now() + Math.max(floor, Math.random() * cap);
   }
 
   public async flush(): Promise<void> {
@@ -1167,7 +1174,7 @@ export class PulseWebClient {
           // Permanent client error: drop packet so queue does not wedge.
         } else {
           this.replayQueue.unshift(pkt);
-          this.recordFailureBackoff();
+          this.recordFailureBackoff(res);
           return;
         }
       } catch {
@@ -1216,7 +1223,7 @@ export class PulseWebClient {
           // Drop malformed batch permanently.
         } else {
           this.enqueueEventsBounded(batch, true);
-          this.recordFailureBackoff();
+          this.recordFailureBackoff(res);
         }
       } catch {
         this.enqueueEventsBounded(batch, true);
