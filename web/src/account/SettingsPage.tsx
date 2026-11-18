@@ -254,7 +254,7 @@ export const SettingsPage: React.FC<{
         {!members ? (
           <ListSkeleton rows={3} />
         ) : (
-          <div className="overflow-x-auto">
+          <div className="relative overflow-x-auto">
             <table className="w-full min-w-[520px] text-left text-sm">
               <thead>
                 <tr className="border-b border-line text-xs text-muted">
@@ -439,7 +439,7 @@ export const SettingsPage: React.FC<{
             {keys.length === 0 ? (
               <EmptyState icon={KeyRound} title="No API keys yet" body="Create an ingest key to send events from your app." />
             ) : (
-              <div className="overflow-x-auto">
+              <div className="relative overflow-x-auto">
                 <table className="w-full min-w-[480px] text-left text-sm">
                   <thead>
                     <tr className="border-b border-line text-xs text-muted">

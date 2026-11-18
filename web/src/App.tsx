@@ -294,6 +294,15 @@ export const App: React.FC = () => {
       });
   }, [signedIn, refreshToken]);
 
+  const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
+  // Hooks stay above the early returns below (rules of hooks).
+  // The event list loads once per project; while it's empty, reload it as soon as
+  // the status poll sees events, so the first data shows up without a page reload.
+  const waitingForFirstEvents = catalogLoaded && availableEvents.length === 0 && totalEvents > 0;
+  useEffect(() => {
+    if (waitingForFirstEvents) void loadCatalog();
+  }, [waitingForFirstEvents, totalEvents, loadCatalog]);
+
   const go = (id: WorkspaceId) => {
     window.location.hash = `/${id}`;
     setActiveTab(id);
@@ -355,13 +364,6 @@ export const App: React.FC = () => {
   }
 
   const activePid = projectId || status?.active_project_id || "";
-  const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
-  // The event list loads once per project; while it's empty, reload it as soon as
-  // the status poll sees events, so the first data shows up without a page reload.
-  const waitingForFirstEvents = catalogLoaded && availableEvents.length === 0 && totalEvents > 0;
-  useEffect(() => {
-    if (waitingForFirstEvents) void loadCatalog();
-  }, [waitingForFirstEvents, totalEvents, loadCatalog]);
   const projects = status?.projects ?? [];
   const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;

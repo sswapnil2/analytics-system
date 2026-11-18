@@ -200,7 +200,10 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const first = overall[0];
   const last = overall[overall.length - 1];
   // Only a comparison of the same steps is meaningful.
-  const prevSteps = prevResult && prevResult.overall_steps.length === overall.length ? prevResult.overall_steps : [];
+  const prevAll = prevResult && prevResult.overall_steps.length === overall.length ? prevResult.overall_steps : [];
+  // An empty comparison period has no rates to compare; say so once instead of "was 0%" per step.
+  const prevEmpty = prevAll.length > 0 && prevAll[0].entered_users === 0;
+  const prevSteps = prevEmpty ? [] : prevAll;
   const prevFirst = prevSteps[0];
   const prevLast = prevSteps[prevSteps.length - 1];
 
@@ -422,6 +425,11 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                   {humanizeEvent(first.event_name)} went on to {humanizeEvent(last.event_name)} within{" "}
                   {WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}.
                 </p>
+                {prevEmpty && (
+                  <p className="text-[0.9375rem] text-ink-2">
+                    {compareLabel(rangeFor(range), compare)}: no users entered this funnel, so there's nothing to compare.
+                  </p>
+                )}
                 {prevLast && prevFirst && (
                   <p className="text-[0.9375rem] text-ink-2">
                     {compareLabel(rangeFor(range), compare)}:{" "}
@@ -775,6 +783,7 @@ const DropOffDrawer: React.FC<{
                 key={selected.session_id}
                 projectId={projectId}
                 distinctId={selected.distinct_id}
+                canonicalUid={selected.canonical_uid}
                 dropTs={selected.drop_ts_ms}
                 fromEvent={fromEvent}
               />

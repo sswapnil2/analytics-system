@@ -443,6 +443,26 @@ async fn check_answers(api: &Api, phase: &str) {
         .collect();
     assert!(ids.contains(&"p0005"), "{phase}: search found {ids:?}");
 
+    // Drop-off lists only carry masked ids; `?uid=` must still find the user.
+    let get = |path: String| {
+        let req = api
+            .http
+            .get(format!("{}{path}", api.base))
+            .bearer_auth(ADMIN);
+        async move { req.send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let by_id = get(format!("/v1/projects/{}/users/p0700", api.pid)).await;
+    let uid = by_id["canonical_uid"].as_u64().unwrap();
+    assert!(uid > 0, "{phase}: {by_id}");
+    let by_uid = get(format!("/v1/projects/{}/users/masked?uid={uid}", api.pid)).await;
+    assert_eq!(by_uid["canonical_uid"].as_u64(), Some(uid), "{phase}");
+    assert_eq!(
+        by_uid["events"].as_array().map(|e| e.len()),
+        by_id["events"].as_array().map(|e| e.len()),
+        "{phase}: user detail by uid"
+    );
+    assert!(!by_uid["events"].as_array().unwrap().is_empty(), "{phase}");
+
     // B-4: imported history keeps its own timestamp
     let imp = api
         .insight(

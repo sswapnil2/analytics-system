@@ -992,9 +992,9 @@ export const api = {
       `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
     ),
 
-  getUserDetail: (projectId: string, distinctId: string) =>
+  getUserDetail: (projectId: string, distinctId: string, canonicalUid?: number) =>
     fetchJson<UserDetailResponse>(
-      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}${canonicalUid ? `?uid=${canonicalUid}` : ""}`,
     ),
 
   deleteUserDpdp: (projectId: string, distinctId: string) =>

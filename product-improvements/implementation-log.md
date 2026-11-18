@@ -228,3 +228,12 @@ Branch `feat/product-improvements`, based on `origin/main` @ `66a0a07`. IDs refe
 ## E-24 Site claims (P1-8)
 
 - **Change:** `site/index.html` no longer claims group-property splits (not supported) or retention cell drill-down (not built). It now describes range comparison, which ships.
+
+## E-25 Fixes from the Studio pass
+
+- **Change:**
+  - `App.tsx`: the first-events reload effect moved above the early returns. Signing out and back in, or a session expiring, blanked the app.
+  - `GET /v1/projects/:id/users/:distinct_id?uid=N` looks the user up by canonical uid. The drop-off drawer passes it, because query results only carry masked ids.
+  - Funnels: an empty comparison period gets one line instead of "was 0%" on each step.
+  - Settings tables: their scroll wrapper is `relative`, so the screen-reader header no longer widens the page on phones.
+- **Tests:** `correctness.rs`: user detail by `?uid=` returns the same user and events (fails without the change). The rest were checked in the Studio (see test-results).

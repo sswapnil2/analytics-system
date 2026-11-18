@@ -174,7 +174,7 @@ take simpler arguments.
 | POST | `/v1/projects/:id/cohorts/preview` | Size a cohort definition without saving it |
 | GET | `/v1/projects/:id/cohorts/:cohort_id/export` | Export cohort members (CSV, or `?format=json`) |
 | GET | `/v1/projects/:id/users` | User profiles, newest first. `?search=` matches any part of the distinct id or of any property (case-insensitive, across all profiles); `?limit=` (default 100, max 500) and `?offset=` paginate |
-| GET, DELETE | `/v1/projects/:id/users/:distinct_id` | Profile detail (properties merged across all of the user's ids) / erase a user (recorded in the deletion log). Erasure hides and, at the next compaction of each day's segments, deletes everything the user did up to the moment of erasure. If the same id sends events later (they signed up again), those new events are counted. |
+| GET, DELETE | `/v1/projects/:id/users/:distinct_id` | Profile detail (properties merged across all of the user's ids; `?uid=N` looks the user up by canonical uid, for the masked ids that query results return) / erase a user (recorded in the deletion log). Erasure hides and, at the next compaction of each day's segments, deletes everything the user did up to the moment of erasure. If the same id sends events later (they signed up again), those new events are counted. |
 | GET | `/v1/projects/:id/deletions` | Erasure audit log |
 | POST | `/v1/projects/:id/import` | Batch import events (JSON, NDJSON or CSV body). Timestamps are kept as given; see *Ingest semantics* |
 | GET | `/v1/projects/:id/export` | Export events: `?format=ndjson` (default) `\|json\|csv`, `start_ts_ms` + `end_ts_ms`, `limit` (default 5000, max 50000) |

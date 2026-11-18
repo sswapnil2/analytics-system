@@ -67,4 +67,26 @@ Release `pulse-node` from this tree with a fresh data dir and no seed. A non-dem
 | MCP `query_funnel` with `Plan_Upgrade` | `isError`: "Did you mean 'Plan_Upgraded'?" |
 | MCP funnel split by `user.company_size` | Breakdowns per company size returned |
 
+### Studio pass on the closing commit (release build, 18 Nov)
+
+Seeded demo node and a fresh node (SaaS schema: 395 events, 200 users), both on the release binary from this tree, signed in with a local test account.
+
+| Check | Result |
+|---|---|
+| Sign out, then sign in again in the same tab | **Was a blank page** (React #310: a hook after the signed-out early return in `App.tsx`). Fixed; now lands on Dashboards |
+| Dashboards landing (demo) | "Overview" starter dashboard: onboarding funnel, DAU, Day-N retention, note |
+| Funnel step "+ where" | Step 4 `city is Mumbai`: 5,684 → 1,231; kept after reload via `?q=`/`range=` |
+| Funnel compare, 7D vs previous | "18.5% of 2,729 users (−8.5 pts now)" and "was …" per step |
+| Funnel compare on an empty earlier period | **Was** "0.0% of 0 users" and "was 0.0%" on every step. Now one line: no users entered, nothing to compare |
+| Drop-off drawer, user without a recording | **Was empty**: it looked the user up by the masked id (`+91 •••• 655`). Now uses `?uid=`; shows events with "Left here" (phone and email ids) |
+| "Download all N" in the drawer | Button shown to admins with the right count. The CSV endpoint is covered by `correctness.rs` (download not clicked) |
+| Trends annotation | Added "v2.3 released" on 10 Nov: marker on the chart, row in the list |
+| Trends cohort split | In cohort 2,297 + Not in cohort 4,994 = 7,291 overall |
+| Retention compare | Dashed indigo curve with its range in the legend |
+| Users page | List, profile and activity; lookups use the raw id |
+| Settings → Projects, key Rotate | Present; time zone picker lists IANA zones |
+| Phone width (415 px) | **Settings scrolled sideways 149 px** (the members table's `sr-only` header escaped its scroller). Fixed; no page scrolls sideways now |
+| Fresh node, SaaS schema | Every page shows the first-event guide before data; then funnel 200/107/47/23 matches exactly what was sent |
+| Light and dark | Retention heatmap, Trends annotations and the drawer are readable in both |
+
 **Not checked manually:** the seeded demo node (its pages weren't touched by this diff, and the full-node `gate4` test, which runs on the seeded demo, passed in `cargo test`); split-role mode in a browser (covered by `ha_02`); the Postgres metadata backend (the SQL is portable: `LOWER`, `LIKE … ESCAPE`, `CASE`, but it wasn't run against Postgres); the web SDK in a real SPA (covered by the unit test only).

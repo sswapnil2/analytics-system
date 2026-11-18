@@ -3501,10 +3501,18 @@ async fn handle_list_user_profiles(
     Ok(Json(out))
 }
 
+#[derive(Deserialize)]
+struct UserDetailQuery {
+    /// Look the user up by canonical uid. Query results only carry masked ids
+    /// (`+91 •••• 655`), which can't be resolved back to the user.
+    uid: Option<u32>,
+}
+
 async fn handle_get_user_detail(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((id, distinct_id)): AxumPath<(String, String)>,
+    Query(q): Query<UserDetailQuery>,
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let id_graph = ctrl
@@ -3521,8 +3529,10 @@ async fn handle_get_user_detail(
         .await
         .map_err(CtrlError::meta)?;
 
-    let canon_uid = id_graph
-        .lookup_canonical(&distinct_id)
+    let canon_uid = q
+        .uid
+        .filter(|u| *u > 0)
+        .or_else(|| id_graph.lookup_canonical(&distinct_id))
         .or_else(|| id_graph.lookup_raw(&distinct_id))
         .or_else(|| profile.as_ref().map(|p| p.canonical_uid))
         .unwrap_or(0);
