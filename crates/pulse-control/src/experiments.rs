@@ -4,7 +4,7 @@ use std::time::Instant;
 use pulse_exec::{
     ExecError, FunnelOrderMode, FunnelQuery, FunnelStepSpec, PropPredicate, QueryEngine, TimeRange,
 };
-use pulse_wire::{evaluate_flag_rule, PropValue};
+use pulse_wire::{cohort_member_hash, evaluate_flag_rule, CohortGate, PropValue};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use xxhash_rust::xxh3::xxh3_64;
@@ -15,13 +15,21 @@ use crate::models::{
 };
 
 /// Evaluates an `EdgeFlagRule` deterministically via the shared `pulse_wire::evaluate_flag_rule`
-/// (`xxh3_64` bucketing + optional `cohort_members` allowlist) (`P2-02`, `P2-03`).
+/// (`xxh3_64` bucketing + optional hashed cohort gate) (`P2-02`, `P2-03`).
 pub fn evaluate_edge_flag(rule: &EdgeFlagRule, distinct_id: &str) -> Option<String> {
+    // A targeted rule with no hashes matches no one (fail closed).
+    let gate = rule
+        .targeting_cohort_id
+        .as_deref()
+        .map(|cohort_id| CohortGate {
+            cohort_id,
+            member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
+        });
     evaluate_flag_rule(
         &rule.key,
         rule.enabled,
         rule.rollout_bps,
-        rule.cohort_members.as_deref(),
+        gate,
         rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
         distinct_id,
     )
@@ -42,13 +50,14 @@ pub fn build_edge_flag_bundle(
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
-            let cohort_members = cohort_id.as_ref().map(|_| Vec::new());
+            let empty = cohort_id.as_ref().map(|_| Vec::new());
             EdgeFlagRule {
                 key: f.key.clone(),
                 enabled: f.enabled,
                 rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
                 targeting_cohort_id: cohort_id,
-                cohort_members,
+                cohort_members: empty.clone(),
+                cohort_member_hashes: empty,
                 variants: f.variants.clone(),
             }
         })
@@ -57,7 +66,7 @@ pub fn build_edge_flag_bundle(
 }
 
 /// Builds an `EdgeFlagBundle` evaluating any `targeting_cohort_id` through `QueryEngine` into exact
-/// external `distinct_id` allowlists (`P2-02`).
+/// hashed member lists (`P2-02`); raw ids never leave the server.
 pub async fn build_edge_flag_bundle_with_cohorts(
     project_id: &str,
     flags: &[FeatureFlag],
@@ -74,15 +83,19 @@ pub async fn build_edge_flag_bundle_with_cohorts(
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
 
-        let cohort_members = if let Some(cid) = &cohort_id {
+        let cohort_member_hashes = if let Some(cid) = &cohort_id {
             if let Some(cached) = cohort_cache.get(cid) {
                 Some(cached.clone())
             } else {
                 let members = qengine
                     .evaluate_saved_cohort_external_ids(project_id, cid)
                     .await?;
-                cohort_cache.insert(cid.clone(), members.clone());
-                Some(members)
+                let mut hashes: Vec<String> =
+                    members.iter().map(|m| cohort_member_hash(cid, m)).collect();
+                hashes.sort_unstable();
+                hashes.dedup();
+                cohort_cache.insert(cid.clone(), hashes.clone());
+                Some(hashes)
             }
         } else {
             None
@@ -92,8 +105,9 @@ pub async fn build_edge_flag_bundle_with_cohorts(
             key: f.key.clone(),
             enabled: f.enabled,
             rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
+            cohort_members: cohort_id.as_ref().map(|_| Vec::new()),
             targeting_cohort_id: cohort_id,
-            cohort_members,
+            cohort_member_hashes,
             variants: f.variants.clone(),
         });
     }

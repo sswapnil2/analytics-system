@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   FIXED_MASK,
   PulseWebClient,
+  cohortMemberHash,
   evaluateEdgeFlag,
   flagRolloutSlot,
   flagVariantSlot,
@@ -42,17 +43,23 @@ test("P2-03: TypeScript xxh3_64 and bucketing match shared Rust test vectors 100
   }
 });
 
-test("P2-02: evaluateEdgeFlag enforces cohort_members allowlist", () => {
+test("P2-02: evaluateEdgeFlag gates on hashed cohort members, never raw ids", () => {
+  const hashes = ["beta_user_1", "beta_user_2"].map((id) => cohortMemberHash("coh_beta", id)).sort();
   const rule = {
     key: "beta_feature",
     enabled: true,
     rollout_bps: 10000,
     targeting_cohort_id: "coh_beta",
-    cohort_members: ["beta_user_1", "beta_user_2"],
+    cohort_members: [],
+    cohort_member_hashes: hashes,
     variants: [{ key: "treatment", weight_bps: 10000 }],
   };
   assert.equal(evaluateEdgeFlag(rule, "beta_user_1"), "treatment");
   assert.equal(evaluateEdgeFlag(rule, "non_member_user"), null);
+  // Targeted with no hashes: fail closed.
+  assert.equal(evaluateEdgeFlag({ ...rule, cohort_member_hashes: undefined }, "beta_user_1"), null);
+  // Same bytes as pulse_wire::cohort_member_hash (pinned in crates/pulse-wire/src/bucketing.rs).
+  assert.equal(cohortMemberHash("coh_beta", "beta_user_1"), "4270f71e9f59a803");
 });
 
 test("P3-01: maskPiiText uses default-deny fixed-length mask and never leaks prefix or length", () => {

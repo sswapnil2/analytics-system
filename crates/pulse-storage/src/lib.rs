@@ -19,8 +19,8 @@ pub use encrypted_store::{
     unseal_ephemeral_blob, ByokEncryptionStatus, EncryptedObjectStore,
 };
 pub use engine::{
-    event_uuid_fingerprint, route_bucket, ProjectStorage, StorageConfig, StorageEngine,
-    DEFAULT_NUM_BUCKETS,
+    event_uuid_fingerprint, route_bucket, MaintenanceErrors, MaintenanceKind, ProjectStorage,
+    StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};

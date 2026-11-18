@@ -7,9 +7,9 @@
  * allowlisted via `data-pulse-unmask` (inputs and contenteditable remain masked unconditionally).
  */
 
-import { flagRolloutSlot, flagVariantSlot, xxh3_64 } from "./xxh3.js";
+import { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 } from "./xxh3.js";
 
-export { flagRolloutSlot, flagVariantSlot, xxh3_64 };
+export { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 };
 
 export type PropPrimitive = string | number | boolean | null;
 export type EventProperties = Record<string, PropPrimitive>;
@@ -108,7 +108,8 @@ export interface EdgeFlagRule {
   enabled: boolean;
   rollout_bps: number;
   targeting_cohort_id?: string;
-  cohort_members?: string[];
+  /** Sorted `cohortMemberHash(targeting_cohort_id, distinctId)` of the cohort's members. */
+  cohort_member_hashes?: string[];
   variants: Array<{ key: string; weight_bps: number; payload?: unknown }>;
 }
 
@@ -160,8 +161,10 @@ export function maskPiiText(raw: string, explicitlyUnmasked = false): string {
 
 export function evaluateEdgeFlag(rule: EdgeFlagRule, distinctId: string): string | null {
   if (!rule.enabled || rule.rollout_bps <= 0) return null;
-  if (Array.isArray(rule.cohort_members)) {
-    if (!rule.cohort_members.includes(distinctId)) {
+  // A targeted rule with no hashes matches no one (fail closed).
+  if (rule.targeting_cohort_id) {
+    const hashes = rule.cohort_member_hashes ?? [];
+    if (!hashes.includes(cohortMemberHash(rule.targeting_cohort_id, distinctId))) {
       return null;
     }
   }
@@ -1320,10 +1323,17 @@ export class PulseWebClient {
     window.addEventListener("click", this.boundClickListener);
   }
 
-  private recordFailureBackoff(): void {
+  /**
+   * Exponential backoff with full jitter (a uniform delay up to a cap that doubles per failure),
+   * so browsers don't all retry in lockstep after an outage. A `Retry-After` header is a floor.
+   */
+  private recordFailureBackoff(res?: Response): void {
     const exp = Math.min(6, this.consecutiveFailures);
     this.consecutiveFailures += 1;
-    this.backoffUntilMs = Date.now() + Math.min(60_000, 1_000 * Math.pow(2, exp));
+    const cap = Math.min(60_000, 1_000 * Math.pow(2, exp));
+    const retryAfterS = Number(res?.headers.get("retry-after") ?? NaN);
+    const floor = Number.isFinite(retryAfterS) ? Math.min(retryAfterS * 1000, 10 * 60_000) : 0;
+    this.backoffUntilMs = Date.now() + Math.max(floor, Math.random() * cap);
   }
 
   public async flush(): Promise<void> {
@@ -1369,7 +1379,7 @@ export class PulseWebClient {
           // Permanent client error: drop packet so queue does not wedge.
         } else {
           this.replayQueue.unshift(pkt);
-          this.recordFailureBackoff();
+          this.recordFailureBackoff(res);
           return;
         }
       } catch {
@@ -1428,7 +1438,7 @@ export class PulseWebClient {
           this.debugLog(`batch refused with ${res.status}; dropped`, await res.text().catch(() => ""));
         } else {
           this.enqueueEventsBounded(batch, true);
-          this.recordFailureBackoff();
+          this.recordFailureBackoff(res);
           this.debugLog(`send failed with ${res.status}; will retry`);
         }
       } catch (err) {

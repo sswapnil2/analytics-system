@@ -1,7 +1,9 @@
+pub mod metrics;
 pub mod seeder;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,13 +18,16 @@ use pulse_control::{
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
-use pulse_storage::{build_object_store, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS};
+use pulse_storage::{
+    build_object_store, MaintenanceKind, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
+};
 use tokio::sync::{oneshot, watch};
 use tower_http::compression::predicate::{NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, DefaultPredicate};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeader;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use seeder::{seed_indian_fintech_dataset, SeedSummary};
@@ -178,10 +183,21 @@ pub struct RunningNode {
     shutdown_bg_tx: watch::Sender<bool>,
     shutdown_http_tx: Option<oneshot::Sender<()>>,
     http_task: tokio::task::JoinHandle<()>,
+    ready: Arc<AtomicBool>,
 }
 
 impl RunningNode {
     pub async fn shutdown(mut self) {
+        // Fail `/readyz` first so load balancers stop routing here, then give them
+        // `PULSE_SHUTDOWN_DRAIN_MS` (default 0) to notice before the listener closes.
+        self.ready.store(false, Ordering::Relaxed);
+        let drain_ms = std::env::var("PULSE_SHUTDOWN_DRAIN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if drain_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+        }
         let _ = self.shutdown_bg_tx.send(true);
         if let Some(q) = &self.quic {
             q.shutdown().await;
@@ -192,8 +208,13 @@ impl RunningNode {
         let _ = self.http_task.await;
         self.qengine.cache().close().await;
         if !self.storage.identity_router().is_read_only() {
-            let _ = self.storage.flush_all_projects().await;
-            let _ = self.storage.identity_router().close_all().await;
+            // Losing these would lose acknowledged data from memory: say so loudly.
+            if let Err(e) = self.storage.flush_all_projects().await {
+                tracing::error!(error = %e, "final flush on shutdown failed");
+            }
+            if let Err(e) = self.storage.identity_router().close_all().await {
+                tracing::error!(error = %e, "closing identity stores on shutdown failed");
+            }
         }
     }
 }
@@ -330,27 +351,31 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                         match role {
                             NodeRole::All => {}
                             NodeRole::Ingest => {
-                                let _ = bg_storage.identity_router().flush_all().await;
+                                let errs = bg_storage.maintenance_errors();
+                                errs.check(MaintenanceKind::IdentityFlush, bg_storage.identity_router().flush_all().await);
                                 for p in bg_storage.open_projects() {
                                     for b in 0..p.config().num_buckets {
                                         let bid = b as u8;
                                         if p.should_flush_bucket(bid) {
-                                            let _ = p.flush_bucket(bid).await;
+                                            errs.check(MaintenanceKind::Flush, p.flush_bucket(bid).await);
                                         }
                                     }
                                 }
-                                let _ = bg_control.reload_caches_from_db().await;
+                                if let Err(e) = bg_control.reload_caches_from_db().await {
+                                    tracing::warn!(error = %e, "reloading API key cache failed");
+                                }
                             }
                             NodeRole::Compactor => {
-                                let _ = bg_storage.refresh_all_manifests().await;
+                                let errs = bg_storage.maintenance_errors();
+                                errs.check(MaintenanceKind::ManifestRefresh, bg_storage.refresh_all_manifests().await);
                                 // Erasure tombstones decide which rows compaction drops.
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
                                     tracing::warn!(error = %e, "compactor failed to reload control state");
                                 }
-                                let _ = bg_storage.compact_all_projects().await;
+                                errs.check(MaintenanceKind::Compaction, bg_storage.compact_all_projects().await);
                             }
                             NodeRole::Query => {
-                                let _ = bg_storage.refresh_all_manifests().await;
+                                bg_storage.maintenance_errors().check(MaintenanceKind::ManifestRefresh, bg_storage.refresh_all_manifests().await);
                                 // Keys, erasures, profiles, cohorts and time zones are written
                                 // by whichever node took the admin call; pick them up here.
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
@@ -389,7 +414,21 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     };
 
     // Public SDK routes (permissive CORS) vs Protected Admin/Query routes (restricted CORS + Bearer auth, `P0-01`)
-    let mut api_router = Router::new().route("/healthz", get(|| async { "ok" }));
+    let ready = Arc::new(AtomicBool::new(true));
+    let http_metrics = Arc::new(metrics::HttpMetrics::default());
+    let mut api_router = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(metrics::router(metrics::Probe {
+            http: http_metrics.clone(),
+            ready: ready.clone(),
+            control: control.clone(),
+            ingest: ingest.clone(),
+            storage: storage.clone(),
+            qengine: qengine.clone(),
+            token: std::env::var("PULSE_METRICS_TOKEN")
+                .ok()
+                .filter(|t| !t.trim().is_empty()),
+        }));
     if config.role.serves_ingest() {
         let ingest_public = Router::new()
             .merge(build_ingest_router(ingest.clone()))
@@ -454,9 +493,15 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     };
     // gzip/br for the web app and JSON. Replay frames are served by byte range, and
     // compressing a range response would corrupt it, so they stay as they are.
-    let app = app.layer(CompressionLayer::new().compress_when(
-        DefaultPredicate::new().and(NotForContentType::const_new("application/x-pulse-frame")),
-    ));
+    let app = app
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new("application/x-pulse-frame")),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            http_metrics,
+            metrics::track,
+        ))
+        .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
     let bound_http_addr = listener.local_addr()?;
@@ -486,6 +531,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         shutdown_bg_tx,
         shutdown_http_tx: Some(shutdown_http_tx),
         http_task,
+        ready,
     })
 }
 
@@ -1107,5 +1153,74 @@ mod tests {
 
         query_node.shutdown().await;
         ingest_node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metrics_and_readyz_report_traffic_and_readiness() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let node = start_pulse_node(NodeConfig {
+            role: NodeRole::All,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: tmp_dir.path().join("node_data"),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_metrics".to_string(),
+            default_api_key: String::new(),
+            admin_token: None,
+            allowed_origins: vec![],
+            auto_seed: false,
+            num_buckets: 4,
+        })
+        .await
+        .expect("start pulse-node");
+        let base = format!("http://{}", node.http_addr);
+        let http = reqwest::Client::new();
+
+        let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status(), reqwest::StatusCode::OK);
+        // A templated route is labelled by its template, not the raw path.
+        let _ = http
+            .get(format!("{base}/v1/projects/proj_secret_123/insights"))
+            .send()
+            .await
+            .unwrap();
+        let _ = http.get(format!("{base}/healthz")).send().await.unwrap();
+
+        let body = http
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains(
+                r#"pulse_http_requests_total{route="/healthz",method="GET",status="200"} 1"#
+            ),
+            "{body}"
+        );
+        assert!(body.contains(r#"route="/readyz""#), "{body}");
+        assert!(
+            body.contains("pulse_ingest_events_accepted_total 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"pulse_maintenance_errors_total{kind="flush"} 0"#),
+            "{body}"
+        );
+        assert!(body.contains("pulse_ready 1"), "{body}");
+        assert!(
+            !body.contains("proj_secret_123"),
+            "raw paths must not become labels: {body}"
+        );
+
+        // Draining: readiness flips before the listener closes.
+        node.ready.store(false, Ordering::Relaxed);
+        let draining = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(draining.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(draining.text().await.unwrap().contains("draining"));
+
+        node.shutdown().await;
     }
 }

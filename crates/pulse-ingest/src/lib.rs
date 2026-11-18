@@ -2,6 +2,7 @@ pub mod dedup;
 pub mod governance;
 pub mod http;
 pub mod quic;
+pub mod rate_limit;
 pub mod service;
 
 pub use dedup::{normalize_event_timestamp, DedupRegistry, DEDUP_WINDOW_MS};
@@ -58,7 +59,12 @@ mod tests {
             let storage = StorageEngine::new(pre_crash_cfg.clone(), store.clone(), id_router);
             let gov = InMemoryGovernance::new();
             gov.register_api_key("pk_gate2", "proj_gate2");
-            let ingest = IngestService::new(storage.clone(), gov);
+            // Bulk load: measures ingest, not the per-project rate limit.
+            let ingest = IngestService::with_rate_limit(
+                storage.clone(),
+                gov,
+                rate_limit::RateLimiter::new(0.0, 0.0),
+            );
 
             let mut total_accepted = 0usize;
             let mut total_deduped = 0usize;
@@ -171,7 +177,11 @@ mod tests {
         let storage2 = StorageEngine::new(post_crash_cfg, store.clone(), id_router2.clone());
         let gov2 = InMemoryGovernance::new();
         gov2.register_api_key("pk_gate2", "proj_gate2");
-        let ingest2 = IngestService::new(storage2.clone(), gov2);
+        let ingest2 = IngestService::with_rate_limit(
+            storage2.clone(),
+            gov2,
+            rate_limit::RateLimiter::new(0.0, 0.0),
+        );
 
         // Verify WAL replay restored 100% of all 500,000 acknowledged events (RPO = 0)!
         let ps2 = storage2

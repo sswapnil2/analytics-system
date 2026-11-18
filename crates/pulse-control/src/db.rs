@@ -1171,6 +1171,12 @@ impl MetaStore {
     // ------------------- Users & Sessions -------------------
 
     /// Accounts with an organisation; sign-ups still waiting to verify their email don't count.
+    /// One round trip to the database, for readiness checks.
+    pub async fn ping(&self) -> Result<(), MetaError> {
+        let _ = db_map_opt!(self, "SELECT 1 AS n", |r| { r.get::<i64, _>("n") });
+        Ok(())
+    }
+
     pub async fn count_users(&self) -> Result<i64, MetaError> {
         let n = db_map_opt!(
             self,

@@ -374,7 +374,9 @@ struct EdgeRule {
     enabled: bool,
     rollout_bps: u32,
     #[serde(default)]
-    cohort_members: Option<Vec<String>>,
+    targeting_cohort_id: Option<String>,
+    #[serde(default)]
+    cohort_member_hashes: Option<Vec<String>>,
     variants: Vec<EdgeVariant>,
 }
 
@@ -865,11 +867,19 @@ impl PulseClient {
         let Some(rule) = cache.rules.get(&flag_key) else {
             return Ok(None);
         };
+        // A targeted rule with no hashes matches no one (fail closed).
+        let gate = rule
+            .targeting_cohort_id
+            .as_deref()
+            .map(|cohort_id| pulse_wire::CohortGate {
+                cohort_id,
+                member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
+            });
         Ok(evaluate_flag_rule(
             &rule.key,
             rule.enabled,
             rule.rollout_bps,
-            rule.cohort_members.as_deref(),
+            gate,
             rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
             &did,
         ))
@@ -1061,15 +1071,19 @@ impl PulseClient {
                     remove_ids.insert(entry.id);
                 }
                 Ok(resp) => {
+                    // 5xx, 429, and also 401/403: a bad or revoked key would otherwise be retried
+                    // every flush. Keep the packets (the key may be fixed) but back off.
                     let status = resp.status();
-                    if status.is_server_error() || status.as_u16() == 429 {
-                        self.record_transient_backoff();
-                    }
+                    let retry_after_ms = retry_after_ms(resp.headers());
+                    self.record_transient_backoff(BackoffHint {
+                        retry_after_ms,
+                        auth_failure: matches!(status.as_u16(), 401 | 403),
+                    });
                     transient_err = Some(SdkError::Network(format!("HTTP {status}")));
                     break;
                 }
                 Err(err) => {
-                    self.record_transient_backoff();
+                    self.record_transient_backoff(BackoffHint::default());
                     transient_err = Some(SdkError::Network(err.to_string()));
                     break;
                 }
@@ -1154,12 +1168,9 @@ impl PulseClient {
         }
     }
 
-    fn record_transient_backoff(&self) {
-        let exp = self
-            .consecutive_failures
-            .fetch_add(1, Ordering::AcqRel)
-            .min(6);
-        let delay_ms = (500i64 << exp).min(30_000);
+    fn record_transient_backoff(&self, hint: BackoffHint) {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
+        let delay_ms = backoff_delay_ms(failures, hint, random_u64());
         let until = Utc::now().timestamp_millis().saturating_add(delay_ms);
         self.backoff_until_ms.store(until, Ordering::Release);
     }
@@ -1338,6 +1349,51 @@ impl PulseClient {
         let _ = &self.wal_path;
         Ok(())
     }
+}
+
+/// What the failed response said about when to retry.
+#[derive(Debug, Clone, Copy, Default)]
+struct BackoffHint {
+    retry_after_ms: Option<i64>,
+    auth_failure: bool,
+}
+
+/// Longest wait an auth failure (401/403) backs off to; other failures cap at 30 s.
+const AUTH_BACKOFF_CAP_MS: i64 = 5 * 60_000;
+/// Ceiling on a server's `Retry-After`, so a bad header can't park a device for days.
+const MAX_RETRY_AFTER_MS: i64 = 10 * 60_000;
+
+/// Exponential backoff with full jitter: a uniform delay in `[0, cap]`, where cap doubles per
+/// failure from 500 ms. Without jitter every device retries in lockstep after an outage.
+/// A server's `Retry-After` is a floor.
+fn backoff_delay_ms(failures: u32, hint: BackoffHint, rand: u64) -> i64 {
+    let max = if hint.auth_failure {
+        AUTH_BACKOFF_CAP_MS
+    } else {
+        30_000
+    };
+    let cap = (500i64 << failures.min(10)).min(max);
+    let jittered = (rand % (cap as u64 + 1)) as i64;
+    match hint.retry_after_ms {
+        Some(ra) => jittered.max(ra.clamp(0, MAX_RETRY_AFTER_MS)),
+        None => jittered,
+    }
+}
+
+/// `Retry-After` in delay-seconds form (what Pulse and most proxies send); HTTP-dates are ignored.
+fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .map(|s| s.saturating_mul(1000))
+}
+
+fn random_u64() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
 }
 
 #[cfg(test)]
@@ -1721,7 +1777,8 @@ mod tests {
                 key: "checkout".into(),
                 enabled: true,
                 rollout_bps: 10_000,
-                cohort_members: None,
+                targeting_cohort_id: None,
+                cohort_member_hashes: None,
                 variants: vec![EdgeVariant {
                     key: "b".into(),
                     weight_bps: 10_000,
@@ -1753,5 +1810,47 @@ mod tests {
             None
         );
         assert_eq!(exposures(), 1);
+    }
+
+    #[test]
+    fn backoff_is_jittered_capped_and_honors_retry_after() {
+        let none = BackoffHint::default();
+        // Full jitter: anywhere in [0, cap], so devices don't retry in lockstep.
+        assert_eq!(backoff_delay_ms(0, none, 0), 0);
+        assert_eq!(backoff_delay_ms(0, none, 500), 500);
+        assert_eq!(backoff_delay_ms(0, none, 501), 0);
+        let spread: std::collections::HashSet<i64> = (0..64)
+            .map(|_| backoff_delay_ms(3, none, random_u64()))
+            .collect();
+        assert!(spread.len() > 8, "delays should vary: {spread:?}");
+        assert!(spread.iter().all(|d| (0..=4_000).contains(d)));
+        // Caps: 30 s normally, 5 min for a bad key.
+        assert_eq!(backoff_delay_ms(30, none, 30_000), 30_000);
+        assert!(backoff_delay_ms(30, none, u64::MAX) <= 30_000);
+        let auth = BackoffHint {
+            auth_failure: true,
+            ..none
+        };
+        assert_eq!(
+            backoff_delay_ms(30, auth, AUTH_BACKOFF_CAP_MS as u64),
+            AUTH_BACKOFF_CAP_MS
+        );
+        // Retry-After is a floor, bounded at 10 min.
+        let ra = |ms| BackoffHint {
+            retry_after_ms: Some(ms),
+            ..none
+        };
+        assert_eq!(backoff_delay_ms(0, ra(7_000), 0), 7_000);
+        assert_eq!(backoff_delay_ms(0, ra(i64::MAX), 0), MAX_RETRY_AFTER_MS);
+
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_ms(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+        assert_eq!(retry_after_ms(&h), Some(12_000));
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_ms(&h), None);
     }
 }

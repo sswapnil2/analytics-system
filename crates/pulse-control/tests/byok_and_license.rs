@@ -216,6 +216,12 @@ async fn mock_llm_handler(axum::Json(req): axum::Json<Value>) -> impl IntoRespon
 }
 
 #[tokio::test]
+// PULSE_LICENSE_PUBKEY_HEX (the test signing key) is honoured only in debug builds; release
+// builds verify against the embedded production key, so the signed test licenses are rejected.
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "test license key override is debug-only"
+)]
 async fn test_full_oss_and_commercial_suite() {
     let vendor = TestVendorKeys::generate();
     let tmp = tempfile::tempdir().unwrap();

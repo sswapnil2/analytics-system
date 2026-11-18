@@ -922,7 +922,46 @@ fn is_error_event(event_name: &str, props: &[(String, PropValue)]) -> bool {
 }
 
 /// Top-level multi-project storage coordinator managing `ProjectStorage`, `ReplayStore`, `VortexSegmentReader`, and `IdentityRouter`.
+/// Background work that failed (flushes, compactions, ...). Each failure is also logged; the
+/// counts are exported on the node's `/metrics`.
+#[derive(Debug, Default)]
+pub struct MaintenanceErrors {
+    pub identity_flush: AtomicU64,
+    pub flush: AtomicU64,
+    pub compaction: AtomicU64,
+    pub manifest_refresh: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MaintenanceKind {
+    IdentityFlush,
+    Flush,
+    Compaction,
+    ManifestRefresh,
+}
+
+impl MaintenanceErrors {
+    /// Counts and logs `r` if it failed, instead of dropping it with `let _ =`.
+    pub fn check<T, E: std::fmt::Display>(
+        &self,
+        kind: MaintenanceKind,
+        r: std::result::Result<T, E>,
+    ) {
+        if let Err(e) = r {
+            let (counter, what) = match kind {
+                MaintenanceKind::IdentityFlush => (&self.identity_flush, "identity flush"),
+                MaintenanceKind::Flush => (&self.flush, "L0 flush"),
+                MaintenanceKind::Compaction => (&self.compaction, "compaction"),
+                MaintenanceKind::ManifestRefresh => (&self.manifest_refresh, "manifest refresh"),
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "background {what} failed");
+        }
+    }
+}
+
 pub struct StorageEngine {
+    maintenance_errors: MaintenanceErrors,
     config: StorageConfig,
     encrypted_store: Arc<EncryptedObjectStore>,
     object_store: Arc<dyn ObjectStore>,
@@ -953,6 +992,7 @@ impl StorageEngine {
         let segment_reader = Arc::new(VortexSegmentReader::new(wrapped_store.clone()));
         let replay_store = Arc::new(ReplayStore::new(wrapped_store.clone()));
         Arc::new(Self {
+            maintenance_errors: MaintenanceErrors::default(),
             config,
             encrypted_store,
             object_store: wrapped_store,
@@ -963,6 +1003,10 @@ impl StorageEngine {
             erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
         })
+    }
+
+    pub fn maintenance_errors(&self) -> &MaintenanceErrors {
+        &self.maintenance_errors
     }
 
     pub fn encrypted_store(&self) -> &Arc<EncryptedObjectStore> {
@@ -1129,17 +1173,21 @@ impl StorageEngine {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = engine.identity_router.flush_all().await;
+                        let errs = &engine.maintenance_errors;
+                        errs.check(MaintenanceKind::IdentityFlush, engine.identity_router.flush_all().await);
                         let projects: Vec<Arc<ProjectStorage>> =
                             engine.projects.iter().map(|e| e.value().clone()).collect();
                         for p in projects {
                             for b in 0..p.config().num_buckets {
                                 let bid = b as u8;
                                 if p.should_flush_bucket(bid) {
-                                    let _ = p.flush_bucket(bid).await;
+                                    errs.check(MaintenanceKind::Flush, p.flush_bucket(bid).await);
                                 }
                             }
-                            let _ = p.compact_overdue(&engine.segment_reader).await;
+                            errs.check(
+                                MaintenanceKind::Compaction,
+                                p.compact_overdue(&engine.segment_reader).await,
+                            );
                         }
                     }
                     changed = shutdown_rx.changed() => {
