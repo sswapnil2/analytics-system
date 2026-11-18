@@ -623,6 +623,37 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
             .to_string(),
     };
 
+    // A project can be renamed and moved to another time zone; bad zones are refused.
+    let patch = |body: Value| {
+        http.patch(format!("{base}/v1/projects/{}", api.pid))
+            .bearer_auth(ADMIN)
+            .json(&body)
+            .send()
+    };
+    let st = patch(json!({"timezone": "Mars/Olympus"}))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(st.as_u16(), 400);
+    let r: Value = patch(json!({"name": "Shop EU", "timezone": "Europe/Berlin"}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (r["name"].as_str(), r["timezone"].as_str()),
+        (Some("Shop EU"), Some("Europe/Berlin")),
+        "{r}"
+    );
+    let r: Value = patch(json!({"name": "Shop", "timezone": "Asia/Kolkata"}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["timezone"].as_str(), Some("Asia/Kolkata"), "{r}");
+
     let import_path = format!("/v1/projects/{}/import", api.pid);
 
     // Ingest the fixture and link anonymous browsing to the users.

@@ -765,6 +765,12 @@ export const api = {
       method: "DELETE",
     }),
 
+  updateProject: (projectId: string, body: { name?: string; timezone?: string }) =>
+    fetchJson<ProjectInfo>(`/v1/projects/${encodeURIComponent(projectId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
   createProject: (body: { name: string; timezone: string }) =>
     fetchJson<{ project: ProjectInfo; api_key: CreatedApiKeyResponse }>(`/v1/projects`, {
       method: "POST",

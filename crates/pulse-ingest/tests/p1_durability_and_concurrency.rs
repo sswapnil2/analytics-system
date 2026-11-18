@@ -190,59 +190,73 @@ async fn p1_02_out_of_order_wal_puts_never_lose_acknowledged_rows() {
     hook.delay_first_wal_ms.store(80, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = hook.clone();
 
-    {
-        let id_router = Arc::new(IdentityRouter::new(store.clone()));
-        let storage = StorageEngine::new(
-            StorageConfig {
-                num_buckets: 1,            // Force both concurrent requests onto bucket 0
-                l0_flush_row_threshold: 2, // Request B (2 rows) triggers flush; Request A (1 row) stays in WAL!
-                l0_flush_max_age: Duration::from_secs(60),
-                compaction_min_segments: 4,
-            },
-            store.clone(),
-            id_router.clone(),
-        );
-        let gov = InMemoryGovernance::new();
-        gov.register_api_key("pk_test", "proj_p1_02");
-        let ingest = IngestService::new(storage.clone(), gov);
-        // Warm up project + identity graph first so task_a deterministically hits WAL seq 1
-        let _ = storage.get_or_open_project("proj_p1_02").await.unwrap();
-        let _ = id_router.get_or_open("proj_p1_02").await.unwrap();
+    // Phase 1 runs on its own runtime, which is shut down afterwards: that kills every task
+    // it spawned, including a background L0 flush still in flight, the way a process crash
+    // would. (Dropping the engine alone doesn't: the flush task holds its own reference.)
+    let crash_store = store.clone();
+    let phase1 = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let store = crash_store;
+            let id_router = Arc::new(IdentityRouter::new(store.clone()));
+            let storage = StorageEngine::new(
+                StorageConfig {
+                    num_buckets: 1,            // Force both concurrent requests onto bucket 0
+                    l0_flush_row_threshold: 2, // Request B (2 rows) triggers flush; Request A (1 row) stays in WAL!
+                    l0_flush_max_age: Duration::from_secs(60),
+                    compaction_min_segments: 4,
+                },
+                store.clone(),
+                id_router.clone(),
+            );
+            let gov = InMemoryGovernance::new();
+            gov.register_api_key("pk_test", "proj_p1_02");
+            let ingest = IngestService::new(storage.clone(), gov);
+            // Warm up project + identity graph first so task_a deterministically hits WAL seq 1
+            let _ = storage.get_or_open_project("proj_p1_02").await.unwrap();
+            let _ = id_router.get_or_open("proj_p1_02").await.unwrap();
 
-        let ing_a = ingest.clone();
-        let ing_b = ingest.clone();
+            let ing_a = ingest.clone();
+            let ing_b = ingest.clone();
 
-        let task_a = tokio::spawn(async move {
-            ing_a
-                .ingest_for_project(
-                    "proj_p1_02",
-                    WireBatch::new(vec![make_event(1, "s", "u_slow", 1_762_000_001_000)]),
-                    1_762_000_001_000,
-                )
-                .await
-                .unwrap()
+            let task_a = tokio::spawn(async move {
+                ing_a
+                    .ingest_for_project(
+                        "proj_p1_02",
+                        WireBatch::new(vec![make_event(1, "s", "u_slow", 1_762_000_001_000)]),
+                        1_762_000_001_000,
+                    )
+                    .await
+                    .unwrap()
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let task_b = tokio::spawn(async move {
+                ing_b
+                    .ingest_for_project(
+                        "proj_p1_02",
+                        WireBatch::new(vec![
+                            make_event(2, "s", "u_fast_1", 1_762_000_002_000),
+                            make_event(3, "s", "u_fast_2", 1_762_000_003_000),
+                        ]),
+                        1_762_000_003_000,
+                    )
+                    .await
+                    .unwrap()
+            });
+
+            let (ra, rb) = tokio::join!(task_a, task_b);
+            assert_eq!(ra.unwrap().accepted, 1);
+            assert_eq!(rb.unwrap().accepted, 2);
+            id_router.close_all().await.unwrap();
         });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let task_b = tokio::spawn(async move {
-            ing_b
-                .ingest_for_project(
-                    "proj_p1_02",
-                    WireBatch::new(vec![
-                        make_event(2, "s", "u_fast_1", 1_762_000_002_000),
-                        make_event(3, "s", "u_fast_2", 1_762_000_003_000),
-                    ]),
-                    1_762_000_003_000,
-                )
-                .await
-                .unwrap()
-        });
-
-        let (ra, rb) = tokio::join!(task_a, task_b);
-        assert_eq!(ra.unwrap().accepted, 1);
-        assert_eq!(rb.unwrap().accepted, 2);
-        id_router.close_all().await.unwrap();
-        // Simulate abrupt process crash (no graceful flush_all!)
-    }
+        // Abrupt process crash: no graceful flush_all, in-flight tasks die mid-write.
+        rt.shutdown_background();
+    });
+    phase1.join().unwrap();
 
     // Recover from object store: ALL 3 acknowledged events MUST be present!
     let id_router2 = Arc::new(IdentityRouter::new(store.clone()));

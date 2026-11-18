@@ -44,7 +44,7 @@ import {
 import { ProfilePage } from "./account/ProfilePage";
 import { SettingsPage } from "./account/SettingsPage";
 import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
-import { errorMessage, formatCount, isNotFound } from "./lib/format";
+import { errorMessage, formatCount, isNotFound, setProjectTimeZone } from "./lib/format";
 import { projectFromHash as projectInHash, withProject } from "./lib/projectUrl";
 import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
 import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
@@ -341,6 +341,18 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (waitingForFirstEvents) void loadCatalog();
   }, [waitingForFirstEvents, totalEvents, loadCatalog]);
+  // Say so when the first event lands, instead of the setup panel silently vanishing.
+  const lastTotal = useRef<{ pid: string; total: number } | null>(null);
+  useEffect(() => {
+    if (!status) return;
+    const pid = status.active_project_id;
+    const prev = lastTotal.current;
+    lastTotal.current = { pid, total: totalEvents };
+    if (prev?.pid === pid && prev.total === 0 && totalEvents > 0) {
+      setNotice(`First event received: ${formatCount(totalEvents)} so far. Reports update as more arrive.`);
+      window.setTimeout(() => setNotice(null), 8000);
+    }
+  }, [status, totalEvents]);
 
   // Every Studio URL carries its project (`p=`), so reloads and shared links open the
   // same project; the last one used is remembered for bare URLs.
@@ -428,6 +440,8 @@ export const App: React.FC = () => {
 
   const activePid = projectId || status?.active_project_id || "";
   const projects = status?.projects ?? [];
+  // Set during render so children format with the right zone on this same render.
+  setProjectTimeZone(projects.find((p) => p.id === activePid)?.timezone);
   const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
   const displayName = user?.name || user?.email || "Admin token";
@@ -777,6 +791,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                 projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
                 projects={projects}
                 onProjectCreated={(id) => switchProject(id, true)}
+                onProjectsChanged={() => void loadStatus()}
               />
             ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
               <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />

@@ -4,7 +4,7 @@ import { api, DeletionAuditRecord, UserDetailResponse, UserEventItem, UserProfil
 import { useAccess } from "../auth/access";
 import { SessionReplay } from "../components/WireframePlayer";
 import { EmptyState, ErrorNotice, ListSkeleton, PageHeader, Panel, Spinner, btn, field } from "../components/ui";
-import { errorMessage, formatCount, formatTimestamp, humanizeEvent } from "../lib/format";
+import { errorMessage, formatCount, formatDate, formatTime, formatTimestamp, humanizeEvent } from "../lib/format";
 
 const PAGE = 50;
 const TIMELINE_STEP = 50;
@@ -29,9 +29,8 @@ function commonKeys(users: UserProfileItem[]): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3).map(([k]) => k);
 }
 
-const dayLabel = (ts: number) =>
-  new Date(ts).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
-const timeLabel = (ts: number) => new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+const dayLabel = (ts: number) => formatDate(ts, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+const timeLabel = formatTime;
 
 /** Event props worth showing in a timeline row: skip internal `$` keys and long blobs. */
 const readableProps = (ev: UserEventItem) =>

@@ -1555,6 +1555,16 @@ impl MetaStore {
         Ok(())
     }
 
+    pub async fn set_project_timezone(&self, id: &str, tz: &str) -> Result<(), MetaError> {
+        let _ = db_exec!(
+            self,
+            "UPDATE projects SET timezone = ? WHERE id = ?",
+            tz,
+            id
+        );
+        Ok(())
+    }
+
     pub async fn rename_org(&self, id: &str, name: &str) -> Result<(), MetaError> {
         let _ = db_exec!(self, "UPDATE orgs SET name = ? WHERE id = ?", name, id);
         Ok(())

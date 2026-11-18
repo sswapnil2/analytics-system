@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
-import { errorMessage, humanizeEvent } from "../lib/format";
+import { errorMessage, formatDate, formatDateTime, humanizeEvent } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { AnnotationsList, useAnnotations } from "../components/Annotations";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
@@ -102,10 +102,9 @@ const INTERVAL_NOUN: Record<Interval, string> = { hour: "hour", day: "day", week
 
 /** Label for one chart bucket at the report's granularity (weeks are labelled by their Monday). */
 function formatBucket(ts: number, interval: Interval = "day"): string {
-  const d = new Date(ts);
-  if (interval === "hour") return d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric" });
-  if (interval === "month") return d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
-  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  if (interval === "hour") return formatDateTime(ts, { day: "numeric", month: "short", hour: "numeric" });
+  if (interval === "month") return formatDate(ts, { month: "short", year: "numeric" });
+  return formatDate(ts, { day: "numeric", month: "short" });
 }
 
 /** 1, 2, 5 x 10^n ceiling so axis ticks land on round numbers. */
@@ -723,7 +722,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                       strokeDasharray="4 3"
                     />
                     <circle cx={xAt(i)} cy={PLOT.bottom - PLOT_H} r={4} fill="rgb(var(--warn))">
-                      <title>{`${new Date(a.ts_ms).toLocaleDateString()}: ${a.text}`}</title>
+                      <title>{`${formatDate(a.ts_ms)}: ${a.text}`}</title>
                     </circle>
                   </g>
                 ))}
@@ -754,7 +753,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 >
                   <p className="mb-1.5 font-semibold text-ink">
                     {interval === "day"
-                      ? new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })
+                      ? formatDate(buckets[hoverIdx], { weekday: "short", day: "numeric", month: "short" })
                       : formatBucket(buckets[hoverIdx], interval)}
                     {hoverIdx === n - 1 && <span className="font-normal text-muted"> (so far)</span>}
                   </p>

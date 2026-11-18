@@ -73,6 +73,7 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         Role::Owner
     } else if ADMIN.contains(&path)
         || (path == "/v1/projects" && m == Method::POST)
+        || (path == "/v1/projects/:id" && m == Method::PATCH)
         || (path == "/v1/projects/:id/users/:distinct_id" && m == Method::DELETE)
     {
         Role::Admin
@@ -990,6 +991,7 @@ mod tests {
             Role::Admin
         );
         assert_eq!(r(Method::POST, "/v1/projects"), Role::Admin);
+        assert_eq!(r(Method::PATCH, "/v1/projects/:id"), Role::Admin);
         assert_eq!(r(Method::GET, "/v1/org/members"), Role::Viewer);
         assert_eq!(r(Method::PATCH, "/v1/org/members/:user_id"), Role::Admin);
         assert_eq!(r(Method::PATCH, "/v1/org"), Role::Owner);

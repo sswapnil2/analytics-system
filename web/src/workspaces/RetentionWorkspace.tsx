@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, RetentionResult } from "../api/client";
-import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
 import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import {
@@ -368,7 +368,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
                   return (
                     <tr key={row.cohort_start_ts_ms}>
                       <td className="sticky left-0 z-10 whitespace-nowrap bg-panel py-1 pr-3 text-ink">
-                        {new Date(row.cohort_start_ts_ms).toLocaleDateString(undefined, {
+                        {formatDate(row.cohort_start_ts_ms, {
                           day: "numeric",
                           month: "short",
                           timeZone: "UTC",

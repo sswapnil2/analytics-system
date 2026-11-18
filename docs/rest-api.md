@@ -117,6 +117,7 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | GET | `/v1/status` | Row counts, segments and identity stats for a project (`?project_id=`) |
 | POST | `/v1/admin/flush` | Flush in-memory rows and compact segments for all projects. Root token or Studio session only. |
 | GET, POST | `/v1/projects` | List projects / create one (`{"name", "timezone"?}`; root or session only, id is generated) |
+| PATCH | `/v1/projects/:id` | Rename a project and/or change its time zone: `{"name"?, "timezone"?}` (IANA name; `400` otherwise). Admin. Reports bucket days and hours on the new clock at once. |
 | GET, POST | `/v1/projects/:id/api-keys` | List keys / create one: `{"label", "role": "ingest_and_flags" \| "admin"}`. The response's `plaintext_key` is shown once. |
 | DELETE | `/v1/projects/:id/api-keys/:key_id` | Revoke a key. It stops working at once on this node and within seconds on other nodes. |
 | GET | `/v1/auth/me` | The signed-in user (Studio `ps_` sessions only; other tokens get `404`) |

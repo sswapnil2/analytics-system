@@ -3,7 +3,7 @@ import { UsersRound } from "lucide-react";
 import { api, UserEventItem } from "../api/client";
 import { useAccess } from "../auth/access";
 import { btn, Spinner } from "../components/ui";
-import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { errorMessage, formatCount, formatDate, formatTime, humanizeEvent } from "../lib/format";
 
 /** The funnel query behind the report, with its time range and global filter. */
 export interface FunnelQueryBody {
@@ -104,7 +104,7 @@ export const WhyTheyLeft: React.FC<{
         query,
         step,
         name,
-        `Dropped off between ${humanizeEvent(fromEvent)} and ${humanizeEvent(toEvent)}, ${new Date(range.start_ts_ms).toLocaleDateString()} – ${new Date(range.end_ts_ms).toLocaleDateString()}. A fixed list saved ${new Date().toLocaleDateString()}.`,
+        `Dropped off between ${humanizeEvent(fromEvent)} and ${humanizeEvent(toEvent)}, ${formatDate(range.start_ts_ms)} – ${formatDate(range.end_ts_ms)}. A fixed list saved ${formatDate(Date.now())}.`,
       );
       setSaved(`Saved "${name}". Use it from the Filter panel on any report.`);
     } catch (err) {
@@ -221,7 +221,7 @@ export const UserTimeline: React.FC<{
           return (
             <li key={i} className={`flex items-baseline gap-3 px-3 py-2 text-sm ${left ? "bg-danger-soft" : ""}`}>
               <span className="w-16 shrink-0 tabular text-xs text-muted">
-                {new Date(e.event_ts_ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                {formatTime(e.event_ts_ms)}
               </span>
               <span className="min-w-0 flex-1 truncate text-ink">{humanizeEvent(e.event_name)}</span>
               <span className="hidden min-w-0 max-w-[50%] truncate text-xs text-faint sm:block">

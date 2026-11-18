@@ -3,7 +3,7 @@ import { AlertTriangle, RefreshCw, Search, Video, Zap } from "lucide-react";
 import { api, SessionSearchResult, SessionSummaryItem } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, ListSkeleton } from "../components/ui";
-import { displayUserId, errorMessage, formatCount, formatDuration, humanizeEvent } from "../lib/format";
+import { displayUserId, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
@@ -168,7 +168,7 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
                         </span>
                       </span>
                       <span className="mt-1 block text-xs text-muted tabular">
-                        {new Date(s.start_ts_ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+                        {formatDateTime(s.start_ts_ms, { dateStyle: "medium", timeStyle: "short" })}
                         {", "}
                         {formatDuration(s.duration_ms)}, {formatCount(s.event_count)} events
                       </span>
@@ -197,7 +197,7 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
                   return (
                     <li key={idx} className="flex items-baseline gap-3 text-sm">
                       <span className="w-20 shrink-0 text-muted tabular">
-                        {new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                        {formatDateTime(ts, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
                       </span>
                       <span className={bad ? "font-medium text-danger" : "text-ink"}>{humanizeEvent(evName)}</span>
                     </li>

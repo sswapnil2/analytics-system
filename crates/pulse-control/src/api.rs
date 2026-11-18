@@ -1275,6 +1275,7 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects",
             get(handle_list_projects).post(handle_create_project),
         )
+        .route("/v1/projects/:id", patch(handle_patch_project))
         .route(
             "/v1/projects/:id/api-keys",
             get(handle_list_keys).post(handle_create_key),
@@ -1670,6 +1671,68 @@ async fn handle_create_project(
     Ok(Json(json!({ "project": proj, "api_key": api_key })))
 }
 
+/// Trims `tz`; `Ok(None)` when blank, an error when it isn't an IANA zone.
+fn valid_timezone(tz: &str) -> Result<Option<String>, CtrlError> {
+    let tz = tz.trim();
+    if tz.is_empty() {
+        return Ok(None);
+    }
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        return Err(CtrlError::bad(format!(
+            "unknown time zone '{tz}': use an IANA name such as 'UTC', 'America/New_York' or 'Asia/Kolkata'"
+        )));
+    }
+    Ok(Some(tz.to_string()))
+}
+
+#[derive(Deserialize)]
+struct PatchProjectReq {
+    name: Option<String>,
+    timezone: Option<String>,
+}
+
+/// Renames a project and/or changes the time zone its reports bucket days in.
+async fn handle_patch_project(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<PatchProjectReq>,
+) -> ApiRes<Project> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if let Some(name) = req.name.as_deref().map(str::trim) {
+        if name.is_empty() {
+            return Err(CtrlError::bad("project name must not be empty"));
+        }
+        let name: String = name.chars().take(80).collect();
+        ctrl.meta
+            .rename_project(&id, &name)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    if let Some(tz) = req
+        .timezone
+        .as_deref()
+        .map(valid_timezone)
+        .transpose()?
+        .flatten()
+    {
+        ctrl.meta
+            .set_project_timezone(&id, &tz)
+            .await
+            .map_err(CtrlError::meta)?;
+        ctrl.refresh_project_virtual_catalog(&id)
+            .await
+            .map_err(CtrlError::internal)?;
+    }
+    let proj = ctrl
+        .meta
+        .get_project(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .ok_or_else(|| CtrlError::not_found("project not found"))?;
+    Ok(Json(proj))
+}
+
 impl ControlPlaneService {
     /// Creates a project in `org_id` with its first ingest key (plaintext returned once).
     async fn create_project_in_org(
@@ -1682,20 +1745,11 @@ impl ControlPlaneService {
         if name.is_empty() {
             return Err(CtrlError::bad("project name must not be empty"));
         }
-        let timezone = match timezone
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-        {
-            Some(tz) => {
-                if tz.parse::<chrono_tz::Tz>().is_err() {
-                    return Err(CtrlError::bad(format!(
-                        "unknown time zone '{tz}': use an IANA name such as 'UTC', 'America/New_York' or 'Asia/Kolkata'"
-                    )));
-                }
-                Some(tz)
-            }
-            None => None,
-        };
+        let timezone = timezone
+            .as_deref()
+            .map(valid_timezone)
+            .transpose()?
+            .flatten();
         let now = Utc::now().timestamp_millis();
         let id = format!("proj_{}", &Uuid::new_v4().simple().to_string()[..12]);
         let proj = Project {
