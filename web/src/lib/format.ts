@@ -111,5 +111,35 @@ export function downloadTextFile(
 /** Format epoch milliseconds into a readable local date/time string. */
 export function formatTimestamp(ms: number | null | undefined): string {
   if (!ms || ms <= 0) return "—";
-  return new Date(ms).toLocaleString();
+  return new Date(ms).toLocaleString(undefined, { timeZone: projectTimeZone, timeZoneName: "short" });
+}
+
+// ponytail: module-level, set by App when the active project changes; pass it as a prop if two projects ever render at once.
+let projectTimeZone: string | undefined;
+
+/** Timestamps render on the project's clock (the one reports bucket days in), not the browser's. */
+export function setProjectTimeZone(tz: string | undefined): void {
+  try {
+    projectTimeZone = tz ? new Intl.DateTimeFormat(undefined, { timeZone: tz }).resolvedOptions().timeZone : undefined;
+  } catch {
+    projectTimeZone = undefined;
+  }
+}
+
+export function formatDateTime(ts: number, opts: Intl.DateTimeFormatOptions = {}): string {
+  return new Date(ts).toLocaleString(undefined, { ...opts, timeZone: projectTimeZone });
+}
+
+export function formatDate(ts: number, opts: Intl.DateTimeFormatOptions = {}): string {
+  return new Date(ts).toLocaleDateString(undefined, { ...opts, timeZone: projectTimeZone });
+}
+
+/** "14:05 IST": the zone is shown so the clock is never ambiguous. */
+export function formatTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: projectTimeZone,
+    timeZoneName: "short",
+  });
 }

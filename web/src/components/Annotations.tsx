@@ -3,7 +3,7 @@ import { Flag, Trash2 } from "lucide-react";
 import { Annotation, api } from "../api/client";
 import { useAccess } from "../auth/access";
 import { btn, field } from "./ui";
-import { errorMessage } from "../lib/format";
+import { errorMessage, formatDate } from "../lib/format";
 
 /** The project's annotations within a range, reloaded when the range changes. */
 export function useAnnotations(projectId: string, startMs: number, endMs: number) {
@@ -69,7 +69,7 @@ export const AnnotationsList: React.FC<{
             <li key={a.id} className="flex items-center gap-2">
               <Flag className="h-3.5 w-3.5 shrink-0 text-warn" aria-hidden="true" />
               <span className="tabular text-xs text-muted">
-                {new Date(a.ts_ms).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                {formatDate(a.ts_ms, { day: "numeric", month: "short" })}
               </span>
               <span className="min-w-0 flex-1 truncate text-ink">{a.text}</span>
               {canEdit && (

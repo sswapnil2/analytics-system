@@ -81,6 +81,11 @@ pub async fn seed_indian_fintech_dataset(
     let today_floor = TimeInterval::Day.align_floor(now_ms);
     let start_day_ms = today_floor - 13 * 86_400_000;
 
+    // Name the demo for what it is; a first owner who names their project at signup overrides this.
+    ctrl.meta()
+        .rename_project(project_id, "Demo: consumer lending app")
+        .await?;
+
     // 1. Seed Control Plane Governance, Lookup Table, Custom Schema, Cohort, Flag & Experiment
     ctrl.meta()
         .upsert_lexicon_property(&LexiconProperty {
@@ -958,6 +963,19 @@ m_croma,Electronics_EMI,9.5,Prime\n";
 
     id_graph.flush().await?;
 
+    // The synthetic timeline can run past "now" for the newest cohort (a few hours). Real clients never
+    // send future events, so slide the whole timeline back; gaps between a user's events stay the same.
+    let overrun = all_events
+        .iter()
+        .map(|e| e.client_event_ts_ms)
+        .max()
+        .unwrap_or(now_ms)
+        - now_ms;
+    if overrun > 0 {
+        for e in &mut all_events {
+            e.client_event_ts_ms -= overrun;
+        }
+    }
     let unique_events = all_events.len();
     // Separate 10% simulated metro/flight delayed offline events (sent in later waves to exercise out-of-order L1 compaction!)
     let mut primary_stream = Vec::with_capacity(unique_events);

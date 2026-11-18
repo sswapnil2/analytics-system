@@ -252,3 +252,22 @@ The product leader re-reviewed `main` after PR 17 (`product-review/re-review.md`
   - Files: `pulse-control/src/api.rs`.
   - Tests: `correctness.rs` imports the same NDJSON as `application/x-ndjson` (2 accepted), then `application/json` and `text/plain` (2 deduped each). It fails without the change.
 - **Checked in the Studio** (release build, two projects): reload, bare URL, Share link in a clean browser, an unknown project, a pasted link to another project, and saving a cohort from a step-filtered funnel (90 = "Download all 90").
+
+## E-27 Pending items after the re-review
+
+- **Flaky `p1_02` WAL test.** This was a bug in how the test models a crash, not data loss. Dropping the engine left a background L0 flush running, and that flush committed the manifest and purged the WAL while the second engine was recovering. Phase 1 now runs on its own Tokio runtime, which `shutdown_background()` kills mid-write, the way a real crash would. Production code is unchanged.
+  - Result: 30 of 30 passes (it failed 24 of 30 before the fix).
+- **Times on the project's clock.** These now render in the project's time zone instead of the browser's: the drop-off drawer and its "Left …" list, the Users timeline, session lists, Trends and Retention day buckets, annotations, and every `formatTimestamp`. Timelines name the zone ("12:00 GMT+9"). Before this, a Tokyo project viewed from India labelled each day bucket with the previous day.
+  - Files: `web/src/lib/format.ts` (`setProjectTimeZone`, `formatDate`, `formatDateTime`, `formatTime`), `App.tsx`, the Funnels, Users, Sessions, Trends and Retention workspaces, `DropOffInsights.tsx` and `Annotations.tsx`.
+  - Left on the browser clock on purpose: the custom date-range picker, and account metadata dates such as dashboard creation.
+  - Tests: `web/src/lib/format.test.ts`.
+- **Change a project's time zone or name.** New route `PATCH /v1/projects/:id` (Admin). It validates the zone and refreshes the query catalog. In Settings → Projects, each project has a time-zone picker, with a confirm before the change.
+  - Tests: `correctness.rs` (bad zone `400`, rename and move, then back); `required_role` unit test.
+- **First event confirmation.** When a project goes from 0 events to some, the Studio says "First event received" instead of the setup panel just disappearing.
+- **Seed hygiene.** The demo project is named "Demo: consumer lending app", unless the first owner names it at signup. The seed no longer writes events with future timestamps: it slides the whole synthetic timeline back by the overrun (a few hours), so the volume (100k+) and the gaps between each user's events are unchanged.
+- **Still open (feature work, not fixes):**
+  - Funnel conversion windows beyond 1h/1d/7d/14d.
+  - Exclusion steps at any position.
+  - Cohort split in Funnels and Retention.
+  - Environments.
+  - MCP filter schemas.

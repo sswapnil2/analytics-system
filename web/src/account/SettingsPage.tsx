@@ -85,7 +85,9 @@ export const SettingsPage: React.FC<{
   projects: ProjectInfo[];
   /** Called with the new project's id after it is created, so the app can switch to it. */
   onProjectCreated: (id: string) => void;
-}> = ({ user, projectId, projectName, projects, onProjectCreated }) => {
+  /** Called after a project is changed, so the app reloads the project list. */
+  onProjectsChanged: () => void;
+}> = ({ user, projectId, projectName, projects, onProjectCreated, onProjectsChanged }) => {
   const [org, setOrg] = useState<OrgInfo | null>(null);
   const [members, setMembers] = useState<OrgMember[] | null>(null);
   const [invites, setInvites] = useState<OrgInvite[]>([]);
@@ -166,6 +168,14 @@ export const SettingsPage: React.FC<{
       onProjectCreated(res.project.id);
     });
     setCreatingProject(false);
+  };
+
+  const setProjectTz = (p: ProjectInfo, timezone: string) => {
+    if (!window.confirm(`Move "${p.name}" to ${timezone}? Reports bucket days and hours on this clock from now on.`)) return;
+    void act(async () => {
+      await api.updateProject(p.id, { timezone });
+      onProjectsChanged();
+    });
   };
 
   // A new key with the same label and role, then the old one revoked at once (the confirm says so).
@@ -387,8 +397,20 @@ export const SettingsPage: React.FC<{
                 {projects.map((p) => (
                   <li key={p.id} className="flex flex-wrap items-baseline justify-between gap-2 py-2">
                     <span className="font-medium text-ink">{p.name}</span>
-                    <span className="text-xs text-muted">
-                      {p.timezone} · <code className="font-mono">{p.id}</code>
+                    <span className="flex items-center gap-2 text-xs text-muted">
+                      <select
+                        aria-label={`Time zone for ${p.name}`}
+                        value={p.timezone}
+                        onChange={(e) => setProjectTz(p, e.target.value)}
+                        className="rounded-md border border-line-strong bg-field px-2 py-1 text-xs text-ink focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25"
+                      >
+                        {(zones.includes(p.timezone) ? zones : [p.timezone, ...zones]).map((z) => (
+                          <option key={z} value={z}>
+                            {z.replace(/_/g, " ")}
+                          </option>
+                        ))}
+                      </select>
+                      <code className="font-mono">{p.id}</code>
                     </span>
                   </li>
                 ))}

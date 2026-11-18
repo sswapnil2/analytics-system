@@ -31,13 +31,7 @@ import {
   useSort,
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
-import {
-  displayUserId,
-  errorMessage,
-  formatCount,
-  formatDuration,
-  humanizeEvent,
-} from "../lib/format";
+import { displayUserId, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
@@ -762,7 +756,7 @@ const DropOffDrawer: React.FC<{
                           </span>
                         </span>
                         <span className="block text-xs text-muted">
-                          Left {new Date(d.drop_ts_ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+                          Left {formatDateTime(d.drop_ts_ms, { dateStyle: "medium", timeStyle: "short" })}
                         </span>
                       </button>
                     </li>
