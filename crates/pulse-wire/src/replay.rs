@@ -168,11 +168,22 @@ pub enum InteractionKind {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum WireframeOp {
     FullSnapshot {
+        /// Offset from `chunk_start_ts_ms` at which this screen appeared. Absent in older
+        /// chunks (defaults to 0, i.e. the chunk start).
+        #[serde(default)]
+        ts_offset_ms: u32,
         width: u16,
         height: u16,
         nodes: Vec<WireNode>,
     },
-    NodeUpsert(WireNode),
+    NodeUpsert {
+        /// Offset from `chunk_start_ts_ms` at which the node changed. Absent in older chunks
+        /// (defaults to 0; the player then falls back to the previous timed op).
+        #[serde(default)]
+        ts_offset_ms: u32,
+        #[serde(flatten)]
+        node: WireNode,
+    },
     NodeRemove {
         node_id: u32,
     },
@@ -197,15 +208,26 @@ impl WireframeOp {
     const OP_NODE_REMOVE: u8 = 3;
     const OP_POINTER: u8 = 4;
     const OP_NETWORK: u8 = 5;
+    /// `OP_FULL_SNAPSHOT` preceded by a `u32` `ts_offset_ms`. Written only when the offset is
+    /// non-zero, so zero-offset snapshots stay readable by older decoders.
+    const OP_FULL_SNAPSHOT_TS: u8 = 6;
+    /// `OP_NODE_UPSERT` preceded by a `u32` `ts_offset_ms`; written only when non-zero.
+    const OP_NODE_UPSERT_TS: u8 = 7;
 
     fn write_to(&self, out: &mut Vec<u8>) {
         match self {
             WireframeOp::FullSnapshot {
+                ts_offset_ms,
                 width,
                 height,
                 nodes,
             } => {
-                out.push(Self::OP_FULL_SNAPSHOT);
+                if *ts_offset_ms == 0 {
+                    out.push(Self::OP_FULL_SNAPSHOT);
+                } else {
+                    out.push(Self::OP_FULL_SNAPSHOT_TS);
+                    out.extend_from_slice(&ts_offset_ms.to_le_bytes());
+                }
                 out.extend_from_slice(&width.to_le_bytes());
                 out.extend_from_slice(&height.to_le_bytes());
                 out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
@@ -213,8 +235,13 @@ impl WireframeOp {
                     node.write_to(out);
                 }
             }
-            WireframeOp::NodeUpsert(node) => {
-                out.push(Self::OP_NODE_UPSERT);
+            WireframeOp::NodeUpsert { ts_offset_ms, node } => {
+                if *ts_offset_ms == 0 {
+                    out.push(Self::OP_NODE_UPSERT);
+                } else {
+                    out.push(Self::OP_NODE_UPSERT_TS);
+                    out.extend_from_slice(&ts_offset_ms.to_le_bytes());
+                }
                 node.write_to(out);
             }
             WireframeOp::NodeRemove { node_id } => {
@@ -261,7 +288,12 @@ impl WireframeOp {
     fn read_from(cursor: &mut ByteCursor<'_>) -> Result<Self> {
         let op = cursor.read_u8("wireframe op")?;
         match op {
-            Self::OP_FULL_SNAPSHOT => {
+            Self::OP_FULL_SNAPSHOT | Self::OP_FULL_SNAPSHOT_TS => {
+                let ts_offset_ms = if op == Self::OP_FULL_SNAPSHOT_TS {
+                    cursor.read_u32("snapshot.ts")?
+                } else {
+                    0
+                };
                 let width = cursor.read_u16("snapshot.width")?;
                 let height = cursor.read_u16("snapshot.height")?;
                 let count = cursor.read_u32("snapshot.nodes.len")? as usize;
@@ -276,12 +308,20 @@ impl WireframeOp {
                     nodes.push(WireNode::read_from(cursor)?);
                 }
                 Ok(WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes,
                 })
             }
-            Self::OP_NODE_UPSERT => Ok(WireframeOp::NodeUpsert(WireNode::read_from(cursor)?)),
+            Self::OP_NODE_UPSERT => Ok(WireframeOp::NodeUpsert {
+                ts_offset_ms: 0,
+                node: WireNode::read_from(cursor)?,
+            }),
+            Self::OP_NODE_UPSERT_TS => Ok(WireframeOp::NodeUpsert {
+                ts_offset_ms: cursor.read_u32("upsert.ts")?,
+                node: WireNode::read_from(cursor)?,
+            }),
             Self::OP_NODE_REMOVE => Ok(WireframeOp::NodeRemove {
                 node_id: cursor.read_u32("remove.node_id")?,
             }),
@@ -408,15 +448,20 @@ impl ReplayChunk {
             .into_iter()
             .map(|op| match op {
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes,
                 } => WireframeOp::FullSnapshot {
+                    ts_offset_ms,
                     width,
                     height,
                     nodes: nodes.into_iter().map(WireNode::sanitized).collect(),
                 },
-                WireframeOp::NodeUpsert(n) => WireframeOp::NodeUpsert(n.sanitized()),
+                WireframeOp::NodeUpsert { ts_offset_ms, node } => WireframeOp::NodeUpsert {
+                    ts_offset_ms,
+                    node: node.sanitized(),
+                },
                 other => other,
             })
             .collect();
@@ -475,15 +520,20 @@ impl ReplayChunk {
                 .into_iter()
                 .map(|op| match op {
                     WireframeOp::FullSnapshot {
+                        ts_offset_ms,
                         width,
                         height,
                         nodes,
                     } => WireframeOp::FullSnapshot {
+                        ts_offset_ms,
                         width,
                         height,
                         nodes: nodes.into_iter().map(WireNode::sanitized).collect(),
                     },
-                    WireframeOp::NodeUpsert(n) => WireframeOp::NodeUpsert(n.sanitized()),
+                    WireframeOp::NodeUpsert { ts_offset_ms, node } => WireframeOp::NodeUpsert {
+                        ts_offset_ms,
+                        node: node.sanitized(),
+                    },
                     other => other,
                 })
                 .collect();
@@ -521,7 +571,7 @@ impl ReplayChunk {
             WireframeOp::FullSnapshot { nodes, .. } => {
                 nodes.iter().any(|n| n.kind == NodeKind::ErrorBanner)
             }
-            WireframeOp::NodeUpsert(n) => n.kind == NodeKind::ErrorBanner,
+            WireframeOp::NodeUpsert { node, .. } => node.kind == NodeKind::ErrorBanner,
             _ => false,
         })
     }
@@ -531,4 +581,67 @@ impl ReplayChunk {
 fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_snapshot_ts_offset_roundtrips_and_stays_backward_compatible() {
+        let snap = |ts_offset_ms| WireframeOp::FullSnapshot {
+            ts_offset_ms,
+            width: 390,
+            height: 844,
+            nodes: vec![],
+        };
+        let chunk = ReplayChunk {
+            project_id: "p".into(),
+            session_id: "s".into(),
+            chunk_start_ts_ms: 1_000,
+            ops: vec![snap(0), snap(4_200)],
+        };
+        let decoded = ReplayChunk::decode_binary(&chunk.encode_binary(3).unwrap()).unwrap();
+        assert_eq!(decoded.ops, chunk.ops);
+
+        // Zero offset keeps the legacy tag, so older decoders can still read it.
+        let mut raw = Vec::new();
+        snap(0).write_to(&mut raw);
+        assert_eq!(raw[0], 1);
+
+        // Node upserts carry their own offset the same way.
+        let banner = |ts_offset_ms| WireframeOp::NodeUpsert {
+            ts_offset_ms,
+            node: WireNode {
+                node_id: 99_000,
+                parent_id: 1,
+                kind: NodeKind::ErrorBanner,
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+                bg_rgba: 0,
+                masked_label: "boom".into(),
+            },
+        };
+        let up = ReplayChunk {
+            ops: vec![banner(0), banner(1_500)],
+            ..chunk.clone()
+        };
+        assert_eq!(
+            ReplayChunk::decode_binary(&up.encode_binary(3).unwrap())
+                .unwrap()
+                .ops,
+            up.ops
+        );
+        let json = serde_json::to_value(banner(1_500)).unwrap();
+        assert_eq!(json["op"], "node_upsert");
+        assert_eq!(json["ts_offset_ms"], 1_500);
+        assert_eq!(json["node_id"], 99_000, "node fields stay flat in JSON");
+
+        // JSON from older SDKs has no ts_offset_ms and lands at the chunk start.
+        let legacy = br#"{"project_id":"","session_id":"s","chunk_start_ts_ms":1,"ops":[{"op":"full_snapshot","width":390,"height":844,"nodes":[]},{"op":"node_upsert","node_id":99000,"parent_id":1,"kind":"error_banner","x":1,"y":2,"w":3,"h":4,"bg_rgba":0,"masked_label":"boom"}]}"#;
+        let c = ReplayChunk::decode_auto(legacy, Some("application/json")).unwrap();
+        assert_eq!(c.ops, vec![snap(0), banner(0)]);
+    }
 }

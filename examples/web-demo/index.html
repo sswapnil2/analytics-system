@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pulse Web Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 40px auto; padding: 0 16px; }
+    section { display: none; } section.active { display: block; }
+    button { display: block; margin: 12px 0; padding: 10px 16px; font-size: 16px; }
+    input { display: block; margin: 8px 0; padding: 8px; font-size: 16px; width: 100%; box-sizing: border-box; }
+    [role=alert] { background: #fee2e2; color: #991b1b; padding: 8px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <section id="welcome" class="active">
+    <h1 data-pulse-unmask>Welcome to DemoPay</h1>
+    <p data-pulse-unmask>Open an account in three steps.</p>
+    <button id="start" data-pulse-unmask>Get started</button>
+  </section>
+
+  <section id="profile">
+    <h1 data-pulse-unmask>Your details</h1>
+    <form id="profile-form">
+      <input id="name" placeholder="Full name" value="Asha Rao" />
+      <input id="pan" placeholder="PAN number" value="ABCDE1234F" />
+      <button type="submit" data-pulse-unmask>Continue</button>
+    </form>
+  </section>
+
+  <section id="plan">
+    <h1 data-pulse-unmask>Pick a plan</h1>
+    <button id="broken" data-pulse-unmask>Apply promo code</button>
+    <div id="err"></div>
+    <button id="pro" data-pulse-unmask>Choose Pro</button>
+  </section>
+
+  <section id="done">
+    <h1 data-pulse-unmask>You're all set</h1>
+  </section>
+
+  <script type="module">
+    import { PulseWebClient } from "/sdks/ts-web/dist/index.js";
+
+    const params = new URLSearchParams(location.search);
+    const pulse = new PulseWebClient({
+      endpointUrl: params.get("endpoint") ?? "http://127.0.0.1:18190",
+      apiKey: params.get("key") ?? "pk_live_REPLACE_ME",
+      enableWireframeReplay: true,
+      autocapture: true,
+    });
+    window.pulse = pulse; // for debugging in devtools
+
+    pulse.identify("web_demo_user_1", { platform: "web", plan: "free" });
+
+    function show(screen) {
+      document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === screen));
+      pulse.track("Onboarding Screen Viewed", { screen });
+      pulse.captureDomWireframeSnapshot();
+    }
+    show("welcome");
+
+    document.getElementById("start").onclick = () => {
+      pulse.track("Onboarding Started");
+      show("profile");
+    };
+    document.getElementById("profile-form").onsubmit = (e) => {
+      e.preventDefault();
+      pulse.track("Profile Submitted", { has_pan: true });
+      show("plan");
+    };
+    // Deliberately broken button: errors on every click, so users rage-tap it.
+    document.getElementById("broken").onclick = () => {
+      try {
+        throw new Error("PromoService unavailable");
+      } catch (err) {
+        document.getElementById("err").innerHTML = `<div role="alert">${err.message}</div>`;
+        pulse.recordConsoleError(err.message);
+      }
+    };
+    document.getElementById("pro").onclick = () => {
+      pulse.track("Plan Selected", { plan: "pro" });
+      show("done");
+      pulse.track("Onboarding Completed");
+      pulse.flush();
+    };
+  </script>
+</body>
+</html>

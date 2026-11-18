@@ -155,6 +155,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   assert.equal(receivedReplays.length, 1);
   // Title "John Smith Account Statement" MUST be masked to FIXED_MASK (`P3-01`)
   assert.equal(receivedReplays[0].ops[0].nodes[0].masked_label, FIXED_MASK);
+  assert.equal(receivedReplays[0].ops[0].ts_offset_ms, 0, "first snapshot starts its chunk");
 
   // 4. 4 rapid clicks -> only ONE `$rage_tap` emitted (`P3-05`)
   const clickFn = Array.from(listeners.get("click"))[0];
@@ -299,6 +300,7 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
   assert.equal(sdk.isRecordingSession(), true);
   sdk.recordNetworkBreadcrumb("POST", "/v1/pay", 504, 1200);
   sdk.recordConsoleError("Unhandled payment timeout");
+  sdk.recordConsoleError("Unhandled payment timeout");
   assert.ok(sdk.getSessionReplayUrl().includes(sdk.getSessionId()));
 
   // Experiment exposure deduplication & remote config payload
@@ -309,6 +311,19 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
   assert.equal(sdk.isEnabled("one_tap_upi_mandate"), true);
   assert.deepEqual(sdk.getVariantPayload("one_tap_upi_mandate"), { theme: "bottom_sheet" });
   await sdk.flush();
+  // Repeated errors upsert one stable banner node instead of stacking copies.
+  const bannerIds = calls
+    .filter((c) => c.url.endsWith("/v1/replay/chunk"))
+    .flatMap((c) => c.body.ops)
+    .filter((op) => op.kind === "error_banner")
+    .map((op) => op.node_id);
+  assert.equal(bannerIds.length, 2);
+  assert.equal(new Set(bannerIds).size, 1);
+  const banners = calls
+    .filter((c) => c.url.endsWith("/v1/replay/chunk"))
+    .flatMap((c) => c.body.ops)
+    .filter((op) => op.kind === "error_banner");
+  assert.ok(banners.every((op) => typeof op.ts_offset_ms === "number"), "banner upserts carry a timestamp");
   const exposureEvents = calls
     .filter((c) => c.url.endsWith("/v1/ingest"))
     .flatMap((c) => c.body.events)

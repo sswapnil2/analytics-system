@@ -683,6 +683,7 @@ async fn p1_16_replay_store_immutable_chunks_survive_midnight_restart_and_reject
             session_id: "sess_midnight_01".into(),
             chunk_start_ts_ms: day1_23_59,
             ops: vec![WireframeOp::FullSnapshot {
+                ts_offset_ms: 0,
                 width: 390,
                 height: 844,
                 nodes: vec![WireNode {

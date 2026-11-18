@@ -192,8 +192,8 @@ export interface WireNode {
 }
 
 export type WireframeOp =
-  | { op: "full_snapshot"; width: number; height: number; nodes: WireNode[] }
-  | ({ op: "node_upsert" } & WireNode)
+  | { op: "full_snapshot"; ts_offset_ms?: number; width: number; height: number; nodes: WireNode[] }
+  | ({ op: "node_upsert"; ts_offset_ms?: number } & WireNode)
   | { op: "node_remove"; node_id: number }
   | {
       op: "pointer_interaction";

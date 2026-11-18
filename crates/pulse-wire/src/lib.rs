@@ -169,6 +169,7 @@ mod tests {
             chunk_start_ts_ms: 1_760_000_100_000,
             ops: vec![
                 WireframeOp::FullSnapshot {
+                    ts_offset_ms: 0,
                     width: 390,
                     height: 844,
                     nodes: vec![
@@ -228,17 +229,20 @@ mod tests {
             project_id: "proj_fintech".to_string(),
             session_id: "sess_frustrated_01".to_string(),
             chunk_start_ts_ms: 1_760_000_105_000,
-            ops: vec![WireframeOp::NodeUpsert(WireNode {
-                node_id: 4,
-                parent_id: 1,
-                kind: NodeKind::ErrorBanner,
-                x: 24,
-                y: 340,
-                w: 342,
-                h: 48,
-                bg_rgba: 0xEF44_44FF,
-                masked_label: "NSDL Gateway 504 Timeout".to_string(),
-            })],
+            ops: vec![WireframeOp::NodeUpsert {
+                ts_offset_ms: 0,
+                node: WireNode {
+                    node_id: 4,
+                    parent_id: 1,
+                    kind: NodeKind::ErrorBanner,
+                    x: 24,
+                    y: 340,
+                    w: 342,
+                    h: 48,
+                    bg_rgba: 0xEF44_44FF,
+                    masked_label: "NSDL Gateway 504 Timeout".to_string(),
+                },
+            }],
         };
 
         let bin1 = chunk1.encode_binary(3).expect("encode chunk1");

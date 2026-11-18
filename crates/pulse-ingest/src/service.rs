@@ -776,7 +776,7 @@ fn apply_lexicon_to_replay_chunk(chunk: &mut ReplayChunk, rules: &ProjectLexicon
                     mask_label(&mut node.masked_label, node.kind);
                 }
             }
-            WireframeOp::NodeUpsert(node) => {
+            WireframeOp::NodeUpsert { node, .. } => {
                 mask_label(&mut node.masked_label, node.kind);
             }
             _ => {}
