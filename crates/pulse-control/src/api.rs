@@ -285,6 +285,11 @@ impl ControlPlaneService {
         &self.meta
     }
 
+    /// Checks the metadata database answers, for `/readyz`.
+    pub async fn ping_metadata(&self) -> Result<(), String> {
+        self.meta.ping().await.map_err(|e| e.to_string())
+    }
+
     pub fn qengine(&self) -> &Arc<QueryEngine> {
         &self.qengine
     }
