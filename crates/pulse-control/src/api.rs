@@ -3499,7 +3499,11 @@ async fn handle_import_events(
                     }),
                 }
             }
-            WireBatch { events, rejected }
+            WireBatch {
+                events,
+                rejected,
+                profile_calls: Vec::new(),
+            }
         } else {
             // CSV with header
             let mut lines = trimmed.lines().filter(|l| !l.trim().is_empty());
@@ -3552,13 +3556,17 @@ async fn handle_import_events(
                     }),
                 }
             }
-            WireBatch { events, rejected }
+            WireBatch {
+                events,
+                rejected,
+                profile_calls: Vec::new(),
+            }
         }
     } else {
         WireBatch::decode_json(&body).map_err(|e| CtrlError::bad(e.to_string()))?
     };
 
-    if batch.events.is_empty() {
+    if batch.events.is_empty() && batch.profile_calls.is_empty() {
         if let Some(first) = batch.rejected.first() {
             return Err(CtrlError::bad(first.error.clone()));
         }
@@ -3583,6 +3591,7 @@ async fn handle_import_events(
         "dropped": res.dropped,
         "server_ts_ms": res.server_ts_ms,
         "rejected": res.rejected,
+        "profiles_updated": res.profiles_updated,
     })))
 }
 

@@ -109,6 +109,17 @@ impl DictionaryRegistry {
     }
 }
 
+/// Segment `identify` and `alias` calls: profile and identity updates, not events.
+fn is_profile_call(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("type")
+            .and_then(|t| t.as_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("identify" | "alias")
+    )
+}
+
 /// Columnar batch container for analytical events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireBatch {
@@ -116,6 +127,9 @@ pub struct WireBatch {
     /// Items of a JSON batch that failed validation; the valid ones are still in `events`.
     #[serde(skip)]
     pub rejected: Vec<RejectedEvent>,
+    /// Segment `identify` / `alias` calls found in a JSON batch, applied as profile updates.
+    #[serde(skip)]
+    pub profile_calls: Vec<serde_json::Value>,
 }
 
 /// One invalid item of a JSON batch: its position in the request and why it was refused.
@@ -130,6 +144,7 @@ impl WireBatch {
         Self {
             events,
             rejected: Vec::new(),
+            profile_calls: Vec::new(),
         }
     }
 
@@ -166,6 +181,10 @@ impl WireBatch {
                                 .to_string(),
                         )),
                     }
+                } else if is_profile_call(&serde_json::Value::Object(map.clone())) {
+                    let mut b = Self::new(Vec::new());
+                    b.profile_calls.push(serde_json::Value::Object(map));
+                    return Ok(b);
                 } else {
                     let ev = WireEvent::deserialize(serde_json::Value::Object(map))
                         .map_err(|e| WireError::InvalidPayload(e.to_string()))?;
@@ -187,7 +206,12 @@ impl WireBatch {
         // Partial success: one malformed event must not cost the caller the rest of the batch.
         let mut events = Vec::with_capacity(items.len());
         let mut rejected = Vec::new();
+        let mut profile_calls = Vec::new();
         for (index, item) in items.into_iter().enumerate() {
+            if is_profile_call(&item) {
+                profile_calls.push(item);
+                continue;
+            }
             match WireEvent::deserialize(item) {
                 Ok(ev) => events.push(ev),
                 Err(e) => rejected.push(RejectedEvent {
@@ -196,7 +220,7 @@ impl WireBatch {
                 }),
             }
         }
-        if events.is_empty() {
+        if events.is_empty() && profile_calls.is_empty() {
             if let Some(first) = rejected.first() {
                 return Err(WireError::InvalidPayload(format!(
                     "event at index {}: {}",
@@ -204,7 +228,11 @@ impl WireBatch {
                 )));
             }
         }
-        Ok(Self { events, rejected })
+        Ok(Self {
+            events,
+            rejected,
+            profile_calls,
+        })
     }
 
     /// Encodes the batch into Pulse's `PLSB` columnar binary layout compressed with raw Zstd (`flags = 0x01`).

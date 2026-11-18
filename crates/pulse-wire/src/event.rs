@@ -297,10 +297,9 @@ fn apply_segment_call_type(
     let event = match kind.as_str() {
         "page" => "$pageview",
         "screen" => "$screen",
-        "identify" => {
-            return Err("Segment \"identify\" calls are not events: send the anonymous-to-user link to /v1/identify and traits to /v1/engage".into())
+        "identify" | "alias" => {
+            return Err(format!("Segment \"{kind}\" calls are applied by /v1/ingest batches; here send them to /v1/identify (anonymous-to-user link) and /v1/engage (traits)"))
         }
-        "alias" => return Err("Segment \"alias\" calls are not events: send them to /v1/identify".into()),
         "group" => return Err("Segment \"group\" calls are not events: send group traits to /v1/groups".into()),
         _ => return Ok(()),
     };

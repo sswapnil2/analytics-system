@@ -536,7 +536,7 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
             json!({"batch": [
                 {"event": "Batch OK", "userId": "b1", "timestamp": t},
                 {"userId": "b2", "timestamp": t},
-                {"type": "identify", "userId": "b3", "traits": {"plan": "x"}},
+                {"type": "identify", "userId": "seg_user", "anonymousId": "seg_anon", "traits": {"segment_plan": "pro"}},
                 {"type": "page", "name": "Home", "userId": "b4", "timestamp": t},
                 {"event": "x".repeat(300), "userId": "b5", "timestamp": t},
             ]}),
@@ -550,7 +550,21 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
         .iter()
         .map(|x| x["index"].as_u64().unwrap())
         .collect();
-    assert_eq!(rejected, [1, 2, 4], "{r}");
+    assert_eq!(rejected, [1, 4], "{r}");
+    assert_eq!(r["profiles_updated"].as_u64(), Some(1), "{r}");
+    // The Segment identify linked seg_anon to seg_user and set its traits: an event the
+    // anonymous id sends is counted for a user with segment_plan = pro.
+    api.ingest(
+        "/v1/ingest",
+        json!({"events": [{"event": "Seg Probe", "anonymousId": "seg_anon", "timestamp": t}]}),
+    )
+    .await;
+    let seg = json!([{"prop_name": "user.segment_plan", "filter": {"op": "eq", "val": "pro"}}]);
+    assert_eq!(
+        api.total("Seg Probe", json!("uniques"), seg).await,
+        1.0,
+        "Segment identify in a batch applies traits and the merge"
+    );
     let pv = api.total("$pageview", json!("totals"), json!([])).await;
     assert_eq!(pv, 1.0, "Segment page becomes $pageview");
 
