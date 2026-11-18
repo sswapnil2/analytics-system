@@ -261,6 +261,11 @@ export function flagRolloutSlot(flagKey: string, distinctId: string): number {
   return Number(xxh3_64(`${flagKey}:${distinctId}`) % 10000n);
 }
 
+/** Matches `pulse_wire::cohort_member_hash`: lowercase 16-hex `xxh3_64("cohort:{id}:{distinctId}")`. */
+export function cohortMemberHash(cohortId: string, distinctId: string): string {
+  return xxh3_64(`cohort:${cohortId}:${distinctId}`).toString(16).padStart(16, "0");
+}
+
 export function flagVariantSlot(flagKey: string, distinctId: string, totalWeight: number): number {
   if (totalWeight <= 0) return 0;
   return Number(xxh3_64(`var:${flagKey}:${distinctId}`) % BigInt(totalWeight));

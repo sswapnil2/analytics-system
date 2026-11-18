@@ -8,7 +8,9 @@ pub use batch::{
     decode_zstd_bounded, DictionaryRegistry, WireBatch, BATCH_MAGIC, DEFAULT_DICT_ID,
     FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
-pub use bucketing::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
+pub use bucketing::{
+    cohort_member_hash, evaluate_flag_rule, flag_rollout_slot, flag_variant_slot, CohortGate,
+};
 pub use error::{sanitize_json_error_message, Result, WireError};
 pub use event::{PropValue, WireEvent};
 pub use replay::{
