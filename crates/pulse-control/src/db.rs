@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -12,9 +12,9 @@ use thiserror::Error;
 use crate::license::SystemLicenseRecord;
 use crate::models::DashboardCard;
 use crate::models::{
-    AlertRule, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard, DeletionAuditRecord,
-    EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
+    AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
+    DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
     SystemKeyringRecord, User, UserProfileRecord,
 };
 
@@ -120,6 +120,33 @@ macro_rules! db_map_all {
             }
         }
     }};
+}
+
+macro_rules! profile_from_row {
+    ($r:ident) => {{
+        let pstr: String = $r.get("props_json");
+        let props: BTreeMap<String, Value> = serde_json::from_str(&pstr).unwrap_or_default();
+        UserProfileRecord {
+            project_id: $r.get("project_id"),
+            distinct_id: $r.get("distinct_id"),
+            canonical_uid: $r.get::<i64, _>("canonical_uid").max(0) as u32,
+            props,
+            total_revenue: $r.get("total_revenue"),
+            updated_at_ms: $r.get("updated_at_ms"),
+        }
+    }};
+}
+
+/// Escapes `LIKE` wildcards so user search text matches literally (paired with `ESCAPE '\\'`).
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 macro_rules! db_map_opt {
@@ -996,6 +1023,59 @@ impl MetaStore {
     }
 
     /// Returns `false` when no report with this id exists in the project.
+    pub async fn insert_annotation(&self, a: &Annotation) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "INSERT INTO annotations (id, project_id, ts_ms, text, created_by, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            a.id.as_str(),
+            a.project_id.as_str(),
+            a.ts_ms,
+            a.text.as_str(),
+            a.created_by.as_deref(),
+            a.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Annotations with `start_ms <= ts_ms < end_ms`, oldest first.
+    pub async fn list_annotations(
+        &self,
+        project_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Annotation>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, ts_ms, text, created_by, created_at_ms FROM annotations
+             WHERE project_id = ? AND ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms ASC LIMIT 500",
+            |r| {
+                Annotation {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    ts_ms: r.get("ts_ms"),
+                    text: r.get("text"),
+                    created_by: r.get("created_by"),
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            project_id,
+            start_ms,
+            end_ms,
+        );
+        Ok(rows)
+    }
+
+    pub async fn delete_annotation(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM annotations WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
     pub async fn delete_saved_report(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
         let affected = db_exec!(
             self,
@@ -1713,33 +1793,116 @@ impl MetaStore {
         Ok(rec)
     }
 
+    /// Newest-first page of a project's profiles, optionally filtered by a case-insensitive
+    /// substring of the distinct id or any property value. Search runs in the database so it
+    /// covers every profile, not just a loaded window.
     pub async fn list_user_profiles(
         &self,
         project_id: &str,
+        search: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<UserProfileRecord>, MetaError> {
-        let lim = (limit.clamp(1, 1000)) as i64;
+        let lim = limit.clamp(1, 1000) as i64;
+        let off = offset.min(i64::MAX as usize) as i64;
+        let pattern = match search.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => format!("%{}%", escape_like(&s.to_lowercase())),
+            None => "%".to_string(),
+        };
         let rows = db_map_all!(
             self,
             "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
-             FROM user_profiles WHERE project_id = ? ORDER BY updated_at_ms DESC LIMIT ?",
-            |r| {
-                let pstr: String = r.get("props_json");
-                let props: BTreeMap<String, Value> =
-                    serde_json::from_str(&pstr).unwrap_or_default();
-                UserProfileRecord {
-                    project_id: r.get("project_id"),
-                    distinct_id: r.get("distinct_id"),
-                    canonical_uid: r.get::<i64, _>("canonical_uid").max(0) as u32,
-                    props,
-                    total_revenue: r.get("total_revenue"),
-                    updated_at_ms: r.get("updated_at_ms"),
-                }
-            },
+             FROM user_profiles
+             WHERE project_id = ? AND (LOWER(distinct_id) LIKE ? ESCAPE '\\' OR LOWER(props_json) LIKE ? ESCAPE '\\')
+             ORDER BY updated_at_ms DESC, distinct_id ASC LIMIT ? OFFSET ?",
+            |r| { profile_from_row!(r) },
             project_id,
+            &pattern,
+            &pattern,
             lim,
+            off,
         );
         Ok(rows)
+    }
+
+    /// Every profile updated at or after `since_ms`, oldest first, so applying them in order
+    /// leaves the newest value of each property. `since_ms = 0` loads the whole project.
+    pub async fn list_user_profiles_updated_since(
+        &self,
+        project_id: &str,
+        since_ms: i64,
+    ) -> Result<Vec<UserProfileRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? AND updated_at_ms >= ?
+             ORDER BY updated_at_ms ASC, distinct_id ASC",
+            |r| { profile_from_row!(r) },
+            project_id,
+            since_ms,
+        );
+        Ok(rows)
+    }
+
+    /// All rows (anonymous and identified ids) that belong to one canonical user, oldest first.
+    pub async fn list_user_profiles_for_canonical(
+        &self,
+        project_id: &str,
+        canonical_uid: u32,
+    ) -> Result<Vec<UserProfileRecord>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT project_id, distinct_id, canonical_uid, props_json, total_revenue, updated_at_ms
+             FROM user_profiles WHERE project_id = ? AND canonical_uid = ?
+             ORDER BY updated_at_ms ASC, distinct_id ASC",
+            |r| { profile_from_row!(r) },
+            project_id,
+            canonical_uid as i64,
+        );
+        Ok(rows)
+    }
+
+    /// Points the given distinct ids' rows at `canonical_uid` after an identity merge.
+    pub async fn rekey_user_profiles(
+        &self,
+        project_id: &str,
+        distinct_ids: &[&str],
+        canonical_uid: u32,
+    ) -> Result<u64, MetaError> {
+        let mut n = 0u64;
+        for did in distinct_ids {
+            n += db_exec!(
+                self,
+                "UPDATE user_profiles SET canonical_uid = ? WHERE project_id = ? AND distinct_id = ?",
+                canonical_uid as i64,
+                project_id,
+                *did,
+            );
+        }
+        Ok(n)
+    }
+
+    /// `(profiles, paying profiles, total revenue)` over every profile in the project.
+    pub async fn user_revenue_summary(
+        &self,
+        project_id: &str,
+    ) -> Result<(u64, u64, f64), MetaError> {
+        let row = db_map_opt!(
+            self,
+            "SELECT COUNT(*) AS n,
+                    COALESCE(SUM(CASE WHEN total_revenue > 0 THEN 1 ELSE 0 END), 0) AS paying,
+                    COALESCE(SUM(CASE WHEN total_revenue > 0 THEN total_revenue ELSE 0 END), 0.0) AS total
+             FROM user_profiles WHERE project_id = ?",
+            |r| {
+                (
+                    r.get::<i64, _>("n").max(0) as u64,
+                    r.get::<i64, _>("paying").max(0) as u64,
+                    r.get::<f64, _>("total"),
+                )
+            },
+            project_id,
+        );
+        Ok(row.unwrap_or((0, 0, 0.0)))
     }
 
     pub async fn delete_user_profiles_for_ids(
@@ -1853,27 +2016,108 @@ impl MetaStore {
         &self,
         project_id: &str,
         uids: &[u32],
+        erased_at_ms: i64,
     ) -> Result<(), MetaError> {
         for &uid in uids {
-            let _ = db_exec!(
+            db_exec!(
                 self,
-                "INSERT INTO erased_uids (project_id, uid) VALUES (?, ?)
-                 ON CONFLICT(project_id, uid) DO NOTHING",
+                "INSERT INTO erased_uids (project_id, uid, erased_at_ms) VALUES (?, ?, ?)
+                 ON CONFLICT(project_id, uid) DO UPDATE SET erased_at_ms = excluded.erased_at_ms",
                 project_id,
                 uid as i64,
+                erased_at_ms,
             );
         }
         Ok(())
     }
 
-    pub async fn list_erased_uids(&self, project_id: &str) -> Result<Vec<u32>, MetaError> {
+    /// `(raw uid, erased at ms)` for every erased id in the project.
+    pub async fn list_erased_uids(&self, project_id: &str) -> Result<Vec<(u32, i64)>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT uid FROM erased_uids WHERE project_id = ?",
-            |r| { r.get::<i64, _>("uid").max(0) as u32 },
+            "SELECT uid, erased_at_ms FROM erased_uids WHERE project_id = ?",
+            |r| {
+                (
+                    r.get::<i64, _>("uid").max(0) as u32,
+                    r.get::<i64, _>("erased_at_ms"),
+                )
+            },
             project_id,
         );
         Ok(rows)
+    }
+
+    /// Records event ids taken in by an import and returns the ones not seen before. Claiming
+    /// first makes two concurrent imports of the same file add each event once.
+    pub async fn claim_import_uuids(
+        &self,
+        project_id: &str,
+        uuids: &[String],
+        now_ms: i64,
+    ) -> Result<HashSet<String>, MetaError> {
+        let mut fresh = HashSet::new();
+        for chunk in uuids.chunks(300) {
+            let mut sql = String::from(
+                "INSERT INTO import_seen (project_id, event_uuid, seen_at_ms) VALUES ",
+            );
+            for i in 0..chunk.len() {
+                sql.push_str(if i == 0 { "(?, ?, ?)" } else { ", (?, ?, ?)" });
+            }
+            sql.push_str(" ON CONFLICT(project_id, event_uuid) DO NOTHING RETURNING event_uuid");
+            let got: Vec<String> = match self {
+                MetaStore::Sqlite(pool) => {
+                    let mut q = sqlx::query(&sql);
+                    for u in chunk {
+                        q = q.bind(project_id).bind(u).bind(now_ms);
+                    }
+                    q.fetch_all(pool)
+                        .await?
+                        .into_iter()
+                        .map(|r| r.get::<String, _>("event_uuid"))
+                        .collect()
+                }
+                MetaStore::Postgres(pool) => {
+                    let pg_q = pg_rewrite(&sql);
+                    let mut q = sqlx::query(&pg_q);
+                    for u in chunk {
+                        q = q.bind(project_id).bind(u).bind(now_ms);
+                    }
+                    q.fetch_all(pool)
+                        .await?
+                        .into_iter()
+                        .map(|r| r.get::<String, _>("event_uuid"))
+                        .collect()
+                }
+            };
+            fresh.extend(got);
+        }
+        Ok(fresh)
+    }
+
+    /// Gives back claims for an import that failed, so a retry is not counted as a duplicate.
+    pub async fn release_import_uuids(
+        &self,
+        project_id: &str,
+        uuids: &[String],
+    ) -> Result<(), MetaError> {
+        for u in uuids {
+            db_exec!(
+                self,
+                "DELETE FROM import_seen WHERE project_id = ? AND event_uuid = ?",
+                project_id,
+                u.as_str(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Forgets import ids older than `before_ms`.
+    pub async fn prune_import_uuids(&self, before_ms: i64) -> Result<u64, MetaError> {
+        Ok(db_exec!(
+            self,
+            "DELETE FROM import_seen WHERE seen_at_ms < ?",
+            before_ms
+        ))
     }
 
     pub async fn upsert_alert_rule(&self, alert: &AlertRule) -> Result<(), MetaError> {

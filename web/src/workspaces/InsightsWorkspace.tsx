@@ -3,6 +3,7 @@ import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, InsightsResult, SeriesOutput } from "../api/client";
 import { errorMessage, humanizeEvent } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
+import { AnnotationsList, useAnnotations } from "../components/Annotations";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
 import {
   btn,
@@ -18,7 +19,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
-import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, useCohortNames } from "../components/FilterPanel";
 
 interface Props {
   projectId: string;
@@ -96,8 +97,15 @@ function formatValue(v: number | null | undefined, digits = 2): string {
   return v.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
-function formatDay(ts: number): string {
-  return new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+type Interval = "hour" | "day" | "week" | "month";
+const INTERVAL_NOUN: Record<Interval, string> = { hour: "hour", day: "day", week: "week", month: "month" };
+
+/** Label for one chart bucket at the report's granularity (weeks are labelled by their Monday). */
+function formatBucket(ts: number, interval: Interval = "day"): string {
+  const d = new Date(ts);
+  if (interval === "hour") return d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric" });
+  if (interval === "month") return d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 /** 1, 2, 5 x 10^n ceiling so axis ticks land on round numbers. */
@@ -148,6 +156,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       ? v.toLocaleString(undefined, { style: "currency", currency, maximumFractionDigits: digits > 0 ? 2 : 0 })
       : formatValue(v, digits);
   const [breakdown, setBreakdown] = useState<string>("");
+  const [interval, setInterval_] = useState<Interval>("day");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
   const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -165,7 +174,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
   const buildQuery = useCallback(
     () => ({
-      interval: "day",
+      interval,
       series: series.map((s) => ({
         label: s.label,
         event_name: s.eventName,
@@ -179,7 +188,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
       // Display only; the engine ignores it.
       display_currency: currency || undefined,
     }),
-    [series, formula, breakdown, comparePrev, filter, currency],
+    [interval, series, formula, breakdown, comparePrev, filter, currency],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -193,11 +202,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
         setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? numericProps[0] ?? "" })));
       setCurrency((q as { display_currency?: string }).display_currency ?? "");
       setBreakdown(s.breakdown_by?.[0] ?? "");
+      const iv = (q as { interval?: string }).interval;
+      setInterval_(iv === "hour" || iv === "week" || iv === "month" ? iv : "day");
       setComparePrev(!!s.compare_previous_period);
       setFormula(s.formula ?? "");
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
+    { query: buildQuery, range },
   );
 
   const runQuery = useCallback(async () => {
@@ -210,7 +222,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
     setError(null);
     try {
       const res = await api.queryInsights(projectId, { time_range: rangeFor(range), ...buildQuery() });
-      if (id === reqId.current) setResult(res);
+      // A cohort split comes back as in_cohort / not_in_cohort; the summary names the cohort.
+      const cohortKey = (k: string) => (k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k);
+      if (id === reqId.current)
+        setResult({
+          ...res,
+          series: res.series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
+          previous_series: res.previous_series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
+        });
     } catch (err) {
       if (id === reqId.current) setError(errorMessage(err));
     } finally {
@@ -257,7 +276,17 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const displayedSeries = result
     ? (formula.trim() && result.formula_series.length > 0 ? result.formula_series : result.series).slice(0, 6)
     : [];
+  const shownRange = rangeFor(range);
+  const notes = useAnnotations(projectId, shownRange.start_ts_ms, shownRange.end_ts_ms);
   const buckets = result?.buckets_ts_ms ?? [];
+  // Bucket index each annotation falls in (the last bucket starting at or before it).
+  const noteMarks = notes.list
+    .map((a) => {
+      let i = -1;
+      for (let j = 0; j < buckets.length && buckets[j] <= a.ts_ms; j++) i = j;
+      return { a, i };
+    })
+    .filter((m) => m.i >= 0);
   const n = buckets.length;
   const maxY = niceCeil(
     Math.max(0, ...displayedSeries.flatMap((s) => s.points.map((p) => p.value ?? 0))),
@@ -271,7 +300,14 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const tableRows = result ? [...result.formula_series, ...result.series].slice(0, 18) : [];
   const tableBuckets = buckets.slice(-7);
 
-  const breakdownOptions = Array.from(new Set([...availableProps, breakdown].filter(Boolean)));
+  const cohortNames = useCohortNames(projectId);
+  const breakdownOptions = Array.from(
+    new Set([...availableProps, breakdown].filter((p) => p && !p.startsWith("$cohort:"))),
+  );
+  const cohortName = (dim: string) =>
+    cohortNames.find((c) => `$cohort:${c.id}` === dim)?.name ?? dim.slice("$cohort:".length);
+  const breakdownLabel = (dim: string) =>
+    dim.startsWith("$cohort:") ? `in cohort ${cohortName(dim)}` : dim.replace(/_/g, " ");
   const eventOptions = Array.from(
     new Set([...availableEvents.filter((e) => !e.startsWith("$")), ...series.map((s) => s.eventName)].filter(Boolean)),
   );
@@ -314,7 +350,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         summary={[
           `${series.length} metric${series.length === 1 ? "" : "s"}`,
           formula.trim() ? `formula ${formula.trim()}` : null,
-          breakdown ? `by ${breakdown.replace(/_/g, " ")}` : "no breakdown",
+          breakdown ? `by ${breakdownLabel(breakdown)}` : "no breakdown",
           describeFilter(filter),
         ]
           .filter(Boolean)
@@ -447,6 +483,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
             />
           </label>
           <label className="flex flex-col gap-1">
+            <span className={fieldLabel}>Group by</span>
+            <select value={interval} onChange={(e) => setInterval_(e.target.value as Interval)} className={field}>
+              <option value="hour">Hour</option>
+              <option value="day">Day</option>
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Break down by</span>
             <select value={breakdown} onChange={(e) => setBreakdown(e.target.value)} className={field}>
               <option value="">No breakdown</option>
@@ -455,6 +500,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   {p.replace(/_/g, " ")}
                 </option>
               ))}
+              {cohortNames.length > 0 && (
+                <optgroup label="In a cohort or not">
+                  {cohortNames.map((c) => (
+                    <option key={c.id} value={`$cohort:${c.id}`}>
+                      {c.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </label>
           <div className="flex flex-wrap items-end justify-between gap-3">
@@ -648,7 +702,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                             <title>
                               {`${seriesName(s)}${s.breakdown_key ? `, ${s.breakdown_key}` : ""}: ${fmt(
                                 p.value,
-                              )} on ${formatDay(p.bucket_ts_ms)}`}
+                              )} on ${formatBucket(p.bucket_ts_ms, interval)}`}
                             </title>
                           </circle>
                         ),
@@ -656,6 +710,23 @@ export const InsightsWorkspace: React.FC<Props> = ({
                     </g>
                   );
                 })}
+
+                {noteMarks.map(({ a, i }) => (
+                  <g key={a.id}>
+                    <line
+                      x1={xAt(i)}
+                      x2={xAt(i)}
+                      y1={PLOT.bottom - PLOT_H}
+                      y2={PLOT.bottom}
+                      stroke="rgb(var(--warn))"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                    <circle cx={xAt(i)} cy={PLOT.bottom - PLOT_H} r={4} fill="rgb(var(--warn))">
+                      <title>{`${new Date(a.ts_ms).toLocaleDateString()}: ${a.text}`}</title>
+                    </circle>
+                  </g>
+                ))}
 
                 {buckets.map((ts, idx) =>
                   idx % labelEvery !== 0 && idx !== n - 1 ? null : (
@@ -667,7 +738,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                       fill="rgb(var(--muted))"
                       fontSize={11}
                     >
-                      {formatDay(ts)}
+                      {formatBucket(ts, interval)}
                     </text>
                   ),
                 )}
@@ -682,7 +753,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   }
                 >
                   <p className="mb-1.5 font-semibold text-ink">
-                    {new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}
+                    {interval === "day"
+                      ? new Date(buckets[hoverIdx]).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })
+                      : formatBucket(buckets[hoverIdx], interval)}
                     {hoverIdx === n - 1 && <span className="font-normal text-muted"> (so far)</span>}
                   </p>
                   <ul className="space-y-1">
@@ -701,12 +774,13 @@ export const InsightsWorkspace: React.FC<Props> = ({
             </div>
           </>
         )}
+        <AnnotationsList projectId={projectId} annotations={notes.list} error={notes.error} onChanged={() => void notes.reload()} />
       </Panel>
 
       {result && tableRows.length > 0 && (
         <Panel
           title="By segment"
-          meta={`Overall is ${rangePhrase(range)}; daily columns show the last ${Math.min(7, tableBuckets.length)} days`}
+          meta={`Overall is ${rangePhrase(range)}; columns show the last ${Math.min(7, tableBuckets.length)} ${INTERVAL_NOUN[interval]}${Math.min(7, tableBuckets.length) === 1 ? "" : "s"}`}
           actions={
             <button type="button" onClick={exportCsv} className={btn.secondary}>
               <Download className="h-4 w-4" /> Export CSV
@@ -722,7 +796,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                   <SortHeader label="Overall" align="right" active={sort.key === "overall"} desc={sort.desc} onClick={() => sort.toggle("overall")} />
                   {tableBuckets.map((ts) => (
                     <th key={ts} className="sticky top-0 z-10 whitespace-nowrap bg-panel px-2 py-2 text-right font-medium">
-                      {formatDay(ts)}
+                      {formatBucket(ts, interval)}
                     </th>
                   ))}
                 </tr>

@@ -67,6 +67,16 @@ pub trait GovernanceProvider: Send + Sync {
     ) {
     }
 
+    /// Called after `anon_id` is merged into `user_id` so profile stores can follow the merge.
+    async fn on_identify(
+        &self,
+        _project_id: &str,
+        _anon_id: &str,
+        _user_id: &str,
+        _canonical_uid: u32,
+    ) {
+    }
+
     /// Applies Group Analytics profile operations from `/v1/groups` (`Gap 8`).
     async fn apply_group_engage(
         &self,

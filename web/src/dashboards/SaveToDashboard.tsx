@@ -162,24 +162,57 @@ export const SaveToDashboard: React.FC<{
   );
 };
 
+const encodeQuery = (q: Record<string, unknown>): string => {
+  const bytes = new TextEncoder().encode(JSON.stringify(q));
+  let bin = "";
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+const decodeQuery = (raw: string): Record<string, unknown> | null => {
+  try {
+    const bin = atob(raw.replace(/-/g, "+").replace(/_/g, "/"));
+    const v: unknown = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0))));
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+};
+
+const RANGE_RE = /^(today|yesterday|\d+|custom:(\d{4}-\d\d-\d\d:\d{4}-\d\d-\d\d|\d+-\d+))$/;
+
 /**
- * Opens a saved report on its report page: `#/funnels?report=<id>&range=<sel>` (from a
- * dashboard card) loads that report's query into the page once, through `apply`.
+ * Keeps a report page's query in its URL and restores it on load:
+ * - `#/funnels?q=<base64url json>&range=<sel>`: the report as last built (shareable, survives reload);
+ * - `#/funnels?report=<id>&range=<sel>` (from a dashboard card): loads that saved report once.
+ * The URL is updated with `replaceState`, so building a report doesn't fill the back history.
  */
 export function useSavedReport(
   projectId: string,
   apply: (query: Record<string, unknown>) => void,
   setRange: (r: RangeSel) => void,
+  current?: { query: () => Record<string, unknown>; range: RangeSel },
 ): string | null {
   const [error, setError] = useState<string | null>(null);
   const applyRef = useRef(apply);
   applyRef.current = apply;
+  const restored = useRef(false);
   useEffect(() => {
+    restored.current = false;
     const params = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
     const id = params.get("report");
     const range = params.get("range");
-    if (range && /^(today|yesterday|\d+|custom:(\d{4}-\d\d-\d\d:\d{4}-\d\d-\d\d|\d+-\d+))$/.test(range)) setRange(range as RangeSel);
-    if (!id) return;
+    const q = params.get("q");
+    if (range && RANGE_RE.test(range)) setRange(range as RangeSel);
+    if (q) {
+      const parsed = decodeQuery(q);
+      if (parsed) applyRef.current(parsed);
+      else setError("The report link is damaged. Showing a new report instead.");
+    }
+    if (!id) {
+      restored.current = true;
+      return;
+    }
     let live = true;
     api
       .listReports(projectId)
@@ -189,11 +222,29 @@ export function useSavedReport(
         if (r) applyRef.current(r.query_json);
         else setError("That saved report was deleted. Showing a new report instead.");
       })
-      .catch((err) => live && setError(`Couldn't open the saved report: ${errorMessage(err)}`));
+      .catch((err) => live && setError(`Couldn't open the saved report: ${errorMessage(err)}`))
+      .finally(() => {
+        if (live) restored.current = true;
+      });
     return () => {
       live = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
+
+  const encoded = current ? encodeQuery(current.query()) : "";
+  const range = current?.range;
+  useEffect(() => {
+    // Wait until a saved report has loaded, or the defaults would replace its id in the URL.
+    if (!current || !restored.current) return;
+    const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+    const params = new URLSearchParams(search);
+    params.delete("report");
+    params.set("q", encoded);
+    if (range) params.set("range", range);
+    const next = `#${path}?${params.toString()}`;
+    if (next !== window.location.hash) window.history.replaceState(null, "", next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [encoded, range]);
   return error;
 }

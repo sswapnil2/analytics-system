@@ -325,3 +325,112 @@ test("Gaps 1-5, 8-11, 13: consent opt-out, super props, timeEvent, UTMs, autocap
 
   sdk.shutdown();
 });
+
+test("SPA navigations: pushState/replaceState emit one $pageview per new path, and teardown restores history", async () => {
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  const location = { href: "https://app.example.com/", pathname: "/", search: "" };
+  const history = {
+    pushState(_s, _t, url) { const u = new URL(url, "https://app.example.com"); location.pathname = u.pathname; location.search = u.search; },
+    replaceState(_s, _t, url) { if (url) this.pushState(_s, _t, url); },
+  };
+  const origPush = history.pushState;
+  globalThis.window = { innerWidth: 1, innerHeight: 1, location, history, addEventListener: () => {}, removeEventListener: () => {} };
+  globalThis.document = { visibilityState: "visible", title: "t", referrer: "", documentElement: { hasAttribute: () => false }, body: { querySelectorAll: () => [] } };
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}), headers: { get: () => null } });
+
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://127.0.0.1:1",
+    apiKey: "pk_test",
+    flushIntervalMs: 0,
+    autocapture: { pageviews: true, clicks: false, forms: false },
+  });
+  assert.equal(sdk.getQueuedEventCount(), 1, "initial pageview");
+  window.history.pushState({}, "", "/pricing");
+  assert.equal(sdk.getQueuedEventCount(), 2, "pushState to a new path");
+  window.history.replaceState({ scroll: 10 }, "");
+  assert.equal(sdk.getQueuedEventCount(), 2, "same-URL replaceState is not a page");
+  window.history.pushState({}, "", "/pricing?plan=pro");
+  assert.equal(sdk.getQueuedEventCount(), 3, "query change is a new page");
+  sdk.shutdown();
+  assert.equal(window.history.pushState, origPush, "history restored on teardown");
+});
+
+function browserEnv({ fetchImpl }) {
+  const store = new Map();
+  const listeners = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  globalThis.window = {
+    innerWidth: 1, innerHeight: 1,
+    location: { href: "https://app.example.com/", pathname: "/", search: "" },
+    addEventListener: (e, f) => { if (!listeners.has(e)) listeners.set(e, new Set()); listeners.get(e).add(f); },
+    removeEventListener: (e, f) => listeners.get(e)?.delete(f),
+    fetch: fetchImpl,
+  };
+  globalThis.document = { visibilityState: "visible", title: "t", referrer: "", documentElement: { hasAttribute: () => false }, body: { querySelectorAll: () => [] } };
+  globalThis.fetch = (...a) => globalThis.window.fetch(...a);
+  return { store, listeners };
+}
+
+test("Persisted queue: events tracked offline survive a reload and are sent by the next page", async () => {
+  let online = false;
+  const sent = [];
+  const env = browserEnv({
+    fetchImpl: async (url, init) => {
+      if (!online) throw new Error("offline");
+      if (String(url).endsWith("/v1/ingest")) sent.push(...JSON.parse(init.body).events);
+      return { ok: true, status: 200, json: async () => ({}), text: async () => "", headers: { get: () => null } };
+    },
+  });
+  const cfg = { endpointUrl: "http://pulse.test", apiKey: "pk_q", flushIntervalMs: 0, captureErrors: false };
+  const a = new PulseWebClient(cfg);
+  a.track("Offline_Event_1");
+  a.track("Offline_Event_2");
+  await a.flush(); // fails: offline
+  a.shutdown();
+  assert.equal(sent.length, 0);
+
+  online = true;
+  const b = new PulseWebClient(cfg); // a "reload": same storage, new instance
+  assert.equal(b.getQueuedEventCount(), 2, "queue restored from localStorage");
+  b.clearBackoffForRetry();
+  await b.flush();
+  assert.deepEqual(sent.map((e) => e.event_name), ["Offline_Event_1", "Offline_Event_2"]);
+  assert.equal(b.getQueuedEventCount(), 0);
+  const c = new PulseWebClient(cfg);
+  assert.equal(c.getQueuedEventCount(), 0, "acknowledged events are not resent");
+  b.shutdown();
+  c.shutdown();
+  assert.ok(env.store.size >= 1);
+});
+
+test("Error and network capture: uncaught errors become $error; fetch calls land on the replay timeline without query strings", async () => {
+  const sent = [];
+  const env = browserEnv({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/v1/ingest")) sent.push(...JSON.parse(init.body).events);
+      if (String(url).includes("/api/kyc")) return { ok: false, status: 504, json: async () => ({}), headers: { get: () => null } };
+      return { ok: true, status: 200, json: async () => ({}), text: async () => "", headers: { get: () => null } };
+    },
+  });
+  const sdk = new PulseWebClient({ endpointUrl: "http://pulse.test", apiKey: "pk_e", flushIntervalMs: 0, captureNetwork: true });
+  for (const f of env.listeners.get("error") ?? []) f({ message: "boom", filename: "https://app.example.com/main.js?v=3", lineno: 7 });
+  for (const f of env.listeners.get("unhandledrejection") ?? []) f({ reason: new Error("nope") });
+  await window.fetch("https://api.example.com/api/kyc?pan=ABCDE1234F", { method: "POST" });
+  const ops = sdk["replayOps"];
+  const crumb = ops.find((o) => o.op === "network_breadcrumb");
+  assert.ok(crumb, "breadcrumb recorded");
+  assert.equal(crumb.path, "https://api.example.com/api/kyc");
+  assert.equal(crumb.status_code, 504);
+  assert.equal(crumb.method, "POST");
+  await sdk.flush();
+  const errors = sent.filter((e) => e.event_name === "$error").map((e) => e.props.message);
+  assert.deepEqual(errors, ["boom (https://app.example.com/main.js:7)", "Unhandled rejection: nope"]);
+  assert.ok(!sent.some((e) => JSON.stringify(e).includes("ABCDE1234F")), "query string never leaves the page");
+  const wrapped = window.fetch;
+  sdk.shutdown();
+  assert.notEqual(window.fetch, wrapped, "fetch restored on shutdown");
+});

@@ -92,6 +92,15 @@ export interface PulseWebConfig {
   maskSelectors?: string[];
   blockSelectors?: string[];
   unmaskSelectors?: string[];
+  /** Send uncaught errors and unhandled promise rejections as `$error` (default `true`). */
+  captureErrors?: boolean;
+  /**
+   * Add every `fetch`/XHR call (method, path without query string, status, duration) to the
+   * replay timeline. Defaults to `enableWireframeReplay`. Calls to the Pulse endpoint are skipped.
+   */
+  captureNetwork?: boolean;
+  /** Log every tracked event and each send result to the console. */
+  debug?: boolean;
 }
 
 export interface EdgeFlagRule {
@@ -129,6 +138,13 @@ export const FIXED_MASK = "████";
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 2_000;
 const MAX_QUEUED_REPLAY_PACKETS = 64;
+const SNAPSHOT_THROTTLE_MS = 1_000;
+
+/** `https://api.x.com/v1/kyc?pan=ABC#x` → `https://api.x.com/v1/kyc`: query strings often carry PII. */
+function stripQuery(url: string): string {
+  const cut = url.search(/[?#]/);
+  return (cut === -1 ? url : url.slice(0, cut)).slice(0, 256);
+}
 
 /**
  * Default-deny PII masking (`P3-01`): returns fixed-length `"████"` for every non-empty string
@@ -286,6 +302,14 @@ export class PulseWebClient {
   private boundAutocaptureClickListener: ((ev: MouseEvent) => void) | null = null;
   private boundAutocaptureSubmitListener: ((ev: Event) => void) | null = null;
   private boundPopstateListener: (() => void) | null = null;
+  private restoreHistory: (() => void) | null = null;
+  private restoreNetwork: (() => void) | null = null;
+  private boundErrorListener: ((ev: ErrorEvent) => void) | null = null;
+  private boundRejectionListener: ((ev: PromiseRejectionEvent) => void) | null = null;
+  private mutationObserver: { disconnect(): void } | null = null;
+  private lastSnapshotMs = 0;
+  /** Events handed to `fetch` but not yet acknowledged; kept in the persisted queue until then. */
+  private inFlightEvents: Array<Record<string, unknown>> = [];
   private boundVisibilityListener: (() => void) | null = null;
 
   constructor(cfg: PulseWebConfig) {
@@ -329,6 +353,10 @@ export class PulseWebClient {
     this.captureUrlAttribution();
     this.initReplaySamplingState();
     this.persistState();
+    // Events left unsent by a previous page (closed tab, offline, crash). Their ids are stable,
+    // so ones that did arrive are dropped by server-side dedup.
+    const pending = this.loadPersistedQueue();
+    if (pending.length > 0) this.enqueueEventsBounded(pending);
 
     const interval = cfg.flushIntervalMs ?? 5000;
     if (interval > 0) {
@@ -348,6 +376,13 @@ export class PulseWebClient {
 
       if (cfg.enableWireframeReplay) {
         this.attachReplayClickListener();
+        this.attachSnapshotObserver();
+      }
+      if (cfg.captureErrors !== false) {
+        this.attachErrorListeners();
+      }
+      if (cfg.captureNetwork ?? Boolean(cfg.enableWireframeReplay)) {
+        this.attachNetworkCapture();
       }
       if (cfg.autocapture) {
         this.attachAutocaptureListeners(cfg.autocapture);
@@ -394,7 +429,14 @@ export class PulseWebClient {
     const cfg: AutocaptureConfig =
       opt === true ? { pageviews: true, clicks: true, forms: true } : opt;
 
+    // One `$pageview` per distinct path + query; hash changes and same-URL replaceState
+    // calls (scroll restoration, state updates) are not new pages.
+    let lastPage: string | null = null;
     const emitPageview = () => {
+      const loc = window.location;
+      const page = loc ? `${loc.pathname ?? ""}${loc.search ?? ""}` : "";
+      if (page === lastPage) return;
+      lastPage = page;
       this.captureUrlAttribution();
       this.track("$pageview", collectDefaultContext());
     };
@@ -403,6 +445,26 @@ export class PulseWebClient {
       emitPageview();
       this.boundPopstateListener = emitPageview;
       window.addEventListener("popstate", this.boundPopstateListener);
+      // Single-page apps navigate with history.pushState/replaceState, which fire no event.
+      const hist = window.history;
+      if (hist && typeof hist.pushState === "function") {
+        const origPush = hist.pushState;
+        const origReplace = hist.replaceState;
+        hist.pushState = function (this: History, ...args: Parameters<History["pushState"]>) {
+          const r = origPush.apply(this, args);
+          emitPageview();
+          return r;
+        };
+        hist.replaceState = function (this: History, ...args: Parameters<History["replaceState"]>) {
+          const r = origReplace.apply(this, args);
+          emitPageview();
+          return r;
+        };
+        this.restoreHistory = () => {
+          hist.pushState = origPush;
+          hist.replaceState = origReplace;
+        };
+      }
     }
 
     const matchesFilter = (el: HTMLElement | null): boolean => {
@@ -446,6 +508,105 @@ export class PulseWebClient {
     }
   }
 
+  /** Uncaught errors and unhandled rejections → `$error` (and an error marker in the replay). */
+  private attachErrorListeners(): void {
+    this.boundErrorListener = (ev: ErrorEvent) => {
+      const where = ev.filename ? ` (${stripQuery(ev.filename)}:${ev.lineno ?? 0})` : "";
+      this.recordConsoleError(`${ev.message || "Script error"}${where}`);
+    };
+    this.boundRejectionListener = (ev: PromiseRejectionEvent) => {
+      const r = ev.reason as { message?: unknown } | undefined;
+      const msg = typeof r?.message === "string" ? r.message : String(ev.reason);
+      this.recordConsoleError(`Unhandled rejection: ${msg}`);
+    };
+    window.addEventListener("error", this.boundErrorListener);
+    window.addEventListener("unhandledrejection", this.boundRejectionListener);
+  }
+
+  /** Wraps `fetch` and `XMLHttpRequest` to put each call on the replay timeline. */
+  private attachNetworkCapture(): void {
+    const w = window as unknown as {
+      fetch?: typeof fetch;
+      XMLHttpRequest?: { prototype: { open: (...a: unknown[]) => void; send: (...a: unknown[]) => void } };
+    };
+    const own = this.endpoint;
+    const record = (method: string, url: string, status: number, started: number) => {
+      if (url.startsWith(own)) return;
+      this.recordNetworkBreadcrumb(method.toUpperCase(), stripQuery(url), status, Math.round(Date.now() - started));
+    };
+    const restores: Array<() => void> = [];
+
+    if (typeof w.fetch === "function") {
+      const origFetch = w.fetch;
+      w.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const method = init?.method ?? (typeof input === "object" && "method" in input ? (input as Request).method : "GET");
+        const started = Date.now();
+        try {
+          const res = await origFetch(input as RequestInfo, init);
+          record(method, url, res.status, started);
+          return res;
+        } catch (err) {
+          record(method, url, 0, started);
+          throw err;
+        }
+      }) as typeof fetch;
+      restores.push(() => {
+        w.fetch = origFetch;
+      });
+    }
+
+    const xhrProto = w.XMLHttpRequest?.prototype;
+    if (xhrProto) {
+      const origOpen = xhrProto.open;
+      const origSend = xhrProto.send;
+      xhrProto.open = function (this: { __pulse?: { method: string; url: string } }, ...args: unknown[]) {
+        this.__pulse = { method: String(args[0] ?? "GET"), url: String(args[1] ?? "") };
+        return origOpen.apply(this, args);
+      };
+      xhrProto.send = function (
+        this: { __pulse?: { method: string; url: string }; status?: number; addEventListener?: (t: string, f: () => void) => void },
+        ...args: unknown[]
+      ) {
+        const meta = this.__pulse;
+        const started = Date.now();
+        if (meta && typeof this.addEventListener === "function") {
+          this.addEventListener("loadend", () => record(meta.method, meta.url, this.status ?? 0, started));
+        }
+        return origSend.apply(this, args);
+      };
+      restores.push(() => {
+        xhrProto.open = origOpen;
+        xhrProto.send = origSend;
+      });
+    }
+    this.restoreNetwork = () => restores.forEach((r) => r());
+  }
+
+  /** Takes a wireframe snapshot on load and when the page changes (throttled to 1 per second). */
+  private attachSnapshotObserver(): void {
+    const snap = () => {
+      const now = Date.now();
+      if (now - this.lastSnapshotMs < SNAPSHOT_THROTTLE_MS) return;
+      this.lastSnapshotMs = now;
+      this.captureDomWireframeSnapshot();
+    };
+    snap();
+    const MO = (globalThis as { MutationObserver?: new (cb: () => void) => { observe(t: unknown, o: unknown): void; disconnect(): void } }).MutationObserver;
+    if (MO && document.body) {
+      let pending: ReturnType<typeof setTimeout> | null = null;
+      const mo = new MO(() => {
+        if (pending) return;
+        pending = setTimeout(() => {
+          pending = null;
+          snap();
+        }, SNAPSHOT_THROTTLE_MS);
+      });
+      mo.observe(document.body, { childList: true, subtree: true, attributes: false });
+      this.mutationObserver = mo;
+    }
+  }
+
   private loadPersistedState(): PersistedWebState | null {
     try {
       if (typeof localStorage === "undefined") return null;
@@ -477,6 +638,43 @@ export class PulseWebClient {
       // Ignore storage quota / SecurityError in sandboxed contexts (`P2-04`).
     }
     return null;
+  }
+
+  private get queueKey(): string {
+    return `${this.storageKey}_queue`;
+  }
+
+  private loadPersistedQueue(): Array<Record<string, unknown>> {
+    try {
+      if (typeof localStorage === "undefined") return [];
+      const raw = localStorage.getItem(this.queueKey);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+      return Array.isArray(parsed)
+        ? parsed.filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Saves unsent and in-flight events so a reload or crash does not lose them. */
+  private persistQueue(): void {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const all = [...this.inFlightEvents, ...this.eventQueue];
+      if (all.length === 0) {
+        localStorage.removeItem(this.queueKey);
+        return;
+      }
+      // ponytail: whole-queue rewrite per change; fine at the default 2,000-event cap.
+      localStorage.setItem(this.queueKey, JSON.stringify(all.slice(-this.maxQueuedEvents)));
+    } catch {
+      // Quota or SecurityError: the in-memory queue still works.
+    }
+  }
+
+  private debugLog(...args: unknown[]): void {
+    if (this.cfg.debug && typeof console !== "undefined") console.debug("[pulse]", ...args);
   }
 
   private persistState(): void {
@@ -555,6 +753,7 @@ export class PulseWebClient {
     if (this.eventQueue.length > this.maxQueuedEvents) {
       this.eventQueue.splice(0, this.eventQueue.length - this.maxQueuedEvents);
     }
+    this.persistQueue();
   }
 
   // --- Consent & Opt-Out (`Gap 4`) ---
@@ -563,6 +762,8 @@ export class PulseWebClient {
     this.optedOut = true;
     this.explicitOptSet = true;
     this.eventQueue = [];
+    this.inFlightEvents = [];
+    this.persistQueue();
     this.engageQueue = [];
     this.replayQueue = [];
     this.replayOps = [];
@@ -665,6 +866,7 @@ export class PulseWebClient {
     }
 
     this.enqueueEventsBounded([eventObj]);
+    this.debugLog("track", eventObj);
 
     if (this.eventQueue.length >= this.flushBatchSize) {
       void this.flush();
@@ -1208,6 +1410,7 @@ export class PulseWebClient {
 
     if (this.eventQueue.length > 0) {
       const batch = this.eventQueue.splice(0, this.eventQueue.length);
+      this.inFlightEvents = batch;
       const sentNow = Date.now();
       const wireBatch = batch.map((ev) => ({ ...ev, client_sent_ts_ms: sentNow }));
       try {
@@ -1219,18 +1422,30 @@ export class PulseWebClient {
           },
           body: JSON.stringify({ events: wireBatch }),
         });
+        this.inFlightEvents = [];
         if (res.ok) {
           this.consecutiveFailures = 0;
           this.backoffUntilMs = 0;
+          this.persistQueue();
+          if (this.cfg.debug) {
+            const body = (await res.json().catch(() => ({}))) as { accepted?: number; deduped?: number; rejected?: unknown[] };
+            this.debugLog(`sent ${batch.length} events`, body);
+            if (body.rejected?.length) console.warn("[pulse] events rejected by the server", body.rejected);
+          }
         } else if (res.status === 400 || res.status === 413 || res.status === 422) {
           // Drop malformed batch permanently.
+          this.persistQueue();
+          this.debugLog(`batch refused with ${res.status}; dropped`, await res.text().catch(() => ""));
         } else {
           this.enqueueEventsBounded(batch, true);
           this.recordFailureBackoff(res);
+          this.debugLog(`send failed with ${res.status}; will retry`);
         }
-      } catch {
+      } catch (err) {
+        this.inFlightEvents = [];
         this.enqueueEventsBounded(batch, true);
         this.recordFailureBackoff();
+        this.debugLog("send failed; will retry", err);
       }
     }
   }
@@ -1279,6 +1494,10 @@ export class PulseWebClient {
 
     if (this.eventQueue.length > 0) {
       const batch = this.eventQueue.splice(0, this.eventQueue.length);
+      // The page may be gone before the response arrives: keep the batch persisted as in-flight
+      // until it is acknowledged; if the page dies first, the next load resends it (deduped).
+      this.inFlightEvents = [...this.inFlightEvents, ...batch];
+      this.persistQueue();
       const sentNow = Date.now();
       const wireBatch = batch.map((ev) => ({ ...ev, client_sent_ts_ms: sentNow }));
       fetch(`${this.endpoint}/v1/ingest`, {
@@ -1289,9 +1508,19 @@ export class PulseWebClient {
         },
         body: JSON.stringify({ events: wireBatch }),
         keepalive: true,
-      }).catch(() => {
-        this.enqueueEventsBounded(batch, true);
-      });
+      })
+        .then((res) => {
+          this.inFlightEvents = this.inFlightEvents.filter((e) => !batch.includes(e));
+          if (res.ok || res.status === 400 || res.status === 413 || res.status === 422) {
+            this.persistQueue();
+          } else {
+            this.enqueueEventsBounded(batch, true);
+          }
+        })
+        .catch(() => {
+          this.inFlightEvents = this.inFlightEvents.filter((e) => !batch.includes(e));
+          this.enqueueEventsBounded(batch, true);
+        });
     }
   }
 
@@ -1312,6 +1541,20 @@ export class PulseWebClient {
       if (this.boundAutocaptureSubmitListener) {
         window.removeEventListener("submit", this.boundAutocaptureSubmitListener);
         this.boundAutocaptureSubmitListener = null;
+      }
+      this.restoreHistory?.();
+      this.restoreHistory = null;
+      this.restoreNetwork?.();
+      this.restoreNetwork = null;
+      this.mutationObserver?.disconnect();
+      this.mutationObserver = null;
+      if (this.boundErrorListener) {
+        window.removeEventListener("error", this.boundErrorListener);
+        this.boundErrorListener = null;
+      }
+      if (this.boundRejectionListener) {
+        window.removeEventListener("unhandledrejection", this.boundRejectionListener);
+        this.boundRejectionListener = null;
       }
       if (this.boundPopstateListener) {
         window.removeEventListener("popstate", this.boundPopstateListener);

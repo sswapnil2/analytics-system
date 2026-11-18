@@ -4,7 +4,16 @@ import { api, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
-import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
+import {
+  CompareControl,
+  CompareSel,
+  compareLabel,
+  compareRangeFor,
+  RangePresets,
+  RangeSel,
+  rangeFor,
+  rangePhrase,
+} from "../dashboards/ReportCard";
 import {
   btn,
   EmptyState,
@@ -79,6 +88,8 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   const [segments, setSegments] = useState<{ value: string; result: RetentionResult }[] | null>(null);
   const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<RetentionResult | null>(null);
+  const [compare, setCompare] = useState<CompareSel>("");
+  const [prevResult, setPrevResult] = useState<RetentionResult | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -109,8 +120,9 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       global_filter: toGlobalFilter(filter),
       // Studio-only: the split runs as one query per value; the engine ignores this field.
       split_by: splitBy || undefined,
+      compare_to: compare || undefined,
     }),
-    [startEvent, returnEvent, mode, unit, numPeriods, filter, splitBy],
+    [startEvent, returnEvent, mode, unit, numPeriods, filter, splitBy, compare],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
@@ -118,9 +130,10 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   const openError = useSavedReport(
     projectId,
     (q) => {
-      const s = q as { start_event?: string; return_event?: string; mode?: Mode; num_periods?: number; unit?: Unit; split_by?: string };
+      const s = q as { start_event?: string; return_event?: string; mode?: Mode; num_periods?: number; unit?: Unit; split_by?: string; compare_to?: string };
       if (s.unit === "week" || s.unit === "month" || s.unit === "day") setUnit(s.unit);
       setSplitBy(s.split_by ?? "");
+      setCompare(s.compare_to ?? "");
       if (s.start_event) setStartEvent(s.start_event);
       if (s.return_event) setReturnEvent(s.return_event);
       if (s.mode) setMode(s.mode);
@@ -128,6 +141,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
+    { query: buildQuery, range },
   );
 
   const runRetention = useCallback(async () => {
@@ -140,8 +154,15 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     setError(null);
     try {
       const body = { time_range: rangeFor(range), ...buildQuery() };
-      const res = await api.queryRetention(projectId, body);
-      if (id === reqId.current) setResult(res);
+      const cmp = compareRangeFor(body.time_range, compare);
+      const [res, prev] = await Promise.all([
+        api.queryRetention(projectId, body),
+        cmp ? api.queryRetention(projectId, { ...body, time_range: cmp }) : Promise.resolve(null),
+      ]);
+      if (id === reqId.current) {
+        setResult(res);
+        setPrevResult(prev);
+      }
       if (!splitBy) {
         setSegments(null);
       } else {
@@ -166,7 +187,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [projectId, buildQuery, range, startEvent, returnEvent, splitBy]);
+  }, [projectId, buildQuery, range, startEvent, returnEvent, splitBy, compare]);
 
   useEffect(() => {
     void runRetention();
@@ -277,6 +298,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
               </select>
             </label>
           </div>
+          <CompareControl main={rangeFor(range)} value={compare} onChange={setCompare} />
           <label className="flex flex-col gap-1">
             <span className={fieldLabel}>Split by</span>
             <select value={splitBy} onChange={(e) => setSplitBy(e.target.value)} className={field}>
@@ -298,7 +320,12 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
 
       {!stickiness && cohorts.length > 0 && (
         <Panel title={`Average return by ${word.toLowerCase()}`} meta={`Weighted by users, only start dates whose ${word.toLowerCase()} is over`}>
-          <RetentionCurve cohorts={cohorts} numPeriods={numPeriods} unit={unit} />
+          <RetentionCurve
+            cohorts={cohorts}
+            numPeriods={numPeriods}
+            unit={unit}
+            compare={prevResult ? { cohorts: prevResult.cohorts, label: compareLabel(rangeFor(range), compare) } : undefined}
+          />
         </Panel>
       )}
 
@@ -460,18 +487,27 @@ const SegmentTable: React.FC<{ segments: { value: string; result: RetentionResul
 };
 
 /** Retention curve: average % back in each period, weighted by users. */
-const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods: number; unit: Unit }> = ({ cohorts, numPeriods, unit }) => {
+const RetentionCurve: React.FC<{
+  cohorts: RetentionResult["cohorts"];
+  numPeriods: number;
+  unit: Unit;
+  /** A second curve for another date range, drawn in the second-series colour. */
+  compare?: { cohorts: RetentionResult["cohorts"]; label: string };
+}> = ({ cohorts, numPeriods, unit, compare }) => {
   const [hover, setHover] = useState<number | null>(null);
   const pts = averageCurve(cohorts, numPeriods, unit);
+  const cmpPts = compare ? averageCurve(compare.cohorts, numPeriods, unit) : [];
   const W = 640;
   const H = 180;
   const pad = { l: 36, r: 8, t: 10, b: 24 };
-  const max = Math.max(10, ...pts.slice(1).map((v) => v ?? 0)) * 1.1;
+  const max = Math.max(10, ...pts.slice(1).map((v) => v ?? 0), ...cmpPts.slice(1).map((v) => v ?? 0)) * 1.1;
   const x = (d: number) => pad.l + (d / numPeriods) * (W - pad.l - pad.r);
   const y = (v: number) => H - pad.b - (v / max) * (H - pad.t - pad.b);
   const known = pts.map((v, d) => [d, v] as const).filter(([d, v]) => d > 0 && v !== null) as [number, number][];
   if (known.length === 0) return <p className="text-sm text-muted">Not enough days have passed to draw a curve.</p>;
   const line = known.map(([d, v], i) => `${i ? "L" : "M"}${x(d).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const cmpKnown = cmpPts.map((v, d) => [d, v] as const).filter(([d, v]) => d > 0 && v !== null) as [number, number][];
+  const cmpLine = cmpKnown.map(([d, v], i) => `${i ? "L" : "M"}${x(d).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
   const area = `${line} L${x(known[known.length - 1][0])},${y(0)} L${x(known[0][0])},${y(0)} Z`;
   const ticks = [0, max / 2, max].map((t) => Math.round(t));
   const hv = hover !== null ? known.find(([d]) => d === hover) : undefined;
@@ -499,6 +535,7 @@ const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods
         </g>
       ))}
       <path d={area} fill="rgb(var(--brand) / 0.1)" />
+      {cmpLine && <path d={cmpLine} fill="none" stroke="rgb(var(--info))" strokeWidth={2} strokeDasharray="5 4" strokeLinejoin="round" />}
       <path d={line} fill="none" stroke="rgb(var(--brand))" strokeWidth={2.5} strokeLinejoin="round" />
       {hv && <line x1={x(hv[0])} x2={x(hv[0])} y1={pad.t} y2={y(0)} stroke="rgb(var(--line-strong))" strokeWidth={1.5} />}
       {known.map(([d, v]) => (
@@ -517,6 +554,21 @@ const RetentionCurve: React.FC<{ cohorts: RetentionResult["cohorts"]; numPeriods
       >
         <p className="font-semibold text-ink">{UNIT_WORD[unit]} {hv[0]}</p>
         <p className="tabular text-ink-2">{hv[1].toFixed(1)}% came back</p>
+        {compare && cmpPts[hv[0]] != null && (
+          <p className="tabular text-info">
+            {cmpPts[hv[0]]!.toFixed(1)}% in {compare.label}
+          </p>
+        )}
+      </div>
+    )}
+    {compare && (
+      <div className="mt-2 flex flex-wrap gap-4 text-[0.8125rem] text-ink-2">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-0.5 w-4 bg-brand" aria-hidden="true" /> This range
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-0.5 w-4 border-t-2 border-dashed border-info" aria-hidden="true" /> {compare.label}
+        </span>
       </div>
     )}
     </div>

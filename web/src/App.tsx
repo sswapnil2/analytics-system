@@ -53,6 +53,7 @@ import { InsightsWorkspace } from "./workspaces/InsightsWorkspace";
 import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
 import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
+import { UsersWorkspace } from "./workspaces/UsersWorkspace";
 import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
 import { ByokCommercialPanel } from "./components/ByokCommercialPanel";
 import { AccessContext } from "./auth/access";
@@ -64,6 +65,7 @@ type WorkspaceId =
   | "journeys"
   | "retention"
   | "replays"
+  | "users"
   | "cohorts"
   | "experiments"
   | "events"
@@ -98,6 +100,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
     label: "Audience and shipping",
     items: [
+      { id: "users", label: "Users", icon: UserRound },
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
@@ -111,7 +114,7 @@ const ACCOUNT_IDS: WorkspaceId[] = ["profile", "settings"];
 const ALL_IDS = [...NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id)), ...ACCOUNT_IDS];
 // Report builders that default to the project's own events.
 const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
-const DEFAULT_TAB: WorkspaceId = "funnels";
+const DEFAULT_TAB: WorkspaceId = "dashboards";
 
 function tabFromHash(): WorkspaceId {
   const h = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] as WorkspaceId;
@@ -251,6 +254,8 @@ export const App: React.FC = () => {
       for (const cp of ext.custom_properties) propNames.add(cp.name);
       for (const lt of ext.lookup_tables)
         for (const col of lt.sample_columns) propNames.add(`${lt.name}.${col}`);
+      // Profile properties ($set / identify traits) filter and split every report as user.<key>.
+      for (const k of ext.user_properties ?? []) propNames.add(`user.${k}`);
       setAvailableEvents(Array.from(evNames));
       setAvailableProps(Array.from(propNames).sort());
       // Numbers as seen at ingest, plus calculated properties (usually arithmetic).
@@ -288,6 +293,15 @@ export const App: React.FC = () => {
         if (!isNotFound(err)) setUser(null);
       });
   }, [signedIn, refreshToken]);
+
+  const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
+  // Hooks stay above the early returns below (rules of hooks).
+  // The event list loads once per project; while it's empty, reload it as soon as
+  // the status poll sees events, so the first data shows up without a page reload.
+  const waitingForFirstEvents = catalogLoaded && availableEvents.length === 0 && totalEvents > 0;
+  useEffect(() => {
+    if (waitingForFirstEvents) void loadCatalog();
+  }, [waitingForFirstEvents, totalEvents, loadCatalog]);
 
   const go = (id: WorkspaceId) => {
     window.location.hash = `/${id}`;
@@ -350,13 +364,6 @@ export const App: React.FC = () => {
   }
 
   const activePid = projectId || status?.active_project_id || "";
-  const totalEvents = (status?.l0_rows ?? 0) + (status?.l1_rows ?? 0);
-  // The event list loads once per project; while it's empty, reload it as soon as
-  // the status poll sees events, so the first data shows up without a page reload.
-  const waitingForFirstEvents = catalogLoaded && availableEvents.length === 0 && totalEvents > 0;
-  useEffect(() => {
-    if (waitingForFirstEvents) void loadCatalog();
-  }, [waitingForFirstEvents, totalEvents, loadCatalog]);
   const projects = status?.projects ?? [];
   const nextTheme: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
@@ -712,6 +719,14 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                 user={user}
                 projectId={activePid}
                 projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
+                projects={projects}
+                onProjectCreated={(id) => {
+                  setProjectId(id);
+                  setCatalogLoaded(false);
+                  setAvailableEvents([]);
+                  setAvailableProps([]);
+                  setRefreshToken((n) => n + 1);
+                }}
               />
             ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
               <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
@@ -781,6 +796,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                     refreshToken={refreshToken}
                   />
                 )}
+                {activeTab === "users" && <UsersWorkspace projectId={activePid} />}
                 {activeTab === "cohorts" && (
                   <CohortsLookupsWorkspace
                     projectId={activePid}

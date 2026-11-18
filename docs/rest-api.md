@@ -101,6 +101,15 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
   -d '{"event": "KYC_PAN_Submitted", "userId": "usr_1042", "properties": {"city": "Bengaluru"}}'
 ```
 
+### Ingest semantics
+
+- **Partial success.** In a JSON batch, invalid events are skipped and the rest are stored. The response lists each refused one as `"rejected": [{"index": 1, "error": "missing event name: …"}]`. The request is a 400 only when no event in it is valid. `/import` behaves the same per NDJSON line or CSV row.
+- **Segment calls.** `type: "track"` works as-is. `type: "page"` is stored as `$pageview` and `type: "screen"` as `$screen`; their `name` becomes the `name` property. In a `/v1/ingest` batch, `identify` with both `userId` and `anonymousId` links the two ids (as `/v1/identify` does) and sets `traits` on the user. `identify` with one id just sets its traits, and `alias` links `previousId` to `userId`. The response counts these in `profiles_updated`. `group` calls are rejected per item (Segment doesn't say the group type); send them to `/v1/groups`.
+- **Limits.** Event and property names can be at most 255 characters; a longer one rejects that event. String property values are truncated to 8 KiB.
+- **Retries and duplicates.** Each event is deduplicated on `event_uuid` / `messageId` / `insert_id`, or, if it has none, on a hash of its content including the timestamp. The dedup window is 15–30 minutes and is re-seeded from the WAL on restart. **Server-side callers must send an id or a `timestamp`.** An event with neither is stamped with the arrival time, so the server can't tell a retry from a second real event, and both are counted. The Web and mobile SDKs always send both. `/v1/projects/:id/import` also remembers every event id it has taken in for 30 days, across restarts, so running the same backfill twice adds nothing the second time (the repeats are counted in `deduped`).
+- **Timestamps.** `/v1/ingest` corrects device clock skew using `sentAt` / `client_sent_ts_ms` when it differs from server time by more than 5 seconds. `/v1/projects/:id/import` never applies that correction, because a backfill's `sentAt` is in the past by design.
+- **Sessions.** An event without `session_id` belongs to the session `sess_<distinct_id>`. So for server-side events, the `sessions` metric counts users, not visits. Send `session_id` to count real sessions; the SDKs do.
+
 ## Admin (bearer token)
 
 | Method | Path | Notes |
@@ -120,6 +129,7 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | POST | `/v1/query` | `{"kind": "insights" \| "funnel" \| "retention" \| "flows", "project_id"?, "query": {...}}` |
 | POST | `/v1/projects/:id/query/insights` | Insights query |
 | POST | `/v1/projects/:id/query/funnel` | Funnel query |
+| POST | `/v1/projects/:id/query/funnel/dropped?step=N` | Same body as a funnel query. Every user who reached step `N-1` but not step `N` (0-based index of the step not reached), as CSV (`distinct_id` per line) or `?format=json`. Exactly the users the funnel counts as dropped. Admin role. |
 | POST | `/v1/projects/:id/query/retention` | Retention query |
 | POST | `/v1/projects/:id/query/flows` | Flows (path) query |
 
@@ -163,15 +173,15 @@ take simpler arguments.
 | GET, POST | `/v1/projects/:id/cohorts` | List / create behavioural cohorts |
 | POST | `/v1/projects/:id/cohorts/preview` | Size a cohort definition without saving it |
 | GET | `/v1/projects/:id/cohorts/:cohort_id/export` | Export cohort members (CSV, or `?format=json`) |
-| GET | `/v1/projects/:id/users` | User profiles (`?search=`, `?limit=` default 100, max 500) |
-| GET, DELETE | `/v1/projects/:id/users/:distinct_id` | Profile detail / erase a user (recorded in the deletion log) |
+| GET | `/v1/projects/:id/users` | User profiles, newest first. `?search=` matches any part of the distinct id or of any property (case-insensitive, across all profiles); `?limit=` (default 100, max 500) and `?offset=` paginate |
+| GET, DELETE | `/v1/projects/:id/users/:distinct_id` | Profile detail (properties merged across all of the user's ids; `?uid=N` looks the user up by canonical uid, for the masked ids that query results return) / erase a user (recorded in the deletion log). Erasure hides and, at the next compaction of each day's segments, deletes everything the user did up to the moment of erasure. If the same id sends events later (they signed up again), those new events are counted. |
 | GET | `/v1/projects/:id/deletions` | Erasure audit log |
-| POST | `/v1/projects/:id/import` | Batch import events (JSON, NDJSON or CSV body) |
+| POST | `/v1/projects/:id/import` | Batch import events (JSON, NDJSON or CSV body). Timestamps are kept as given; see *Ingest semantics* |
 | GET | `/v1/projects/:id/export` | Export events: `?format=ndjson` (default) `\|json\|csv`, `start_ts_ms` + `end_ts_ms`, `limit` (default 5000, max 50000) |
 | GET | `/v1/projects/:id/revenue` | Revenue summary from user profiles' `total_revenue` (built from `$track_charge` profile operations), plus a 14-day daily series of `$revenue` events (sum of `amount`, unique payers). Pass `?event=Order_Paid` to chart your own purchase event instead |
 | GET, POST | `/v1/projects/:id/alerts` | List / create metric alerts: `{"name", "event_name", "operator": "gt" \| "gte" \| "lt" \| "lte", "threshold", "webhook_url"?}`. The node checks every 5 minutes against the event's count over the last 24 hours, and fires at most once per 24 hours while the condition holds. It POSTs `pulse.alert.triggered` to `webhook_url` (or the project's webhook credential URL), signed with that credential's secret in `X-Pulse-Signature-256`. Delivery needs the `webhook_alerts` licence feature and a webhook credential; without them the trigger is only recorded in `last_triggered_ms`. |
 | DELETE | `/v1/projects/:id/alerts/:alert_id` | Delete an alert |
-| GET | `/v1/projects/:id/schema-extensions` | Lookup tables, custom events and custom properties |
+| GET | `/v1/projects/:id/schema-extensions` | Lookup tables, custom events, custom properties, and `user_properties` (profile keys, queryable as `user.<key>`) |
 | GET, POST | `/v1/projects/:id/lookup-tables` | List / upload lookup tables |
 | POST | `/v1/projects/:id/custom-events` | Define a custom (composite) event |
 | POST | `/v1/projects/:id/custom-properties` | Define a computed property |
@@ -180,6 +190,8 @@ take simpler arguments.
 
 | Method | Path |
 |---|---|
+| GET, POST | `/v1/projects/:id/annotations`: list with `?start_ts_ms=&end_ts_ms=`, create with `{"ts_ms", "text"}` (1–280 characters). Shown as markers on Trends charts. |
+| DELETE | `/v1/projects/:id/annotations/:ann_id` |
 | GET, POST | `/v1/projects/:id/saved-reports` |
 | GET, PUT, DELETE | `/v1/projects/:id/saved-reports/:rep_id` |
 | GET, POST | `/v1/projects/:id/dashboards` |

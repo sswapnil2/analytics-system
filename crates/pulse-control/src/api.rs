@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -50,12 +50,13 @@ use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
-    unseal_byok_config_json, unseal_secret, AlertRule, ApiKeyRecord, ByokCredentialRecord,
-    ByokCredentialView, CohortRecord, CreatedApiKeyResponse, CustomSchemaBundle, Dashboard,
-    DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord, Experiment, ExperimentMetricSpec,
-    FeatureFlag, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project, Role,
-    SavedReport, SystemKeyringRecord, UserProfileRecord, VariantAllocation, BYOK_CATEGORIES,
-    KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    unseal_byok_config_json, unseal_secret, AlertRule, Annotation, ApiKeyRecord,
+    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
+    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
+    LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
+    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -166,6 +167,8 @@ pub struct ControlPlaneService {
     /// Project id → owning org id.
     known_projects: DashMap<String, String>,
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
+    /// Per project: the update time up to which user profiles are loaded into the catalog.
+    profiles_synced_ms: DashMap<String, i64>,
     license_state: parking_lot::RwLock<Option<LicenseClaims>>,
     max_seen_ts_ms: AtomicI64,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
@@ -236,6 +239,7 @@ impl ControlPlaneService {
             api_key_cache: DashMap::new(),
             known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
+            profiles_synced_ms: DashMap::new(),
             license_state: parking_lot::RwLock::new(None),
             max_seen_ts_ms: AtomicI64::new(0),
             discovery_tx: tx,
@@ -745,6 +749,66 @@ impl ControlPlaneService {
         Ok(())
     }
 
+    /// Loads user profiles into the query catalog: every profile on the first call for a
+    /// project, then only the users whose rows changed since the previous call.
+    // ponytail: all profiles live in RAM (one map entry per user, as the live path already
+    // grows to); move to an on-disk KV keyed by canonical uid if projects pass ~10M users.
+    async fn refresh_user_profiles(&self, project_id: &str) -> Result<(), String> {
+        let cat = self.qengine.catalogs().for_project(project_id);
+        let started_ms = Utc::now().timestamp_millis();
+        let since = self.profiles_synced_ms.get(project_id).map(|v| *v);
+        match since {
+            None => {
+                let rows = self
+                    .meta
+                    .list_user_profiles_updated_since(project_id, 0)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let merged = merge_profile_rows(rows)
+                    .into_iter()
+                    .map(|(uid, p)| (uid, profile_to_catalog_props(&p)))
+                    .collect();
+                cat.set_user_profiles(merged);
+            }
+            Some(since) => {
+                let rows = self
+                    .meta
+                    .list_user_profiles_updated_since(project_id, since)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let uids: std::collections::BTreeSet<u32> =
+                    rows.iter().map(|r| r.canonical_uid).collect();
+                for uid in uids {
+                    self.rebuild_user_profile(project_id, uid).await?;
+                }
+            }
+        }
+        // Re-read a little overlap next time so a write that committed with an older
+        // timestamp while this load ran is not missed; rebuilding a user is idempotent.
+        self.profiles_synced_ms
+            .insert(project_id.to_string(), started_ms - PROFILE_SYNC_OVERLAP_MS);
+        Ok(())
+    }
+
+    /// Recomputes one canonical user's merged properties from all of their profile rows.
+    async fn rebuild_user_profile(
+        &self,
+        project_id: &str,
+        canonical_uid: u32,
+    ) -> Result<(), String> {
+        let rows = self
+            .meta
+            .list_user_profiles_for_canonical(project_id, canonical_uid)
+            .await
+            .map_err(|e| e.to_string())?;
+        let cat = self.qengine.catalogs().for_project(project_id);
+        match merge_profile_rows(rows).remove(&canonical_uid) {
+            Some(p) => cat.upsert_user_profile(canonical_uid, profile_to_catalog_props(&p)),
+            None => cat.remove_user_profile(canonical_uid),
+        }
+        Ok(())
+    }
+
     pub async fn refresh_project_virtual_catalog(&self, project_id: &str) -> Result<(), String> {
         let cat = self.qengine.catalogs().for_project(project_id);
 
@@ -797,37 +861,16 @@ impl ControlPlaneService {
             cat.saved_cohorts.insert(c.id.clone(), c.definition);
         }
 
-        let profiles = self
-            .meta
-            .list_user_profiles(project_id, 1000)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut prof_map: HashMap<u32, HashMap<String, PropValue>> =
-            HashMap::with_capacity(profiles.len());
-        for p in profiles {
-            if p.canonical_uid > 0 || !p.props.is_empty() {
-                let mut converted = HashMap::with_capacity(p.props.len());
-                for (k, v) in &p.props {
-                    converted.insert(k.clone(), json_value_to_prop_value(v));
-                }
-                prof_map
-                    .entry(p.canonical_uid)
-                    .or_default()
-                    .extend(converted);
-            }
-        }
-        cat.set_user_profiles(prof_map);
+        self.refresh_user_profiles(project_id).await?;
 
         let erased = self
             .meta
             .list_erased_uids(project_id)
             .await
             .map_err(|e| e.to_string())?;
-        let mut erased_bm = RoaringBitmap::new();
-        for u in erased {
-            erased_bm.insert(u);
-        }
-        cat.set_deleted_uids(erased_bm);
+        self.qengine
+            .storage()
+            .set_erased(project_id, erased.into_iter().collect());
 
         Ok(())
     }
@@ -918,13 +961,19 @@ impl ControlPlaneService {
             .map_err(CtrlError::meta)?;
 
         let uid_vec: Vec<u32> = uids_bm.iter().collect();
+        let erased_at_ms = Utc::now().timestamp_millis();
         self.meta
-            .insert_erased_uids(project_id, &uid_vec)
+            .insert_erased_uids(project_id, &uid_vec, erased_at_ms)
             .await
             .map_err(CtrlError::meta)?;
 
+        let storage = self.qengine.storage();
+        let mut erased = (*storage.erased_snapshot(project_id)).clone();
+        for &u in &uid_vec {
+            erased.insert(u, erased_at_ms);
+        }
+        storage.set_erased(project_id, erased);
         let cat = self.qengine.catalogs().for_project(project_id);
-        cat.mark_deleted_uids(&uids_bm);
         cat.remove_user_profile(canon_uid);
 
         let rec = DeletionAuditRecord {
@@ -943,6 +992,47 @@ impl ControlPlaneService {
             .map_err(CtrlError::meta)?;
         Ok(rec)
     }
+}
+
+/// How far back each incremental profile reload re-reads, to cover writes that were in flight.
+const PROFILE_SYNC_OVERLAP_MS: i64 = 60_000;
+
+/// Merges profile rows (oldest first) into one record per canonical user: for each property
+/// the most recently written value wins, and revenue adds up across the user's ids.
+pub(crate) fn merge_profile_rows(
+    rows: Vec<UserProfileRecord>,
+) -> std::collections::BTreeMap<u32, UserProfileRecord> {
+    let mut out = std::collections::BTreeMap::<u32, UserProfileRecord>::new();
+    for row in rows {
+        match out.get_mut(&row.canonical_uid) {
+            Some(m) => {
+                m.props.extend(row.props);
+                m.total_revenue += row.total_revenue;
+                if row.updated_at_ms >= m.updated_at_ms {
+                    m.updated_at_ms = row.updated_at_ms;
+                    m.distinct_id = row.distinct_id;
+                }
+            }
+            None => {
+                out.insert(row.canonical_uid, row);
+            }
+        }
+    }
+    out
+}
+
+/// Catalog view of a merged profile; `total_revenue` is queryable as `user.total_revenue`.
+fn profile_to_catalog_props(p: &UserProfileRecord) -> HashMap<String, PropValue> {
+    let mut m: HashMap<String, PropValue> = p
+        .props
+        .iter()
+        .map(|(k, v)| (k.clone(), json_value_to_prop_value(v)))
+        .collect();
+    m.insert(
+        "total_revenue".to_string(),
+        PropValue::Float(p.total_revenue),
+    );
+    m
 }
 
 fn json_value_to_prop_value(v: &Value) -> PropValue {
@@ -1031,17 +1121,35 @@ impl GovernanceProvider for ControlPlaneService {
             total_revenue,
             updated_at_ms: Utc::now().timestamp_millis(),
         };
-        let _ = self.meta.upsert_user_profile(&rec).await;
-
-        let mut converted = HashMap::with_capacity(props.len() + 1);
-        for (k, v) in &props {
-            converted.insert(k.clone(), json_value_to_prop_value(v));
+        if let Err(e) = self.meta.upsert_user_profile(&rec).await {
+            tracing::error!(project_id, error = %e, "failed to store user profile");
+            return;
         }
-        converted.insert("total_revenue".to_string(), PropValue::Float(total_revenue));
-        self.qengine
-            .catalogs()
-            .for_project(project_id)
-            .upsert_user_profile(canonical_uid, converted);
+        if let Err(e) = self.rebuild_user_profile(project_id, canonical_uid).await {
+            tracing::error!(project_id, error = %e, "failed to refresh user profile in catalog");
+        }
+    }
+
+    async fn on_identify(
+        &self,
+        project_id: &str,
+        anon_id: &str,
+        user_id: &str,
+        canonical_uid: u32,
+    ) {
+        // Rows written before the merge carry the pre-merge uid; point both ids at the
+        // canonical user so the anonymous traits show on the identified user.
+        if let Err(e) = self
+            .meta
+            .rekey_user_profiles(project_id, &[anon_id, user_id], canonical_uid)
+            .await
+        {
+            tracing::error!(project_id, error = %e, "failed to re-key profiles after identify");
+            return;
+        }
+        if let Err(e) = self.rebuild_user_profile(project_id, canonical_uid).await {
+            tracing::error!(project_id, error = %e, "failed to refresh user profile in catalog");
+        }
     }
 
     async fn apply_group_engage(
@@ -1183,6 +1291,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         )
         .route("/v1/projects/:id/query/funnel", post(handle_query_funnel))
         .route(
+            "/v1/projects/:id/query/funnel/dropped",
+            post(handle_query_funnel_dropped),
+        )
+        .route(
             "/v1/projects/:id/query/retention",
             post(handle_query_retention),
         )
@@ -1257,6 +1369,14 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/custom-properties",
             post(handle_create_custom_property),
+        )
+        .route(
+            "/v1/projects/:id/annotations",
+            get(handle_list_annotations).post(handle_create_annotation),
+        )
+        .route(
+            "/v1/projects/:id/annotations/:ann_id",
+            axum::routing::delete(handle_delete_annotation),
         )
         // Saved Reports & Dashboards
         .route(
@@ -1558,6 +1678,20 @@ impl ControlPlaneService {
         if name.is_empty() {
             return Err(CtrlError::bad("project name must not be empty"));
         }
+        let timezone = match timezone
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        {
+            Some(tz) => {
+                if tz.parse::<chrono_tz::Tz>().is_err() {
+                    return Err(CtrlError::bad(format!(
+                        "unknown time zone '{tz}': use an IANA name such as 'UTC', 'America/New_York' or 'Asia/Kolkata'"
+                    )));
+                }
+                Some(tz)
+            }
+            None => None,
+        };
         let now = Utc::now().timestamp_millis();
         let id = format!("proj_{}", &Uuid::new_v4().simple().to_string()[..12]);
         let proj = Project {
@@ -1831,6 +1965,47 @@ async fn handle_query_funnel(
         .await
         .map_err(CtrlError::exec)?;
     Ok(Json(res))
+}
+
+/// Every user who dropped off before `?step=N` of the funnel in the body, as CSV
+/// (`distinct_id` per line) or JSON with `?format=json`.
+async fn handle_query_funnel_dropped(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, CtrlError> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let q: FunnelQuery = parse_json_body("funnel query", &body)?;
+    let step = params
+        .get("step")
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
+    let users = ctrl
+        .qengine
+        .query_funnel_dropped_users(&id, &q, step)
+        .await
+        .map_err(CtrlError::exec)?;
+    if params.get("format").map(String::as_str) == Some("json") {
+        return Ok(Json(json!({ "step": step, "users": users })).into_response());
+    }
+    let mut csv = String::from("distinct_id\n");
+    for u in &users {
+        csv.push_str(&csv_escape(u));
+        csv.push('\n');
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"dropped_step_{step}.csv\""),
+            ),
+        ],
+        csv,
+    )
+        .into_response())
 }
 
 async fn handle_query_retention(
@@ -2334,10 +2509,12 @@ async fn handle_get_schema_extensions(
         .into_iter()
         .map(|(s, _)| s)
         .collect();
+    let user_properties = ctrl.qengine.catalogs().for_project(&id).user_prop_keys();
     Ok(Json(CustomSchemaBundle {
         custom_events,
         custom_properties,
         lookup_tables,
+        user_properties,
     }))
 }
 
@@ -2570,6 +2747,82 @@ fn validate_description(raw: Option<String>) -> Result<Option<String>, CtrlError
         )));
     }
     Ok(desc)
+}
+
+async fn handle_list_annotations(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiRes<Vec<Annotation>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let num = |k: &str| q.get(k).and_then(|s| s.parse::<i64>().ok());
+    let list = ctrl
+        .meta
+        .list_annotations(
+            &id,
+            num("start_ts_ms").unwrap_or(i64::MIN),
+            num("end_ts_ms").unwrap_or(i64::MAX),
+        )
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(list))
+}
+
+#[derive(Deserialize)]
+struct CreateAnnotationReq {
+    ts_ms: i64,
+    text: String,
+}
+
+async fn handle_create_annotation(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateAnnotationReq>,
+) -> ApiRes<Annotation> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let text = req.text.trim();
+    if text.is_empty() || text.chars().count() > 280 {
+        return Err(CtrlError::bad(
+            "annotation text must be 1 to 280 characters",
+        ));
+    }
+    if req.ts_ms <= 0 {
+        return Err(CtrlError::bad("ts_ms must be a Unix time in milliseconds"));
+    }
+    let a = Annotation {
+        id: format!("ann_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id,
+        ts_ms: req.ts_ms,
+        text: text.to_string(),
+        created_by: Some(ctrl.principal_label(&principal).await?),
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .insert_annotation(&a)
+        .await
+        .map_err(CtrlError::meta)?;
+    Ok(Json(a))
+}
+
+async fn handle_delete_annotation(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, ann_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_annotation(&id, &ann_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!(
+            "annotation '{ann_id}' not found"
+        )));
+    }
+    Ok(Json(json!({ "deleted": ann_id })))
 }
 
 async fn handle_list_reports(
@@ -3226,28 +3479,18 @@ async fn handle_list_user_profiles(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 500);
-    let search = q.get("search").map(|s| s.trim().to_ascii_lowercase());
+    let offset = q
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let profiles = ctrl
         .meta
-        .list_user_profiles(&id, 1000)
+        .list_user_profiles(&id, q.get("search").map(String::as_str), limit, offset)
         .await
         .map_err(CtrlError::meta)?;
 
     let out: Vec<Value> = profiles
         .into_iter()
-        .filter(|p| match &search {
-            Some(s) if !s.is_empty() => {
-                p.distinct_id.to_ascii_lowercase().contains(s)
-                    || mask_user_identifier(&p.distinct_id)
-                        .to_ascii_lowercase()
-                        .contains(s)
-                    || p.props
-                        .values()
-                        .any(|v| v.to_string().to_ascii_lowercase().contains(s))
-            }
-            _ => true,
-        })
-        .take(limit)
         .map(|p| {
             json!({
                 "project_id": p.project_id,
@@ -3263,10 +3506,18 @@ async fn handle_list_user_profiles(
     Ok(Json(out))
 }
 
+#[derive(Deserialize)]
+struct UserDetailQuery {
+    /// Look the user up by canonical uid. Query results only carry masked ids
+    /// (`+91 •••• 655`), which can't be resolved back to the user.
+    uid: Option<u32>,
+}
+
 async fn handle_get_user_detail(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((id, distinct_id)): AxumPath<(String, String)>,
+    Query(q): Query<UserDetailQuery>,
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let id_graph = ctrl
@@ -3283,8 +3534,10 @@ async fn handle_get_user_detail(
         .await
         .map_err(CtrlError::meta)?;
 
-    let canon_uid = id_graph
-        .lookup_canonical(&distinct_id)
+    let canon_uid = q
+        .uid
+        .filter(|u| *u > 0)
+        .or_else(|| id_graph.lookup_canonical(&distinct_id))
         .or_else(|| id_graph.lookup_raw(&distinct_id))
         .or_else(|| profile.as_ref().map(|p| p.canonical_uid))
         .unwrap_or(0);
@@ -3308,6 +3561,18 @@ async fn handle_get_user_detail(
             replay_sessions.push(ev.session_id.clone());
         }
     }
+
+    // Show what every id merged into this user set, not just this id's row.
+    let profile = if canon_uid > 0 {
+        let rows = ctrl
+            .meta
+            .list_user_profiles_for_canonical(&id, canon_uid)
+            .await
+            .map_err(CtrlError::meta)?;
+        merge_profile_rows(rows).remove(&canon_uid).or(profile)
+    } else {
+        profile
+    };
 
     Ok(Json(json!({
         "distinct_id": distinct_id,
@@ -3348,6 +3613,10 @@ async fn handle_list_deletions(
     Ok(Json(list))
 }
 
+/// How long `/import` remembers an event id. Re-importing the same file within this window adds
+/// nothing. ponytail: one global window; make it per project if someone backfills older reruns.
+const IMPORT_DEDUP_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
+
 async fn handle_import_events(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -3374,6 +3643,7 @@ async fn handle_import_events(
         let text = std::str::from_utf8(&body)
             .map_err(|_| CtrlError::bad("CSV/NDJSON import must be valid UTF-8"))?;
         let trimmed = text.trim();
+        let mut rejected = Vec::new();
         if trimmed.starts_with('{') {
             // NDJSON lines
             let mut events = Vec::new();
@@ -3382,16 +3652,23 @@ async fn handle_import_events(
                 if l.is_empty() {
                     continue;
                 }
-                let ev: WireEvent = serde_json::from_str(l).map_err(|e| {
-                    CtrlError::bad(format!(
-                        "NDJSON line {}: {}",
-                        idx + 1,
-                        pulse_wire::sanitize_json_error_message(&e.to_string())
-                    ))
-                })?;
-                events.push(ev);
+                match serde_json::from_str::<WireEvent>(l) {
+                    Ok(ev) => events.push(ev),
+                    Err(e) => rejected.push(pulse_wire::RejectedEvent {
+                        index: idx,
+                        error: format!(
+                            "NDJSON line {}: {}",
+                            idx + 1,
+                            pulse_wire::sanitize_json_error_message(&e.to_string())
+                        ),
+                    }),
+                }
             }
-            WireBatch::new(events)
+            WireBatch {
+                events,
+                rejected,
+                profile_calls: Vec::new(),
+            }
         } else {
             // CSV with header
             let mut lines = trimmed.lines().filter(|l| !l.trim().is_empty());
@@ -3432,34 +3709,88 @@ async fn handle_import_events(
                 if !props_map.is_empty() {
                     map.insert("properties".to_string(), Value::Object(props_map));
                 }
-                let ev: WireEvent = serde_json::from_value(Value::Object(map)).map_err(|e| {
-                    CtrlError::bad(format!(
-                        "CSV row {}: {}",
-                        row_idx + 1,
-                        pulse_wire::sanitize_json_error_message(&e.to_string())
-                    ))
-                })?;
-                events.push(ev);
+                match serde_json::from_value::<WireEvent>(Value::Object(map)) {
+                    Ok(ev) => events.push(ev),
+                    Err(e) => rejected.push(pulse_wire::RejectedEvent {
+                        index: row_idx,
+                        error: format!(
+                            "CSV row {}: {}",
+                            row_idx + 1,
+                            pulse_wire::sanitize_json_error_message(&e.to_string())
+                        ),
+                    }),
+                }
             }
-            WireBatch::new(events)
+            WireBatch {
+                events,
+                rejected,
+                profile_calls: Vec::new(),
+            }
         }
     } else {
         WireBatch::decode_json(&body).map_err(|e| CtrlError::bad(e.to_string()))?
     };
 
+    if batch.events.is_empty() && batch.profile_calls.is_empty() {
+        if let Some(first) = batch.rejected.first() {
+            return Err(CtrlError::bad(first.error.clone()));
+        }
+    }
+    // An import is a backfill: `sentAt` is when the source system sent the event long ago,
+    // not a live device clock, so the mobile clock-skew correction must not restamp it.
+    let mut batch = batch;
+    for ev in &mut batch.events {
+        ev.client_sent_ts_ms = 0;
+    }
     let now_ms = Utc::now().timestamp_millis();
-    let res = ingest
-        .ingest_for_project(&id, batch, now_ms)
+
+    // Re-running a backfill must add nothing, long after the in-memory dedup window has passed.
+    // Claim every event id first; only ids not seen before go through.
+    let ids: Vec<String> = batch
+        .events
+        .iter()
+        .map(|e| Uuid::from_bytes(e.event_uuid).simple().to_string())
+        .collect();
+    let fresh = ctrl
+        .meta
+        .claim_import_uuids(&id, &ids, now_ms)
         .await
-        .map_err(|e| CtrlError::bad(e.to_string()))?;
+        .map_err(CtrlError::meta)?;
+    let claimed: Vec<String> = fresh.iter().cloned().collect();
+    let mut taken = HashSet::new();
+    let before = batch.events.len();
+    let mut keep = ids
+        .iter()
+        .map(|u| fresh.contains(u) && taken.insert(u.clone()));
+    batch.events.retain(|_| keep.next().unwrap_or(false));
+    let import_dupes = before - batch.events.len();
+
+    let res = match ingest.ingest_for_project(&id, batch, now_ms).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(re) = ctrl.meta.release_import_uuids(&id, &claimed).await {
+                tracing::warn!(error = %re, "failed to release import ids after a failed import");
+            }
+            return Err(CtrlError::bad(e.to_string()));
+        }
+    };
     let _ = ctrl.qengine.storage().flush_all_projects().await;
+    if let Err(e) = ctrl
+        .meta
+        .prune_import_uuids(now_ms - IMPORT_DEDUP_RETENTION_MS)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to prune old import ids");
+    }
 
     Ok(Json(json!({
         "status": res.status,
         "accepted": res.accepted,
-        "deduped": res.deduped,
+        "deduped": res.deduped + import_dupes,
         "dropped": res.dropped,
         "server_ts_ms": res.server_ts_ms,
+        "rejected": res.rejected,
+        "profiles_updated": res.profiles_updated,
     })))
 }
 
@@ -3556,11 +3887,10 @@ async fn handle_export_cohort(
         .map_err(CtrlError::exec)?;
     let profiles = ctrl
         .meta
-        .list_user_profiles(&id, 1000)
+        .list_user_profiles_updated_since(&id, 0)
         .await
         .map_err(CtrlError::meta)?;
-    let by_uid: HashMap<u32, UserProfileRecord> =
-        profiles.into_iter().map(|p| (p.canonical_uid, p)).collect();
+    let by_uid = merge_profile_rows(profiles);
 
     let format = q
         .get("format")
@@ -3633,21 +3963,11 @@ async fn handle_get_revenue_summary(
         .filter(|s| !s.is_empty())
         .unwrap_or("$revenue")
         .to_string();
-    let profiles = ctrl
+    let (total_profiles, paying_users, total_revenue) = ctrl
         .meta
-        .list_user_profiles(&id, 1000)
+        .user_revenue_summary(&id)
         .await
         .map_err(CtrlError::meta)?;
-
-    let mut total_revenue = 0.0;
-    let mut paying_users = 0usize;
-    let total_profiles = profiles.len();
-    for p in &profiles {
-        if p.total_revenue > 0.0 {
-            paying_users += 1;
-            total_revenue += p.total_revenue;
-        }
-    }
 
     let now_ms = Utc::now().timestamp_millis();
     let iq = InsightsQuery {

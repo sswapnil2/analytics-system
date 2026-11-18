@@ -81,6 +81,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
       setFilter(fromGlobalFilter(s.global_filter));
     },
     setRange,
+    { query: buildQuery, range },
   );
 
   const runFlows = useCallback(async () => {

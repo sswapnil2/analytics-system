@@ -278,6 +278,41 @@ impl QueryEngine {
         .await
     }
 
+    /// Every user who reached step `step - 1` of the funnel but not step `step` (1-based steps
+    /// after the first), as distinct ids. Same rules as the funnel counts.
+    pub async fn query_funnel_dropped_users(
+        &self,
+        project_id: &str,
+        query: &FunnelQuery,
+        step: usize,
+    ) -> Result<Vec<String>> {
+        if step == 0 || step >= query.steps.len() {
+            return Err(ExecError::InvalidQuery(format!(
+                "step must be between 1 and {} (the step users didn't reach)",
+                query.steps.len().saturating_sub(1)
+            )));
+        }
+        let res = self.query_funnel(project_id, query).await?;
+        let id_graph = self
+            .storage
+            .identity_router()
+            .get_or_open(project_id)
+            .await?;
+        Ok(res
+            .dropped_uids_by_step
+            .get(step)
+            .map(|bm| {
+                bm.iter()
+                    .map(|u| {
+                        id_graph
+                            .external_id(u)
+                            .unwrap_or_else(|| format!("uid_{u}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub async fn query_retention(
         &self,
         project_id: &str,
@@ -402,12 +437,10 @@ impl QueryEngine {
             let id_snap = id_graph.snapshot();
 
             let bm = evaluate_cohort(&def, None, &ps, &snap, &id_snap, &self.cache, &cat).await?;
-            let deleted = cat.deleted_uids_snapshot();
+            // ponytail: no erasure check here; membership comes from scans and profiles, which
+            // already exclude erased events and rows.
             let mut out = Vec::new();
             for uid in bm.iter() {
-                if deleted.contains(uid) {
-                    continue;
-                }
                 let ext = id_graph
                     .external_id(uid)
                     .map(|raw| mask_user_identifier(&raw))
@@ -602,7 +635,7 @@ impl QueryEngine {
             let mut total_sessions_inspected = 0usize;
             let mut sessions_pruned_by_bloom = 0usize;
             let mut top_heap: BinaryHeap<Reverse<RankedSession>> = BinaryHeap::with_capacity(limit);
-            let deleted_uids = cat.deleted_uids_snapshot();
+            let erased = ps.erased_snapshot();
 
             // 1. Scan hot L0 `MemBucket` sessions first to establish an immediate recency floor for `limit` pushdown (`P3-02`)
             type L0SessionAcc = (u16, Vec<(i64, u16, u32)>);
@@ -611,9 +644,9 @@ impl QueryEngine {
                 let rows = ps.snapshot_l0_bucket(&snap, b as u8);
                 for r in rows.iter() {
                     let canon_uid = id_snap.resolve(r.uid_internal);
-                    if !deleted_uids.is_empty()
-                        && (deleted_uids.contains(r.uid_internal)
-                            || deleted_uids.contains(canon_uid))
+                    if !erased.is_empty()
+                        && (erased.hides(r.uid_internal, r.event_ts_ms)
+                            || erased.hides(canon_uid, r.event_ts_ms))
                     {
                         continue;
                     }
@@ -723,9 +756,9 @@ impl QueryEngine {
                 };
 
                 let mut matched_ranges = sidx.matching_session_ranges(|hdr: &SessionHeader| {
-                    if !deleted_uids.is_empty()
-                        && (deleted_uids.contains(hdr.raw_uid)
-                            || deleted_uids.contains(id_snap.resolve(hdr.raw_uid)))
+                    if !erased.is_empty()
+                        && (erased.hides(hdr.raw_uid, hdr.start_ts_ms)
+                            || erased.hides(id_snap.resolve(hdr.raw_uid), hdr.start_ts_ms))
                     {
                         return false;
                     }

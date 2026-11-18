@@ -6,6 +6,15 @@ export interface ProjectInfo {
   created_at_ms: number;
 }
 
+export interface Annotation {
+  id: string;
+  project_id: string;
+  ts_ms: number;
+  text: string;
+  created_by: string | null;
+  created_at_ms: number;
+}
+
 export interface ApiKeyRecord {
   id: string;
   key_prefix: string;
@@ -742,6 +751,26 @@ export const api = {
     ),
 
 
+  listAnnotations: (projectId: string, startMs: number, endMs: number) =>
+    fetchJson<Annotation[]>(
+      `/v1/projects/${encodeURIComponent(projectId)}/annotations?start_ts_ms=${startMs}&end_ts_ms=${endMs}`,
+    ),
+  createAnnotation: (projectId: string, body: { ts_ms: number; text: string }) =>
+    fetchJson<Annotation>(`/v1/projects/${encodeURIComponent(projectId)}/annotations`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteAnnotation: (projectId: string, id: string) =>
+    fetchJson<unknown>(`/v1/projects/${encodeURIComponent(projectId)}/annotations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
+  createProject: (body: { name: string; timezone: string }) =>
+    fetchJson<{ project: ProjectInfo; api_key: CreatedApiKeyResponse }>(`/v1/projects`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
   getStatus: (projectId?: string) =>
     fetchJson<NodeStatus>(
       projectId ? `/v1/status?project_id=${encodeURIComponent(projectId)}` : "/v1/status",
@@ -773,6 +802,14 @@ export const api = {
   queryInsights: (projectId: string, body: unknown) =>
     fetchJson<InsightsResult>(`/v1/projects/${encodeURIComponent(projectId)}/query/insights`, {
       method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** CSV of every user who stopped before funnel step `step` (0-based index of the step not reached). */
+  exportFunnelDropped: (projectId: string, body: unknown, step: number) =>
+    fetchText(`/v1/projects/${encodeURIComponent(projectId)}/query/funnel/dropped?step=${step}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
 
@@ -873,6 +910,8 @@ export const api = {
         row_count: number;
         sample_columns: string[];
       }>;
+      /** Profile property keys; use them as `user.<key>` in filters and splits. */
+      user_properties?: string[];
     }>(`/v1/projects/${encodeURIComponent(projectId)}/schema-extensions`),
 
   uploadLookupTable: (
@@ -948,14 +987,14 @@ export const api = {
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results`,
     ),
 
-  listUsers: (projectId: string, search = "", limit = 100) =>
+  listUsers: (projectId: string, search = "", limit = 100, offset = 0) =>
     fetchJson<UserProfileItem[]>(
-      `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}`,
+      `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
     ),
 
-  getUserDetail: (projectId: string, distinctId: string) =>
+  getUserDetail: (projectId: string, distinctId: string, canonicalUid?: number) =>
     fetchJson<UserDetailResponse>(
-      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}${canonicalUid ? `?uid=${canonicalUid}` : ""}`,
     ),
 
   deleteUserDpdp: (projectId: string, distinctId: string) =>

@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use chrono::Utc;
 use pulse_control::{
-    AlertRule, CohortRecord, ControlPlaneService, Experiment, ExperimentMetricSpec, FeatureFlag,
-    LexiconProperty, UserProfileRecord, VariantAllocation,
+    AlertRule, CohortRecord, ControlPlaneService, Dashboard, DashboardCard, Experiment,
+    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, UserProfileRecord,
+    VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -1098,6 +1099,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         })
         .await?;
 
+    seed_starter_dashboard(ctrl, project_id, now_ms).await?;
+
     ctrl.refresh_project_virtual_catalog(project_id)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -1120,4 +1123,108 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     );
 
     Ok(summary)
+}
+
+/// The dashboard a new demo user lands on: the onboarding funnel, daily active users and
+/// day-N retention, each a saved report that opens in its own page.
+async fn seed_starter_dashboard(
+    ctrl: &Arc<ControlPlaneService>,
+    project_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let no_filter = serde_json::json!({"predicates": [], "cohort": null});
+    let funnel_steps: Vec<serde_json::Value> = [
+        "App_Open",
+        "KYC_PAN_Submitted",
+        "Video_KYC_Completed",
+        "UPI_Autopay_Mandate_Approved",
+        "First_Disbursal_Success",
+    ]
+    .iter()
+    .map(|e| serde_json::json!({"event_name": e, "filters": [], "first_time_ever": false}))
+    .collect();
+    let reports = [
+        (
+            "rep_demo_onboarding_funnel",
+            "Onboarding funnel",
+            "funnel",
+            serde_json::json!({
+                "steps": funnel_steps,
+                "order_mode": "loose_order",
+                "conversion_window_ms": 7 * 86_400_000i64,
+                "exclusions": [],
+                "hold_constant_props": [],
+                "breakdown_by": null,
+                "global_filter": no_filter,
+            }),
+        ),
+        (
+            "rep_demo_daily_active",
+            "Daily active users",
+            "insights",
+            serde_json::json!({
+                "interval": "day",
+                "series": [{"label": "A", "event_name": "App_Open", "metric": {"type": "uniques"}, "filters": []}],
+                "breakdown_by": [],
+                "compare_previous_period": false,
+                "formula": null,
+                "global_filter": no_filter,
+            }),
+        ),
+        (
+            "rep_demo_retention",
+            "Day-N retention",
+            "retention",
+            serde_json::json!({
+                "start_event": "App_Open",
+                "return_event": "$any_event",
+                "mode": "n_day",
+                "unit": "day",
+                "num_periods": 7,
+                "global_filter": no_filter,
+            }),
+        ),
+    ];
+    let mut cards = vec![DashboardCard {
+        id: "card_demo_note".to_string(),
+        kind: "text".to_string(),
+        report_id: None,
+        text: Some(
+            "Demo data: a lending app's onboarding over the last 14 days. Open any card to explore it, or build your own report from the sidebar.".to_string(),
+        ),
+        width: 2,
+    }];
+    for (id, name, kind, query) in reports {
+        ctrl.meta()
+            .upsert_saved_report(&SavedReport {
+                id: id.to_string(),
+                project_id: project_id.to_string(),
+                name: name.to_string(),
+                report_kind: kind.to_string(),
+                query_json: query,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            })
+            .await?;
+        cards.push(DashboardCard {
+            id: format!("card_{id}"),
+            kind: "report".to_string(),
+            report_id: Some(id.to_string()),
+            text: None,
+            width: if kind == "funnel" { 2 } else { 1 },
+        });
+    }
+    ctrl.meta()
+        .upsert_dashboard(&Dashboard {
+            id: "dash_demo_overview".to_string(),
+            project_id: project_id.to_string(),
+            name: "Overview".to_string(),
+            description: Some("Starter dashboard for the demo project".to_string()),
+            cards,
+            created_by: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .await?;
+    Ok(())
 }

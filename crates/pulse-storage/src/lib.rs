@@ -1,6 +1,7 @@
 pub mod dictionary;
 pub mod encrypted_store;
 pub mod engine;
+pub mod erased;
 pub mod error;
 pub mod manifest;
 pub mod mem_bucket;
@@ -21,6 +22,7 @@ pub use engine::{
     event_uuid_fingerprint, route_bucket, MaintenanceErrors, MaintenanceKind, ProjectStorage,
     StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
 };
+pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
 pub use manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
 pub use mem_bucket::{

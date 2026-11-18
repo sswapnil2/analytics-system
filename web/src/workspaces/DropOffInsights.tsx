@@ -183,9 +183,16 @@ export const WhyTheyLeft: React.FC<{
 };
 
 /** A dropped user's events around the moment they left, for when there's no recording. */
-export const UserTimeline: React.FC<{ projectId: string; distinctId: string; dropTs: number; fromEvent: string }> = ({
+export const UserTimeline: React.FC<{
+  projectId: string;
+  distinctId: string;
+  canonicalUid: number;
+  dropTs: number;
+  fromEvent: string;
+}> = ({
   projectId,
   distinctId,
+  canonicalUid,
   dropTs,
   fromEvent,
 }) => {
@@ -194,13 +201,13 @@ export const UserTimeline: React.FC<{ projectId: string; distinctId: string; dro
   useEffect(() => {
     let alive = true;
     api
-      .getUserDetail(projectId, distinctId)
+      .getUserDetail(projectId, distinctId, canonicalUid)
       .then((d) => alive && setEvents(d.events))
       .catch((err) => alive && setError(errorMessage(err)));
     return () => {
       alive = false;
     };
-  }, [projectId, distinctId]);
+  }, [projectId, distinctId, canonicalUid]);
 
   if (error) return <p className="text-sm text-muted">Couldn't load this user's events: {error}</p>;
   if (!events) return <Spinner label="Loading events" />;
@@ -209,6 +216,7 @@ export const UserTimeline: React.FC<{ projectId: string; distinctId: string; dro
     .filter((e) => Math.abs(e.event_ts_ms - dropTs) <= 3_600_000)
     .sort((a, b) => a.event_ts_ms - b.event_ts_ms);
   const shown = near.length > 0 ? near : [...events].sort((a, b) => b.event_ts_ms - a.event_ts_ms).slice(0, 15).reverse();
+  if (shown.length === 0) return <p className="text-sm text-muted">No recording and no stored events for this user.</p>;
   return (
     <div className="space-y-2">
       <p className="text-sm text-muted">No recording for this session, so here's what they did around the time they left.</p>

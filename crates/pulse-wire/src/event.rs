@@ -265,6 +265,56 @@ fn parse_timestamp_ms(val: &serde_json::Value) -> Option<i64> {
     }
 }
 
+/// Longest accepted event or property name, in characters.
+pub const MAX_NAME_CHARS: usize = 255;
+/// String property values are truncated to this many bytes (on a character boundary).
+pub const MAX_STRING_PROP_BYTES: usize = 8 * 1024;
+
+fn truncate_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut cut = max_bytes;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+}
+
+/// Maps Segment's call types onto Pulse events: `page` → `$pageview`, `screen` → `$screen`
+/// (the page or screen `name` is kept as a property). `identify`, `alias` and `group` are not
+/// events and are refused with a pointer to the right endpoint; `track` and untyped objects
+/// pass through unchanged.
+fn apply_segment_call_type(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let Some(kind) = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return Ok(());
+    };
+    let event = match kind.as_str() {
+        "page" => "$pageview",
+        "screen" => "$screen",
+        "identify" | "alias" => {
+            return Err(format!("Segment \"{kind}\" calls are applied by /v1/ingest batches; here send them to /v1/identify (anonymous-to-user link) and /v1/engage (traits)"))
+        }
+        "group" => return Err("Segment \"group\" calls are not events: send group traits to /v1/groups".into()),
+        _ => return Ok(()),
+    };
+    if let Some(name) = obj.remove("name").filter(|v| !v.is_null()) {
+        let props = obj
+            .entry("properties")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if let serde_json::Value::Object(m) = props {
+            m.entry("name").or_insert(name);
+        }
+    }
+    obj.insert("event_name".into(), serde_json::Value::String(event.into()));
+    Ok(())
+}
+
 fn non_empty_str<'a>(
     map: &'a serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
@@ -283,6 +333,7 @@ fn non_empty_str<'a>(
 impl<'de> Deserialize<'de> for WireEvent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        apply_segment_call_type(&mut obj).map_err(serde::de::Error::custom)?;
 
         // Support Pulse native (`event_name`), Segment (`event`), or generic (`name`) (`PR-8`)
         let event_name = non_empty_str(&obj, &["event_name", "event", "name"])
@@ -290,6 +341,11 @@ impl<'de> Deserialize<'de> for WireEvent {
                 serde::de::Error::custom("missing event name: provide \"event_name\" or \"event\"")
             })?
             .to_string();
+        if event_name.chars().count() > MAX_NAME_CHARS {
+            return Err(serde::de::Error::custom(format!(
+                "event name is longer than {MAX_NAME_CHARS} characters"
+            )));
+        }
 
         // Parse properties (`props` or Segment `properties`) before falling back for IDs
         let props_val = obj.remove("props").or_else(|| obj.remove("properties"));
@@ -360,7 +416,7 @@ impl<'de> Deserialize<'de> for WireEvent {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
 
-        let props: Vec<(String, PropValue)> = match props_val {
+        let mut props: Vec<(String, PropValue)> = match props_val {
             Some(serde_json::Value::Object(m)) => m
                 .into_iter()
                 .map(|(k, v)| (k, PropValue::from_json_value(v)))
@@ -378,6 +434,17 @@ impl<'de> Deserialize<'de> for WireEvent {
                 ));
             }
         };
+
+        for (k, v) in &mut props {
+            if k.chars().count() > MAX_NAME_CHARS {
+                return Err(serde::de::Error::custom(format!(
+                    "property name is longer than {MAX_NAME_CHARS} characters"
+                )));
+            }
+            if let PropValue::Str(text) = v {
+                truncate_utf8(text, MAX_STRING_PROP_BYTES);
+            }
+        }
 
         let raw_uuid = obj
             .remove("event_uuid")

@@ -58,6 +58,16 @@ pub struct IngestResponse {
     pub deduped: usize,
     pub dropped: usize,
     pub server_ts_ms: i64,
+    /// Events of the request that were refused, by index; the rest were processed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<pulse_wire::RejectedEvent>,
+    /// Segment `identify` / `alias` calls in the batch that were applied to profiles.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub profiles_updated: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -229,7 +239,7 @@ impl IngestService {
     pub async fn ingest_for_project(
         &self,
         project_id: &str,
-        batch: WireBatch,
+        mut batch: WireBatch,
         server_now_ms: i64,
     ) -> Result<IngestResponse> {
         let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
@@ -245,6 +255,8 @@ impl IngestService {
         let mut accepted = 0usize;
         let mut deduped = 0usize;
         let mut dropped = 0usize;
+        let rejected = std::mem::take(&mut batch.rejected);
+        let profile_calls = std::mem::take(&mut batch.profile_calls);
 
         type PropTypeList = Vec<(String, &'static str)>;
         let mut by_bucket: BTreeMap<u8, Vec<(WireEvent, u32, u64)>> = BTreeMap::new();
@@ -432,7 +444,69 @@ impl IngestService {
             deduped,
             dropped,
             server_ts_ms: server_now_ms,
+            rejected,
+            profiles_updated: self
+                .apply_segment_profile_calls(project_id, profile_calls)
+                .await?,
         })
+    }
+
+    /// Applies Segment calls that travel in event batches:
+    /// - `identify` with `userId` + `anonymousId` links the two ids and sets `traits` on the user;
+    ///   with only one id it sets `traits` on that id.
+    /// - `alias` links `previousId` to `userId`.
+    async fn apply_segment_profile_calls(
+        &self,
+        project_id: &str,
+        calls: Vec<serde_json::Value>,
+    ) -> Result<usize> {
+        let s = |v: &serde_json::Value, keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+        };
+        let mut applied = 0usize;
+        for call in calls {
+            let kind = s(&call, &["type"]).unwrap_or_default().to_ascii_lowercase();
+            let user = s(&call, &["userId", "user_id"]);
+            let traits = call
+                .get("traits")
+                .or_else(|| call.get("context").and_then(|c| c.get("traits")))
+                .filter(|t| t.as_object().is_some_and(|o| !o.is_empty()))
+                .cloned();
+            let other = if kind == "alias" {
+                s(&call, &["previousId", "previous_id"])
+            } else {
+                s(&call, &["anonymousId", "anonymous_id"])
+            };
+            match (user, other) {
+                (Some(user_id), Some(anon_id)) if user_id != anon_id => {
+                    self.identify_for_project(
+                        project_id,
+                        IdentifyRequest {
+                            anon_id,
+                            user_id,
+                            user_properties: traits,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                }
+                (Some(id), _) | (None, Some(id)) => {
+                    let Some(t) = traits else { continue };
+                    self.engage_for_project(
+                        project_id,
+                        serde_json::json!({ "distinct_id": id, "$set": t }),
+                    )
+                    .await?;
+                }
+                (None, None) => continue,
+            }
+            applied += 1;
+        }
+        Ok(applied)
     }
 
     pub async fn identify(&self, api_key: &str, req: IdentifyRequest) -> Result<IdentifyResponse> {
@@ -473,6 +547,9 @@ impl IngestService {
         let canonical_uid = id_graph
             .alias_durable(&req.anon_id, &req.user_id, anon_bucket, user_bucket)
             .await?;
+        self.governance
+            .on_identify(project_id, &req.anon_id, &req.user_id, canonical_uid)
+            .await;
 
         if let Some(up) = req.user_properties {
             let payload = serde_json::json!({ "$set": up });
