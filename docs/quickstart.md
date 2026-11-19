@@ -2,9 +2,25 @@
 
 Run a Pulse node locally, get credentials, and send a first event.
 
-## 1. Build
+## 1. Install
 
-Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it up) and Node.js for the Studio UI.
+**Docker** (Linux x86_64 and arm64 images):
+
+```bash
+docker run -p 8080:8080 -v pulse_data:/data \
+  -e PULSE_ADMIN_TOKEN="sk_root_$(openssl rand -hex 24)" \
+  ghcr.io/sswapnil2/pulse:latest --seed
+```
+
+Inside the container the node listens on `0.0.0.0:8080` and keeps everything in `/data`. Drop
+`--seed` for an empty node. Then skip to step 3.
+
+**Release tarball** (Linux x86_64 or aarch64, glibc 2.35+: Ubuntu 22.04+, Debian 12+): download
+`pulse-linux-<arch>.tar.gz` from the [latest release](https://github.com/sswapnil2/analytics-system/releases/latest),
+check it against `SHA256SUMS`, unpack it, and run `./pulse/pulse-node --web-dir pulse/web/dist`.
+The tarball also contains a systemd unit, a Caddyfile and an env template from `deploy/`.
+
+**From source** (macOS, or any other platform). Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it up) and Node.js for the Studio UI.
 
 ```bash
 npm --prefix web ci && npm --prefix web run build   # Studio UI -> web/dist (optional, API works without it)

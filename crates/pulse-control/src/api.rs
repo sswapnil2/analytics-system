@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -41,11 +40,6 @@ pub use auth::AuthConfig;
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
 use crate::db::{MetaError, MetaStore};
 use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
-use crate::license::{
-    evaluate_license_health, verify_license_signature, CommercialFeature, EditionTier,
-    LicenseClaims, LicenseHealth, LicenseStatusResponse, SystemLicenseRecord,
-    LICENSE_GRACE_PERIOD_MS,
-};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
@@ -129,7 +123,7 @@ impl AuthPrincipal {
         }
     }
 
-    /// Encryption keys and the licence: root admin token only. Studio users (any self-registered
+    /// Encryption keys and the audit log: root admin token only. Studio users (any self-registered
     /// account in an allowed domain) and project keys are refused.
     fn require_cluster_admin(&self) -> Result<String, CtrlError> {
         match self {
@@ -169,8 +163,6 @@ pub struct ControlPlaneService {
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     /// Per project: the update time up to which user profiles are loaded into the catalog.
     profiles_synced_ms: DashMap<String, i64>,
-    license_state: parking_lot::RwLock<Option<LicenseClaims>>,
-    max_seen_ts_ms: AtomicI64,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
     auth_cfg: parking_lot::RwLock<AuthConfig>,
     auth_state: auth::AuthState,
@@ -240,8 +232,6 @@ impl ControlPlaneService {
             known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
             profiles_synced_ms: DashMap::new(),
-            license_state: parking_lot::RwLock::new(None),
-            max_seen_ts_ms: AtomicI64::new(0),
             discovery_tx: tx,
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
@@ -253,7 +243,7 @@ impl ControlPlaneService {
             .await?;
         svc.bootstrap_creds.lock().generated_ingest_key = generated_ingest;
         svc.reload_caches_from_db().await?;
-        svc.restore_license_and_byok().await?;
+        svc.restore_encryption_keyring().await?;
 
         let meta_bg = meta;
         tokio::spawn(async move {
@@ -482,53 +472,8 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    async fn restore_license_and_byok(&self) -> Result<(), String> {
-        let wall_now = Utc::now().timestamp_millis();
-        let db_lic = self
-            .meta
-            .get_system_license()
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut max_seen = db_lic
-            .as_ref()
-            .map(|r| r.max_seen_ts_ms)
-            .unwrap_or(0)
-            .max(wall_now);
-        self.max_seen_ts_ms.store(max_seen, Ordering::Relaxed);
-
-        if let Ok(env_key) = std::env::var("PULSE_LICENSE_KEY") {
-            let trimmed = env_key.trim();
-            if !trimmed.is_empty() {
-                let claims = verify_license_signature(trimmed)?;
-                *self.license_state.write() = Some(claims.clone());
-                max_seen = max_seen.max(Utc::now().timestamp_millis());
-                self.max_seen_ts_ms.store(max_seen, Ordering::Relaxed);
-                let _ = self
-                    .meta
-                    .upsert_system_license(&SystemLicenseRecord {
-                        license_key: trimmed.to_string(),
-                        customer_org: claims.customer_org,
-                        edition: claims.edition.as_str().to_string(),
-                        features: claims.features,
-                        expires_at_ms: claims.expires_at_ms,
-                        activated_at_ms: wall_now,
-                        max_seen_ts_ms: max_seen,
-                    })
-                    .await;
-            }
-        }
-        if self.license_state.read().is_none() {
-            if let Some(rec) = db_lic {
-                let claims = verify_license_signature(&rec.license_key).map_err(|e| {
-                    format!("stored system_license failed Ed25519 verification: {e}")
-                })?;
-                *self.license_state.write() = Some(claims);
-                let _ = self.meta.update_license_max_seen_ts(max_seen).await;
-            }
-        }
-
-        // Open-Source encryption keyring is ALWAYS restored across restarts regardless of license
-        // tier or expiration (`C3`/`C4`), failing closed if sealed secrets cannot decrypt.
+    /// Restores the encryption keyring across restarts, failing closed if sealed secrets cannot decrypt.
+    async fn restore_encryption_keyring(&self) -> Result<(), String> {
         let keyring_rows = self
             .meta
             .list_system_keyring()
@@ -558,85 +503,6 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    fn current_license_with_health(&self) -> (Option<LicenseClaims>, LicenseHealth) {
-        let guard = self.license_state.read();
-        let Some(claims) = guard.as_ref() else {
-            return (None, LicenseHealth::Expired);
-        };
-        let wall_now = Utc::now().timestamp_millis();
-        let prev = self.max_seen_ts_ms.fetch_max(wall_now, Ordering::AcqRel);
-        let max_seen = prev.max(wall_now);
-        if wall_now > prev && (wall_now - prev) >= 60_000 {
-            let meta = self.meta.clone();
-            tokio::spawn(async move {
-                let _ = meta.update_license_max_seen_ts(max_seen).await;
-            });
-        }
-        let health = evaluate_license_health(claims, wall_now, max_seen);
-        (Some(claims.clone()), health)
-    }
-
-    fn build_license_status(&self) -> LicenseStatusResponse {
-        let enc = self.qengine.storage().byok_encryption_status();
-        let (claims_opt, health) = self.current_license_with_health();
-        match (claims_opt, health) {
-            (Some(claims), LicenseHealth::Active) => LicenseStatusResponse {
-                edition: claims.edition.as_str().to_string(),
-                health: "active".to_string(),
-                is_commercial: true,
-                in_grace_period: false,
-                customer_org: Some(claims.customer_org),
-                license_id: Some(claims.license_id),
-                expires_at_ms: Some(claims.expires_at_ms),
-                grace_ends_at_ms: Some(
-                    claims.expires_at_ms.saturating_add(LICENSE_GRACE_PERIOD_MS),
-                ),
-                features: claims.features,
-                encryption: enc,
-            },
-            (Some(claims), LicenseHealth::GracePeriod) => LicenseStatusResponse {
-                edition: claims.edition.as_str().to_string(),
-                health: "grace_period".to_string(),
-                is_commercial: true,
-                in_grace_period: true,
-                customer_org: Some(claims.customer_org),
-                license_id: Some(claims.license_id),
-                expires_at_ms: Some(claims.expires_at_ms),
-                grace_ends_at_ms: Some(
-                    claims.expires_at_ms.saturating_add(LICENSE_GRACE_PERIOD_MS),
-                ),
-                features: claims.features,
-                encryption: enc,
-            },
-            (Some(claims), LicenseHealth::Expired) => LicenseStatusResponse {
-                edition: EditionTier::Community.as_str().to_string(),
-                health: "expired".to_string(),
-                is_commercial: false,
-                in_grace_period: false,
-                customer_org: Some(claims.customer_org),
-                license_id: Some(claims.license_id),
-                expires_at_ms: Some(claims.expires_at_ms),
-                grace_ends_at_ms: Some(
-                    claims.expires_at_ms.saturating_add(LICENSE_GRACE_PERIOD_MS),
-                ),
-                features: Vec::new(),
-                encryption: enc,
-            },
-            (None, _) => LicenseStatusResponse {
-                edition: EditionTier::Community.as_str().to_string(),
-                health: "community".to_string(),
-                is_commercial: false,
-                in_grace_period: false,
-                customer_org: None,
-                license_id: None,
-                expires_at_ms: None,
-                grace_ends_at_ms: None,
-                features: Vec::new(),
-                encryption: enc,
-            },
-        }
-    }
-
     /// Anything sealed under an ephemeral KEK is unreadable after a restart, so refuse to seal.
     fn require_durable_kek(&self) -> Result<(), CtrlError> {
         let allow_ephemeral = matches!(
@@ -649,30 +515,6 @@ impl ControlPlaneService {
             ));
         }
         Ok(())
-    }
-
-    fn require_commercial_feature(&self, feature: CommercialFeature) -> Result<(), CtrlError> {
-        let (claims_opt, health) = self.current_license_with_health();
-        match (claims_opt, health) {
-            (Some(claims), LicenseHealth::Active | LicenseHealth::GracePeriod) => {
-                if claims.features.iter().any(|f| f == feature.as_str()) {
-                    Ok(())
-                } else {
-                    Err(CtrlError::payment_required(
-                        feature.as_str(),
-                        format!("License does not include feature '{}'", feature.as_str()),
-                    ))
-                }
-            }
-            (Some(_), LicenseHealth::Expired) => Err(CtrlError::payment_required(
-                feature.as_str(),
-                "Commercial license and 14-day grace period have expired.",
-            )),
-            (None, _) => Err(CtrlError::payment_required(
-                feature.as_str(),
-                "This capability requires a Commercial BYOK license key (PULSE_LICENSE_KEY or POST /v1/license).",
-            )),
-        }
     }
 
     async fn record_enterprise_audit(
@@ -1549,17 +1391,11 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
-        // Open-Source Encryption at Rest + Commercial BYOK License, Audit, Vault, Export & Copilot
+        // Encryption at rest, audit log, provider credentials, warehouse export & copilot
         .route("/v1/system/encryption", get(handle_get_encryption))
         .route(
             "/v1/system/encryption/rotate",
             post(handle_rotate_encryption),
-        )
-        .route(
-            "/v1/license",
-            get(handle_get_license)
-                .post(handle_activate_license)
-                .delete(handle_deactivate_license),
         )
         .route("/v1/audit-logs", get(handle_list_audit_logs))
         .route(
@@ -1622,12 +1458,6 @@ impl CtrlError {
     }
     fn bad_gateway(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_GATEWAY, msg.into())
-    }
-    fn payment_required(feature: &str, msg: impl Into<String>) -> Self {
-        Self(
-            StatusCode::PAYMENT_REQUIRED,
-            format!("commercial_license_required ({feature}): {}", msg.into()),
-        )
     }
     fn meta(err: MetaError) -> Self {
         match err {
@@ -4343,20 +4173,13 @@ impl ControlPlaneService {
     }
 
     /// Posts the alert to its `webhook_url`, or to the project's webhook credential URL, signed with
-    /// that credential's secret. Needs the `webhook_alerts` licence feature and a webhook credential;
-    /// returns `Ok(None)` when either is missing.
+    /// that credential's secret. Returns `Ok(None)` when the project has no webhook credential.
     async fn deliver_alert(
         &self,
         a: &AlertRule,
         value: f64,
         now_ms: i64,
     ) -> Result<Option<reqwest::StatusCode>, String> {
-        if self
-            .require_commercial_feature(CommercialFeature::WebhookAlerts)
-            .is_err()
-        {
-            return Ok(None);
-        }
         let Some(rec) = self
             .meta
             .get_byok_credential(&a.project_id, "webhook")
@@ -4524,18 +4347,7 @@ async fn handle_delete_alert(
     Ok(Json(json!({ "status": "ok", "id": alert_id })))
 }
 
-// ======================= OPEN-SOURCE ENCRYPTION, COMMERCIAL LICENSE, BYOK & COPILOT =======================
-
-fn byok_feature_for_category(category: &str) -> Result<CommercialFeature, CtrlError> {
-    match category {
-        "llm" => Ok(CommercialFeature::ByokAiCopilot),
-        "storage" => Ok(CommercialFeature::WarehouseExport),
-        "webhook" => Ok(CommercialFeature::WebhookAlerts),
-        _ => Err(CtrlError::bad(
-            "category must be one of: llm, storage, webhook",
-        )),
-    }
-}
+// ======================= ENCRYPTION, PROVIDER CREDENTIALS & COPILOT =======================
 
 struct StorageCfg<'a> {
     url: Option<&'a str>,
@@ -4748,95 +4560,6 @@ async fn handle_rotate_encryption(
     })))
 }
 
-async fn handle_get_license(
-    State(ctrl): State<Arc<ControlPlaneService>>,
-) -> ApiRes<LicenseStatusResponse> {
-    Ok(Json(ctrl.build_license_status()))
-}
-
-#[derive(Deserialize)]
-struct ActivateLicenseReq {
-    #[serde(default)]
-    license_key: Option<String>,
-    #[serde(default)]
-    trial: bool,
-}
-
-async fn handle_activate_license(
-    State(ctrl): State<Arc<ControlPlaneService>>,
-    Extension(principal): Extension<AuthPrincipal>,
-    Json(req): Json<ActivateLicenseReq>,
-) -> ApiRes<LicenseStatusResponse> {
-    let actor = principal.require_cluster_admin()?;
-    if req.trial {
-        return Err(CtrlError::bad(
-            "self-serve trial key minting is disabled; supply an Ed25519-signed license_key",
-        ));
-    }
-    let key_str = req
-        .license_key
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| CtrlError::bad("license_key is required"))?;
-
-    let claims = verify_license_signature(&key_str).map_err(CtrlError::bad)?;
-    let now_ms = Utc::now().timestamp_millis();
-    let max_seen = ctrl
-        .max_seen_ts_ms
-        .fetch_max(now_ms, Ordering::AcqRel)
-        .max(now_ms);
-    if matches!(
-        evaluate_license_health(&claims, now_ms, max_seen),
-        LicenseHealth::Expired
-    ) {
-        return Err(CtrlError::bad(
-            "license key and 14-day grace period have expired",
-        ));
-    }
-
-    ctrl.meta
-        .upsert_system_license(&SystemLicenseRecord {
-            license_key: key_str,
-            customer_org: claims.customer_org.clone(),
-            edition: claims.edition.as_str().to_string(),
-            features: claims.features.clone(),
-            expires_at_ms: claims.expires_at_ms,
-            activated_at_ms: now_ms,
-            max_seen_ts_ms: max_seen,
-        })
-        .await
-        .map_err(CtrlError::meta)?;
-
-    *ctrl.license_state.write() = Some(claims.clone());
-    ctrl.record_enterprise_audit(
-        &actor,
-        "license.activate",
-        "system_license",
-        json!({ "license_id": claims.license_id, "customer_org": claims.customer_org }),
-    )
-    .await;
-
-    Ok(Json(ctrl.build_license_status()))
-}
-
-async fn handle_deactivate_license(
-    State(ctrl): State<Arc<ControlPlaneService>>,
-    Extension(principal): Extension<AuthPrincipal>,
-) -> ApiRes<LicenseStatusResponse> {
-    let actor = principal.require_cluster_admin()?;
-    ctrl.meta
-        .delete_system_license()
-        .await
-        .map_err(CtrlError::meta)?;
-    *ctrl.license_state.write() = None;
-
-    // Preserves cluster encryption keyring so existing encrypted objects stay readable (`C3`).
-    ctrl.record_enterprise_audit(&actor, "license.deactivate", "system_license", json!({}))
-        .await;
-
-    Ok(Json(ctrl.build_license_status()))
-}
-
 #[derive(Deserialize)]
 struct AuditLogQuery {
     limit: Option<i64>,
@@ -4848,7 +4571,6 @@ async fn handle_list_audit_logs(
     Query(query): Query<AuditLogQuery>,
 ) -> ApiRes<Vec<EnterpriseAuditRecord>> {
     let _ = principal.require_cluster_admin()?;
-    ctrl.require_commercial_feature(CommercialFeature::EnterpriseAuditLog)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let logs = ctrl
         .meta
@@ -4896,8 +4618,6 @@ async fn handle_upsert_byok(
             "category must be one of: llm, storage, webhook",
         ));
     }
-    let feature = byok_feature_for_category(&category)?;
-    ctrl.require_commercial_feature(feature)?;
 
     let secret = req.secret.trim();
     if secret.is_empty() {
@@ -4983,8 +4703,11 @@ async fn handle_verify_byok(
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let cat = req.category.trim().to_ascii_lowercase();
-    let feature = byok_feature_for_category(&cat)?;
-    ctrl.require_commercial_feature(feature)?;
+    if !BYOK_CATEGORIES.contains(&cat.as_str()) {
+        return Err(CtrlError::bad(
+            "category must be one of: llm, storage, webhook",
+        ));
+    }
 
     let rec = ctrl
         .meta
@@ -5106,7 +4829,6 @@ async fn handle_warehouse_export(
     body: Option<Json<WarehouseExportReq>>,
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
-    ctrl.require_commercial_feature(CommercialFeature::WarehouseExport)?;
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
     let storage_rec = ctrl
@@ -5206,7 +4928,6 @@ async fn handle_byok_copilot(
     Json(req): Json<CopilotRequest>,
 ) -> ApiRes<crate::copilot::CopilotResponse> {
     ctrl.authorize_and_check(&principal, &id).await?;
-    ctrl.require_commercial_feature(CommercialFeature::ByokAiCopilot)?;
 
     let llm_cred = ctrl
         .meta

@@ -66,7 +66,7 @@ const UsersWorkspace = lazy(() => import("./workspaces/UsersWorkspace").then((m)
 const CohortsLookupsWorkspace = lazy(() => import("./workspaces/CohortsLookupsWorkspace").then((m) => ({ default: m.CohortsLookupsWorkspace })));
 const ExperimentsFlagsWorkspace = lazy(() => import("./workspaces/ExperimentsFlagsWorkspace").then((m) => ({ default: m.ExperimentsFlagsWorkspace })));
 const LexiconMcpWorkspace = lazy(() => import("./workspaces/LexiconMcpWorkspace").then((m) => ({ default: m.LexiconMcpWorkspace })));
-const ByokCommercialPanel = lazy(() => import("./components/ByokCommercialPanel").then((m) => ({ default: m.ByokCommercialPanel })));
+const SecurityPanel = lazy(() => import("./components/SecurityPanel").then((m) => ({ default: m.SecurityPanel })));
 
 /** Escapes a string for safe embedding inside single-quoted POSIX shell literals. */
 function shellSingleQuote(s: string): string {
@@ -119,7 +119,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
-      { id: "security", label: "Enterprise and security", icon: Lock },
+      { id: "security", label: "Security and integrations", icon: Lock },
     ],
   },
 ];
@@ -1011,13 +1011,13 @@ export const App: React.FC = () => {
                     )}
                     {activeTab === "security" &&
                       (canManageKeys ? (
-                        <ByokCommercialPanel projectId={activePid} />
+                        <SecurityPanel projectId={activePid} />
                       ) : (
                         <Panel>
                           <EmptyState
                             icon={Lock}
                             title="Admin access required"
-                            body="Enterprise encryption, BYOK keys, and audit logs are restricted to workspace admins and owners."
+                            body="Encryption, BYOK keys, and audit logs are restricted to workspace admins and owners."
                             action={
                               <button type="button" onClick={() => go("dashboards")} className={btn.secondary}>
                                 Back to Dashboards

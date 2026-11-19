@@ -3,13 +3,30 @@
   "version": "0.1.0",
   "license": "Apache-2.0",
   "description": "Zero-dependency Web & React Native compatible SDK + Privacy-First DOM Wireframe Diff Collector for Pulse Analytics",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sswapnil2/analytics-system.git",
+    "directory": "sdks/ts-web"
+  },
+  "homepage": "https://github.com/sswapnil2/analytics-system/blob/main/docs/web-sdk.md",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "tsc && node --test test/sdk.test.mjs"
+    "test": "tsc && node --test test/sdk.test.mjs",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "typescript": "^5.6.3"

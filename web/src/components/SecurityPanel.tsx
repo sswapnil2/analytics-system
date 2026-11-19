@@ -5,8 +5,6 @@ import {
   Download,
   KeyRound,
   Lock,
-  ShieldAlert,
-  ShieldCheck,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -16,7 +14,6 @@ import {
   CopilotResponse,
   EncryptionStatusResponse,
   EnterpriseAuditRecord,
-  LicenseStatus,
 } from "../api/client";
 import {
   ErrorNotice,
@@ -44,7 +41,7 @@ type CategoryMeta = {
 const CATEGORIES: CategoryMeta[] = [
   {
     category: "llm",
-    title: "BYOK AI Provider Key",
+    title: "AI provider key",
     subtitle: "Powers AI Copilot using your own OpenAI, Anthropic, or Gemini API key.",
     providers: [
       { value: "openai", label: "OpenAI (gpt-4o-mini)" },
@@ -55,7 +52,7 @@ const CATEGORIES: CategoryMeta[] = [
   },
   {
     category: "storage",
-    title: "BYOC Object Storage & Warehouse Export",
+    title: "Data export storage",
     subtitle: "Connect customer-owned S3, Cloudflare R2, MinIO, or local archive buckets.",
     providers: [
       { value: "s3_compatible", label: "AWS S3 / MinIO / R2 (s3://bucket)" },
@@ -65,7 +62,7 @@ const CATEGORIES: CategoryMeta[] = [
   },
   {
     category: "webhook",
-    title: "Alert Webhook Destination",
+    title: "Alert webhook",
     subtitle: "Webhook endpoint; requests are HMAC-SHA256 signed with your signing secret.",
     providers: [
       { value: "slack_webhook", label: "Slack / Teams Incoming Webhook" },
@@ -80,20 +77,15 @@ const COPILOT_PRESETS = [
   "Summarize errors and rage taps affecting conversion",
 ];
 
-export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
+export const SecurityPanel: React.FC<{ projectId: string }> = ({
   projectId,
 }) => {
-  const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [encryption, setEncryption] = useState<EncryptionStatusResponse | null>(null);
   const [auditLogs, setAuditLogs] = useState<EnterpriseAuditRecord[]>([]);
   const [credentials, setCredentials] = useState<ByokCredentialItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-
-  const [licenseInput, setLicenseInput] = useState("");
-  const [licBusy, setLicBusy] = useState(false);
-  const [confirmDeactivate, setConfirmDeactivate] = useState(false);
 
   // Key rotation state
   const [newKeyInput, setNewKeyInput] = useState("");
@@ -123,21 +115,14 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
     setLoading(true);
     setError(null);
     try {
-      const [lic, enc, creds] = await Promise.all([
-        api.getLicense(),
+      const [enc, creds, logs] = await Promise.all([
         api.getEncryptionStatus().catch(() => null),
         api.listByokCredentials(projectId),
+        api.listAuditLogs(20).catch(() => []),
       ]);
-      setLicense(lic);
       setEncryption(enc);
       setCredentials(creds);
-
-      if (lic.is_commercial && lic.features.includes("enterprise_audit_log")) {
-        const logs = await api.listAuditLogs(20).catch(() => []);
-        setAuditLogs(logs);
-      } else {
-        setAuditLogs([]);
-      }
+      setAuditLogs(logs);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -147,51 +132,8 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
 
   useEffect(() => {
     setCopilotRes(null);
-    setConfirmDeactivate(false);
     void loadState();
   }, [projectId, loadState]);
-
-  const handleActivateKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!licenseInput.trim()) return;
-    setLicBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const res = await api.activateLicense({
-        license_key: licenseInput.trim(),
-      });
-      setLicense(res);
-      setLicenseInput("");
-      setNotice(`Activated Commercial BYOK license for ${res.customer_org ?? "org"}.`);
-      await loadState();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setLicBusy(false);
-    }
-  };
-
-  const handleDeactivateLicense = async () => {
-    if (!confirmDeactivate) {
-      setConfirmDeactivate(true);
-      return;
-    }
-    setLicBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const res = await api.deactivateLicense();
-      setLicense(res);
-      setConfirmDeactivate(false);
-      setNotice("Deactivated commercial license. Existing encrypted data remains readable via cluster keyring.");
-      await loadState();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setLicBusy(false);
-    }
-  };
 
   const handleRotateKey = async (disableWrites = false) => {
     setRotateBusy(true);
@@ -244,7 +186,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
       if (cat.category === "webhook") setDraftSigningSecret("");
       if (cat.category === "storage") setDraftStorageAccessKey("");
       await loadState();
-      setNotice(`Saved sealed BYOK ${cat.category.toUpperCase()} credential.`);
+      setNotice(`Saved ${cat.title}.`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -274,7 +216,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
     try {
       await api.deleteByokCredential(projectId, category);
       await loadState();
-      setNotice(`Removed BYOK ${category.toUpperCase()} credential.`);
+      setNotice(`Removed the ${category} credential.`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -315,21 +257,29 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
   };
 
   const credByCat = new Map(credentials.map((c) => [c.category, c]));
-  const isCommercial = license?.is_commercial ?? false;
-  const inGrace = license?.in_grace_period ?? false;
   const hasLlmKey = credByCat.has("llm");
   const hasStorageKey = credByCat.has("storage");
 
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Enterprise and security"
-        description="Encryption at rest, licence, your own AI provider keys, and the audit log."
+        title="Security and integrations"
+        description="Encryption at rest, your own AI provider key, data export, and the audit log."
       />
-      {/* 1. Open-Source Cluster Encryption at Rest */}
+      {error && <ErrorNotice message={error} onRetry={loadState} />}
+      {notice && (
+        <div
+          className="flex items-center gap-2 rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ink"
+          role="status"
+        >
+          <CheckCircle2 className="h-4 w-4 shrink-0 text-ok" />
+          <span>{notice}</span>
+        </div>
+      )}
+      {/* 1. Encryption at rest */}
       <Panel
         title="Cluster Encryption at Rest (AES-256-GCM)"
-        meta={loading ? "Loading…" : "Open-Source (Apache-2.0)"}
+        meta={loading ? "Loading…" : undefined}
         actions={
           <span
             className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${
@@ -402,134 +352,9 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
         </div>
       </Panel>
 
-      {/* 2. Commercial BYOK License & Verification */}
+      {/* 2. Provider credentials */}
       <Panel
-        title="Enterprise BYOK License"
-        meta={isCommercial ? (inGrace ? "14-Day Grace Period" : "Active Commercial") : "Community OSS Edition"}
-        actions={
-          license && (
-            <span
-              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${
-                isCommercial
-                  ? inGrace
-                    ? "border-warn/30 bg-warn-soft text-warn"
-                    : "border-ok/30 bg-ok-soft text-ok"
-                  : "border-line bg-sunken text-muted"
-              }`}
-            >
-              <ShieldCheck className="h-3.5 w-3.5" />
-              {isCommercial ? (inGrace ? "Grace Period Active" : "Commercial License Active") : "Community Edition"}
-            </span>
-          )
-        }
-      >
-        <div className="space-y-4">
-          {error && <ErrorNotice message={error} onRetry={loadState} />}
-
-          {notice && (
-            <div
-              className="flex items-center gap-2 rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ink"
-              role="status"
-            >
-              <CheckCircle2 className="h-4 w-4 shrink-0 text-ok" />
-              <span>{notice}</span>
-            </div>
-          )}
-
-          {isCommercial ? (
-            <div className="space-y-3 rounded-xl border border-line bg-sunken p-4">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                <div>
-                  Licensed to <strong className="text-ink">{license?.customer_org ?? "Enterprise Customer"}</strong>
-                  {license?.license_id && <span className="ml-2 font-mono text-muted">({license.license_id})</span>}
-                </div>
-                <div className="text-muted">
-                  Expires {formatTimestamp(license?.expires_at_ms)}
-                  {inGrace && (
-                    <span className="ml-2 text-warn font-semibold">
-                      (Grace ends {formatTimestamp(license?.grace_ends_at_ms)})
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-1.5">
-                {(license?.features ?? []).map((f) => (
-                  <span
-                    key={f}
-                    className="rounded border border-line bg-panel px-2 py-0.5 font-mono text-[11px] text-ink"
-                  >
-                    {f}
-                  </span>
-                ))}
-              </div>
-
-              <div className="pt-2">
-                {confirmDeactivate ? (
-                  <div className="flex items-center gap-2 rounded-lg border border-warn/30 bg-warn-soft p-3 text-xs text-ink">
-                    <ShieldAlert className="h-4 w-4 shrink-0 text-warn" />
-                    <span className="flex-1">
-                      Are you sure? Paid features (Copilot, Warehouse Sync, Audit Log) will pause. Decryption of all historical data is never affected.
-                    </span>
-                    <button
-                      type="button"
-                      disabled={licBusy}
-                      onClick={() => void handleDeactivateLicense()}
-                      className="inline-flex items-center gap-1 rounded-lg border border-destructive/30 bg-destructive px-3 py-1 font-medium text-white hover:opacity-90"
-                    >
-                      Confirm Deactivate
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDeactivate(false)}
-                      className={btn.secondary}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={licBusy}
-                    onClick={() => setConfirmDeactivate(true)}
-                    className={btn.secondary}
-                  >
-                    Deactivate License
-                  </button>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <p className="text-xs text-muted">
-                Core query engines, session replays, custom properties, cohorts, and dashboards are free forever under Apache-2.0.
-                To unlock BYOK AI Copilot, Cloud Warehouse Sync, Enterprise Audit Logs, and Signed Webhook Alerts, paste an offline Ed25519-signed commercial license.
-              </p>
-              <form onSubmit={handleActivateKey} className="flex flex-wrap items-center gap-2">
-                <input
-                  type="text"
-                  value={licenseInput}
-                  onChange={(e) => setLicenseInput(e.target.value)}
-                  placeholder="pulse_lic_v1.<payload_b64>.<sig_hex>"
-                  className={`${field} min-w-[20rem] flex-1 font-mono text-xs`}
-                  aria-label="Offline Ed25519 license key"
-                />
-                <button
-                  type="submit"
-                  disabled={licBusy || !licenseInput.trim()}
-                  className={btn.primary}
-                >
-                  {licBusy ? <Spinner label="Verifying" /> : "Activate License"}
-                </button>
-              </form>
-            </div>
-          )}
-        </div>
-      </Panel>
-
-      {/* 3. Commercial BYOK Vault */}
-      <Panel
-        title="Commercial BYOK Vault"
+        title="Provider credentials"
         meta="AES-256-GCM Sealed Secrets"
       >
         <div className="space-y-4">
@@ -567,7 +392,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                     <select
                       aria-label={`${cat.title} provider`}
                       value={draftProvider[cat.category] ?? cat.providers[0].value}
-                      disabled={!isCommercial || busy}
+                      disabled={busy}
                       onChange={(e) =>
                         setDraftProvider((p) => ({
                           ...p,
@@ -588,17 +413,17 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                         <input
                           type="text"
                           value={draftStorageUrl}
-                          disabled={!isCommercial || busy}
+                          disabled={busy}
                           onChange={(e) => setDraftStorageUrl(e.target.value)}
                           placeholder="s3://customer-analytics-bucket or memory://bucket"
                           className={`${field} w-full font-mono text-xs`}
-                          aria-label="BYOC storage destination URL"
+                          aria-label="Export storage destination URL"
                         />
                         <div className="grid grid-cols-2 gap-1.5">
                           <input
                             type="text"
                             value={draftStorageRegion}
-                            disabled={!isCommercial || busy}
+                            disabled={busy}
                             onChange={(e) => setDraftStorageRegion(e.target.value)}
                             placeholder="Region (ap-south-1)"
                             className={`${field} font-mono text-xs`}
@@ -606,7 +431,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                           <input
                             type="text"
                             value={draftStorageAccessKey}
-                            disabled={!isCommercial || busy}
+                            disabled={busy}
                             onChange={(e) => setDraftStorageAccessKey(e.target.value)}
                             placeholder="Access key ID"
                             className={`${field} font-mono text-xs`}
@@ -615,7 +440,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                         <input
                           type="text"
                           value={draftStorageEndpoint}
-                          disabled={!isCommercial || busy}
+                          disabled={busy}
                           onChange={(e) => setDraftStorageEndpoint(e.target.value)}
                           placeholder="Custom endpoint (optional, e.g. MinIO/R2)"
                           className={`${field} w-full font-mono text-xs`}
@@ -628,7 +453,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                         type="password"
                         autoComplete="off"
                         value={draftSigningSecret}
-                        disabled={!isCommercial || busy}
+                        disabled={busy}
                         onChange={(e) => setDraftSigningSecret(e.target.value)}
                         placeholder="Signing secret (at least 16 characters)"
                         className={`${field} w-full font-mono text-xs`}
@@ -641,22 +466,20 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                         type="password"
                         autoComplete="off"
                         value={draftSecret[cat.category] ?? ""}
-                        disabled={!isCommercial || busy}
+                        disabled={busy}
                         onChange={(e) =>
                           setDraftSecret((p) => ({
                             ...p,
                             [cat.category]: e.target.value,
                           }))
                         }
-                        placeholder={
-                          isCommercial ? cat.placeholder : "Commercial BYOK license required"
-                        }
+                        placeholder={cat.placeholder}
                         className={`${field} flex-1 font-mono text-xs`}
                         aria-label={`${cat.title} secret`}
                       />
                       <button
                         type="button"
-                        disabled={!isCommercial || busy || !(draftSecret[cat.category] ?? "").trim()}
+                        disabled={busy || !(draftSecret[cat.category] ?? "").trim()}
                         onClick={() => void handleSaveCred(cat)}
                         className={btn.primary}
                       >
@@ -674,7 +497,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                         <div className="flex items-center gap-1.5">
                           <button
                             type="button"
-                            disabled={!isCommercial || busy}
+                            disabled={busy}
                             onClick={() => void handleVerifyCred(cat.category)}
                             className={`${btn.secondary} px-2.5 py-1 text-xs`}
                           >
@@ -682,7 +505,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                           </button>
                           <button
                             type="button"
-                            disabled={!isCommercial || busy}
+                            disabled={busy}
                             onClick={() => void handleDeleteCred(cat.category)}
                             className="inline-flex items-center gap-1 rounded-lg border border-destructive/30 bg-destructive-soft px-2 py-1 text-xs font-medium text-destructive hover:opacity-90"
                             aria-label={`Remove ${cat.title}`}
@@ -704,15 +527,15 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
               <div>
                 <div className="flex items-center gap-2 text-sm font-semibold text-ink">
                   <Database className="h-4 w-4 text-brand" />
-                  Cloud Data Warehouse Sync (NDJSON)
+                  Data export (NDJSON)
                 </div>
                 <p className="text-xs text-muted">
-                  Exports raw event batches honoring DPDP erasure tombstones and Lexicon PII rules directly to your BYOC bucket.
+                  Exports raw event batches honoring DPDP erasure tombstones and Lexicon PII rules directly to your bucket.
                 </p>
               </div>
               <button
                 type="button"
-                disabled={!isCommercial || exportBusy}
+                disabled={exportBusy}
                 onClick={() => void handleExportWarehouse()}
                 className={btn.primary}
               >
@@ -728,9 +551,9 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
         </div>
       </Panel>
 
-      {/* 4. Enterprise Audit Log */}
-      {isCommercial && auditLogs.length > 0 && (
-        <Panel title="Enterprise Audit Log" meta="Cryptographically tracked security actions">
+      {/* 3. Audit log */}
+      {auditLogs.length > 0 && (
+        <Panel title="Audit log" meta="Cryptographically tracked security actions">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
@@ -760,10 +583,10 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
         </Panel>
       )}
 
-      {/* 5. BYOK AI Root-Cause Copilot */}
+      {/* 4. AI copilot */}
       <Panel
-        title="BYOK AI Root-Cause Copilot"
-        meta={hasLlmKey ? `Using ${credByCat.get("llm")?.provider} key` : "Requires BYOK LLM key"}
+        title="AI copilot"
+        meta={hasLlmKey ? `Using ${credByCat.get("llm")?.provider} key` : "Requires an AI provider key"}
       >
         <div className="space-y-4">
           <div className="rounded-lg border border-line bg-sunken px-3 py-2 text-xs text-muted">
@@ -775,7 +598,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
               <button
                 key={preset}
                 type="button"
-                disabled={!isCommercial || !hasLlmKey || copilotLoading}
+                disabled={!hasLlmKey || copilotLoading}
                 onClick={() => {
                   setCopilotPrompt(preset);
                   void handleAskCopilot(undefined, preset);
@@ -789,26 +612,24 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
 
           <form onSubmit={(e) => void handleAskCopilot(e)} className="flex flex-wrap gap-2">
             <label htmlFor="byok-copilot-input" className={`${fieldLabel} sr-only`}>
-              Ask BYOK Copilot
+              Ask the AI copilot
             </label>
             <input
               id="byok-copilot-input"
               type="text"
               value={copilotPrompt}
-              disabled={!isCommercial || !hasLlmKey || copilotLoading}
+              disabled={!hasLlmKey || copilotLoading}
               onChange={(e) => setCopilotPrompt(e.target.value)}
               placeholder={
-                isCommercial
-                  ? hasLlmKey
-                    ? "Ask why users drop off or which replay sessions failed..."
-                    : "Save a BYOK AI Provider Key above first..."
-                  : "Activate Commercial BYOK license above to unlock Copilot"
+                hasLlmKey
+                  ? "Ask why users drop off or which replay sessions failed..."
+                  : "Save an AI provider key above first..."
               }
               className={`${field} min-w-[16rem] flex-1`}
             />
             <button
               type="submit"
-              disabled={!isCommercial || !hasLlmKey || copilotLoading || !copilotPrompt.trim()}
+              disabled={!hasLlmKey || copilotLoading || !copilotPrompt.trim()}
               className={btn.primary}
             >
               {copilotLoading ? (
@@ -827,7 +648,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
                 <span>
                   <strong className="text-ink">{copilotRes.provider}</strong> ({copilotRes.model}) ·{" "}
-                  <code className="font-mono">BYOK Outbound</code>
+                  <code className="font-mono">Outbound</code>
                 </span>
                 <span>Ran in {copilotRes.exec_time_ms} ms</span>
               </div>
