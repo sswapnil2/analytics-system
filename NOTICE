@@ -1,0 +1,9 @@
+Pulse Analytics
+Copyright 2026 The Pulse Analytics authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Binary distributions include third-party components under their own licences, mainly MIT,
+Apache-2.0, BSD, ISC, Zlib, Unicode-3.0 and MPL-2.0 (Rust crates listed in Cargo.lock, and
+npm packages listed in web/package-lock.json). The Studio bundles the Instrument Sans font
+under the SIL Open Font License 1.1.

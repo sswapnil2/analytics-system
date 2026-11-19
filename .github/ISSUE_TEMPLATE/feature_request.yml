@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The question you can't answer today
+      description: The product question or task you're stuck on, e.g. "I can't compare funnel conversion for Android vs iOS users".
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: Your idea for a solution. Optional.
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: How you work around it today, if at all.
