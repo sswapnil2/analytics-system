@@ -59,11 +59,35 @@ Fresh node started on an **empty** data dir; demo checks on a separate seeded no
 | Regression: drop-off drawer opens, replay plays, experiment results table | demo | ✅ |
 | Demo-name grep on changed files | — | no hits |
 
+### Third pass (Journeys, Cohorts, segmentation, Users), 20 Nov 2026
+Fresh node with the SaaS events plus 120 profiles (`plan`, `country`, `company`) sent to `/v1/engage`; demo node `ux-demo-2`.
+
+| Checked | Node / theme / size | Result |
+|---|---|---|
+| Journeys step table sums: step 1 = 108 + 107 + 55 + 21 = 291 | fresh, light, 1440 | ✅ |
+| Journeys node / path hover: only connected items lit (3 of 21 paths), tooltip text and share correct, next to the pointer | fresh, light, 1440 | ✅ (was clipped, then far from pointer → fixed) |
+| Tab through step rows lights the node and its neighbours | fresh | ✅ |
+| Key event picker by keyboard (Enter, "invite", Enter) | fresh | ✅ "After Invite Sent" |
+| Filter panel picker: profile properties grouped; value suggestions pro/team/free and BR/IN/DE/US | fresh | ✅ |
+| Cohort "Did Signed Up ≥1" = 300 (300 users in the sent data) | fresh | ✅ |
+| Cohort event picker in a row | fresh, 1440 | ❌ squeezed to "P…" → fixed (`basis-36`, row wraps) → ✅ |
+| + "Has property" profile plan = pro → 36 (36 profiles with plan pro) | fresh | ✅ |
+| Save cohort: listed with description and saved date; offered in Trends "Users in cohort" (291 → 36), then filter country = DE → 6 | fresh | ✅ |
+| Users: open u80 → profile in view and focused; Back to the list focuses the row; clearing the search restores the full page (35 → 50 rows) | fresh, light, 1440 | ✅ |
+| Users at 375: first open did not scroll or focus | fresh, dark, 375 | ❌ → fixed (effect after commit, rerun after load) → ✅ top 16px, focused |
+| Users: no Revenue column when all revenue is 0; shown on demo | fresh / demo | ✅ |
+| No horizontal page scroll at 375: Trends, Journeys, Cohorts, Users | fresh, dark | ✅ 375 = 375 |
+| Picker popover at 375 stays on screen (49–299 px) | fresh, dark | ✅ |
+| Journeys step table at 375 | fresh, dark | ❌ cramped → fixed → ✅ |
+| Regression: demo Journeys (8,000 per step), Cohorts preview, drop-off drawer, replay plays | demo, light, 1440 | ✅ |
+| `npm --prefix web test` 21/21, build, demo-name grep on changed files | — | ✅ |
+
 ## Not checked
 - Reduced motion was not emulated in the browser; it relies on the existing global CSS rule plus `motion-safe:` prefixes.
 - Safari/Firefox: `d` path tweening is Chromium-only by design; not opened in other browsers.
 - Screen reader pass not done (roles/labels were checked in the accessibility tree).
-- Journeys, Cohorts, Experiments, Users: opened on both nodes (empty and seeded) but not changed or exercised in depth.
+- Experiments, Events and privacy, Security: opened on both nodes but not exercised in depth.
+- Cohort CSV export and lookup-table upload were not run in the third pass.
 - Hover sync and the picker on a touch device: there is no hover on touch; rows are still tappable to focus. Not tried on a real phone.
 - Some interaction steps were driven by in-page script clicks (chart-type menu sweep, one Group by change); the rest used real clicks and keys.
 

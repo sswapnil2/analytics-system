@@ -20,7 +20,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
-import { PropertyPicker } from "../components/PropertyPicker";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { ChartKindPicker, ChartSeries, TrendChart } from "../components/TrendChart";
 import { CHART_KINDS, ChartKind, chartKindBlocker, isAdditive } from "../lib/chart";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, useCohortNames } from "../components/FilterPanel";
@@ -537,7 +537,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
             noneLabel="No breakdown"
             recentKey={`pulse.recent-props.${projectId}`}
             options={[
-              ...breakdownOptions.map((p) => ({ value: p, label: p.replace(/_/g, " "), group: "Properties" })),
+              ...propertyOptions(breakdownOptions),
               ...cohortNames.map((c) => ({ value: `$cohort:${c.id}`, label: c.name, group: "In a cohort or not" })),
             ]}
           />

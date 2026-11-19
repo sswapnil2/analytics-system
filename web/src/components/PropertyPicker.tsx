@@ -2,6 +2,8 @@ import React, { useEffect, useId, useRef, useState } from "react";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { field, fieldLabel } from "./ui";
 
+export { propertyOptions } from "../lib/format";
+
 export interface PickerOption {
   value: string;
   label: string;
@@ -10,6 +12,7 @@ export interface PickerOption {
 }
 
 const RECENT_MAX = 5;
+
 
 function readRecents(key: string): string[] {
   try {
@@ -37,11 +40,15 @@ export const PropertyPicker: React.FC<{
   value: string;
   onChange: (v: string) => void;
   options: PickerOption[];
-  /** The "nothing chosen" choice, listed first, e.g. "No breakdown". */
-  noneLabel: string;
+  /** The "nothing chosen" choice, listed first, e.g. "No breakdown". Omit when a choice is required. */
+  noneLabel?: string;
   /** localStorage key for recent picks; per project. */
   recentKey: string;
-}> = ({ label, value, onChange, options, noneLabel, recentKey }) => {
+  /** Search box placeholder; also names what is listed in the no-match message. */
+  placeholder?: string;
+  /** For dense rows: the label is for screen readers only and the button is shorter. */
+  dense?: boolean;
+}> = ({ label, value, onChange, options, noneLabel, recentKey, placeholder = "Search properties", dense = false }) => {
   const id = useId();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
@@ -55,7 +62,7 @@ export const PropertyPicker: React.FC<{
   const listRef = useRef<HTMLDivElement>(null);
 
   const needle = q.trim().toLowerCase();
-  const none: PickerOption = { value: "", label: noneLabel, group: "" };
+  const none: PickerOption[] = noneLabel === undefined ? [] : [{ value: "", label: noneLabel, group: "" }];
   const byValue = new Map(options.map((o) => [o.value, o]));
   const recentOpts = needle
     ? []
@@ -63,8 +70,8 @@ export const PropertyPicker: React.FC<{
   const matches = options.filter(
     (o) => !needle || o.label.toLowerCase().includes(needle) || o.value.toLowerCase().includes(needle),
   );
-  const flat = [...(needle ? [] : [none]), ...recentOpts, ...matches];
-  const current = byValue.get(value)?.label ?? (value ? value : noneLabel);
+  const flat = [...(needle ? [] : none), ...recentOpts, ...matches];
+  const current = byValue.get(value)?.label ?? (value ? value : noneLabel ?? "Choose…");
 
   const show = () => {
     // The search is empty whenever the list is closed, so this is the unfiltered list: start on the current choice.
@@ -128,8 +135,8 @@ export const PropertyPicker: React.FC<{
   const optId = (i: number) => `${id}-opt-${i}`;
 
   return (
-    <div className="flex flex-col gap-1" ref={boxRef}>
-      <span id={`${id}-label`} className={fieldLabel}>
+    <div className={`flex min-w-0 flex-col gap-1 ${dense ? "flex-1 basis-36" : ""}`} ref={boxRef}>
+      <span id={`${id}-label`} className={dense ? "sr-only" : fieldLabel}>
         {label}
       </span>
       <div className="relative">
@@ -146,7 +153,7 @@ export const PropertyPicker: React.FC<{
             show();
           }
         }}
-        className={`${field} flex w-full items-center justify-between gap-2 text-left`}
+        className={`${field} flex w-full items-center justify-between gap-2 text-left ${dense ? "py-1" : ""}`}
       >
         <span id={`${id}-value`} className={`truncate ${value ? "" : "text-muted"}`}>
           {current}
@@ -154,7 +161,7 @@ export const PropertyPicker: React.FC<{
         <ChevronDown className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
       </button>
       {open && (
-        <div className={`absolute left-0 right-0 z-40 rounded-xl ${up ? "bottom-full mb-1 origin-bottom" : "top-full mt-1 origin-top"} border border-line-strong bg-panel p-1 shadow-pop motion-safe:animate-pop`}>
+        <div className={`absolute left-0 right-0 z-40 min-w-[min(16rem,calc(100vw-2rem))] rounded-xl ${up ? "bottom-full mb-1 origin-bottom" : "top-full mt-1 origin-top"} border border-line-strong bg-panel p-1 shadow-pop motion-safe:animate-pop`}>
           <div className="relative p-1">
             <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" aria-hidden="true" />
             <input
@@ -165,7 +172,7 @@ export const PropertyPicker: React.FC<{
               aria-autocomplete="list"
               aria-activedescendant={flat[active] ? optId(active) : undefined}
               aria-label={`Search ${label.toLowerCase()}`}
-              placeholder="Search properties"
+              placeholder={placeholder}
               value={q}
               onChange={(e) => {
                 setQ(e.target.value);
@@ -176,7 +183,7 @@ export const PropertyPicker: React.FC<{
             />
           </div>
           <div ref={listRef} id={`${id}-list`} role="listbox" aria-label={label} className="max-h-64 overflow-auto">
-            {flat.length === 0 && <p className="px-3 py-2 text-sm text-muted">No properties match "{q.trim()}".</p>}
+            {flat.length === 0 && <p className="px-3 py-2 text-sm text-muted">Nothing matches "{q.trim()}".</p>}
             {groups.map((g, gi) => (
               <div key={`${g.name}-${gi}`} role="group" aria-label={g.name || undefined}>
                 {g.name && (

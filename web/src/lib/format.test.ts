@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatTime, setProjectTimeZone } from "./format.ts";
+import { formatTime, propertyOptions, segmentName, setProjectTimeZone } from "./format.ts";
 
 test("times render on the project's clock", () => {
   setProjectTimeZone("Asia/Kolkata");
@@ -12,4 +12,17 @@ test("times render on the project's clock", () => {
 test("an unknown zone falls back to the browser's instead of throwing", () => {
   setProjectTimeZone("Mars/Olympus");
   assert.doesNotThrow(() => formatTime(0));
+});
+
+test("profile properties are listed after event properties, without the user. prefix", () => {
+  const opts = propertyOptions(["user.plan", "country", "user.total_revenue", "page_url"]);
+  assert.deepEqual(opts.map((o) => o.value), ["country", "page_url", "user.plan", "user.total_revenue"]);
+  assert.deepEqual(opts.map((o) => o.label), ["country", "page url", "plan", "total revenue"]);
+  assert.deepEqual(opts.map((o) => o.group), ["Event properties", "Event properties", "User profile", "User profile"]);
+});
+
+test("cohort split keys read as words", () => {
+  assert.equal(segmentName("in_cohort"), "In cohort");
+  assert.equal(segmentName("not_in_cohort"), "Not in cohort");
+  assert.equal(segmentName("Mumbai"), "Mumbai");
 });

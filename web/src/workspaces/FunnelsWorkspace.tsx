@@ -32,7 +32,7 @@ import {
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
-import { PropertyPicker } from "../components/PropertyPicker";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 
 interface Props {
   projectId: string;
@@ -377,7 +377,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
             onChange={setBreakdownBy}
             noneLabel="No split"
             recentKey={`pulse.recent-props.${projectId}`}
-            options={propOptions.map((p) => ({ value: p, label: humanizeEvent(p), group: "Properties" }))}
+            options={propertyOptions(propOptions)}
           />
         </div>
       </Panel>

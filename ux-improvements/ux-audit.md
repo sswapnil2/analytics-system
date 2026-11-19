@@ -33,7 +33,7 @@ Audited on the seeded demo node (consumer-lending schema) and a fresh node fed a
 - On phones the page header's date presets made the page 24px wider than the screen.
 - Four copies of the same arbitrary popover shadow.
 
-**P3** (second pass fixed: picker, hover sync, interval placement, Funnels/Retention tokens; still open: saved/unsaved state, bespoke Journeys chart)
+**P3** (second pass fixed: picker, hover sync, interval placement, Funnels/Retention tokens; third pass: Journeys hover and step table, Cohorts/filter pickers, Users profile focus; still open: saved/unsaved state, bespoke Journeys chart)
 - No shared searchable property picker; no recents.
 - No saved/unsaved state for reports; Save to dashboard always makes a copy.
 - Segment table and chart don't share hover.

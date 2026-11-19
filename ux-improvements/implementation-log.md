@@ -29,6 +29,17 @@ All changes are in `web/`. No new dependencies; no backend changes.
 | `src/lib/format.ts` | `segmentName` (in_cohort → "In cohort"), shared by Trends and dashboard cards. |
 | `src/dashboards/ReportCard.tsx` | Bug fix: cohort-split trend cards showed raw `in_cohort` / `not_in_cohort` in the legend and headline. |
 
+### Third pass (Journeys, Cohorts, segmentation, Users)
+| File | Change |
+|---|---|
+| `src/workspaces/FlowsWorkspace.tsx` | Journeys: pointing at a step or path lights only what it connects to (others dim) with a tooltip by the pointer ("Signed Up · 108 users · 37% of step 1"; "Page Viewed → Signed Up · 108 users · 37% of Page Viewed"); the tooltip sits outside the scroll box so it isn't clipped. New "Step by step" table under the diagram (step, swatch, event, users, share of step, "most common"); rows are focusable and light their node. Key event uses the picker (search, recents; no "none"). Phone: "most common" is screen-reader only and the header reads "Share" so the table fits 375px. |
+| `src/workspaces/CohortsLookupsWorkspace.tsx` | Condition rows use the dense picker for Event (search events, recent events) and Property (event and profile properties grouped); property values suggest real top values. Empty preview explains what to pick. Saved cohorts show their saved date. Lookup "Match on property" suggests known properties. |
+| `src/components/FilterPanel.tsx` | Filter property uses the dense picker with profile properties grouped; `useTopValues` exported for Cohorts. |
+| `src/components/PropertyPicker.tsx` | `dense` mode (screen-reader label, short button, `basis-36` so it wraps in a row instead of shrinking to "P…"), `placeholder`, required mode (no "none"), wider popover on narrow buttons. |
+| `src/lib/format.ts` | `propertyOptions`: `user.*` properties listed as "User profile" after "Event properties", without the prefix. Used by every picker. Tests added. |
+| `src/workspaces/UsersWorkspace.tsx` | Opening a user scrolls the profile into view and moves focus to it (from an effect, so it also works on the first open, and again after loading so it reaches the top). "Back to the list" returns focus to that row. Revenue column and lifetime revenue hidden when every user has 0. Clearing the search shows everyone again. Search box fills the width on phones. |
+| `src/workspaces/{Insights,Funnels,Retention}Workspace.tsx` | Pickers use `propertyOptions`. |
+
 ## Decisions
 - **Hover sync, not row checkboxes.** Rows and series highlight each other; hiding stays on the legend so there is one place to toggle.
 - **Legend toggles instead of table checkboxes.** Mixpanel uses table checkboxes; Pulse's table is below the fold, so the legend is where the user's eyes are.

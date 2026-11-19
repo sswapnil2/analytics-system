@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Download, Plus, Upload, Users, X } from "lucide-react";
 import { api, isAbortError } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
-import { clearFilterCaches } from "../components/FilterPanel";
+import { clearFilterCaches, useTopValues } from "../components/FilterPanel";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { useAccess } from "../auth/access";
-import { downloadTextFile, errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { downloadTextFile, errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
@@ -48,6 +49,28 @@ export function cohortDefinition(conds: Cond[], match: "and" | "or") {
   if (ok.length === 0) return null;
   return ok.length === 1 ? condDef(ok[0]) : { kind: match, clauses: ok.map(condDef) };
 }
+
+/** Value box for "Has property": suggests the property's most common values. */
+const ValueInput: React.FC<{ projectId: string; anchorEvent: string; prop: string; value: string; onChange: (v: string) => void }> = ({
+  projectId,
+  anchorEvent,
+  prop,
+  value,
+  onChange,
+}) => {
+  const listId = useId();
+  const values = useTopValues(projectId, anchorEvent, prop);
+  return (
+    <>
+      <input aria-label="Value" value={value} onChange={(e) => onChange(e.target.value)} list={listId} placeholder={values[0] ?? "value"} className={`${field} w-28 py-1`} />
+      <datalist id={listId}>
+        {values.map((v) => (
+          <option key={v} value={v} />
+        ))}
+      </datalist>
+    </>
+  );
+};
 
 const FeedbackLine: React.FC<{ feedback: Feedback }> = ({ feedback }) => {
   if (!feedback) return null;
@@ -302,25 +325,28 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     </select>
                     {c.type === "prop" ? (
                       <>
-                        <select aria-label="Property" value={c.prop} onChange={(e) => setCond(i, { prop: e.target.value })} className={`${field} min-w-0 flex-1 py-1`}>
-                          {availableProps.map((p) => (
-                            <option key={p} value={p}>
-                              {humanizeEvent(p)}
-                            </option>
-                          ))}
-                        </select>
+                        <PropertyPicker
+                          dense
+                          label="Property"
+                          value={c.prop}
+                          onChange={(p) => setCond(i, { prop: p, value: "" })}
+                          recentKey={`pulse.recent-props.${projectId}`}
+                          options={propertyOptions(availableProps)}
+                        />
                         <span className="text-sm text-muted">is</span>
-                        <input aria-label="Value" value={c.value} onChange={(e) => setCond(i, { value: e.target.value })} placeholder="value" className={`${field} w-28 py-1`} />
+                        <ValueInput projectId={projectId} anchorEvent={cleanEvents[0] ?? ""} prop={c.prop} value={c.value} onChange={(v) => setCond(i, { value: v })} />
                       </>
                     ) : (
                       <>
-                        <select aria-label="Event" value={c.event} onChange={(e) => setCond(i, { event: e.target.value })} className={`${field} min-w-0 flex-1 py-1`}>
-                          {eventOptions.map((ev) => (
-                            <option key={ev} value={ev}>
-                              {humanizeEvent(ev)}
-                            </option>
-                          ))}
-                        </select>
+                        <PropertyPicker
+                          dense
+                          label="Event"
+                          value={c.event}
+                          onChange={(ev) => setCond(i, { event: ev })}
+                          placeholder="Search events"
+                          recentKey={`pulse.recent-events.${projectId}`}
+                          options={eventOptions.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }))}
+                        />
                         {c.type === "did" && (
                           <label className="flex items-center gap-1 text-sm text-muted">
                             <input
@@ -381,7 +407,9 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                   </strong>{" "}
                   {preview.count === 1 ? "user matches" : "users match"}
                 </p>
-              ) : null}
+              ) : (
+                <p className="text-sm text-muted">Pick an event or a property value to count matching users.</p>
+              )}
             </div>
 
             {canEdit && (
@@ -413,6 +441,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                       <div className="min-w-0">
                         <div className="text-sm font-medium text-ink">{c.name}</div>
                         <div className="text-xs text-muted">{c.description}</div>
+                        <div className="mt-0.5 text-[11px] text-faint">Saved {formatDate(c.created_at_ms)}</div>
                       </div>
                       {canAdmin && <button
                         type="button"
@@ -465,8 +494,14 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     value={joinProp}
                     onChange={(e) => setJoinProp(e.target.value)}
                     placeholder={availableProps[0] ?? "item_id"}
+                    list="lookup-key-props"
                     className={`${field} w-full font-mono`}
                   />
+                  <datalist id="lookup-key-props">
+                    {availableProps.map((p) => (
+                      <option key={p} value={p} />
+                    ))}
+                  </datalist>
                 </div>
               </div>
               <div className="space-y-1">

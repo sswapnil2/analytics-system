@@ -147,3 +147,13 @@ export function formatTime(ts: number): string {
 /** A cohort split comes back as in_cohort / not_in_cohort; say it in words. */
 export const segmentName = (k: string): string =>
   k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k;
+
+/** Property names as picker options: event properties first, then profile ones (`user.<key>`) under their own heading. */
+export function propertyOptions(props: string[]): { value: string; label: string; group: string }[] {
+  const opts = props.map((p) =>
+    p.startsWith("user.")
+      ? { value: p, label: humanizeEvent(p.slice(5)), group: "User profile" }
+      : { value: p, label: humanizeEvent(p), group: "Event properties" },
+  );
+  return [...opts.filter((o) => o.group !== "User profile"), ...opts.filter((o) => o.group === "User profile")];
+}

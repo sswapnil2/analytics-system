@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, isAbortError, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
-import { PropertyPicker } from "../components/PropertyPicker";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import {
@@ -318,7 +318,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
             onChange={setSplitBy}
             noneLabel="No split"
             recentKey={`pulse.recent-props.${projectId}`}
-            options={Array.from(new Set([...availableProps, splitBy].filter(Boolean))).map((p) => ({ value: p, label: humanizeEvent(p), group: "Properties" }))}
+            options={propertyOptions(Array.from(new Set([...availableProps, splitBy].filter(Boolean))))}
           />
         </div>
       </Panel>
