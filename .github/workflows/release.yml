@@ -1,0 +1,133 @@
+name: Release
+
+# On a version tag (v*): builds pulse-node + Studio for Linux x86_64 and aarch64, publishes a
+# GitHub Release with tarballs and checksums, pushes a multi-arch image to GHCR, and publishes
+# the web SDK to npm when the NPM_TOKEN secret is set.
+# On pull requests that touch packaging, and on manual runs: builds and smoke-tests only.
+# Binaries are built on Ubuntu 22.04 (glibc 2.35), so they run on Ubuntu 22.04+ and Debian 12+.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml", "Dockerfile", "deploy/**", "sdks/ts-web/package.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/pulse
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+          - runner: ubuntu-22.04
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix web ci && npm --prefix web run build
+      - run: rustup show # installs the toolchain pinned in rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p pulse-node
+      - run: |
+          mkdir -p out/pulse/web
+          cp target/release/pulse-node out/pulse/
+          cp -r web/dist out/pulse/web/
+          cp deploy/* LICENSE NOTICE out/pulse/
+          tar -C out -czf pulse-linux-${{ matrix.arch }}.tar.gz pulse
+      - name: Smoke test
+        run: |
+          ./out/pulse/pulse-node --port 18080 --data-dir "$RUNNER_TEMP/data" --web-dir out/pulse/web/dist --no-quic &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/healthz && exit 0; sleep 1; done
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-linux-${{ matrix.arch }}
+          path: pulse-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 14
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pulse-linux-*
+          merge-multiple: true
+      # The Dockerfile picks dist/<docker arch>/pulse for each platform.
+      - run: |
+          mkdir -p dist/amd64 dist/arm64
+          tar -C dist/amd64 -xzf pulse-linux-x86_64.tar.gz
+          tar -C dist/arm64 -xzf pulse-linux-aarch64.tar.gz
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Smoke test the amd64 image
+        run: |
+          docker buildx build --platform linux/amd64 --load -t pulse:test .
+          docker run -d --name pulse -p 8080:8080 pulse:test
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/healthz && exit 0; sleep 1; done
+          docker logs pulse; exit 1
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: env.PUBLISH == 'true'
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            -t "$IMAGE:${GITHUB_REF_NAME#v}" -t "$IMAGE:latest" .
+
+  release:
+    needs: [build, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pulse-linux-*
+          merge-multiple: true
+      - run: sha256sum pulse-linux-*.tar.gz > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" pulse-linux-*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "Pulse $GITHUB_REF_NAME" --generate-notes \
+            $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
+
+  sdk:
+    runs-on: ubuntu-latest
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci && npm test && npm pack --dry-run
+        working-directory: sdks/ts-web
+      - name: Publish to npm
+        if: env.PUBLISH == 'true' && env.HAS_NPM_TOKEN == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: sdks/ts-web
+        run: |
+          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version
+          npm publish --access public
