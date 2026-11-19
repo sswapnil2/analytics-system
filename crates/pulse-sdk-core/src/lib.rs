@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -26,6 +26,22 @@ pub const RAGE_TAP_RADIUS_PX: i32 = 40;
 
 const SDK_WAL_MAGIC: [u8; 4] = *b"PSDK";
 const SDK_WAL_HEADER_LEN: usize = 20; // 4B magic + 8B packet_id + 4B len + 4B crc32
+/// Ack record: packets with these ids were delivered. `PSDA | count u32 | crc32 u32 | ids (u64 LE)…`.
+/// Appending one is far cheaper than rewriting the queue file after every upload.
+const SDK_WAL_ACK_MAGIC: [u8; 4] = *b"PSDA";
+
+fn wal_ack_frame(ids: &HashSet<u64>) -> Vec<u8> {
+    let mut body = Vec::with_capacity(ids.len() * 8);
+    for id in ids {
+        body.extend_from_slice(&id.to_le_bytes());
+    }
+    let mut frame = Vec::with_capacity(12 + body.len());
+    frame.extend_from_slice(&SDK_WAL_ACK_MAGIC);
+    frame.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
 
 /// Shared background Tokio runtime ensuring `PulseClient` works even when invoked from
 /// bare OS / Kotlin / Swift threads that have no ambient Tokio runtime.
@@ -211,11 +227,68 @@ impl WalQueueEntry {
     }
 }
 
+/// Background disk work. Queue writes are synchronous (see `enqueue_packet`): once `write()` has
+/// returned, the data survives the app being killed or crashing.
+///
+/// ponytail: the hot paths never fsync. On Apple platforms `sync_data` is `F_FULLFSYNC`, which
+/// stalls writes across the whole volume for milliseconds, and with it every `track()`. The cost
+/// is that a power loss or OS crash can lose what the OS hadn't written back yet (seconds).
+/// `shutdown()` still syncs. If that window matters, fsync on a timer off the main thread.
 enum WalIoCmd {
-    Append(Vec<u8>),
-    Compact(Vec<u8>),
-    PersistIdentity(Vec<u8>),
+    /// Write the snapshot waiting in `identity_pending`. Many requests coalesce into one write.
+    PersistIdentity,
     Sync(oneshot::Sender<Result<(), String>>),
+}
+
+/// Unsealed events (fewer than `flush_batch_size`) are journaled here, one frame per `track()`,
+/// so a kill before the batch is sealed doesn't lose them. Frame: `len u32 LE | crc32 u32 LE | JSON batch`.
+/// `(sequence, serialized identity)` waiting for the background writer.
+type PendingIdentity = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+
+const SDK_RING_FILE: &str = "sdk_ring.bin";
+
+fn ring_journal_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Reads journaled events, stopping at the first torn or corrupt frame (a write cut short by a kill).
+fn read_ring_journal(path: &Path) -> Vec<WireEvent> {
+    let Ok(raw) = fs::read(path) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= raw.len() {
+        let len = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
+        let crc = u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]]);
+        let Some(payload) = raw.get(pos + 8..pos + 8 + len) else {
+            break;
+        };
+        if crc32fast::hash(payload) != crc {
+            break;
+        }
+        match WireBatch::decode_json(payload) {
+            Ok(batch) => events.extend(batch.events),
+            Err(_) => break,
+        }
+        pos += 8 + len;
+    }
+    events
+}
+
+/// Replaces a file's contents via temp file + rename. No fsync: callers request one in the background.
+fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if data.is_empty() {
+        return File::create(path).map(|_| ());
+    }
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+    let tmp = path.with_extension(format!("swap.{}", TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)
 }
 
 fn load_wal_entries(wal_path: &Path) -> (VecDeque<WalQueueEntry>, usize, u64, bool) {
@@ -229,6 +302,31 @@ fn load_wal_entries(wal_path: &Path) -> (VecDeque<WalQueueEntry>, usize, u64, bo
     let mut had_corruption = false;
 
     while pos < raw.len() {
+        if raw.get(pos..pos + 4) == Some(&SDK_WAL_ACK_MAGIC[..]) {
+            let Some(hdr) = raw.get(pos + 4..pos + 12) else {
+                had_corruption = true;
+                break;
+            };
+            let count = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+            let crc = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+            let Some(body) = raw.get(pos + 12..pos + 12 + count.saturating_mul(8)) else {
+                had_corruption = true;
+                break;
+            };
+            if crc32fast::hash(body) != crc {
+                had_corruption = true;
+                break;
+            }
+            let acked: HashSet<u64> = body
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+                .collect();
+            queue.retain(|e: &WalQueueEntry| !acked.contains(&e.id));
+            total_bytes = queue.iter().map(|e| e.disk_len()).sum();
+            had_corruption = true; // not corruption: just asks the caller to compact the file
+            pos += 12 + body.len();
+            continue;
+        }
         if pos + SDK_WAL_HEADER_LEN > raw.len() {
             had_corruption = true;
             break;
@@ -302,30 +400,31 @@ fn write_atomic_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn spawn_wal_io_worker(wal_path: PathBuf, state_path: PathBuf) -> mpsc::UnboundedSender<WalIoCmd> {
+fn spawn_wal_io_worker(
+    wal_path: PathBuf,
+    state_path: PathBuf,
+    identity_written: Arc<Mutex<u64>>,
+    identity_pending: PendingIdentity,
+) -> mpsc::UnboundedSender<WalIoCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WalIoCmd>();
     sdk_runtime().spawn(async move {
         while let Some(cmd) = rx.recv().await {
             let path = wal_path.clone();
             let id_path = state_path.clone();
             match cmd {
-                WalIoCmd::Append(frame) => {
-                    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-                        f.write_all(&frame)?;
-                        f.sync_data()
+                WalIoCmd::PersistIdentity => {
+                    let Some((seq, bytes)) = identity_pending.lock().take() else {
+                        continue;
+                    };
+                    let written = identity_written.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut last = written.lock();
+                        if seq > *last {
+                            *last = seq;
+                            let _ = replace_file(&id_path, &bytes);
+                        }
                     })
                     .await;
-                }
-                WalIoCmd::Compact(snapshot) => {
-                    let _ =
-                        tokio::task::spawn_blocking(move || write_atomic_file(&path, &snapshot))
-                            .await;
-                }
-                WalIoCmd::PersistIdentity(bytes) => {
-                    let _ =
-                        tokio::task::spawn_blocking(move || write_atomic_file(&id_path, &bytes))
-                            .await;
                 }
                 WalIoCmd::Sync(reply) => {
                     let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -406,6 +505,16 @@ pub struct PulseClient {
     wal_path: PathBuf,
     identity: RwLock<PersistedIdentityState>,
     event_ring: Mutex<Vec<WireEvent>>,
+    /// Append handle to `sdk_ring.bin`, mirroring `event_ring`. Lock order: `event_ring`, then this.
+    ring_journal: Mutex<Option<File>>,
+    /// Bytes in `sdk_wal.bin`, live packets plus ack records. Changed only under `disk_queue`.
+    wal_file_bytes: AtomicUsize,
+    identity_seq: AtomicU64,
+    /// Sequence of the newest identity snapshot on disk, shared with the background writer.
+    identity_written: Arc<Mutex<u64>>,
+    /// Newest snapshot waiting for the background writer: `track()` updates last-activity on
+    /// every call, and this keeps that to one file write per burst instead of one per event.
+    identity_pending: PendingIdentity,
     /// `(chunk_start_ts_ms, session_id_for_ops, ops)`
     replay_ops_ring: Mutex<(Option<i64>, Option<String>, Vec<WireframeOp>)>,
     disk_queue: Mutex<(VecDeque<WalQueueEntry>, usize)>,
@@ -456,7 +565,21 @@ impl PulseClient {
             let _ = write_atomic_file(&wal_path, &compacted);
         }
 
-        let wal_io_tx = spawn_wal_io_worker(wal_path.clone(), state_path.clone());
+        let identity_written = Arc::new(Mutex::new(0u64));
+        let identity_pending = Arc::new(Mutex::new(None));
+        let wal_io_tx = spawn_wal_io_worker(
+            wal_path.clone(),
+            state_path.clone(),
+            identity_written.clone(),
+            identity_pending.clone(),
+        );
+        let ring_path = dir.join(SDK_RING_FILE);
+        let journaled = read_ring_journal(&ring_path);
+        let ring_journal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ring_path)
+            .ok();
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -469,6 +592,11 @@ impl PulseClient {
             wal_path,
             identity: RwLock::new(identity),
             event_ring: Mutex::new(Vec::with_capacity(config.flush_batch_size as usize)),
+            ring_journal: Mutex::new(ring_journal),
+            wal_file_bytes: AtomicUsize::new(total_bytes),
+            identity_seq: AtomicU64::new(0),
+            identity_written,
+            identity_pending,
             replay_ops_ring: Mutex::new((None, None, Vec::new())),
             disk_queue: Mutex::new((loaded_queue, total_bytes)),
             wal_io_tx,
@@ -485,6 +613,15 @@ impl PulseClient {
             shutdown_flag: shutdown_flag.clone(),
             http_client,
         });
+
+        // Events tracked but not yet sealed when the app last died: queue them as one packet.
+        if !journaled.is_empty() {
+            let _ring = client.event_ring.lock();
+            if let Ok(bin) = WireBatch::new(journaled).encode_binary(1) {
+                client.enqueue_packet(QueuedPacket::Events(bin));
+                client.truncate_ring_journal();
+            }
+        }
 
         // Always start background flush worker on `sdk_runtime()` when `flush_interval_ms > 0`,
         // even if the caller thread has no Tokio runtime!
@@ -539,12 +676,15 @@ impl PulseClient {
     }
 
     pub fn opt_out(&self) -> Result<(), SdkError> {
-        let snap = {
+        {
             let mut id = self.identity.write();
             id.opted_out = true;
-            id.clone()
-        };
-        self.event_ring.lock().clear();
+        }
+        {
+            let mut ring = self.event_ring.lock();
+            ring.clear();
+            self.truncate_ring_journal();
+        }
         {
             let mut r = self.replay_ops_ring.lock();
             r.0 = None;
@@ -555,20 +695,20 @@ impl PulseClient {
             let mut dq = self.disk_queue.lock();
             dq.0.clear();
             dq.1 = 0;
+            let _ = replace_file(&self.wal_path, &[]);
+            self.wal_file_bytes.store(0, Ordering::Relaxed);
         }
         self.timed_events.lock().clear();
-        let _ = self.wal_io_tx.send(WalIoCmd::Compact(Vec::new()));
-        self.persist_identity_async(snap);
+        self.persist_identity(true);
         Ok(())
     }
 
     pub fn opt_in(&self) -> Result<(), SdkError> {
-        let snap = {
+        {
             let mut id = self.identity.write();
             id.opted_out = false;
-            id.clone()
-        };
-        self.persist_identity_async(snap);
+        }
+        self.persist_identity(true);
         Ok(())
     }
 
@@ -579,7 +719,7 @@ impl PulseClient {
     pub fn register_super_props(&self, props_json: String) -> Result<(), SdkError> {
         let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&props_json)
             .map_err(|e| SdkError::Serialization(e.to_string()))?;
-        let snap = {
+        {
             let mut id = self.identity.write();
             for (k, v) in map {
                 let pv = PropValue::from_json_value(v);
@@ -589,9 +729,8 @@ impl PulseClient {
                     id.super_props.push((k, pv));
                 }
             }
-            id.clone()
-        };
-        self.persist_identity_async(snap);
+        }
+        self.persist_identity(true);
         Ok(())
     }
 
@@ -673,9 +812,8 @@ impl PulseClient {
             let anon = id.anon_id.clone();
             let seed = id.routing_seed.clone();
             id.identified_user_id = Some(user_id.clone());
-            let snap = id.clone();
             drop(id);
-            self.persist_identity_async(snap);
+            self.persist_identity(true);
             (anon, seed)
         };
 
@@ -692,17 +830,16 @@ impl PulseClient {
     pub fn reset(&self) -> Result<(), SdkError> {
         self.seal_rings_to_disk_queue()?;
         let now_ms = Utc::now().timestamp_millis();
-        let snap = {
+        {
             let mut id = self.identity.write();
             id.anon_id = format!("anon_{}", &Uuid::new_v4().simple().to_string()[..12]);
             id.identified_user_id = None;
             id.session_id = format!("sess_{}", &Uuid::new_v4().simple().to_string()[..12]);
             id.last_activity_ts_ms = now_ms;
             self.replay_offset_kb.store(0, Ordering::Release);
-            id.clone()
-        };
+        }
         self.tap_history.lock().clear();
-        self.persist_identity_async(snap);
+        self.persist_identity(true);
         Ok(())
     }
 
@@ -953,7 +1090,6 @@ impl PulseClient {
     pub async fn flush(&self) -> Result<u32, SdkError> {
         let _flush_guard = self.flush_lock.lock().await;
         self.seal_rings_to_disk_queue()?;
-        self.sync_wal_io().await?;
 
         let now_ms = Utc::now().timestamp_millis();
         let backoff_until = self.backoff_until_ms.load(Ordering::Acquire);
@@ -1091,7 +1227,6 @@ impl PulseClient {
 
         if !remove_ids.is_empty() {
             self.remove_packets_by_id(&remove_ids);
-            self.sync_wal_io().await?;
         }
 
         if let Some(err) = transient_err {
@@ -1142,28 +1277,55 @@ impl PulseClient {
         }
 
         let mut id = self.identity.write();
-        if id.last_activity_ts_ms > 0
+        let rotated = id.last_activity_ts_ms > 0
             && activity_ts_ms > id.last_activity_ts_ms
-            && activity_ts_ms.saturating_sub(id.last_activity_ts_ms) > SESSION_INACTIVITY_TIMEOUT_MS
-        {
+            && activity_ts_ms.saturating_sub(id.last_activity_ts_ms)
+                > SESSION_INACTIVITY_TIMEOUT_MS;
+        if rotated {
             id.session_id = format!("sess_{}", &Uuid::new_v4().simple().to_string()[..12]);
             self.replay_offset_kb.store(0, Ordering::Release);
         }
         if id.last_activity_ts_ms == 0 || activity_ts_ms > id.last_activity_ts_ms {
             id.last_activity_ts_ms = activity_ts_ms;
-            let snap = id.clone();
             let cur = id.session_id.clone();
             drop(id);
-            self.persist_identity_async(snap);
+            self.persist_identity(rotated);
             Ok(cur)
         } else {
             Ok(id.session_id.clone())
         }
     }
 
-    fn persist_identity_async(&self, state: PersistedIdentityState) {
-        if let Ok(bytes) = serde_json::to_vec(&state) {
-            let _ = self.wal_io_tx.send(WalIoCmd::PersistIdentity(bytes));
+    /// Saves identity. `now` writes before returning (for changes a kill must not undo: login,
+    /// logout, consent, super properties, a new session); otherwise the background worker writes it.
+    fn persist_identity(&self, now: bool) {
+        // Snapshot and number it under the lock, so a higher sequence always means newer state.
+        let (seq, bytes) = {
+            let id = self.identity.read();
+            let seq = self.identity_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            (seq, serde_json::to_vec(&*id))
+        };
+        let Ok(bytes) = bytes else {
+            return;
+        };
+        if !now {
+            let mut slot = self.identity_pending.lock();
+            let wake = slot.is_none();
+            if slot.as_ref().is_none_or(|(s, _)| seq > *s) {
+                *slot = Some((seq, bytes));
+            }
+            drop(slot);
+            if wake {
+                let _ = self.wal_io_tx.send(WalIoCmd::PersistIdentity);
+            }
+            return;
+        }
+        {
+            let mut last = self.identity_written.lock();
+            if seq > *last {
+                *last = seq;
+                let _ = replace_file(&self.wal_path.with_file_name("sdk_identity.json"), &bytes);
+            }
         }
     }
 
@@ -1237,6 +1399,13 @@ impl PulseClient {
 
         let should_seal = {
             let mut ring = self.event_ring.lock();
+            if let Some(f) = self.ring_journal.lock().as_mut() {
+                if let Ok(json) = WireBatch::new(vec![ev.clone()]).encode_json() {
+                    // ponytail: best effort, like the rest of the SDK's disk I/O; a failed write
+                    // only loses the crash protection for this event.
+                    let _ = f.write_all(&ring_journal_frame(&json));
+                }
+            }
             ring.push(ev);
             ring.len() >= (self.config.flush_batch_size.max(1) as usize)
         };
@@ -1277,25 +1446,27 @@ impl PulseClient {
     fn seal_rings_to_disk_queue(&self) -> Result<(), SdkError> {
         self.seal_replay_ring_only()?;
 
-        let events = {
-            let mut er = self.event_ring.lock();
-            if er.is_empty() {
-                Vec::new()
-            } else {
-                std::mem::take(&mut *er)
-            }
-        };
-
-        if !events.is_empty() {
-            let batch = WireBatch::new(events);
-            let bin = batch
+        // Hold the ring lock until the batch is in the queue file and the journal is cleared,
+        // so a concurrent `track()` can't journal an event that the truncate then erases.
+        let mut er = self.event_ring.lock();
+        if !er.is_empty() {
+            let bin = WireBatch::new(std::mem::take(&mut *er))
                 .encode_binary(1)
                 .map_err(|e| SdkError::Serialization(e.to_string()))?;
             self.enqueue_packet(QueuedPacket::Events(bin));
+            self.truncate_ring_journal();
         }
         Ok(())
     }
 
+    /// Caller holds `event_ring`.
+    fn truncate_ring_journal(&self) {
+        if let Some(f) = self.ring_journal.lock().as_mut() {
+            let _ = f.set_len(0);
+        }
+    }
+
+    /// Writes the packet to `sdk_wal.bin` before returning, so it survives the app being killed.
     fn enqueue_packet(&self, pkt: QueuedPacket) {
         let id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let entry = WalQueueEntry::new(id, pkt);
@@ -1312,24 +1483,48 @@ impl PulseClient {
                 evicted = true;
             }
         }
-        let frame_clone = entry.frame_bytes.clone();
         guard.1 += entry_disk_len;
-        guard.0.push_back(entry);
-
-        if evicted {
-            let snapshot = Self::concat_frames(&guard.0, guard.1);
-            let _ = self.wal_io_tx.send(WalIoCmd::Compact(snapshot));
+        // Written under the queue lock so the file order always matches the queue.
+        let _ = if evicted {
+            guard.0.push_back(entry);
+            self.wal_file_bytes.store(guard.1, Ordering::Relaxed);
+            replace_file(&self.wal_path, &Self::concat_frames(&guard.0, guard.1))
         } else {
-            let _ = self.wal_io_tx.send(WalIoCmd::Append(frame_clone));
-        }
+            self.wal_file_bytes
+                .fetch_add(entry_disk_len, Ordering::Relaxed);
+            let res = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.wal_path)
+                .and_then(|mut f| f.write_all(&entry.frame_bytes));
+            guard.0.push_back(entry);
+            res
+        };
+        drop(guard);
     }
 
     fn remove_packets_by_id(&self, ids: &HashSet<u64>) {
         let mut guard = self.disk_queue.lock();
         guard.0.retain(|e| !ids.contains(&e.id));
         guard.1 = guard.0.iter().map(|e| e.disk_len()).sum();
-        let snapshot = Self::concat_frames(&guard.0, guard.1);
-        let _ = self.wal_io_tx.send(WalIoCmd::Compact(snapshot));
+        // Empty queue: truncate. Otherwise append a small ack record, and rewrite only once
+        // acked packets make up most of the file, so uploads never block `track()` for long.
+        let file_bytes = self.wal_file_bytes.load(Ordering::Relaxed);
+        if guard.0.is_empty() || file_bytes > 2 * guard.1 + 256 * 1024 {
+            let _ = replace_file(&self.wal_path, &Self::concat_frames(&guard.0, guard.1));
+            self.wal_file_bytes.store(guard.1, Ordering::Relaxed);
+        } else {
+            let frame = wal_ack_frame(ids);
+            let res = OpenOptions::new()
+                .append(true)
+                .open(&self.wal_path)
+                .and_then(|mut f| f.write_all(&frame));
+            if res.is_ok() {
+                self.wal_file_bytes
+                    .store(file_bytes + frame.len(), Ordering::Relaxed);
+            }
+        }
+        drop(guard);
     }
 
     fn concat_frames(queue: &VecDeque<WalQueueEntry>, cap: usize) -> Vec<u8> {
@@ -1883,5 +2078,192 @@ mod tests {
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(retry_after_ms(&h), None);
+    }
+
+    fn kill_test_config(dir: &tempfile::TempDir) -> SdkConfig {
+        SdkConfig {
+            endpoint_url: "http://127.0.0.1:9".into(),
+            api_key: "pk_test".into(),
+            storage_dir: dir.path().to_string_lossy().into_owned(),
+            flush_batch_size: 20,
+            flush_interval_ms: 0,
+        }
+    }
+
+    /// Simulates the process being killed: nothing runs on the way out.
+    fn kill(client: Arc<PulseClient>) {
+        std::mem::forget(client);
+    }
+
+    fn queued_events(client: &PulseClient) -> Vec<WireEvent> {
+        client
+            .disk_queue
+            .lock()
+            .0
+            .iter()
+            .flat_map(|e| match &e.pkt {
+                QueuedPacket::Events(bin) => WireBatch::decode_binary(bin).unwrap().events,
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unsealed_events_survive_the_app_being_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(kill_test_config(&dir)).unwrap();
+        for i in 0..7 {
+            client
+                .track(
+                    "Checkout_Started".into(),
+                    format!(r#"{{"i":{i},"amount":12.5,"ok":true,"plan":"pro"}}"#),
+                )
+                .unwrap();
+        }
+        let tracked = client.event_ring.lock().clone();
+        assert_eq!(
+            client.queued_packet_count(),
+            0,
+            "7 < batch size, so nothing is sealed yet"
+        );
+        kill(client);
+
+        let relaunched = PulseClient::new(kill_test_config(&dir)).unwrap();
+        assert_eq!(relaunched.queued_packet_count(), 1);
+        assert_eq!(
+            queued_events(&relaunched),
+            tracked,
+            "same events, props and ids"
+        );
+        assert_eq!(
+            fs::metadata(dir.path().join(SDK_RING_FILE)).unwrap().len(),
+            0
+        );
+
+        // And they aren't queued a second time on the next launch.
+        kill(relaunched);
+        let again = PulseClient::new(kill_test_config(&dir)).unwrap();
+        assert_eq!(queued_events(&again).len(), 7);
+    }
+
+    #[test]
+    fn sealed_packets_are_on_disk_when_track_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(kill_test_config(&dir)).unwrap();
+        for i in 0..5_000 {
+            client
+                .track("Burst".into(), format!(r#"{{"i":{i}}}"#))
+                .unwrap();
+        }
+        // No await, no flush: read the files exactly as a relaunch would.
+        let (on_disk, _, _, corrupt) = load_wal_entries(&dir.path().join("sdk_wal.bin"));
+        assert!(!corrupt);
+        assert_eq!(on_disk.len(), 250, "5,000 events / 20 per packet");
+        kill(client);
+
+        let relaunched = PulseClient::new(kill_test_config(&dir)).unwrap();
+        let mut ids: Vec<i64> = queued_events(&relaunched)
+            .iter()
+            .map(
+                |e| match e.props.iter().find(|(k, _)| k == "i").unwrap().1 {
+                    PropValue::Int(i) => i,
+                    ref other => panic!("unexpected {other:?}"),
+                },
+            )
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..5_000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_torn_journal_write_keeps_the_events_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(kill_test_config(&dir)).unwrap();
+        for _ in 0..3 {
+            client.track("Tap".into(), String::new()).unwrap();
+        }
+        kill(client);
+        // A kill in the middle of a write leaves a partial frame at the end.
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(SDK_RING_FILE))
+            .unwrap();
+        f.write_all(&[200, 0, 0, 0, 1, 2]).unwrap();
+
+        let relaunched = PulseClient::new(kill_test_config(&dir)).unwrap();
+        assert_eq!(queued_events(&relaunched).len(), 3);
+    }
+
+    #[test]
+    fn opting_out_clears_the_journal_and_queue_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(kill_test_config(&dir)).unwrap();
+        for _ in 0..25 {
+            client.track("Tap".into(), String::new()).unwrap();
+        }
+        client.opt_out().unwrap();
+        kill(client);
+        let relaunched = PulseClient::new(kill_test_config(&dir)).unwrap();
+        assert_eq!(relaunched.queued_packet_count(), 0);
+    }
+
+    #[test]
+    fn login_survives_the_app_being_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(kill_test_config(&dir)).unwrap();
+        client.track("App_Open".into(), String::new()).unwrap();
+        client.identify("usr_42".into()).unwrap();
+        for _ in 0..50 {
+            client.track("Tap".into(), String::new()).unwrap(); // background identity writes
+        }
+        kill(client);
+        let relaunched = PulseClient::new(kill_test_config(&dir)).unwrap();
+        assert_eq!(relaunched.distinct_id(), "usr_42");
+    }
+
+    #[tokio::test]
+    async fn delivered_packets_are_not_resent_after_a_kill() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/v1/ingest",
+            post(move |_b: Bytes| {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_test_config(&dir);
+        cfg.endpoint_url = format!("http://{addr}");
+        let client = PulseClient::new(cfg.clone()).unwrap();
+        for _ in 0..100 {
+            client.track("Tap".into(), String::new()).unwrap();
+        }
+        // Deliver only the first 3 packets: remove them the way a partial flush does.
+        let first: HashSet<u64> = client
+            .disk_queue
+            .lock()
+            .0
+            .iter()
+            .take(3)
+            .map(|e| e.id)
+            .collect();
+        client.remove_packets_by_id(&first);
+        let (on_disk, _, _, _) = load_wal_entries(&dir.path().join("sdk_wal.bin"));
+        assert_eq!(on_disk.len(), 2, "ack record hides the 3 delivered packets");
+        kill(client);
+
+        let relaunched = PulseClient::new(cfg).unwrap();
+        assert_eq!(relaunched.queued_packet_count(), 2);
+        relaunched.flush().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(relaunched.queued_packet_count(), 0);
     }
 }
