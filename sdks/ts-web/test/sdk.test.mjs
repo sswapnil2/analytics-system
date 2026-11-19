@@ -449,3 +449,41 @@ test("Error and network capture: uncaught errors become $error; fetch calls land
   sdk.shutdown();
   assert.notEqual(window.fetch, wrapped, "fetch restored on shutdown");
 });
+
+test("URL privacy: strips query strings, fragments, userinfo, and mailto/tel from context and autocapture", async () => {
+  const sent = [];
+  const env = browserEnv({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/v1/ingest")) sent.push(...JSON.parse(init.body).events);
+      return { ok: true, status: 200, json: async () => ({}), headers: { get: () => null } };
+    },
+  });
+  window.location.href = "https://alice:secret@app.example.com/reset?token=reset_999&utm_source=email#frag";
+  window.location.search = "?token=reset_999&utm_source=email";
+  document.referrer = "https://idp.example.com/oauth?code=oauth_secret_123";
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://pulse.test",
+    apiKey: "pk_u",
+    flushIntervalMs: 0,
+    autocapture: { pageviews: false, clicks: true, forms: false },
+  });
+  sdk.track("Visited");
+  const fakeAnchor = {
+    tagName: "A",
+    textContent: "Email Support",
+    href: "mailto:private@example.com?subject=help",
+    closest: (sel) => (sel.includes("a") ? fakeAnchor : null),
+  };
+  for (const f of env.listeners.get("click") ?? []) f({ target: fakeAnchor });
+  await sdk.flush();
+
+  const visited = sent.find((e) => e.event_name === "Visited");
+  assert.equal(visited.props.$current_url, "https://app.example.com/reset");
+  assert.equal(visited.props.$referrer, "https://idp.example.com/oauth");
+  assert.equal(visited.props.utm_source, "email");
+  const click = sent.find((e) => e.event_name === "$autocapture");
+  assert.equal(click.props.href, "mailto:[redacted]");
+  const raw = JSON.stringify(sent);
+  assert.ok(!raw.includes("reset_999") && !raw.includes("oauth_secret_123") && !raw.includes("private@example.com") && !raw.includes("alice:secret"));
+  sdk.shutdown();
+});

@@ -52,17 +52,22 @@ For $0, use Oracle's free tier with the same steps, since both are ARM (`aarch64
 
 Everything below uses `analytics.example.com`; replace it with your domain.
 
-## 2. Build the binary (not on the VM)
+## 2. Get or build the binary (not on the VM)
 
-The release build takes about 15 minutes and a lot of RAM, so build it somewhere else.
+The release build takes about 15 minutes and a lot of RAM, so don't compile it on a small VM.
 
-**GitHub Actions (simplest):** the manual workflow `.github/workflows/build-linux.yml` builds
-`pulse-node` and the Studio for `aarch64` and `x86_64` on GitHub's free runners for public repos:
+**GitHub Releases (simplest):** download `pulse-linux-aarch64.tar.gz` (or `pulse-linux-x86_64.tar.gz`) and `SHA256SUMS` from the [latest release](https://github.com/sswapnil2/analytics-system/releases/latest) and verify the checksum:
 
 ```bash
-gh workflow run build-linux.yml --ref <branch>
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+**Or build a branch on GitHub Actions:** trigger `.github/workflows/release.yml` manually (non-tag runs build and smoke-test without publishing):
+
+```bash
+gh workflow run release.yml --ref <branch>
 gh run watch
-gh run download --name pulse-linux-aarch64      # x86_64 for Lightsail
+gh run download --name pulse-linux-aarch64      # or pulse-linux-x86_64
 ```
 
 **Or cross-compile from a Mac** (not tested in CI):

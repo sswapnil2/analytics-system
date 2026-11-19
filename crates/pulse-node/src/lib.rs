@@ -205,7 +205,13 @@ impl RunningNode {
         if let Some(tx) = self.shutdown_http_tx.take() {
             let _ = tx.send(());
         }
-        let _ = self.http_task.await;
+        if tokio::time::timeout(Duration::from_secs(15), &mut self.http_task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("HTTP server did not stop within 15s during shutdown; aborting listener to proceed with final flush");
+            self.http_task.abort();
+        }
         self.qengine.cache().close().await;
         if !self.storage.identity_router().is_read_only() {
             // Losing these would lose acknowledged data from memory: say so loudly.

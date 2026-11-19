@@ -1,5 +1,11 @@
 # /etc/caddy/Caddyfile. Replace the domain; Caddy gets and renews the HTTPS certificate itself.
 analytics.example.com {
 	encode zstd gzip
+
+	# Block public access to Prometheus metrics by default. Scrape 127.0.0.1:8080/metrics
+	# locally or over a private network, or remove this block after setting PULSE_METRICS_TOKEN.
+	@metrics path /metrics
+	respond @metrics 403
+
 	reverse_proxy 127.0.0.1:8080
 }

@@ -157,10 +157,26 @@ const DEFAULT_MAX_QUEUED_EVENTS = 2_000;
 const MAX_QUEUED_REPLAY_PACKETS = 64;
 const SNAPSHOT_THROTTLE_MS = 1_000;
 
-/** `https://api.x.com/v1/kyc?pan=ABC#x` → `https://api.x.com/v1/kyc`: query strings often carry PII. */
-function stripQuery(url: string): string {
-  const cut = url.search(/[?#]/);
-  return (cut === -1 ? url : url.slice(0, cut)).slice(0, 256);
+/** `https://api.x.com/v1/kyc?pan=ABC#x` → `https://api.x.com/v1/kyc`: query strings, fragments, userinfo, and mailto/tel URIs often carry PII. */
+function stripQuery(url: string, maxLen = 256): string {
+  const trimmed = url.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("mailto:")) return "mailto:[redacted]";
+  if (lower.startsWith("tel:")) return "tel:[redacted]";
+  const cut = trimmed.search(/[?#]/);
+  let clean = cut === -1 ? trimmed : trimmed.slice(0, cut);
+  // Strip embedded credentials (`https://user:pass@host/path` -> `https://host/path`).
+  const schemeEnd = clean.indexOf("://");
+  if (schemeEnd !== -1) {
+    const hostStart = schemeEnd + 3;
+    const pathStart = clean.indexOf("/", hostStart);
+    const authorityEnd = pathStart === -1 ? clean.length : pathStart;
+    const at = clean.lastIndexOf("@", authorityEnd - 1);
+    if (at >= hostStart) {
+      clean = clean.slice(0, hostStart) + clean.slice(at + 1);
+    }
+  }
+  return clean.slice(0, maxLen);
 }
 
 /**
@@ -253,13 +269,13 @@ function collectDefaultContext(): EventProperties {
     if (navigator.language) ctx.$locale = navigator.language;
   }
   if (typeof window !== "undefined") {
-    if (window.location?.href) ctx.$current_url = window.location.href.slice(0, 512);
+    if (window.location?.href) ctx.$current_url = stripQuery(window.location.href, 512);
     if (window.location?.pathname) ctx.$pathname = window.location.pathname;
     if (typeof window.innerWidth === "number") ctx.$screen_width = window.innerWidth;
     if (typeof window.innerHeight === "number") ctx.$screen_height = window.innerHeight;
   }
   if (typeof document !== "undefined" && typeof document.referrer === "string" && document.referrer) {
-    ctx.$referrer = document.referrer.slice(0, 512);
+    ctx.$referrer = stripQuery(document.referrer, 512);
     try {
       ctx.$referring_domain = new URL(document.referrer).hostname;
     } catch {
@@ -502,11 +518,12 @@ export class PulseWebClient {
           | null;
         if (!interactive) return;
         const explicitlyUnmasked = Boolean(interactive.closest?.("[data-pulse-unmask]"));
+        const rawHref = (interactive as HTMLAnchorElement).href || "";
         this.track("$autocapture", {
           $event_type: "click",
           tag: (interactive.tagName || "").toLowerCase(),
           masked_text: maskPiiText(interactive.textContent || "", explicitlyUnmasked),
-          href: (interactive as HTMLAnchorElement).href || null,
+          href: rawHref ? stripQuery(rawHref, 512) : null,
         });
       };
       window.addEventListener("click", this.boundAutocaptureClickListener);
@@ -1182,7 +1199,7 @@ export class PulseWebClient {
         kind: "error_banner",
         ...box,
         bg_rgba: 0xdc2626ff,
-        masked_label: maskPiiText(message, true),
+        masked_label: maskPiiText(message, false),
       });
     }
     this.track("$error", { message: message.slice(0, 256) });

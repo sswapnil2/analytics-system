@@ -245,13 +245,19 @@ async fn handle_readyz(State(p): State<Probe>) -> Response {
     }
     match tokio::time::timeout(CHECK_TIMEOUT, p.control.ping_metadata()).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => failures.push(format!("metadata database: {e}")),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "readyz metadata database check failed");
+            failures.push("metadata database: unavailable".into());
+        }
         Err(_) => failures.push("metadata database: timed out".into()),
     }
     let probe_path = ObjectPath::from("_pulse_readyz");
     match tokio::time::timeout(CHECK_TIMEOUT, p.storage.object_store().head(&probe_path)).await {
         Ok(Ok(_)) | Ok(Err(object_store::Error::NotFound { .. })) => {}
-        Ok(Err(e)) => failures.push(format!("object store: {e}")),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "readyz object store check failed");
+            failures.push("object store: unavailable".into());
+        }
         Err(_) => failures.push("object store: timed out".into()),
     }
     if failures.is_empty() {
