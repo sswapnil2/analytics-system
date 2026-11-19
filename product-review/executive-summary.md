@@ -1,5 +1,7 @@
 # Pulse: executive summary
 
+> **Snapshot of `a709476` (18 Nov 2026).** Most findings below are fixed. See [README.md](README.md) for current status.
+
 **Reviewer stance:** Principal PM evaluating Pulse for a company with 50k–500k MAU, several product teams, web and mobile, and hundreds of events.
 **Basis:** the public site, every doc in `docs/`, a source read of all crates and the Studio, a release build run locally, a hand-built e-commerce dataset with known answers, and real workflows in the Studio and over MCP. Evidence is in [test-results.md](test-results.md).
 

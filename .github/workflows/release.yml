@@ -93,7 +93,7 @@ jobs:
             -t "$IMAGE:${GITHUB_REF_NAME#v}" -t "$IMAGE:latest" .
 
   release:
-    needs: [build, image]
+    needs: [build, image, sdk]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -101,13 +101,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: pulse-linux-*
           merge-multiple: true
-      - run: sha256sum pulse-linux-*.tar.gz > SHA256SUMS
+      - run: sha256sum pulse-linux-*.tar.gz pulse-analytics-ts-web-*.tgz > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" pulse-linux-*.tar.gz SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" pulse-linux-*.tar.gz pulse-analytics-ts-web-*.tgz SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --title "Pulse $GITHUB_REF_NAME" --generate-notes \
             $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
 
@@ -121,13 +120,21 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - run: npm ci && npm test && npm pack --dry-run
+      # The packed SDK is attached to every release, so `npm install <release asset url>` works
+      # whether or not npm publishing is set up.
+      - run: |
+          npm ci && npm test
+          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version || true
+          npm pack
         working-directory: sdks/ts-web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-tarball
+          path: sdks/ts-web/pulse-analytics-ts-web-*.tgz
+          retention-days: 14
       - name: Publish to npm
         if: env.PUBLISH == 'true' && env.HAS_NPM_TOKEN == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: sdks/ts-web
-        run: |
-          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version
-          npm publish --access public
+        run: npm publish --access public
