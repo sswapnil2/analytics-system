@@ -120,8 +120,24 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | PATCH | `/v1/projects/:id` | Rename a project and/or change its time zone: `{"name"?, "timezone"?}` (IANA name; `400` otherwise). Admin. Reports bucket days and hours on the new clock at once. |
 | GET, POST | `/v1/projects/:id/api-keys` | List keys / create one: `{"label", "role": "ingest_and_flags" \| "admin"}`. The response's `plaintext_key` is shown once. |
 | DELETE | `/v1/projects/:id/api-keys/:key_id` | Revoke a key. It stops working at once on this node and within seconds on other nodes. |
-| GET | `/v1/auth/me` | The signed-in user (Studio `ps_` sessions only; other tokens get `404`) |
 | POST | `/v1/auth/logout` | End a `ps_` session |
+| GET | `/v1/system/encryption` | Cluster encryption status (root token only) |
+| POST | `/v1/system/encryption/rotate` | Rotate the cluster encryption key (root token only) |
+| GET | `/v1/audit-logs` | Paginated security and admin audit log (root token only) |
+| GET, PUT | `/v1/projects/:id/byok` | Inspect or save project BYOK credentials (LLM, S3 warehouse, webhooks) |
+| DELETE | `/v1/projects/:id/byok/:category` | Delete a stored BYOK credential category |
+| POST | `/v1/projects/:id/byok-verify` | Test a stored BYOK configuration |
+| POST | `/v1/projects/:id/export/warehouse` | Trigger an on-demand Parquet export to a configured BYOK S3 bucket |
+| POST | `/v1/projects/:id/ai/copilot` | Run an AI Copilot analytics query using the project's BYOK LLM |
+| PATCH | `/v1/projects/:id/experiments/:exp_id` | Update an existing experiment definition |
+
+## Operations & health (unauthenticated unless noted)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/healthz` | Process liveness probe (`200 OK`) |
+| GET | `/readyz` | Readiness probe (checks drain state, metadata DB, and object store; returns `503` when not ready) |
+| GET | `/metrics` | Prometheus text exposition; requires `Authorization: Bearer $PULSE_METRICS_TOKEN` when `PULSE_METRICS_TOKEN` is set |
 
 ## Queries (bearer token)
 
@@ -245,7 +261,6 @@ take simpler arguments.
 | POST | `/v1/org/members/:user_id/password-reset` | admin | Returns a one-hour `reset_url` |
 | GET, POST | `/v1/org/invites` | admin | `{email, role}`: returns `invite_url` once (7 days, one use) |
 | DELETE | `/v1/org/invites/:invite_id` | admin | Revoke a pending invite |
-| DELETE | `/v1/projects/:id/api-keys/:key_id` | admin | Revoke an API key |
 
 These events are written to the audit log: sign-ins and failed sign-ins, password changes and resets,
 role changes, member removals, invites created, accepted and revoked, organisation renames, and API

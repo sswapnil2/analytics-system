@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm --prefix web ci && npm --prefix web run build
+      - run: npm --prefix web ci && npm --prefix web test && npm --prefix web run build
       - run: rustup show # installs the toolchain pinned in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p pulse-node
@@ -123,6 +123,7 @@ jobs:
       # The packed SDK is attached to every release, so `npm install <release asset url>` works
       # whether or not npm publishing is set up.
       - run: |
+          cp ../../LICENSE ../../NOTICE .
           npm ci && npm test
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version || true
           npm pack

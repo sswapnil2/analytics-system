@@ -1,5 +1,8 @@
 /**
  * Zero-dependency 64-bit XXH3 (`xxh3_64` with seed = 0) matching `xxhash_rust::xxh3::xxh3_64` bit-for-bit.
+ *
+ * Implements the XXH3 algorithm specification and default secret table defined by Yann Collet's
+ * xxHash (BSD-2-Clause, https://github.com/Cyan4973/xxHash).
  */
 
 const MASK64 = 0xffffffffffffffffn;

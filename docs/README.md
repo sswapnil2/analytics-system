@@ -30,8 +30,8 @@ Every account belongs to one organisation and sees only that organisation's proj
 
 - **First account:** sign-up asks for the root admin token as a setup code. That account owns the default organisation and the data already on the node.
 - **Later accounts:** sign-up asks for an organisation name and creates a new, separate organisation with its own empty project and ingest key.
-- **Teammates:** set `PULSE_ALLOWED_EMAIL_DOMAINS=yourco.com`. People at that domain who leave the organisation name blank join the default organisation.
-- **Closed node:** set `PULSE_ALLOW_NEW_ORGS=false` to stop strangers creating organisations. Then only allowed domains can sign up.
-- **Google sign-in:** a new Google account gets a workspace named after its owner.
+- **Teammates (invites or allowed domains):** organisation admins can create single-use invite links in the Studio (or via `POST /v1/org/invites`), or you can set `PULSE_ALLOWED_EMAIL_DOMAINS=yourco.com` so teammates at that domain who leave the organisation name blank join the default organisation.
+- **Closed node:** set `PULSE_ALLOW_NEW_ORGS=false` to stop strangers creating organisations. Then only invited users or allowed domains can sign up.
+- **Google sign-in:** configure `PULSE_GOOGLE_CLIENT_ID`, `PULSE_GOOGLE_CLIENT_SECRET`, and `PULSE_PUBLIC_URL`. A new Google account gets a workspace named after its owner unless `PULSE_ALLOW_NEW_ORGS=false` is set.
 
-There are no invites yet, so the allowed-domain setting is how people join an existing organisation. The root admin token still sees every organisation.
+The root admin token sees every organisation.

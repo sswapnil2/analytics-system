@@ -93,7 +93,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --release
 npm --prefix sdks/ts-web run typecheck && npm --prefix sdks/ts-web test
-npm --prefix web run typecheck && npm --prefix web run build
+npm --prefix web run typecheck && npm --prefix web test && npm --prefix web run build
 ./scripts/verify_e2e.sh
 ./scripts/bench_scale.sh all   # runs 100k & 1m SLO profiles (cold/warm scans + concurrent load)
 ```

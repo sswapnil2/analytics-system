@@ -61,8 +61,6 @@ For full control, `query_insights` accepts a complete Insights query body (with 
 `query_funnel` accepts step objects (`[{"event_name": ...}]` plus `time_range`, `conversion_window_ms`),
 the same shapes as the [REST query routes](rest-api.md#queries-bearer-token).
 
-Results come back both as pretty-printed JSON text and as `structuredContent`.
-
 ## Connect a client
 
 Replace the URL and token with yours. Use your node's host and port; the examples use `http://127.0.0.1:8080`.

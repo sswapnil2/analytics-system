@@ -24,6 +24,7 @@ pub(crate) async fn pinned_outbound_client(
     let url = validate_outbound_url_ssrf(raw_url).map_err(|e| e.to_string())?;
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let (Some(host), false) = (url.domain(), allow_private_endpoints()) {
         let port = url.port_or_known_default().unwrap_or(443);

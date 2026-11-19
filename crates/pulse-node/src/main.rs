@@ -17,7 +17,22 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        let next_val = |flag: &str, idx: &mut usize| -> anyhow::Result<&str> {
+            *idx += 1;
+            args.get(*idx)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+        };
+        match arg {
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("pulse-node {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--seed" => {
                 cfg.auto_seed = true;
                 if cfg.default_project_id == "proj_default" {
@@ -27,51 +42,52 @@ async fn main() -> anyhow::Result<()> {
             "--no-seed" => {
                 cfg.auto_seed = false;
             }
-            "--host" if i + 1 < args.len() => {
-                if let Ok(ip) = args[i + 1].parse::<IpAddr>() {
-                    cfg.http_addr.set_ip(ip);
-                }
-                i += 1;
+            "--host" => {
+                let raw = next_val("--host", &mut i)?;
+                let ip: IpAddr = raw
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid --host '{raw}': {e}"))?;
+                cfg.http_addr.set_ip(ip);
             }
-            "--port" if i + 1 < args.len() => {
-                if let Ok(p) = args[i + 1].parse::<u16>() {
-                    cfg.http_addr.set_port(p);
-                }
-                i += 1;
+            "--port" => {
+                let raw = next_val("--port", &mut i)?;
+                let p: u16 = raw
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid --port '{raw}': {e}"))?;
+                cfg.http_addr.set_port(p);
             }
-            "--quic-addr" if i + 1 < args.len() => {
-                if let Ok(addr) = args[i + 1].parse() {
-                    cfg.quic_addr = Some(addr);
-                }
-                i += 1;
+            "--quic-addr" => {
+                let raw = next_val("--quic-addr", &mut i)?;
+                let addr = raw
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid --quic-addr '{raw}': {e}"))?;
+                cfg.quic_addr = Some(addr);
             }
             "--no-quic" => {
                 cfg.quic_addr = None;
             }
-            "--project-id" if i + 1 < args.len() => {
-                cfg.default_project_id = args[i + 1].clone();
-                i += 1;
+            "--project-id" => {
+                cfg.default_project_id = next_val("--project-id", &mut i)?.to_string();
             }
-            "--data-dir" if i + 1 < args.len() => {
-                cfg.data_dir = args[i + 1].clone().into();
-                i += 1;
+            "--data-dir" => {
+                cfg.data_dir = next_val("--data-dir", &mut i)?.into();
             }
-            "--web-dir" if i + 1 < args.len() => {
-                cfg.web_dist_dir = args[i + 1].clone().into();
-                i += 1;
+            "--web-dir" => {
+                cfg.web_dist_dir = next_val("--web-dir", &mut i)?.into();
             }
-            "--role" if i + 1 < args.len() => {
-                if let Some(r) = NodeRole::parse(&args[i + 1]) {
+            "--role" => {
+                let raw = next_val("--role", &mut i)?;
+                if let Some(r) = NodeRole::parse(raw) {
                     cfg.role = r;
                 } else {
                     anyhow::bail!(
-                        "invalid --role '{}': expected one of all, ingest, query, compactor",
-                        args[i + 1]
+                        "invalid --role '{raw}': expected one of all, ingest, query, compactor"
                     );
                 }
-                i += 1;
             }
-            _ => {}
+            other => {
+                anyhow::bail!("unknown argument '{other}' (run with --help for usage)");
+            }
         }
         i += 1;
     }
@@ -101,4 +117,28 @@ async fn wait_for_shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn print_usage() {
+    println!(
+        "pulse-node {} — Single-binary product analytics, replay, flags & experimentation\n\
+         \n\
+         USAGE:\n\
+         \tpulse-node [OPTIONS]\n\
+         \n\
+         OPTIONS:\n\
+         \t--host <IP>          HTTP bind address (default: 127.0.0.1, env: PULSE_HOST)\n\
+         \t--port <PORT>        HTTP bind port (default: 8080, env: PORT)\n\
+         \t--data-dir <PATH>    Data directory (default: ./pulse_data, env: PULSE_DATA_DIR)\n\
+         \t--web-dir <PATH>     Studio dist directory (default: ./web/dist, env: PULSE_WEB_DIST_DIR)\n\
+         \t--project-id <ID>    Default project ID (default: proj_default, env: PULSE_DEFAULT_PROJECT)\n\
+         \t--role <ROLE>        Node role: all | ingest | query | compactor (env: PULSE_NODE_ROLE)\n\
+         \t--quic-addr <ADDR>   Enable QUIC ingest listener on <IP:PORT> (env: PULSE_QUIC_ADDR)\n\
+         \t--no-quic            Disable QUIC ingest listener (default)\n\
+         \t--seed               Seed demo dataset on startup (env: PULSE_SEED=1)\n\
+         \t--no-seed            Disable demo dataset seeding (default)\n\
+         \t-h, --help           Print help information\n\
+         \t-V, --version        Print version information",
+        env!("CARGO_PKG_VERSION")
+    );
 }

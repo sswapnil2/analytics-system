@@ -36,7 +36,7 @@ cargo test --workspace --locked
 If you touched the Studio or the SDK, also run:
 
 ```bash
-npm --prefix web run typecheck && npm --prefix web run build
+npm --prefix web run typecheck && npm --prefix web test && npm --prefix web run build
 npm --prefix sdks/ts-web run typecheck && npm --prefix sdks/ts-web test
 ```
 

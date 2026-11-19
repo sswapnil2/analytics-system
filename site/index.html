@@ -901,7 +901,7 @@ claude mcp add --transport http pulse http://127.0.0.1:8080/v1/mcp \
 <div class="rv" style="--rd:.1s">
 <div class="side-card"><h3>Storage you choose</h3><p>Segments live where you point them. Keep the data next to the rest of your stack.</p><div class="opt"><span>Local disk</span><span>S3-compatible bucket</span></div></div>
 <div class="side-card"><h3>Scale out with roles</h3><p>Run the same binary as separate <code>ingest</code>, <code>query</code> and <code>compactor</code> nodes over shared object storage, with Postgres for metadata.</p></div>
-<div class="side-card"><h3>Up in one command</h3><p><code>./pulse-node --seed</code> starts the node with a demo dataset. Studio, API and MCP share port 8080.</p><p style="margin-top:14px"><a class="link" href="https://github.com/sswapnil2/analytics-system/blob/main/docs/quickstart.md">Self-hosting guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p></div>
+<div class="side-card"><h3>Up in one command</h3><p><code>./pulse-node --seed</code> starts the node with a demo dataset. Studio, API and MCP share port 8080.</p><p style="margin-top:14px"><a class="link" href="https://github.com/sswapnil2/analytics-system/blob/main/docs/self-hosting-cloud.md">Self-hosting guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p></div>
 </div>
 </div>
 </div>
@@ -1054,7 +1054,7 @@ claude mcp add --transport http pulse http://127.0.0.1:8080/v1/mcp \
 
 pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>, { cart_value: 99, currency: <span class="st">"USD"</span> });
 <span class="kw">await</span> pulse.<span class="fnn">identify</span>(<span class="st">"usr_1042"</span>, { plan: <span class="st">"pro"</span> });</pre>
-<p class="note">Not on npm yet: build it from <code>sdks/ts-web</code> and install it locally. <a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/web-sdk.md">Web SDK guide →</a></p></div>
+<p class="note">Not on npm yet: install the packed <code>.tgz</code> from the <a href="https://github.com/sswapnil2/analytics-system/releases/latest">latest release</a> or build locally from <code>sdks/ts-web</code>. <a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/web-sdk.md">Web SDK guide →</a></p></div>
 <div class="tp" role="tabpanel" id="p-mcp" aria-labelledby="t-mcp" hidden><button class="copy" type="button">Copy</button>
 <pre><span class="cm"># 1. Create a key that can only see one project</span>
 <span class="p">$</span> curl -s -X POST http://127.0.0.1:8080/v1/projects/proj_default/api-keys \
@@ -1098,7 +1098,7 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 </div>
 <nav class="docs rv" style="--rd:.1s" aria-label="Documentation">
 <a href="https://github.com/sswapnil2/analytics-system/tree/main/docs"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-book"/></svg></span><span><b>Documentation</b><span>docs/</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/quickstart.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-server"/></svg></span><span><b>Self-hosting guide</b><span>docs/quickstart.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/self-hosting-cloud.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-server"/></svg></span><span><b>Self-hosting guide</b><span>docs/self-hosting-cloud.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 <a href="https://github.com/sswapnil2/analytics-system/tree/main/sdks/ts-web"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-code"/></svg></span><span><b>TypeScript SDK</b><span>sdks/ts-web</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 <a href="https://github.com/sswapnil2/analytics-system/tree/main/crates"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-cpu"/></svg></span><span><b>Rust implementation</b><span>crates/</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 <a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/mcp.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg></span><span><b>MCP integration</b><span>docs/mcp.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>

@@ -282,8 +282,12 @@ impl ControlPlaneService {
             json!({ "email": user.email }),
         )
         .await;
-        let cookie = build_session_cookie(&token, is_https_request(headers, Some(uri)));
+        let is_https = is_https_request(headers, Some(uri))
+            || self.auth_cfg.read().public_url.starts_with("https://");
+        let cookie = build_session_cookie(&token, is_https);
         let mut resp = Json(json!({ "token": token, "user": user_json(user) })).into_response();
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         if let Ok(val) = HeaderValue::from_str(&cookie) {
             resp.headers_mut().append(header::SET_COOKIE, val);
         }

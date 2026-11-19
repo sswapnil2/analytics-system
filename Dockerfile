@@ -1,7 +1,7 @@
-# Runtime image for prebuilt release binaries; see .github/workflows/release.yml.
+# Runtime image for CI-built release tarballs; see .github/workflows/release.yml.
 # Expects dist/amd64/pulse and dist/arm64/pulse (the unpacked release tarballs).
-# ponytail: packages CI-built binaries instead of compiling in Docker (a release build takes
-# ~15 min); add a cargo build stage if people need to build images from source.
+# To build a Docker image locally from source, use Dockerfile.source instead:
+#   docker build -f Dockerfile.source -t pulse:local .
 FROM debian:bookworm-slim
 ARG TARGETARCH
 RUN apt-get update \
