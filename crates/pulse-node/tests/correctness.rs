@@ -1,7 +1,7 @@
 //! Release gate for analytics correctness: boots a full node, loads a dataset with
 //! hand-computed answers (the product review's e-commerce fixture plus 1,200 user profiles),
-//! and checks every answer before and after a restart. Each assertion names the review
-//! finding it guards (B-n / I-n in product-improvements/validated-findings.md).
+//! and checks every answer before and after a restart. Each assertion guards a specific
+//! analytics correctness invariant.
 
 use chrono::{TimeZone, Utc};
 use pulse_node::{start_pulse_node, NodeConfig, NodeRole, RunningNode};
@@ -44,7 +44,7 @@ async fn boot(dir: &Path) -> RunningNode {
     .expect("start node")
 }
 
-/// The review's fixture (product-review/fixtures/gen_ecommerce.py), generated in Rust.
+/// Deterministic synthetic e-commerce fixture generated in Rust.
 fn ecommerce_events() -> Vec<Value> {
     let base = ms(2026, 11, 1, 10, 0);
     let mut out = Vec::new();
