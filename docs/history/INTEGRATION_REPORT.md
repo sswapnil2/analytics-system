@@ -1,7 +1,7 @@
 # Pulse SDK integration report — web, iOS, Android
 
 Date: 2026-11-17. Tested on a fresh node built from this branch (`pulse-node --seed --no-quic`, port 18190),
-Studio served from a fresh `web/dist`. Sample apps live in [`examples/`](examples/README.md).
+Studio served from a fresh `web/dist`. Sample apps live in [`examples/`](../../examples/README.md).
 
 Every sample runs the same flow: identify a user → welcome → details form (name + **PAN in a text field
 that must be masked**) → plan screen with a deliberately broken "Apply promo code" button (one error per tap,

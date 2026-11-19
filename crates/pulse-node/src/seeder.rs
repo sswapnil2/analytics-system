@@ -36,7 +36,7 @@ fn seed_hash(salt: &str, u: usize) -> u64 {
 }
 
 fn pick_cohort_day(u: usize) -> i64 {
-    // Smooth two-week acquisition trend with realistic weekend softenings on days 5-6 (`PR-4`)
+    // Smooth two-week acquisition trend with realistic weekend softenings on days 5-6
     const WEIGHTS: [u64; 14] = [48, 52, 60, 63, 66, 54, 51, 70, 74, 82, 86, 89, 101, 104];
     let slot = seed_hash("cohort_day", u) % 1000;
     let mut acc = 0u64;
@@ -220,7 +220,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     };
     ctrl.meta().upsert_experiment(&exp).await?;
 
-    // 2. Seed Multi-Frame Frustrated Wireframe Replay Sessions across ALL funnel drop-off steps (`PR-1`)
+    // 2. Seed Multi-Frame Frustrated Wireframe Replay Sessions across ALL funnel drop-off steps
     let total_users = 8_000usize;
     let replay_session_count = 32usize;
     let mut replay_offsets_by_sess: std::collections::HashMap<String, u32> =
@@ -390,7 +390,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         replay_offsets_by_sess.insert(sess_id, r2.replay_offset_kb);
     }
 
-    // Seed recordings for Step 0->1 (Calculator/PAN Gate), Step 2->3 (UPI Autopay Sheet), and Step 3->4 (Disbursal e-Sign) (`PR-1`)
+    // Seed recordings for Step 0->1 (Calculator/PAN Gate), Step 2->3 (UPI Autopay Sheet), and Step 3->4 (Disbursal e-Sign)
     let extra_step_replays: &[(usize, &str, &str, &str)] = &[
         (
             6005,
@@ -816,7 +816,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                     replay_offset_kb: if is_step2_3_replay { replay_kb } else { 0 },
                 });
 
-                // Natural hash-based ~50/50 split on `exp_one_tap_upi_mandate` (`PR-4`):
+                // Natural hash-based ~50/50 split on `exp_one_tap_upi_mandate`:
                 //   control       ~48.0% conversion
                 //   one_tap_sheet ~55.0% conversion (~+14.5% relative lift)
                 let is_treatment =

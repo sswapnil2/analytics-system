@@ -275,7 +275,7 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Inserts a brand-new project; NEVER overwrites an existing project (`P0-03`).
+    /// Inserts a brand-new project; NEVER overwrites an existing project.
     pub async fn insert_project(&self, proj: &Project) -> Result<(), MetaError> {
         let affected = db_exec!(
             self,
@@ -958,7 +958,7 @@ impl MetaStore {
         Ok(row.flatten())
     }
 
-    // ------------------- Saved Reports & Dashboards (`P0-03`) -------------------
+    // ------------------- Saved Reports & Dashboards -------------------
 
     pub async fn upsert_saved_report(&self, rep: &SavedReport) -> Result<(), MetaError> {
         let qjson = serde_json::to_string(&rep.query_json).unwrap_or_else(|_| "{}".into());
@@ -2193,7 +2193,7 @@ impl MetaStore {
 
     // ------------------- Provider credential vault -------------------
 
-    /// Resolves a persistent cluster KEK from `PULSE_VAULT_KEK` or `<db_dir>/.pulse_cluster.kek` (`C3`),
+    /// Resolves a persistent cluster KEK from `PULSE_VAULT_KEK` or `<db_dir>/.pulse_cluster.kek`,
     /// completely independent of `PULSE_ADMIN_TOKEN`. Returns `Ok(None)` only for pure in-memory stores.
     pub async fn resolve_or_create_cluster_kek(&self) -> Result<Option<[u8; 32]>, String> {
         if let Ok(raw) = std::env::var("PULSE_VAULT_KEK") {

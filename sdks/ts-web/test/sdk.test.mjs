@@ -117,7 +117,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
     return { ok: true, status: 200, json: async () => ({ flags: [] }), headers: { get: () => null } };
   };
 
-  // 1. Visibility listener registered even when enableWireframeReplay is false (`P2-05`)
+  // 1. Visibility listener registered even when enableWireframeReplay is false
   const c1 = new PulseWebClient({
     endpointUrl: "http://127.0.0.1:18080",
     apiKey: "pk_live_persist_test",
@@ -128,7 +128,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   const anon1 = c1.getDistinctId();
   const sess1 = c1.getSessionId();
 
-  // 2. Reload client -> persists anonId and sessionId via localStorage (`P2-04`)
+  // 2. Reload client -> persists anonId and sessionId via localStorage
   c1.shutdown();
   assert.equal(listeners.get("visibilitychange")?.size, 0, "shutdown() must remove visibilitychange listener");
 
@@ -141,7 +141,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   assert.equal(c2.getDistinctId(), anon1, "anonId must persist across page loads");
   assert.equal(c2.getSessionId(), sess1, "sessionId must persist within 30m window");
 
-  // 3. Failed flush requeues events instead of dropping them (`P2-05`)
+  // 3. Failed flush requeues events instead of dropping them
   c2.track("Checkout_Click", { amount: 999 });
   c2.captureDomWireframeSnapshot();
   await c2.flush();
@@ -153,11 +153,11 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
   assert.equal(c2.getQueuedEventCount(), 0);
   assert.equal(receivedBatches.length, 1);
   assert.equal(receivedReplays.length, 1);
-  // Title "John Smith Account Statement" MUST be masked to FIXED_MASK (`P3-01`)
+  // Title "John Smith Account Statement" MUST be masked to FIXED_MASK
   assert.equal(receivedReplays[0].ops[0].nodes[0].masked_label, FIXED_MASK);
   assert.equal(receivedReplays[0].ops[0].ts_offset_ms, 0, "first snapshot starts its chunk");
 
-  // 4. 4 rapid clicks -> only ONE `$rage_tap` emitted (`P3-05`)
+  // 4. 4 rapid clicks -> only ONE `$rage_tap` emitted
   const clickFn = Array.from(listeners.get("click"))[0];
   for (let i = 0; i < 4; i++) {
     clickFn({ clientX: 100, clientY: 100, target: { closest: () => true } });
@@ -168,7 +168,7 @@ test("P2-04, P2-05, P1-08, P3-05: localStorage persistence, reset(), failure req
     .filter((e) => e.event_name === "$rage_tap");
   assert.equal(rageEvents.length, 1, "4 clicks must emit exactly 1 $rage_tap, not 2");
 
-  // 5. reset() rotates anonId and sessionId (`P1-08`)
+  // 5. reset() rotates anonId and sessionId
   c2.reset();
   assert.notEqual(c2.getDistinctId(), anon1);
   assert.notEqual(c2.getSessionId(), sess1);

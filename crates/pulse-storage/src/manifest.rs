@@ -242,7 +242,7 @@ fn parse_epoch_from_path(path: &str) -> Option<u64> {
     body.parse::<u64>().ok()
 }
 
-/// Pin tracker ensuring compacted/superseded L1 segments are deleted ONLY once all active readers finish (`P1-05`).
+/// Pin tracker ensuring compacted/superseded L1 segments are deleted ONLY once all active readers finish.
 #[derive(Default)]
 pub struct ReaderPinTracker {
     segment_pins: DashMap<String, usize>,
@@ -260,7 +260,7 @@ impl ReaderPinTracker {
             if let Some(mut entry) = self.segment_pins.get_mut(p) {
                 *entry = entry.saturating_sub(1);
             }
-            // Atomic shard-locked conditional removal so a concurrent `0 -> 1` pin is NEVER erased (`P1-05`)!
+            // Atomic shard-locked conditional removal so a concurrent `0 -> 1` pin is NEVER erased!
             self.segment_pins.remove_if(p, |_, v| *v == 0);
         }
     }
@@ -305,7 +305,7 @@ impl StorageSnapshot {
         self.manifest.epoch
     }
 
-    /// Returns captured L0 rows for `bucket_id` strictly inside `(bucket_l0_floor, l0_watermark]` (`P1-07`).
+    /// Returns captured L0 rows for `bucket_id` strictly inside `(bucket_l0_floor, l0_watermark]`.
     pub fn l0_bucket_rows(&self, bucket_id: u8) -> Vec<StoredRow> {
         let Some(slice) = self.l0_buckets.get(bucket_id as usize) else {
             return Vec::new();

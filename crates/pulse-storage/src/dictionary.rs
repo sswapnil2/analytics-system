@@ -57,7 +57,7 @@ impl ProjectDictionary {
         dict
     }
 
-    /// Fallible event interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX` (`P1-12`).
+    /// Fallible event interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX`.
     #[inline]
     pub fn try_get_or_intern_event(&self, event_name: &str) -> Result<u16> {
         if let Some(id) = self.event_to_id.get(event_name) {
@@ -100,7 +100,7 @@ impl ProjectDictionary {
             .collect()
     }
 
-    /// Fallible property-key interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX` (`P1-12`).
+    /// Fallible property-key interning returning `Err(StorageError::DictionaryFull)` instead of silently aliasing onto `u16::MAX`.
     #[inline]
     pub fn try_get_or_intern_prop_key(&self, key: &str) -> Result<u16> {
         if let Some(id) = self.prop_to_id.get(key) {

@@ -39,7 +39,7 @@ fn ev(
 }
 
 #[test]
-fn p0_08_formula_unknown_var_and_trailing_junk_are_rejected() {
+fn formula_unknown_var_and_trailing_junk_are_rejected() {
     let mut vars = HashMap::new();
     vars.insert("A".to_string(), 10.0);
     vars.insert("B".to_string(), 2.0);
@@ -67,7 +67,7 @@ fn p0_08_formula_unknown_var_and_trailing_junk_are_rejected() {
 }
 
 #[test]
-fn p0_08_formula_deep_unary_and_nested_parens_do_not_stack_overflow() {
+fn formula_deep_unary_and_nested_parens_do_not_stack_overflow() {
     let mut vars = HashMap::new();
     vars.insert("A".to_string(), 42.0);
 
@@ -81,7 +81,7 @@ fn p0_08_formula_deep_unary_and_nested_parens_do_not_stack_overflow() {
 }
 
 #[tokio::test]
-async fn p0_09_cyclic_cohort_references_return_error_instead_of_infinite_recursion() {
+async fn cyclic_cohort_references_return_error_instead_of_infinite_recursion() {
     let store = Arc::new(InMemory::new());
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
     let storage = StorageEngine::new(
@@ -152,7 +152,7 @@ async fn p0_09_cyclic_cohort_references_return_error_instead_of_infinite_recursi
 }
 
 #[test]
-fn p2_09c_previous_period_is_exact_inclusive_duration() {
+fn previous_period_is_exact_inclusive_duration() {
     // [1_000, 1_999] is an inclusive 1,000 ms window; previous period must be [0, 999], not [1, 999]!
     let tr = TimeRange {
         start_ts_ms: 1_000,
@@ -169,7 +169,7 @@ fn p2_09c_previous_period_is_exact_inclusive_duration() {
 }
 
 #[tokio::test]
-async fn p2_09i_custom_property_preserves_camel_case_identifiers() {
+async fn custom_property_preserves_camel_case_identifiers() {
     let store = Arc::new(InMemory::new());
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
     let storage = StorageEngine::new(
@@ -264,7 +264,7 @@ async fn p2_09i_custom_property_preserves_camel_case_identifiers() {
 }
 
 #[tokio::test]
-async fn p2_01_inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_cardinality() {
+async fn inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_cardinality() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
@@ -419,7 +419,7 @@ async fn p2_01_inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_
 }
 
 #[tokio::test]
-async fn p2_09_semantics_and_p3_02_governance_regression_suite() {
+async fn semantics_and_governance_regression_suite() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
@@ -831,7 +831,7 @@ async fn p2_09_semantics_and_p3_02_governance_regression_suite() {
 }
 
 #[tokio::test]
-async fn p3_02_per_query_deadline_enforces_timeout() {
+async fn per_query_deadline_enforces_timeout() {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
     let inner = InMemory::new();

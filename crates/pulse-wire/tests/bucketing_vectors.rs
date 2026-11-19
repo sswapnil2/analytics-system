@@ -19,7 +19,7 @@ fn vectors_file_path() -> PathBuf {
 }
 
 #[test]
-fn p2_03_shared_bucketing_test_vectors_match_rust_xxh3_64() {
+fn shared_bucketing_test_vectors_match_rust_xxh3_64() {
     let inputs: Vec<(&str, String)> = vec![
         ("one_tap_upi", "".to_string()),
         ("a", "b".to_string()),

@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p0_07_quic_authenticates_header_before_body_and_caps_streams() {
+    async fn quic_authenticates_header_before_body_and_caps_streams() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let id_router = Arc::new(IdentityRouter::new(store.clone()));
         let storage = StorageEngine::new(

@@ -71,7 +71,7 @@ impl QuicIngestHandle {
 /// Spawns a bounded UDP QUIC listener (`quinn`) sharing `IngestService`.
 ///
 /// Disabled by default in `pulse-node`; when enabled via `--quic-addr`, enforces connection,
-/// stream, window, and idle limits and authenticates the API key BEFORE reading the body (`P0-07`).
+/// stream, window, and idle limits and authenticates the API key BEFORE reading the body.
 pub fn spawn_quic_listener(
     bind_addr: SocketAddr,
     service: Arc<IngestService>,
@@ -183,7 +183,7 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
         return br#"{"status":"error","message":"invalid quic key length"}"#.to_vec();
     }
 
-    // 2. Read ONLY the API key and authenticate BEFORE reading a single byte of the body (`P0-07`)
+    // 2. Read ONLY the API key and authenticate BEFORE reading a single byte of the body
     let Ok(key_bytes) = read_exact_bounded(recv, key_len).await else {
         let _ = recv.stop(400u32.into());
         return br#"{"status":"error","message":"truncated quic api key"}"#.to_vec();

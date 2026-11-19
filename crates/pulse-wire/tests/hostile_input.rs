@@ -72,7 +72,7 @@ where
 }
 
 #[test]
-fn p0_05_zstd_decompression_bomb_rejected_across_all_decoders() {
+fn zstd_decompression_bomb_rejected_across_all_decoders() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 100 MiB of zeros compresses down to ~3.2 KiB with Zstd.
     let uncompressed_bomb = vec![0u8; 100 * 1024 * 1024];
@@ -145,7 +145,7 @@ fn p0_05_zstd_decompression_bomb_rejected_across_all_decoders() {
 }
 
 #[test]
-fn p0_06_string_table_amplification_attack_rejected() {
+fn string_table_amplification_attack_rejected() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 1x 32 KiB string referenced across 4 fields + 4 string props in 3,000 events
     // -> decompressed frame is < 350 KiB, but naive cloning materializes > 768 MiB of Strings!
@@ -188,7 +188,7 @@ fn p0_06_string_table_amplification_attack_rejected() {
 }
 
 #[test]
-fn p0_06_untrusted_replay_op_and_node_counts_do_not_overallocate() {
+fn untrusted_replay_op_and_node_counts_do_not_overallocate() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Craft a tiny uncompressed body claiming `op_count = 4_000_000` with 0 actual ops following.
     let mut raw = Vec::new();

@@ -172,7 +172,7 @@ impl SegmentSessionIndex {
 }
 
 /// Type discriminator preventing `PropValue::Bool(true)` and `PropValue::Str("true")` from colliding
-/// in `SegmentInvertedIndex` (`P1-15`).
+/// in `SegmentInvertedIndex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum InvertedValueTag {

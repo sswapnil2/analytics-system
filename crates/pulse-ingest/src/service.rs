@@ -16,7 +16,7 @@ use thiserror::Error;
 use crate::dedup::{normalize_event_timestamp, DedupRegistry};
 use crate::governance::{DiscoveredEventSchema, GovernanceProvider, ProjectLexiconRules};
 
-/// Per-batch and per-project schema cardinality caps preventing dictionary exhaustion (`P1-12`).
+/// Per-batch and per-project schema cardinality caps preventing dictionary exhaustion.
 pub const MAX_NEW_EVENTS_PER_BATCH: usize = 128;
 pub const MAX_NEW_PROP_KEYS_PER_BATCH: usize = 256;
 pub const MAX_EVENTS_PER_PROJECT: usize = 8_192;
@@ -271,7 +271,7 @@ impl IngestService {
                 continue;
             }
 
-            // 2. Deterministic Bucket Routing & Non-Mutating Dedup Pre-Check (`P1-01`)
+            // 2. Deterministic Bucket Routing & Non-Mutating Dedup Pre-Check
             let seed = if ev.routing_seed.is_empty() {
                 ev.distinct_id.as_str()
             } else {
@@ -289,7 +289,7 @@ impl IngestService {
                 continue;
             }
 
-            // 3. Enforce per-batch and per-project schema cardinality governance (`P1-12`)
+            // 3. Enforce per-batch and per-project schema cardinality governance
             if dict.lookup_event(&ev.event_name).is_none() {
                 new_events_in_batch.insert(ev.event_name.clone());
                 if new_events_in_batch.len() > MAX_NEW_EVENTS_PER_BATCH
@@ -314,7 +314,7 @@ impl IngestService {
                 }
             }
 
-            // 4. Mobile Clock-Skew Normalization (`P1-13`)
+            // 4. Mobile Clock-Skew Normalization
             ev.client_event_ts_ms = normalize_event_timestamp(
                 ev.client_event_ts_ms,
                 ev.client_sent_ts_ms,
@@ -331,7 +331,7 @@ impl IngestService {
             ps.check_l0_backpressure(bucket_id)?;
         }
 
-        // 7. Flush interned u32 identities durably BEFORE writing WAL or scheduling L1 flushes (`P1-10`)!
+        // 7. Flush interned u32 identities durably BEFORE writing WAL or scheduling L1 flushes!
         if !by_bucket.is_empty() && id_graph.has_pending_mutations() {
             id_graph.flush().await?;
         }
@@ -744,7 +744,7 @@ impl IngestService {
     }
 }
 
-/// Applies project Lexicon PII rules and input masking to wireframe replay labels on ingest (`P3-01`).
+/// Applies project Lexicon PII rules and input masking to wireframe replay labels on ingest.
 fn apply_lexicon_to_replay_chunk(chunk: &mut ReplayChunk, rules: &ProjectLexiconRules) {
     let mask_label = |label: &mut String, kind: pulse_wire::NodeKind| {
         if label.is_empty() || label == "████" {

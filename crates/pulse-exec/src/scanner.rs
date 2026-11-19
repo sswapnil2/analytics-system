@@ -629,7 +629,7 @@ pub(crate) fn align_floor_tz_cached(
 }
 
 /// Validates synchronously at save/preview time that a `BehavioralCohortDef` contains no reference cycles
-/// and does not exceed `MAX_COHORT_DEPTH` (`P0-09`).
+/// and does not exceed `MAX_COHORT_DEPTH`.
 pub fn validate_cohort_acyclic(
     self_id: Option<&str>,
     def: &BehavioralCohortDef,

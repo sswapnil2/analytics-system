@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 uniffi::setup_scaffolding!();
 
-/// Strict 10 MiB bound measured on actual on-disk WAL frame bytes (`P2-07`).
+/// Strict 10 MiB bound measured on actual on-disk WAL frame bytes.
 pub const MAX_DISK_QUEUE_BYTES: usize = 10 * 1024 * 1024;
 pub const SESSION_INACTIVITY_TIMEOUT_MS: i64 = 30 * 60 * 1_000; // 30 minutes
 pub const RAGE_TAP_WINDOW_MS: i64 = 800;
@@ -28,7 +28,7 @@ const SDK_WAL_MAGIC: [u8; 4] = *b"PSDK";
 const SDK_WAL_HEADER_LEN: usize = 20; // 4B magic + 8B packet_id + 4B len + 4B crc32
 
 /// Shared background Tokio runtime ensuring `PulseClient` works even when invoked from
-/// bare OS / Kotlin / Swift threads that have no ambient Tokio runtime (`P2-08`).
+/// bare OS / Kotlin / Swift threads that have no ambient Tokio runtime.
 fn sdk_runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -72,7 +72,7 @@ pub struct SdkWireNode {
     pub h: u16,
     pub bg_rgba: u32,
     pub label: String,
-    /// Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+    /// Default-deny privacy: unless `unmasked == true` (and `kind != "masked_input"`),
     /// any non-empty `label` is replaced on client with fixed-length `"████"`.
     #[uniffi(default = false)]
     pub unmasked: bool,
@@ -487,7 +487,7 @@ impl PulseClient {
         });
 
         // Always start background flush worker on `sdk_runtime()` when `flush_interval_ms > 0`,
-        // even if the caller thread has no Tokio runtime (`P2-08`)!
+        // even if the caller thread has no Tokio runtime!
         if config.flush_interval_ms > 0 {
             let weak = Arc::downgrade(&client);
             let interval_ms = config.flush_interval_ms.max(200);
@@ -687,7 +687,7 @@ impl PulseClient {
         Ok(())
     }
 
-    /// Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+    /// Resets identity on logout, sealing pending replay/event rings for the outgoing user
     /// before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
     pub fn reset(&self) -> Result<(), SdkError> {
         self.seal_rings_to_disk_queue()?;
@@ -706,7 +706,7 @@ impl PulseClient {
         Ok(())
     }
 
-    /// Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
+    /// Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking.
     pub fn record_wireframe_snapshot(
         &self,
         width: u16,
@@ -808,7 +808,7 @@ impl PulseClient {
                 .count();
 
             if nearby_count >= 3 {
-                // Clear tap history immediately after detecting a rage-tap cluster (`P3-05`)
+                // Clear tap history immediately after detecting a rage-tap cluster
                 // so clicks 4, 5, ... do not emit duplicate `$rage_tap` events on every tap!
                 taps.clear();
                 InteractionKind::RageTap {
@@ -990,7 +990,7 @@ impl PulseClient {
                 .spawn(async move {
                     match pkt {
                         QueuedPacket::Events(raw_bin) => {
-                            // Stamp `client_sent_ts_ms` at actual transmit time (`P1-13`)!
+                            // Stamp `client_sent_ts_ms` at actual transmit time!
                             let transmit_body = match WireBatch::decode_binary(&raw_bin) {
                                 Ok(mut batch) => {
                                     let tx_now = Utc::now().timestamp_millis();
@@ -1066,7 +1066,7 @@ impl PulseClient {
                     self.backoff_until_ms.store(0, Ordering::Release);
                 }
                 Ok(resp) if matches!(resp.status().as_u16(), 400 | 413 | 422) => {
-                    // Permanent client/schema rejection (`P2-06`): drop poison packet so queue head never stalls forever!
+                    // Permanent client/schema rejection: drop poison packet so queue head never stalls forever!
                     remove_ids.insert(entry.id);
                 }
                 Ok(resp) => {
@@ -1127,7 +1127,7 @@ impl PulseClient {
 
     /// Checks session inactivity, sealing any pending replay ops under the OLD `session_id` BEFORE
     /// rotating `session_id`, and updates `last_activity_ts_ms` monotonically so backdated `track_at`
-    /// timestamps never trigger spurious session rotations (`P3-05`).
+    /// timestamps never trigger spurious session rotations.
     fn touch_activity_and_maybe_rotate(&self, activity_ts_ms: i64) -> Result<String, SdkError> {
         let needs_rotation = {
             let id = self.identity.read();
@@ -1137,7 +1137,7 @@ impl PulseClient {
                     > SESSION_INACTIVITY_TIMEOUT_MS
         };
         if needs_rotation {
-            // Seal pending replay ops attributed to the outgoing session BEFORE rotating (`P3-05`)!
+            // Seal pending replay ops attributed to the outgoing session BEFORE rotating!
             self.seal_replay_ring_only()?;
         }
 
@@ -1229,7 +1229,7 @@ impl PulseClient {
             session_id,
             event_name,
             client_event_ts_ms: event_ts_ms,
-            // Overwritten with actual transmission timestamp in `flush()` (`P1-13`).
+            // Overwritten with actual transmission timestamp in `flush()`.
             client_sent_ts_ms: 0,
             props: merged_props,
             replay_offset_kb: self.replay_offset_kb.load(Ordering::Acquire),
@@ -1423,7 +1423,7 @@ mod tests {
         client.track_at("App_Open".into(), vec![], base_ts).unwrap();
         assert_eq!(client.session_id(), s1);
 
-        // Backdated `track_at` must NOT regress `last_activity_ts_ms` or trigger spurious rotation (`P3-05`)!
+        // Backdated `track_at` must NOT regress `last_activity_ts_ms` or trigger spurious rotation!
         client
             .track_at("Backdated_Import".into(), vec![], base_ts - 3_600_000)
             .unwrap();
@@ -1433,7 +1433,7 @@ mod tests {
             .unwrap();
         assert_eq!(client.session_id(), s1);
 
-        // Record wireframe on session s1 BEFORE 31-minute inactivity gap (`P3-05`)
+        // Record wireframe on session s1 BEFORE 31-minute inactivity gap
         client
             .record_wireframe_snapshot(
                 390,
@@ -1461,7 +1461,7 @@ mod tests {
         let s2 = client.session_id();
         assert_ne!(s1, s2, "session must rotate after 30-min inactivity");
 
-        // 3 rapid taps -> Rage Tap; 4th tap must NOT emit a second Rage Tap (`P3-05`)!
+        // 3 rapid taps -> Rage Tap; 4th tap must NOT emit a second Rage Tap!
         let t_tap = t_later + 1_000;
         assert_eq!(client.record_touch(200, 300, true, t_tap).unwrap(), "tap");
         assert_eq!(
@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p2_06_p2_07_p1_13_concurrent_flush_id_removal_4xx_drop_and_disk_bound() {
+    async fn concurrent_flush_id_removal_4xx_drop_and_disk_bound() {
         let ingest_calls = Arc::new(AtomicUsize::new(0));
         let last_sent_ts = Arc::new(AtomicI64::new(0));
         let return_422_first = Arc::new(AtomicBool::new(true));
@@ -1577,7 +1577,7 @@ mod tests {
             .track_at("Valid_Offline_Batch".into(), vec![], old_event_ts + 1000)
             .unwrap();
 
-        // Race two concurrent `flush()` calls (`P2-06`): single mutex must prevent double-sending or over-popping!
+        // Race two concurrent `flush()` calls: single mutex must prevent double-sending or over-popping!
         let c1 = client.clone();
         let c2 = client.clone();
         let (f1, f2) = tokio::join!(c1.flush(), c2.flush());
@@ -1594,7 +1594,7 @@ mod tests {
             "SDK must stamp client_sent_ts_ms at transmit time, got {transmitted_sent_ts}"
         );
 
-        // Verify `reset()` rotates anon_id and session_id (`P1-08`)
+        // Verify `reset()` rotates anon_id and session_id
         client.identify("alice@pulse.in".into()).unwrap();
         assert_eq!(client.distinct_id(), "alice@pulse.in");
         let prev_sess = client.session_id();
@@ -1603,7 +1603,7 @@ mod tests {
         assert!(client.distinct_id().starts_with("anon_"));
         assert_ne!(client.session_id(), prev_sess);
 
-        // Verify `sdk_wal.bin` CRC corruption truncation & 10 MiB on-disk byte bound (`P2-07`)
+        // Verify `sdk_wal.bin` CRC corruption truncation & 10 MiB on-disk byte bound
         let wal_file = dir.path().join("sdk_wal.bin");
         let offline = PulseClient::new(SdkConfig {
             endpoint_url: "http://127.0.0.1:9".into(),
@@ -1638,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_08_sdk_works_from_plain_os_thread_without_tokio_runtime() {
+    fn sdk_works_from_plain_os_thread_without_tokio_runtime() {
         // Spawn a bare OS thread with ZERO ambient Tokio runtime!
         let handle = std::thread::spawn(|| {
             assert!(

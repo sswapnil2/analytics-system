@@ -26,7 +26,7 @@ struct ReplayChunkMeta {
     size: u64,
 }
 
-/// Validates `project_id` and `session_id` against `[A-Za-z0-9_-]{1,128}` (`P1-16`).
+/// Validates `project_id` and `session_id` against `[A-Za-z0-9_-]{1,128}`.
 pub fn validate_replay_identifier(field: &'static str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
@@ -48,7 +48,7 @@ fn parse_chunk_seq(path: &str) -> Option<u64> {
 }
 
 /// Object-store backed `.plsr` wireframe replay store storing immutable per-chunk objects
-/// at `replays/{project_id}/{session_id}/{seq:010}.plsr` (`P1-16`).
+/// at `replays/{project_id}/{session_id}/{seq:010}.plsr`.
 ///
 /// Eliminates O(n^2) read-modify-write object amplification, prevents multi-writer chunk loss via
 /// conditional `PutMode::Create`, and avoids UTC midnight file splits across process restarts.
@@ -76,7 +76,7 @@ impl ReplayStore {
             .insert((project_id.to_string(), xxh3_64(session_id.as_bytes())));
     }
 
-    /// Scans `replays/{project_id}/` once to populate the in-memory recorded-session index (`PR-1`).
+    /// Scans `replays/{project_id}/` once to populate the in-memory recorded-session index.
     pub async fn warm_project(&self, project_id: &str) {
         if self.warmed_projects.contains(project_id) {
             return;
@@ -106,7 +106,7 @@ impl ReplayStore {
         }
     }
 
-    /// Returns the set of `xxh3_64(session_id)` hashes that currently have a recorded replay (`PR-1`).
+    /// Returns the set of `xxh3_64(session_id)` hashes that currently have a recorded replay.
     pub async fn recorded_hashes_for_project(&self, project_id: &str) -> HashSet<u64> {
         self.warm_project(project_id).await;
         self.recorded_hashes
@@ -115,7 +115,7 @@ impl ReplayStore {
             .collect()
     }
 
-    /// Returns `true` if `session_id` has at least one `.plsr` replay chunk in `project_id` (`PR-1`).
+    /// Returns `true` if `session_id` has at least one `.plsr` replay chunk in `project_id`.
     pub async fn has_session(&self, project_id: &str, session_id: &str) -> bool {
         let key = (project_id.to_string(), session_id.to_string());
         if self.recorded_sessions.contains(&key) {

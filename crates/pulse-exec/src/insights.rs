@@ -678,7 +678,7 @@ async fn evaluate_single_series(
             .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
     }
 
-    // Cap breakdown cardinality to `MAX_BREAKDOWN_GROUPS`, folding tail groups into `"$other"` (`P3-02`).
+    // Cap breakdown cardinality to `MAX_BREAKDOWN_GROUPS`, folding tail groups into `"$other"`.
     let mut group_vec: Vec<(String, BreakdownGroup)> = groups.into_iter().collect();
     if group_vec.len() > MAX_BREAKDOWN_GROUPS {
         group_vec.sort_by(|a, b| {
@@ -814,7 +814,7 @@ fn evaluate_formulas(
 /// Recursive-descent arithmetic expression evaluator (`+`, `-`, `*`, `/`, unary `+/-`, parens, numbers, and series variables).
 ///
 /// Enforces length (`<= 1024` bytes) and recursion depth (`<= 64`), rejects unknown variables and trailing tokens,
-/// and returns `Ok(None)` on division by zero or non-finite values (`P0-08`).
+/// and returns `Ok(None)` on division by zero or non-finite values.
 pub fn eval_math_expr(expr: &str, vars: &HashMap<String, f64>) -> Result<Option<f64>> {
     let opt_vars: HashMap<String, Option<f64>> =
         vars.iter().map(|(k, &v)| (k.clone(), Some(v))).collect();

@@ -73,7 +73,7 @@ async fn send_json(
 }
 
 #[tokio::test]
-async fn p0_01_admin_routes_require_bearer_token_and_reject_public_ingest_keys() {
+async fn admin_routes_require_bearer_token_and_reject_public_ingest_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
 
@@ -130,7 +130,7 @@ async fn p0_01_admin_routes_require_bearer_token_and_reject_public_ingest_keys()
 }
 
 #[tokio::test]
-async fn p0_02_keys_never_exposed_in_status_or_list_and_stored_hashed() {
+async fn keys_never_exposed_in_status_or_list_and_stored_hashed() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
     let admin = Some("sk_root_test_admin_secret_0123456789");
@@ -183,7 +183,7 @@ async fn p0_02_keys_never_exposed_in_status_or_list_and_stored_hashed() {
 }
 
 #[tokio::test]
-async fn p0_03_cross_tenant_upserts_and_project_hijack_are_rejected() {
+async fn cross_tenant_upserts_and_project_hijack_are_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
     let admin = Some("sk_root_test_admin_secret_0123456789");
@@ -256,7 +256,7 @@ async fn p0_03_cross_tenant_upserts_and_project_hijack_are_rejected() {
 }
 
 #[tokio::test]
-async fn p0_04_cross_project_idor_reads_and_mcp_project_override_blocked() {
+async fn cross_project_idor_reads_and_mcp_project_override_blocked() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
     let admin = Some("sk_root_test_admin_secret_0123456789");

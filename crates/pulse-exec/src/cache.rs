@@ -53,7 +53,7 @@ impl TierAColumns {
     }
 }
 
-/// Hybrid RAM + NVMe Block Cache (`foyer`) + byte-bounded decoded columnar caches (`moka`) (`P3-03`).
+/// Hybrid RAM + NVMe Block Cache (`foyer`) + byte-bounded decoded columnar caches (`moka`).
 pub struct SegmentBlockCache {
     hybrid: HybridCache<String, Vec<u8>>,
     reader: Arc<VortexSegmentReader>,

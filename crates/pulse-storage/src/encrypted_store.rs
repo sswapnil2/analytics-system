@@ -450,7 +450,7 @@ impl EncryptedObjectStore {
     }
 
     /// Registers a 256-bit key under `key_id` into the persistent decryption keyring.
-    /// When `make_active` is true, new writes encrypt using `key_id` while older `key_id`s remain readable (`C4`).
+    /// When `make_active` is true, new writes encrypt using `key_id` while older `key_id`s remain readable.
     pub fn register_master_key(
         &self,
         key_id: &str,
@@ -469,7 +469,7 @@ impl EncryptedObjectStore {
         Ok(())
     }
 
-    /// Stops encrypting *new* writes while preserving the decryption keyring so all existing objects stay readable (`C3`).
+    /// Stops encrypting *new* writes while preserving the decryption keyring so all existing objects stay readable.
     pub fn disable_new_encryption(&self) {
         *self.active_key_id.write() = None;
     }

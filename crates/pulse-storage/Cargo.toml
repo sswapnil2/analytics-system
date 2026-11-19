@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Pulse storage: write-ahead log, columnar segments and object-store backends"
 
 [dependencies]
 pulse-wire.workspace = true

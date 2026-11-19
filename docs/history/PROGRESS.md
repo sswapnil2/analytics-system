@@ -59,7 +59,7 @@
   - [x] Zero-dependency TypeScript SDK (shared `xxh3_64` bucketing, `localStorage` persistence, `reset()`, failure requeue + backoff, unconditional `visibilitychange` `keepalive`, default-deny DOM/title/contenteditable `"████"` masking, listener cleanup)
 - [x] Implement `crates/pulse-node` *(verified: P0-01, P0-02, P0-07, P3-05, Section 6)*:
   - [x] Secure defaults (`127.0.0.1` bind, random first-boot `pk_`/`sk_` keys printed once, `--seed` opt-in, `--quic` opt-in, restricted admin CORS, `SIGTERM` graceful shutdown)
-- [x] **Acceptance Gate 4** (`crates/pulse-control/tests/security_and_tenancy.rs`, `crates/pulse-control/tests/p2_flags_and_experiments.rs`, `pulse-node` `gate4`)
+- [x] **Acceptance Gate 4** (`crates/pulse-control/tests/security_and_tenancy.rs`, `crates/pulse-control/tests/flags_and_experiments.rs`, `pulse-node` `gate4`)
 
 ## Milestone 5: `web/` Full Analytics Studio, Production Build & End-to-End Verification
 - [x] Scaffold `web/` (Vite + React + TypeScript + Tailwind dark-mode `#090d16` studio)

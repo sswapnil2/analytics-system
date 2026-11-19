@@ -1549,7 +1549,7 @@ public interface PulseClientInterface {
     fun `recordTouch`(`x`: kotlin.UShort, `y`: kotlin.UShort, `targetIsInteractive`: kotlin.Boolean, `tsMs`: kotlin.Long): kotlin.String
     
     /**
-     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking.
      */
     fun `recordWireframeSnapshot`(`width`: kotlin.UShort, `height`: kotlin.UShort, `nodes`: List<SdkWireNode>)
     
@@ -1558,7 +1558,7 @@ public interface PulseClientInterface {
     fun `registerSuperProps`(`propsJson`: kotlin.String)
     
     /**
-     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * Resets identity on logout, sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
      */
     fun `reset`()
@@ -1839,7 +1839,7 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
-     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking.
      */
     @Throws(SdkException::class)override fun `recordWireframeSnapshot`(`width`: kotlin.UShort, `height`: kotlin.UShort, `nodes`: List<SdkWireNode>)
         = 
@@ -1888,7 +1888,7 @@ open class PulseClient: Disposable, AutoCloseable, PulseClientInterface {
 
     
     /**
-     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * Resets identity on logout, sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
      */
     @Throws(SdkException::class)override fun `reset`()
@@ -2083,7 +2083,7 @@ data class SdkWireNode (
     var `bgRgba`: kotlin.UInt, 
     var `label`: kotlin.String, 
     /**
-     * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+     * Default-deny privacy: unless `unmasked == true` (and `kind != "masked_input"`),
      * any non-empty `label` is replaced on client with fixed-length `"████"`.
      */
     var `unmasked`: kotlin.Boolean = false

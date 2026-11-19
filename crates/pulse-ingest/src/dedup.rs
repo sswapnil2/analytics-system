@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 
 pub const DEDUP_WINDOW_MS: i64 = 15 * 60 * 1_000;
-/// Hard per-bucket window cap preventing unbounded RAM growth under UUID flood (`P3-03`).
+/// Hard per-bucket window cap preventing unbounded RAM growth under UUID flood.
 pub const MAX_DEDUP_WINDOW_ENTRIES: usize = 524_288;
 
 struct RotatingRing {
@@ -43,7 +43,7 @@ impl RotatingRing {
     fn insert_bounded(&mut self, fp: u64, now_ms: i64) {
         self.rotate_if_needed(now_ms);
         if self.current.len() >= MAX_DEDUP_WINDOW_ENTRIES {
-            // Rotate early under memory pressure rather than growing without bound (`P3-03`).
+            // Rotate early under memory pressure rather than growing without bound.
             self.previous = std::mem::take(&mut self.current);
         }
         self.current.insert(fp);
@@ -76,7 +76,7 @@ impl DedupRegistry {
         Self::default()
     }
 
-    /// Non-mutating check used BEFORE durable WAL append (`P1-01`).
+    /// Non-mutating check used BEFORE durable WAL append.
     pub fn contains(&self, project_id: &str, bucket_id: u8, fp: u64, now_ms: i64) -> bool {
         let key = (project_id.to_string(), bucket_id);
         let entry = self
@@ -87,7 +87,7 @@ impl DedupRegistry {
         found
     }
 
-    /// Commits fingerprints ONLY AFTER durable WAL + MemBucket append succeeds (`P1-01`).
+    /// Commits fingerprints ONLY AFTER durable WAL + MemBucket append succeeds.
     pub fn commit_batch(&self, project_id: &str, bucket_id: u8, fps: &[u64], now_ms: i64) {
         if fps.is_empty() {
             return;
@@ -125,7 +125,7 @@ impl DedupRegistry {
     }
 }
 
-/// Clock-skew normalizer implementing Pulse's mobile clock-drift correction law (`P1-13`).
+/// Clock-skew normalizer implementing Pulse's mobile clock-drift correction law.
 ///
 /// Only adjusts when `client_sent_ts_ms > 0` (present on SDK transmissions, `0` on server-side/backfill JSON)
 /// and `client_event_ts_ms <= client_sent_ts_ms`, shifting by `(server_now_ms - client_sent_ts_ms)` when

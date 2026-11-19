@@ -587,7 +587,7 @@ public protocol PulseClientProtocol : AnyObject {
     func recordTouch(x: UInt16, y: UInt16, targetIsInteractive: Bool, tsMs: Int64) throws  -> String
     
     /**
-     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking.
      */
     func recordWireframeSnapshot(width: UInt16, height: UInt16, nodes: [SdkWireNode]) throws 
     
@@ -596,7 +596,7 @@ public protocol PulseClientProtocol : AnyObject {
     func registerSuperProps(propsJson: String) throws 
     
     /**
-     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * Resets identity on logout, sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
      */
     func reset() throws 
@@ -799,7 +799,7 @@ open func recordTouch(x: UInt16, y: UInt16, targetIsInteractive: Bool, tsMs: Int
 }
     
     /**
-     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking (`P3-01`).
+     * Records a wireframe layout snapshot with default-deny fixed-length `"████"` PII masking.
      */
 open func recordWireframeSnapshot(width: UInt16, height: UInt16, nodes: [SdkWireNode])throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
     uniffi_pulse_sdk_core_fn_method_pulseclient_record_wireframe_snapshot(self.uniffiClonePointer(),
@@ -835,7 +835,7 @@ open func registerSuperProps(propsJson: String)throws  {try rustCallWithError(Ff
 }
     
     /**
-     * Resets identity on logout (`P1-08`), sealing pending replay/event rings for the outgoing user
+     * Resets identity on logout, sealing pending replay/event rings for the outgoing user
      * before rotating `anon_id` and `session_id` so a subsequent login on the same device never merges two users!
      */
 open func reset()throws  {try rustCallWithError(FfiConverterTypeSdkError.lift) {
@@ -1061,7 +1061,7 @@ public struct SdkWireNode {
     public var bgRgba: UInt32
     public var label: String
     /**
-     * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+     * Default-deny privacy: unless `unmasked == true` (and `kind != "masked_input"`),
      * any non-empty `label` is replaced on client with fixed-length `"████"`.
      */
     public var unmasked: Bool
@@ -1073,7 +1073,7 @@ public struct SdkWireNode {
          * `"screen" | "container" | "button" | "masked_input" | "text" | "image_placeholder" | "error_banner"`
          */kind: String, x: UInt16, y: UInt16, w: UInt16, h: UInt16, bgRgba: UInt32, label: String, 
         /**
-         * Default-deny privacy (`P3-01`): unless `unmasked == true` (and `kind != "masked_input"`),
+         * Default-deny privacy: unless `unmasked == true` (and `kind != "masked_input"`),
          * any non-empty `label` is replaced on client with fixed-length `"████"`.
          */unmasked: Bool = false) {
         self.nodeId = nodeId

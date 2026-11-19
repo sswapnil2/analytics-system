@@ -36,7 +36,7 @@ pub fn evaluate_edge_flag(rule: &EdgeFlagRule, distinct_id: &str) -> Option<Stri
 }
 
 /// Builds an `EdgeFlagBundle` without a `QueryEngine` (for non-cohort unit callers).
-/// Any flag carrying a `targeting_cohort_id` fails closed (`Some(vec![])`) rather than failing open to 100% of users (`P2-02`).
+/// Any flag carrying a `targeting_cohort_id` fails closed (`Some(vec![])`) rather than failing open to 100% of users.
 pub fn build_edge_flag_bundle(
     project_id: &str,
     flags: &[FeatureFlag],
@@ -66,7 +66,7 @@ pub fn build_edge_flag_bundle(
 }
 
 /// Builds an `EdgeFlagBundle` evaluating any `targeting_cohort_id` through `QueryEngine` into exact
-/// hashed member lists (`P2-02`); raw ids never leave the server.
+/// hashed member lists; raw ids never leave the server.
 pub async fn build_edge_flag_bundle_with_cohorts(
     project_id: &str,
     flags: &[FeatureFlag],
@@ -268,7 +268,7 @@ async fn evaluate_metric_for_experiment(
     Ok((rows, counts_by_variant))
 }
 
-/// Pearson's Chi-square Sample Ratio Mismatch test against configured variant `weight_bps` (`P2-10`).
+/// Pearson's Chi-square Sample Ratio Mismatch test against configured variant `weight_bps`.
 /// Flags `sample_ratio_mismatch = true` when `total_n >= 50` and `p < 0.001`.
 pub fn compute_sample_ratio_mismatch(
     counts_by_variant: &BTreeMap<String, (u64, u64)>,
@@ -311,7 +311,7 @@ pub fn compute_sample_ratio_mismatch(
 
 /// Computes Frequentist Two-Proportion Z-test (`p_value` with Holm-Bonferroni multi-variant adjustment),
 /// Fieller/Delta 95% relative lift CI (accounting for control `p_c` variance), and 20,000-draw Monte Carlo
-/// Bayesian Beta-Binomial `P(Treatment > Control)` (`P2-10`).
+/// Bayesian Beta-Binomial `P(Treatment > Control)`.
 pub fn compute_statistical_lift_table(
     counts_by_variant: &BTreeMap<String, (u64, u64)>,
 ) -> Vec<VariantLiftRow> {
@@ -396,7 +396,7 @@ pub fn compute_statistical_lift_table(
             0.0
         };
 
-        // Fieller's theorem / Delta-method 95% CI on relative lift `(p_t / p_c - 1)` accounting for uncertainty in BOTH `p_t` and `p_c` (`P2-10`).
+        // Fieller's theorem / Delta-method 95% CI on relative lift `(p_t / p_c - 1)` accounting for uncertainty in BOTH `p_t` and `p_c`.
         let (ci95_low_pct, ci95_high_pct) = relative_lift_ci95_pct(p_c, n_c, p_t, n_t);
 
         // Pooled two-proportion Z-test for two-sided p-value
@@ -438,7 +438,7 @@ pub fn compute_statistical_lift_table(
         });
     }
 
-    // Apply Holm-Bonferroni step-down family-wise error correction across all `m` treatment variants (`P2-10`).
+    // Apply Holm-Bonferroni step-down family-wise error correction across all `m` treatment variants.
     let m = treatment_indices.len();
     if m > 0 {
         treatment_indices.sort_by(|&a, &b| {
@@ -461,7 +461,7 @@ pub fn compute_statistical_lift_table(
 }
 
 /// Fieller's exact 95% confidence interval for relative lift `(p_t / p_c - 1) * 100%`
-/// (with Delta-method fallback when `g >= 0.99`), propagating variance from BOTH `p_t` and `p_c` (`P2-10`).
+/// (with Delta-method fallback when `g >= 0.99`), propagating variance from BOTH `p_t` and `p_c`.
 fn relative_lift_ci95_pct(p_c: f64, n_c: u64, p_t: f64, n_t: u64) -> (f64, f64) {
     if p_c <= 1e-12 || n_c == 0 || n_t == 0 {
         return (0.0, 0.0);

@@ -1,7 +1,7 @@
 /**
  * Pulse Analytics — Zero-Dependency Web & React Native SDK (`@pulse-analytics/ts-web`)
  *
- * Privacy-by-Design Invariant (`P3-01`):
+ * Privacy-by-Design Invariant:
  * Never records screenshots, canvases, or unmasked text/inputs. All text, titles, inputs, and
  * `contenteditable` elements are masked to fixed-length `"████"` on the client unless explicitly
  * allowlisted via `data-pulse-unmask` (inputs and contenteditable remain masked unconditionally).
@@ -164,7 +164,7 @@ function stripQuery(url: string): string {
 }
 
 /**
- * Default-deny PII masking (`P3-01`): returns fixed-length `"████"` for every non-empty string
+ * Default-deny PII masking: returns fixed-length `"████"` for every non-empty string
  * unless `explicitlyUnmasked === true`. Never leaks prefix labels or character lengths.
  */
 export function maskPiiText(raw: string, explicitlyUnmasked = false): string {
@@ -383,7 +383,7 @@ export class PulseWebClient {
     }
 
     if (typeof window !== "undefined" && typeof document !== "undefined") {
-      // Unconditional visibilitychange listener (`P2-05`) so both events and replay ops flush on page hide!
+      // Unconditional visibilitychange listener so both events and replay ops flush on page hide!
       this.boundVisibilityListener = () => {
         if (document.visibilityState === "hidden") {
           this.flushBeacon();
@@ -652,7 +652,7 @@ export class PulseWebClient {
         };
       }
     } catch {
-      // Ignore storage quota / SecurityError in sandboxed contexts (`P2-04`).
+      // Ignore storage quota / SecurityError in sandboxed contexts.
     }
     return null;
   }
@@ -713,7 +713,7 @@ export class PulseWebClient {
       };
       localStorage.setItem(this.storageKey, JSON.stringify(payload));
     } catch {
-      // Ignore storage quota / SecurityError (`P2-04`).
+      // Ignore storage quota / SecurityError.
     }
   }
 
@@ -750,7 +750,7 @@ export class PulseWebClient {
 
   private touchSession(now: number): void {
     if (now > this.lastActivityMs && now - this.lastActivityMs > SESSION_TIMEOUT_MS) {
-      // Seal pending replay ops under the outgoing session BEFORE rotating (`P3-05`)!
+      // Seal pending replay ops under the outgoing session BEFORE rotating!
       this.sealPendingReplayOps();
       this.sessionId = randomId("sess");
       this.replayOffsetKb = 0;
@@ -1034,7 +1034,7 @@ export class PulseWebClient {
   }
 
   /**
-   * Resets identity on logout (`P1-08`), rotating `anonId` and `sessionId` so shared-device logins
+   * Resets identity on logout, rotating `anonId` and `sessionId` so shared-device logins
    * never merge two distinct authenticated users.
    */
   public reset(): void {
@@ -1189,7 +1189,7 @@ export class PulseWebClient {
   }
 
   /**
-   * Walks live DOM bounding boxes and emits a default-deny masked wireframe snapshot (`P3-01`).
+   * Walks live DOM bounding boxes and emits a default-deny masked wireframe snapshot.
    */
   public captureDomWireframeSnapshot(): void {
     if (this.optedOut || !this.isRecordingSession()) return;
@@ -1313,7 +1313,7 @@ export class PulseWebClient {
       const offset = Math.max(0, now - this.chunkStartTsMs);
 
       if (cluster.length >= 3) {
-        // Clear click history immediately after rage-tap detection (`P3-05`)!
+        // Clear click history immediately after rage-tap detection!
         this.recentClicks = [];
         this.replayOps.push({
           op: "pointer_interaction",

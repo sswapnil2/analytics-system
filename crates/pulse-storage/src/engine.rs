@@ -29,7 +29,7 @@ use crate::segment::{write_vortex_segment, SegmentMeta, VortexSegmentReader};
 use crate::wal::BucketWal;
 
 pub const DEFAULT_NUM_BUCKETS: u16 = 16;
-/// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback (`P3-04`).
+/// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback.
 const DEDUP_SEED_LOOKBACK_MS: i64 = 30 * 60 * 1_000;
 const MAX_SESSION_FLAGS_CACHE_ENTRIES: u64 = 262_144;
 
@@ -213,7 +213,7 @@ impl ProjectStorage {
             let mut seen_replay_fps: HashSet<u64> = HashSet::new();
 
             // Seed dedup ONLY from recent L1 segments (`max_ts_ms >= now - 30 min`) so startup cost is O(recent),
-            // not O(total history) (`P3-04`).
+            // not O(total history).
             let cutoff_ts_ms = Utc::now()
                 .timestamp_millis()
                 .saturating_sub(DEDUP_SEED_LOOKBACK_MS);
@@ -305,7 +305,7 @@ impl ProjectStorage {
         StorageSnapshot::new(manifest, watermark, l0_buckets, self.pin_tracker.clone())
     }
 
-    /// Reads L0 rows for `bucket_id` strictly from the snapshot's captured MVCC state (`P1-07`).
+    /// Reads L0 rows for `bucket_id` strictly from the snapshot's captured MVCC state.
     pub fn snapshot_l0_bucket(&self, snap: &StorageSnapshot, bucket_id: u8) -> Vec<StoredRow> {
         snap.l0_bucket_rows(bucket_id)
     }
@@ -498,7 +498,7 @@ impl ProjectStorage {
         };
         let _bucket_guard = flush_lock.lock().await;
 
-        // Guarantee interned u32 identities are durable in SlateDB BEFORE publishing any L1 segment (`P1-10`).
+        // Guarantee interned u32 identities are durable in SlateDB BEFORE publishing any L1 segment.
         self.id_graph.flush().await?;
 
         let floor_l0 = self
@@ -712,7 +712,7 @@ impl ProjectStorage {
     }
 
     /// Background/manual Late-Data Compactor: merges any `(date, bucket)` partition with `>= min_segments`
-    /// overlapping L1 segments into a single sorted Vortex segment under a per-partition lock (`P1-06`).
+    /// overlapping L1 segments into a single sorted Vortex segment under a per-partition lock.
     pub async fn compact_overdue(&self, reader: &VortexSegmentReader) -> Result<usize> {
         self.compact_min_segments(reader, self.config.compaction_min_segments)
             .await
@@ -790,7 +790,7 @@ impl ProjectStorage {
                         .entry((date, bucket_id))
                         .or_default();
 
-                    // Verify ALL `source_ids` are still active before replacing them (`P1-06`).
+                    // Verify ALL `source_ids` are still active before replacing them.
                     let active_ids: HashSet<&str> =
                         entry.iter().map(|s| s.segment_id.as_str()).collect();
                     if !source_ids
@@ -821,7 +821,7 @@ impl ProjectStorage {
         Ok(compacted_partitions)
     }
 
-    /// Deletes superseded segment files whose active reader pin count is 0, re-checked under `manifest.read()` (`P1-05`).
+    /// Deletes superseded segment files whose active reader pin count is 0, re-checked under `manifest.read()`.
     pub async fn run_gc(&self) -> Result<usize> {
         let candidates = {
             let mf_guard = self.manifest.read();

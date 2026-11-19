@@ -570,7 +570,7 @@ impl QueryEngine {
     }
 
     /// Searches sessions leveraging `SessionIndex` 64-bit event Bloom bitmasks, frustration flags,
-    /// and `limit` pushdown (`P3-02`) BEFORE reading any Tier A/B arrays on pruned segments!
+    /// and `limit` pushdown BEFORE reading any Tier A/B arrays on pruned segments!
     pub async fn search_sessions(
         &self,
         project_id: &str,
@@ -650,7 +650,7 @@ impl QueryEngine {
             let mut top_heap: BinaryHeap<Reverse<RankedSession>> = BinaryHeap::with_capacity(limit);
             let erased = ps.erased_snapshot();
 
-            // 1. Scan hot L0 `MemBucket` sessions first to establish an immediate recency floor for `limit` pushdown (`P3-02`)
+            // 1. Scan hot L0 `MemBucket` sessions first to establish an immediate recency floor for `limit` pushdown
             type L0SessionAcc = (u16, Vec<(i64, u16, u32)>);
             let mut l0_grouped: HashMap<(u32, String), L0SessionAcc> = HashMap::new();
             for b in 0..ps.config().num_buckets {
@@ -745,7 +745,7 @@ impl QueryEngine {
                 );
             }
 
-            // 2. Scan L1 Vortex segments newest-first (`footer.max_ts_ms DESC`), pushing `limit` down (`P3-02`)
+            // 2. Scan L1 Vortex segments newest-first (`footer.max_ts_ms DESC`), pushing `limit` down
             let mut segs = snap.segments_for_range(start_date, end_date, None);
             segs.sort_by_key(|s| Reverse(s.footer.max_ts_ms));
 

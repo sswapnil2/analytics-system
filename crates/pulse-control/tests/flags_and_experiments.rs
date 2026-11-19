@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn p2_02_and_p2_09f_flag_cohort_targeting_and_sub_24h_experiment_window() {
+async fn flag_cohort_targeting_and_sub_24h_experiment_window() {
     let store = build_from_url("memory://").unwrap();
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
     let storage = StorageEngine::new(
@@ -156,7 +156,7 @@ async fn p2_02_and_p2_09f_flag_cohort_targeting_and_sub_24h_experiment_window() 
         serde_json::from_slice(&to_bytes(coh_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     let cohort_id = coh_json["id"].as_str().unwrap().to_string();
 
-    // 2. Create flag targeted at `cohort_id` at 100% rollout (`P2-02`)
+    // 2. Create flag targeted at `cohort_id` at 100% rollout
     let flag_resp = app
         .clone()
         .oneshot(
@@ -184,7 +184,7 @@ async fn p2_02_and_p2_09f_flag_cohort_targeting_and_sub_24h_experiment_window() 
         .unwrap();
     assert_eq!(flag_resp.status(), StatusCode::OK);
 
-    // Fetch public flag bundle -> `beta_tester` MUST match, `regular_user` MUST get `None` (`P2-02`)!
+    // Fetch public flag bundle -> `beta_tester` MUST match, `regular_user` MUST get `None`!
     let bundle_resp = app
         .clone()
         .oneshot(
@@ -284,7 +284,7 @@ async fn p2_02_and_p2_09f_flag_cohort_targeting_and_sub_24h_experiment_window() 
 }
 
 #[test]
-fn p2_10_srm_detection_holm_bonferroni_and_fieller_ci() {
+fn srm_detection_holm_bonferroni_and_fieller_ci() {
     let mut skewed = BTreeMap::new();
     skewed.insert("control".to_string(), (650u64, 65u64));
     skewed.insert("treatment".to_string(), (350u64, 55u64));

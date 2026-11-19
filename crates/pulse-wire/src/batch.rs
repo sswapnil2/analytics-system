@@ -25,7 +25,7 @@ pub const MAX_BATCH_EVENTS: usize = 250_000;
 /// Maximum pre-allocated `Vec` elements before verifying individual entries from the stream.
 pub(crate) const MAX_INITIAL_VEC_CAP: usize = 65_536;
 
-/// Shared bounded Zstd decoder preventing decompression-bomb memory exhaustion (`P0-05`).
+/// Shared bounded Zstd decoder preventing decompression-bomb memory exhaustion.
 pub fn decode_zstd_bounded(
     compressed: &[u8],
     dict: Option<&[u8]>,

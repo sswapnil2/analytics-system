@@ -1,6 +1,6 @@
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Shared deterministic flag rollout slot in `0..10_000` (`xxh3_64("{flag_key}:{distinct_id}") % 10_000`) (`P2-03`).
+/// Shared deterministic flag rollout slot in `0..10_000` (`xxh3_64("{flag_key}:{distinct_id}") % 10_000`).
 #[inline]
 pub fn flag_rollout_slot(flag_key: &str, distinct_id: &str) -> u32 {
     let mut buf = Vec::with_capacity(flag_key.len() + 1 + distinct_id.len());
@@ -10,7 +10,7 @@ pub fn flag_rollout_slot(flag_key: &str, distinct_id: &str) -> u32 {
     (xxh3_64(&buf) % 10_000) as u32
 }
 
-/// Shared deterministic variant allocation slot in `0..total_weight` (`xxh3_64("var:{flag_key}:{distinct_id}") % total_weight`) (`P2-03`).
+/// Shared deterministic variant allocation slot in `0..total_weight` (`xxh3_64("var:{flag_key}:{distinct_id}") % total_weight`).
 #[inline]
 pub fn flag_variant_slot(flag_key: &str, distinct_id: &str, total_weight: u32) -> u32 {
     if total_weight == 0 {
@@ -54,7 +54,7 @@ impl CohortGate<'_> {
 
 /// Evaluates a feature flag rule deterministically across Control Plane and SDKs (`P2-02`, `P2-03`).
 ///
-/// With `cohort: Some(gate)`, the flag only matches users in the gate (`P2-02`).
+/// With `cohort: Some(gate)`, the flag only matches users in the gate.
 pub fn evaluate_flag_rule<'a, I>(
     flag_key: &str,
     enabled: bool,

@@ -149,7 +149,7 @@ fn make_event(uuid_byte: u8, seed: &str, uid: &str, ts: i64) -> WireEvent {
 }
 
 #[tokio::test]
-async fn p1_01_wal_put_failure_does_not_poison_dedup_on_retry() {
+async fn wal_put_failure_does_not_poison_dedup_on_retry() {
     let hook = HookStore::new();
     let store: Arc<dyn ObjectStore> = hook.clone();
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
@@ -185,7 +185,7 @@ async fn p1_01_wal_put_failure_does_not_poison_dedup_on_retry() {
 }
 
 #[tokio::test]
-async fn p1_02_out_of_order_wal_puts_never_lose_acknowledged_rows() {
+async fn out_of_order_wal_puts_never_lose_acknowledged_rows() {
     let hook = HookStore::new();
     hook.delay_first_wal_ms.store(80, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = hook.clone();
@@ -280,7 +280,7 @@ async fn p1_02_out_of_order_wal_puts_never_lose_acknowledged_rows() {
 }
 
 #[tokio::test]
-async fn p1_03_default_local_object_store_uses_fsync_wrapper() {
+async fn default_local_object_store_uses_fsync_wrapper() {
     let tmp = tempfile::tempdir().unwrap();
     let store = build_object_store(tmp.path()).unwrap();
     let desc = format!("{store}");
@@ -291,7 +291,7 @@ async fn p1_03_default_local_object_store_uses_fsync_wrapper() {
 }
 
 #[tokio::test]
-async fn p1_04_corrupt_wal_frame_is_quarantined_and_header_seq_is_crc_protected() {
+async fn corrupt_wal_frame_is_quarantined_and_header_seq_is_crc_protected() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     // 1. Write seq 1 (valid), seq 2 (will be corrupted on object store), seq 3 (valid)
@@ -356,7 +356,7 @@ async fn p1_04_corrupt_wal_frame_is_quarantined_and_header_seq_is_crc_protected(
 }
 
 #[test]
-fn p1_05_reader_pin_tracker_atomic_remove_if_never_drops_concurrent_pin() {
+fn reader_pin_tracker_atomic_remove_if_never_drops_concurrent_pin() {
     let tracker = Arc::new(ReaderPinTracker::default());
     let seg = vec!["segments/p/20261116/bucket_000/seg_hot.vortex".to_string()];
 
@@ -384,7 +384,7 @@ fn p1_05_reader_pin_tracker_atomic_remove_if_never_drops_concurrent_pin() {
 }
 
 #[tokio::test]
-async fn p1_06_concurrent_compactions_do_not_duplicate_rows() {
+async fn concurrent_compactions_do_not_duplicate_rows() {
     let hook = HookStore::new();
     let store: Arc<dyn ObjectStore> = hook.clone();
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
@@ -435,7 +435,7 @@ async fn p1_06_concurrent_compactions_do_not_duplicate_rows() {
 }
 
 #[tokio::test]
-async fn p1_07_snapshot_taken_before_flush_never_misses_evicted_l0_rows() {
+async fn snapshot_taken_before_flush_never_misses_evicted_l0_rows() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let id_router = Arc::new(IdentityRouter::new(store.clone()));
     let storage = StorageEngine::new(
@@ -473,7 +473,7 @@ async fn p1_07_snapshot_taken_before_flush_never_misses_evicted_l0_rows() {
 }
 
 #[tokio::test]
-async fn p1_10_interned_ids_are_durable_before_inline_l1_flush() {
+async fn interned_ids_are_durable_before_inline_l1_flush() {
     let hook = HookStore::new();
     // Bucket 1 WAL will fail, while Bucket 0 succeeds and triggers inline L1 flush (`threshold = 1`)!
     hook.fail_bucket1_wal.store(true, Ordering::SeqCst);
@@ -542,7 +542,7 @@ async fn p1_10_interned_ids_are_durable_before_inline_l1_flush() {
 }
 
 #[test]
-fn p1_12_dictionary_does_not_silently_alias_at_u16_max() {
+fn dictionary_does_not_silently_alias_at_u16_max() {
     let keys: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("k_{i}")).collect();
     let dict = ProjectDictionary::from_snapshot(ProjectDictSnapshot {
         events: Vec::new(),
@@ -563,7 +563,7 @@ fn p1_12_dictionary_does_not_silently_alias_at_u16_max() {
 }
 
 #[tokio::test]
-async fn p1_13_and_p1_14_json_backfill_timestamps_and_distinct_prop_uuids_preserved() {
+async fn json_backfill_timestamps_and_distinct_prop_uuids_preserved() {
     // Check overflow safety on extreme i64 timestamps
     let _ = normalize_event_timestamp(i64::MIN, i64::MAX, 0);
 
@@ -610,7 +610,7 @@ async fn p1_13_and_p1_14_json_backfill_timestamps_and_distinct_prop_uuids_preser
 }
 
 #[tokio::test]
-async fn p1_15_bool_true_and_str_true_do_not_collide_in_inverted_index() {
+async fn bool_true_and_str_true_do_not_collide_in_inverted_index() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
 
@@ -658,7 +658,7 @@ async fn p1_15_bool_true_and_str_true_do_not_collide_in_inverted_index() {
 }
 
 #[tokio::test]
-async fn p1_16_replay_store_immutable_chunks_survive_midnight_restart_and_reject_traversal() {
+async fn replay_store_immutable_chunks_survive_midnight_restart_and_reject_traversal() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     let day1_23_59 = 1_763_251_140_000i64; // 2025-11-15 23:59:00 UTC

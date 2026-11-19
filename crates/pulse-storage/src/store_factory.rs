@@ -21,7 +21,7 @@ use url::Url;
 use crate::error::{Result, StorageError};
 
 /// Durable wrapper around `object_store::local::LocalFileSystem` that issues `File::sync_data`
-/// on the written file AND `File::sync_all` on its parent directory after every `put_opts` (`P1-03`),
+/// on the written file AND `File::sync_all` on its parent directory after every `put_opts`,
 /// guaranteeing true RPO = 0 crash durability on local ext4/APFS/XFS filesystems.
 #[derive(Debug)]
 pub struct DurableLocalObjectStore {
@@ -135,7 +135,7 @@ impl ObjectStore for DurableLocalObjectStore {
 ///
 /// Honors `PULSE_OBJECT_STORE_URL` (`s3://bucket`, `memory://`, or `file:///path`).
 /// Defaults to fsync-enforced `DurableLocalObjectStore` at `<data_dir>/object_store` so local/CI runs
-/// require zero AWS credentials while maintaining RPO = 0 durability (`P1-03`).
+/// require zero AWS credentials while maintaining RPO = 0 durability.
 pub fn build_object_store(data_dir: &Path) -> Result<Arc<dyn ObjectStore>> {
     if let Ok(raw_url) = std::env::var("PULSE_OBJECT_STORE_URL") {
         let trimmed = raw_url.trim();
