@@ -49,7 +49,7 @@ jobs:
           ./out/pulse/pulse-node --port 18080 --data-dir "$RUNNER_TEMP/data" --web-dir out/pulse/web/dist --no-quic &
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/healthz && exit 0; sleep 1; done
           exit 1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pulse-linux-${{ matrix.arch }}
           path: pulse-linux-${{ matrix.arch }}.tar.gz
@@ -128,7 +128,7 @@ jobs:
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version || true
           npm pack
         working-directory: sdks/ts-web
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdk-tarball
           path: sdks/ts-web/pulse-analytics-ts-web-*.tgz
