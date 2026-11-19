@@ -1105,9 +1105,7 @@ fn origin_matches_request(
         if origin.eq_ignore_ascii_case(&format!("{scheme}://{host}")) {
             return true;
         }
-        if let Some(stripped) =
-            host.strip_suffix(if scheme == "https" { ":443" } else { ":80" })
-        {
+        if let Some(stripped) = host.strip_suffix(if scheme == "https" { ":443" } else { ":80" }) {
             if origin.eq_ignore_ascii_case(&format!("{scheme}://{stripped}")) {
                 return true;
             }

@@ -53,12 +53,11 @@ const CATEGORIES: CategoryMeta[] = [
   {
     category: "storage",
     title: "Data export storage",
-    subtitle: "Connect customer-owned S3, Cloudflare R2, MinIO, or local archive buckets.",
+    subtitle: "Connect your own S3, Cloudflare R2 or MinIO bucket.",
     providers: [
       { value: "s3_compatible", label: "AWS S3 / MinIO / R2 (s3://bucket)" },
-      { value: "memory_archive", label: "Named Memory Bucket (memory://bucket)" },
     ],
-    placeholder: "Secret access key (or local secret)",
+    placeholder: "Secret access key",
   },
   {
     category: "webhook",
@@ -415,7 +414,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                           value={draftStorageUrl}
                           disabled={busy}
                           onChange={(e) => setDraftStorageUrl(e.target.value)}
-                          placeholder="s3://customer-analytics-bucket or memory://bucket"
+                          placeholder="s3://your-analytics-bucket"
                           className={`${field} w-full font-mono text-xs`}
                           aria-label="Export storage destination URL"
                         />

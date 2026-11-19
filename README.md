@@ -16,20 +16,35 @@ Single-binary product analytics, session wireframe replay, feature flags, and ex
 - [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude, Cursor, OpenAI Codex and Responses API, Gemini CLI, Antigravity)
 - [Claude Code plugin](integrations/claude-code-plugin/README.md): `/plugin marketplace add sswapnil2/analytics-system`, then `/plugin install pulse@pulse`
 
+## What you can install today
+
+| Platform | Status |
+|---|---|
+| Server (`pulse-node` + Studio) | Docker image `ghcr.io/sswapnil2/pulse` and Linux x86_64/aarch64 binaries on every [release](https://github.com/sswapnil2/analytics-system/releases/latest); build from source elsewhere |
+| Web SDK | Packed `.tgz` on every release (`npm install <asset url>`, see [Web SDK](docs/web-sdk.md)); not on the npm registry yet |
+| Backend / server-side events | Plain HTTP: `POST /v1/ingest` (Pulse or Segment JSON). No server SDKs yet |
+| iOS and Android | **No installable SDK yet.** A Rust core with Swift/Kotlin bindings exists for early adopters who build it themselves ([mobile core, beta](docs/mobile-core.md)) |
+
 ## 60-Second Quickstart
 
-### 1. Build the Studio UI & Rust Node
+### 1. Run a node
+
+With Docker:
+
+```bash
+export PULSE_ADMIN_TOKEN="sk_root_$(openssl rand -hex 24)"   # keep this: it's your setup code
+docker run -p 8080:8080 -v pulse_data:/data -e PULSE_ADMIN_TOKEN ghcr.io/sswapnil2/pulse:latest
+```
+
+Or build from source:
 
 ```bash
 npm --prefix web ci && npm --prefix web run build
 cargo build --release --bin pulse-node
-```
-
-### 2. Start a node
-
-```bash
 PORT=8080 ./target/release/pulse-node --no-quic
 ```
+
+### 2. Open the Studio
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) and create the first account at `/#/signup`. It asks for a setup code: the `sk_root_…` root admin token in `pulse_data/root_admin_token` (or the `PULSE_ADMIN_TOKEN` you set), so nobody else can claim a fresh node. The Studio then walks you through sending your first event. Anyone who signs up after that gets their own organisation and can't see yours. See [accounts and organisations](docs/README.md#accounts-and-organisations).
 

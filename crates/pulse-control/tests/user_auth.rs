@@ -768,14 +768,8 @@ async fn session_cookie_issuance_auth_csrf_and_logout() {
 
     // 4. Non-session token (e.g. root admin token) in cookie is rejected with 401.
     let root_cookie = format!("pulse_session={ROOT}");
-    let (s, _, _) = send_with_headers(
-        &app,
-        "GET",
-        "/v1/status",
-        &[("cookie", &root_cookie)],
-        None,
-    )
-    .await;
+    let (s, _, _) =
+        send_with_headers(&app, "GET", "/v1/status", &[("cookie", &root_cookie)], None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     // 5. CSRF protection for cookie-authenticated mutations:
