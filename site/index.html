@@ -1113,12 +1113,12 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <div class="wrap">
 <div class="center rv">
 <span class="kicker"><b>11</b>Open source</span>
-<h2>Open source at the core.<br><span class="mute">No artificial limits.</span></h2>
-<p class="lede">The Community edition is Apache-2.0 and has everything you need to run product analytics. A few add-ons for larger organisations need a commercial licence key.</p>
+<h2>Open source, all of it.<br><span class="mute">No artificial limits.</span></h2>
+<p class="lede">There is one edition and it is Apache-2.0. Every feature ships in the same binary, with no licence key and no paid tier.</p>
 </div>
 <div class="eds">
 <div class="ed rv">
-<div class="tp-l"><b>Community</b><span class="badge">Apache-2.0</span></div>
+<div class="tp-l"><b>Pulse</b><span class="badge">Apache-2.0</span></div>
 <div class="price">$0<small>self-hosted, forever</small></div>
 <p class="desc">Run it, modify it and redistribute it, including commercially.</p>
 <ul>
@@ -1133,16 +1133,16 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <a class="btn btn-p" href="#developers">Deploy Pulse <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 </div>
 <div class="ed com rv" style="--rd:.1s">
-<div class="tp-l"><b>Commercial add-ons</b><span class="badge">Licence key</span></div>
+<div class="tp-l"><b>Also included</b><span class="badge">Free</span></div>
 <div class="price">For teams rolling Pulse out company-wide</div>
-<p class="desc">Unlocked on the same binary with an offline licence key. Not included in Community.</p>
+<p class="desc">Same binary, same licence. Nothing to unlock.</p>
 <ul>
 <li><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg><span><b>AI Copilot in Studio</b><span>Bring your own model provider key.</span></span></li>
 <li><svg class="i" aria-hidden="true"><use href="#i-db"/></svg><span><b>Warehouse export</b><span>Ship events to your warehouse, user IDs masked.</span></span></li>
-<li><svg class="i" aria-hidden="true"><use href="#i-book"/></svg><span><b>Enterprise audit log</b><span>A record of administrative actions.</span></span></li>
+<li><svg class="i" aria-hidden="true"><use href="#i-book"/></svg><span><b>Audit log</b><span>A record of administrative actions.</span></span></li>
 <li><svg class="i" aria-hidden="true"><use href="#i-bolt"/></svg><span><b>Webhook alerts</b><span>Thresholds checked every 5 minutes, sent to signed webhooks.</span></span></li>
 </ul>
-<a class="btn btn-s" href="https://github.com/sswapnil2/analytics-system/issues/new">Talk to us <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a class="btn btn-s" href="https://github.com/sswapnil2/analytics-system/tree/main/docs">Read the docs <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 </div>
 </div>
 
@@ -1150,11 +1150,11 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <div class="rv"><h3>Questions, answered.</h3></div>
 <div class="rv" style="--rd:.1s">
 <details><summary>Is it really open source?</summary><p>Yes. The code is Apache-2.0: run it, modify it and redistribute it, including commercially.</p></details>
-<details><summary>Do I need a licence key?</summary><p>Not for analytics, replay, flags, cohorts or the MCP server, and there are no event or seat limits. The built-in AI Copilot, warehouse export, enterprise audit log and webhook alerts check for a commercial licence key and return an error without one.</p></details>
+<details><summary>Do I need a licence key?</summary><p>No. Every feature, including the AI Copilot, warehouse export, audit log and webhook alerts, is Apache-2.0 and works without a key. There are no event or seat limits.</p></details>
 <details><summary>Where is my data stored?</summary><p>On the disk or S3-compatible bucket you point Pulse at. For encryption at rest, enable your disk's or bucket's own encryption.</p></details>
 <details><summary>Can it replace my current product analytics tool?</summary><p>For funnels, retention, cohorts, flags and replay, yes. The web SDK captures page views, clicks and UTM parameters, and the import API backfills history. Multi-touch attribution reports aren't built yet.</p></details>
 <details><summary>How fast is it, really?</summary><p>On one M2 Pro laptop with 1M events, a warm 5-step funnel takes 14.5 ms at p50 and ingest runs at about 249k events per second. Run <code>scripts/bench_scale.sh 1m</code> to measure your own hardware.</p></details>
-<details><summary>Will the Community edition stay free?</summary><p>The Community features stay free and Apache-2.0.</p></details>
+<details><summary>Will it stay free?</summary><p>Pulse has one edition, and it is Apache-2.0.</p></details>
 </div>
 </div>
 </div>

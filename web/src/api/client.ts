@@ -537,19 +537,6 @@ export interface ByokEncryptionStatus {
   ops_decrypted: number;
 }
 
-export interface LicenseStatus {
-  edition: string;
-  health: string;
-  is_commercial: boolean;
-  in_grace_period: boolean;
-  customer_org: string | null;
-  license_id: string | null;
-  expires_at_ms: number | null;
-  grace_ends_at_ms: number | null;
-  features: string[];
-  encryption: ByokEncryptionStatus;
-}
-
 export interface SystemKeyringRecord {
   key_id: string;
   salt_hex: string;
@@ -1043,17 +1030,6 @@ export const api = {
     fetchText(
       `/v1/projects/${projectId}/export?format=${format}&limit=${limit}`,
     ),
-
-  getLicense: () => fetchJson<LicenseStatus>("/v1/license"),
-
-  activateLicense: (opts: { license_key: string }) =>
-    fetchJson<LicenseStatus>("/v1/license", {
-      method: "POST",
-      body: JSON.stringify(opts),
-    }),
-
-  deactivateLicense: () =>
-    fetchJson<LicenseStatus>("/v1/license", { method: "DELETE" }),
 
   getEncryptionStatus: () =>
     fetchJson<EncryptionStatusResponse>("/v1/system/encryption"),

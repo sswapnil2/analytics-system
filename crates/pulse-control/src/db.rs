@@ -9,7 +9,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use sqlx::Row;
 use thiserror::Error;
 
-use crate::license::SystemLicenseRecord;
 use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
@@ -2192,69 +2191,7 @@ impl MetaStore {
         Ok(affected)
     }
 
-    // ------------------- Open-Core License & Commercial BYOK Vault -------------------
-
-    pub async fn get_system_license(&self) -> Result<Option<SystemLicenseRecord>, MetaError> {
-        let rec = db_map_opt!(
-            self,
-            "SELECT license_key, customer_org, edition, features_json, expires_at_ms, activated_at_ms, max_seen_ts_ms
-             FROM system_license WHERE id = 1",
-            |r| {
-                let fstr: String = r.get("features_json");
-                let features: Vec<String> = serde_json::from_str(&fstr).unwrap_or_default();
-                SystemLicenseRecord {
-                    license_key: r.get("license_key"),
-                    customer_org: r.get("customer_org"),
-                    edition: r.get("edition"),
-                    features,
-                    expires_at_ms: r.get("expires_at_ms"),
-                    activated_at_ms: r.get("activated_at_ms"),
-                    max_seen_ts_ms: r.get("max_seen_ts_ms"),
-                }
-            },
-        );
-        Ok(rec)
-    }
-
-    pub async fn upsert_system_license(&self, rec: &SystemLicenseRecord) -> Result<(), MetaError> {
-        let fjson = serde_json::to_string(&rec.features).unwrap_or_else(|_| "[]".into());
-        let _ = db_exec!(
-            self,
-            "INSERT INTO system_license (id, license_key, customer_org, edition, features_json, expires_at_ms, activated_at_ms, max_seen_ts_ms)
-             VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                license_key = excluded.license_key,
-                customer_org = excluded.customer_org,
-                edition = excluded.edition,
-                features_json = excluded.features_json,
-                expires_at_ms = excluded.expires_at_ms,
-                activated_at_ms = excluded.activated_at_ms,
-                max_seen_ts_ms = excluded.max_seen_ts_ms",
-            &rec.license_key,
-            &rec.customer_org,
-            &rec.edition,
-            fjson,
-            rec.expires_at_ms,
-            rec.activated_at_ms,
-            rec.max_seen_ts_ms,
-        );
-        Ok(())
-    }
-
-    pub async fn update_license_max_seen_ts(&self, now_ms: i64) -> Result<(), MetaError> {
-        let _ = db_exec!(
-            self,
-            "UPDATE system_license SET max_seen_ts_ms = ? WHERE id = 1 AND max_seen_ts_ms < ?",
-            now_ms,
-            now_ms,
-        );
-        Ok(())
-    }
-
-    pub async fn delete_system_license(&self) -> Result<(), MetaError> {
-        let _ = db_exec!(self, "DELETE FROM system_license WHERE id = 1");
-        Ok(())
-    }
+    // ------------------- Provider credential vault -------------------
 
     /// Resolves a persistent cluster KEK from `PULSE_VAULT_KEK` or `<db_dir>/.pulse_cluster.kek` (`C3`),
     /// completely independent of `PULSE_ADMIN_TOKEN`. Returns `Ok(None)` only for pure in-memory stores.

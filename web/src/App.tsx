@@ -56,7 +56,7 @@ import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
 import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
 import { UsersWorkspace } from "./workspaces/UsersWorkspace";
 import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
-import { ByokCommercialPanel } from "./components/ByokCommercialPanel";
+import { SecurityPanel } from "./components/SecurityPanel";
 import { AccessContext } from "./auth/access";
 
 type WorkspaceId =
@@ -105,7 +105,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
-      { id: "security", label: "Enterprise and security", icon: Lock },
+      { id: "security", label: "Security and integrations", icon: Lock },
     ],
   },
 ];
@@ -892,7 +892,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
                   />
                 )}
                 {activeTab === "security" && canManageKeys && (
-                  <ByokCommercialPanel projectId={activePid} />
+                  <SecurityPanel projectId={activePid} />
                 )}
               </AccessContext.Provider>
             )}
