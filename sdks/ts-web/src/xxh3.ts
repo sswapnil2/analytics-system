@@ -1,5 +1,5 @@
 /**
- * Zero-dependency 64-bit XXH3 (`xxh3_64` with seed = 0) matching `xxhash_rust::xxh3::xxh3_64` bit-for-bit (`P2-03`).
+ * Zero-dependency 64-bit XXH3 (`xxh3_64` with seed = 0) matching `xxhash_rust::xxh3::xxh3_64` bit-for-bit.
  */
 
 const MASK64 = 0xffffffffffffffffn;

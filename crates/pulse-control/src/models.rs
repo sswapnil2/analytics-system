@@ -85,7 +85,7 @@ impl Role {
 pub const KEY_ROLE_INGEST_AND_FLAGS: &str = "ingest_and_flags";
 pub const KEY_ROLE_ADMIN: &str = "admin";
 
-/// Computes a lowercase hex SHA-256 digest of a high-entropy API key or bearer token (`P0-02`).
+/// Computes a lowercase hex SHA-256 digest of a high-entropy API key or bearer token.
 pub fn sha256_hex(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     hex::encode(digest)
@@ -141,7 +141,7 @@ pub struct ApiKeyRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatedApiKeyResponse {
     pub record: ApiKeyRecord,
-    /// Returned ONCE at creation time; never stored or returned again (`P0-02`).
+    /// Returned ONCE at creation time; never stored or returned again.
     pub plaintext_key: String,
 }
 

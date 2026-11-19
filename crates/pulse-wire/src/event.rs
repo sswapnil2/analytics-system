@@ -144,7 +144,7 @@ impl WireEvent {
         xxh3_128(&buf).to_le_bytes()
     }
 
-    /// Computes a canonical 128-bit content hash over all event fields AND sorted properties (`P1-14`)
+    /// Computes a canonical 128-bit content hash over all event fields AND sorted properties
     /// so JSON events without a client-supplied `event_uuid` never collide across distinct payloads.
     pub fn canonical_content_uuid(
         distinct_id: &str,
@@ -335,7 +335,7 @@ impl<'de> Deserialize<'de> for WireEvent {
         let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
         apply_segment_call_type(&mut obj).map_err(serde::de::Error::custom)?;
 
-        // Support Pulse native (`event_name`), Segment (`event`), or generic (`name`) (`PR-8`)
+        // Support Pulse native (`event_name`), Segment (`event`), or generic (`name`)
         let event_name = non_empty_str(&obj, &["event_name", "event", "name"])
             .ok_or_else(|| {
                 serde::de::Error::custom("missing event name: provide \"event_name\" or \"event\"")

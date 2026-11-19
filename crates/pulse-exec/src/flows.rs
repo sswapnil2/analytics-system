@@ -72,7 +72,7 @@ impl FlowsEngine {
         )
         .await?;
 
-        // Map `event_id -> event_name` once and identify `$`-prefixed system events (`PR-10`)
+        // Map `event_id -> event_name` once and identify `$`-prefixed system events
         let id_to_name: HashMap<u16, String> = dict.all_events().into_iter().collect();
         let include_system_events = query.anchor_event.starts_with('$');
         let system_eids: HashSet<u16> = id_to_name
@@ -80,7 +80,7 @@ impl FlowsEngine {
             .filter_map(|(&eid, name)| name.starts_with('$').then_some(eid))
             .collect();
 
-        // Parallelize per-chunk event filtering, then assemble user timelines in chunk order with resource bounds (`P3-02`).
+        // Parallelize per-chunk event filtering, then assemble user timelines in chunk order with resource bounds.
         let chunk_batches: Vec<Vec<(u32, i64, u16, bool)>> =
             crate::scanner::run_rayon_compute(|stop| {
                 chunks

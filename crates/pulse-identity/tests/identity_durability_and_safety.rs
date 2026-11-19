@@ -96,7 +96,7 @@ impl ObjectStore for FailWriteStore {
 }
 
 #[tokio::test]
-async fn p1_08_alias_refuses_to_merge_two_already_identified_users() {
+async fn alias_refuses_to_merge_two_already_identified_users() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let graph = ProjectIdentityGraph::open("proj_p1_08", store)
         .await
@@ -137,7 +137,7 @@ async fn p1_08_alias_refuses_to_merge_two_already_identified_users() {
 }
 
 #[tokio::test]
-async fn p1_09_flush_failure_preserves_mutations_until_retry_succeeds() {
+async fn flush_failure_preserves_mutations_until_retry_succeeds() {
     let fail_store = FailWriteStore::new();
     let store: Arc<dyn ObjectStore> = fail_store.clone();
 
@@ -181,7 +181,7 @@ async fn p1_09_flush_failure_preserves_mutations_until_retry_succeeds() {
 }
 
 #[tokio::test]
-async fn p1_11_missing_chunk_or_dangling_alias_fails_loudly_on_replay() {
+async fn missing_chunk_or_dangling_alias_fails_loudly_on_replay() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     // Write a metadata header claiming `chunk_count = 1` with NO `log/chunk_000000000000` present

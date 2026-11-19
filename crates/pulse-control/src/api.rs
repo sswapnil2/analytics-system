@@ -156,7 +156,7 @@ pub struct ControlPlaneService {
     vault_kek: [u8; 32],
     has_durable_kek: bool,
     bootstrap_creds: Mutex<BootstrapCredentials>,
-    /// Keyed by lowercase SHA-256 hex digest (`P0-02`).
+    /// Keyed by lowercase SHA-256 hex digest.
     api_key_cache: DashMap<String, CachedApiKey>,
     /// Project id → owning org id.
     known_projects: DashMap<String, String>,
@@ -266,7 +266,7 @@ impl ControlPlaneService {
         Ok(svc)
     }
 
-    /// Takes one-time randomly generated startup credentials so `pulse-node` can log them once and clear memory (`P0-02`).
+    /// Takes one-time randomly generated startup credentials so `pulse-node` can log them once and clear memory.
     pub fn take_bootstrap_credentials(&self) -> BootstrapCredentials {
         std::mem::take(&mut *self.bootstrap_creds.lock())
     }
@@ -1231,7 +1231,7 @@ pub fn build_public_flag_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .with_state(ctrl)
 }
 
-/// Builds the authenticated Control Plane + Query + Replay + MCP router (`P0-01`).
+/// Builds the authenticated Control Plane + Query + Replay + MCP router.
 pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
     Router::new()
         .route("/v1/status", get(handle_status))
@@ -2173,7 +2173,7 @@ async fn handle_get_replay(
     serve_replay(&ctrl, &id, &session_id, &headers, &params).await
 }
 
-/// Validates RFC 9110 single byte-range header (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`) (`P3-05`).
+/// Validates RFC 9110 single byte-range header (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`).
 fn resolve_http_byte_range(
     spec: &str,
     total_len: usize,
@@ -2413,7 +2413,7 @@ async fn handle_put_lexicon_prop(
     Ok(Json(prop))
 }
 
-// ------------------- Cohorts & Virtual Schema Extensions (`P0-03`) -------------------
+// ------------------- Cohorts & Virtual Schema Extensions -------------------
 
 async fn handle_list_cohorts(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3466,7 +3466,7 @@ async fn handle_experiment_results_scoped(
     Ok(Json(results))
 }
 
-// ------------------- MCP JSON-RPC 2.0 (`P0-04`) -------------------
+// ------------------- MCP JSON-RPC 2.0 -------------------
 
 async fn handle_mcp(
     State(ctrl): State<Arc<ControlPlaneService>>,

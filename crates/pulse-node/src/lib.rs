@@ -92,11 +92,11 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub web_dist_dir: PathBuf,
     pub default_project_id: String,
-    /// Optional explicit initial ingest key (used in deterministic tests); empty in production so a random key is generated once (`P0-02`).
+    /// Optional explicit initial ingest key (used in deterministic tests); empty in production so a random key is generated once.
     pub default_api_key: String,
     /// Optional explicit root admin bearer token; when `None` and `PULSE_ADMIN_TOKEN` is unset, a random `sk_root_...` token is generated once (`P0-01`, `P0-02`).
     pub admin_token: Option<String>,
-    /// Allowed browser origins for admin/query CORS (`P0-01`).
+    /// Allowed browser origins for admin/query CORS.
     pub allowed_origins: Vec<String>,
     /// Opt-in synthetic demo dataset seeder (`false` by default, enabled via `--seed` or `PULSE_SEED=1`, Section 6).
     pub auto_seed: bool,
@@ -613,7 +613,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn p0_01_and_p0_07_secure_node_config_defaults() {
+    fn secure_node_config_defaults() {
         let cfg = NodeConfig::default();
         assert!(
             cfg.http_addr.ip().is_loopback(),

@@ -17,7 +17,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-authors = ["Pulse Analytics Engineering"]
+authors = ["Pulse contributors"]
+repository = "https://github.com/sswapnil2/analytics-system"
+homepage = "https://sswapnil2.github.io/analytics-system/"
 
 [workspace.dependencies]
 # Internal workspace crates

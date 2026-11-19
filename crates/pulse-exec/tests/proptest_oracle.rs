@@ -1,4 +1,4 @@
-//! Independent, zero-shared-code naive reference oracle driven by `proptest` (`REVIEW.md` Section 5, `P2-01`, `P2-09`).
+//! Independent, zero-shared-code naive reference oracle driven by `proptest` (`docs/history/REVIEW.md` Section 5).
 //!
 //! `mod naive_oracle` intentionally imports NOTHING from `pulse_*` crates so zero filter, bucketing,
 //! cohort, funnel, insights, retention, or flows code is shared with the execution engine.
@@ -814,10 +814,10 @@ fn arb_tier_opt() -> impl Strategy<Value = Option<NVal>> {
         1 => Just(None),
         1 => Just(Some(NVal::Null)),
         3 => Just(Some(NVal::Int(1))),
-        3 => Just(Some(NVal::Str("1".to_string()))), // exercises Int(1) vs Str("1") coalescing (`P2-01`)
+        3 => Just(Some(NVal::Str("1".to_string()))), // exercises Int(1) vs Str("1") coalescing
         3 => Just(Some(NVal::Int(2))),
         2 => Just(Some(NVal::Bool(true))),
-        2 => Just(Some(NVal::Str("true".to_string()))), // exercises Bool(true) vs Str("true") (`P2-01`)
+        2 => Just(Some(NVal::Str("true".to_string()))), // exercises Bool(true) vs Str("true")
     ]
 }
 

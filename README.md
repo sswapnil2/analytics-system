@@ -2,18 +2,19 @@
 
 Single-binary product analytics, session wireframe replay, feature flags, and experimentation engine built in Rust. Zero legacy big-data middleware (no ClickHouse, Kafka, ZooKeeper, or external Redis).
 
-## Architecture at a Glance
+## How it works
 
-- **Entity-centric columnar storage (`pulse-storage`):** WAL durability + immutable Vortex L1 segments partitioned by `project_id / yyyymmdd / bucket_00..15`, physically sorted by `(uid_internal, session_seq, event_ts_ms)`. Background L0 -> L1 flushing uses `spawn_blocking` segment serialization, CAS manifest commits (`commit_manifest_cas`), and HTTP `429 Too Many Requests` (`Retry-After: 1`) under L0 backpressure.
-- **Exact unsampled user math & isolated compute (`pulse-exec`, `pulse-identity`):** Dense `u32` user ID interning with SlateDB-backed Union-Find identity merging (`anon_id -> user_id`) supporting group-committed flushes and read-only `DbReader` refresh mode, plus `RoaringBitmap` set operations and Rayon parallel scans isolated from Tokio I/O via `block_in_place` (`run_rayon_compute`) for Funnels, Retention, Insights, Flows, and Behavioral Cohorts.
-- **Privacy-by-design wireframe replay (`pulse-wire`):** DOM bounding-box snapshots (`PLSR` byte-range streams) with client-side `"████"` text/input masking, rage-tap / dead-tap detection, and network breadcrumbs.
-- **Unified Control Plane & AI MCP (`pulse-control`):** Cookie/session auth + bearer API tokens, Lexicon PII governance, deterministic `xxh3_64` edge feature flags, A/B experimentation with SRM check + Holm-Bonferroni correction, and JSON-RPC 2.0 MCP tools.
+- **Storage (`pulse-storage`):** events land in a write-ahead log, then flush to compressed columnar segments on local disk or any S3-compatible bucket, sorted by user and time so per-user questions are fast.
+- **Queries (`pulse-exec`, `pulse-identity`):** funnels, retention, trends, journeys and cohorts are computed exactly, with no sampling. Anonymous visitors are merged into users when they log in, and earlier events follow them.
+- **Session replay (`pulse-wire`):** the SDK records page layout (element boxes and masked text), not pixels or HTML. Text is masked on the device. Rage taps, dead taps, errors and network calls are on the timeline.
+- **Control plane (`pulse-control`):** Studio accounts and API keys, an event dictionary with PII controls, feature flags, A/B tests with sample-ratio and multiple-comparison checks, and an MCP server for AI agents.
 
 ## Documentation
 
 - [Quickstart](docs/quickstart.md): build, run, admin token and ingest keys
 - [Web SDK](docs/web-sdk.md) and [mobile core (beta)](docs/mobile-core.md)
 - [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude, Cursor, OpenAI Codex and Responses API, Gemini CLI, Antigravity)
+- [Changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)
 - [Claude Code plugin](integrations/claude-code-plugin/README.md): `/plugin marketplace add sswapnil2/analytics-system`, then `/plugin install pulse@pulse`
 
 ## What you can install today
@@ -97,7 +98,7 @@ npm --prefix web run typecheck && npm --prefix web run build
 ./scripts/bench_scale.sh all   # runs 100k & 1m SLO profiles (cold/warm scans + concurrent load)
 ```
 
-### Measured Release Benchmark (`gate3` & `bench_scale.sh 1m`)
+### Measured release benchmark (`bench_scale.sh 1m`)
 
 - `1,000,000` stored events across `25,000` users, 4-step `LooseOrder` funnel: **`44.49 ms`** cold scan, **`7.98 ms`** warm cache scan (single-node M-series macOS release build).
 - Concurrent 1M scale SLOs (`./scripts/bench_scale.sh 1m`): `ingest_throughput` **`226,585 ev/s`**, `ingest_under_load` **`7.24 ms`** p50 / **`42.65 ms`** p99, `query_under_ingest` **`149.43 ms`** p50 / **`237.40 ms`** p99.

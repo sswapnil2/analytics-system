@@ -113,14 +113,14 @@ impl WireNode {
     }
 }
 
-/// Masks sensitive text or input values to a constant-length `"████"` placeholder (`P3-01`),
+/// Masks sensitive text or input values to a constant-length `"████"` placeholder,
 /// never preserving prefix labels or character counts that could leak PII.
 pub fn mask_input_value(_raw: &str) -> String {
     FIXED_MASK_PLACEHOLDER.to_string()
 }
 
 /// Masks PII-like user identifiers (email addresses and phone numbers) before surfacing them
-/// in query, session-explorer, or MCP tool responses (`PR-3`). Opaque IDs pass through unchanged.
+/// in query, session-explorer, or MCP tool responses. Opaque IDs pass through unchanged.
 pub fn mask_user_identifier(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some((local, domain)) = trimmed.split_once('@') {

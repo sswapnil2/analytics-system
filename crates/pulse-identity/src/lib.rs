@@ -273,7 +273,7 @@ fn decode_mutation_chunk(bytes: &[u8]) -> Result<Vec<MutationEntry>> {
     Ok(out)
 }
 
-/// Compacted SlateDB checkpoint record bounding startup recovery cost (`P3-04`).
+/// Compacted SlateDB checkpoint record bounding startup recovery cost.
 #[derive(Serialize, Deserialize)]
 struct IdentityCheckpoint {
     next_chunk_seq: u64,
@@ -579,7 +579,7 @@ impl ProjectIdentityGraph {
         let mut state = GraphState::new();
         let mut start_seq = 0u64;
 
-        // Restore compacted checkpoint if available (`P3-04`)
+        // Restore compacted checkpoint if available
         if let Some(cp_bytes) = db.get(META_CHECKPOINT_KEY).await? {
             let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
                 .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
@@ -792,7 +792,7 @@ impl ProjectIdentityGraph {
         state.parent.push(uid);
         state.bucket_masks.push(mask);
 
-        // Push to `pending_mutations` BEFORE publishing in `fast_lookup` or releasing `state` (`P1-11`)!
+        // Push to `pending_mutations` BEFORE publishing in `fast_lookup` or releasing `state`!
         {
             let mut pending = self.pending_mutations.lock();
             pending.push(MutationEntry::Intern {
@@ -893,7 +893,7 @@ impl ProjectIdentityGraph {
     }
 
     /// Expands a bitmap of canonical `u32` user IDs into a sorted, deduplicated `Vec<String>` of ALL
-    /// external `distinct_id`s (both pre-login `anon_id`s and identified `user_id`s) belonging to those users (`P2-02`).
+    /// external `distinct_id`s (both pre-login `anon_id`s and identified `user_id`s) belonging to those users.
     pub fn external_ids_for_canonical_roots(&self, canonical_roots: &RoaringBitmap) -> Vec<String> {
         if canonical_roots.is_empty() {
             return Vec::new();
@@ -947,7 +947,7 @@ impl ProjectIdentityGraph {
         snap
     }
 
-    /// Flushes all staged intern & alias records durably to SlateDB on `object_store` (`P1-09`).
+    /// Flushes all staged intern & alias records durably to SlateDB on `object_store`.
     ///
     /// Uses epoch-based group-commit coalescing so concurrent callers share a single SlateDB flush,
     /// and retains `pending_mutations` and `next_chunk_seq` unchanged if the write or flush fails.
@@ -995,7 +995,7 @@ impl ProjectIdentityGraph {
         }
         batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
 
-        // Periodically compact log history into `meta/checkpoint` (`P3-04`)
+        // Periodically compact log history into `meta/checkpoint`
         let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
         let wrote_checkpoint = if new_seq.saturating_sub(prev_cp) >= CHECKPOINT_INTERVAL_CHUNKS {
             let cp_opt = {
@@ -1034,7 +1034,7 @@ impl ProjectIdentityGraph {
             return Err(IdentityError::SlateDb(e));
         }
 
-        // Commit state ONLY after SlateDB flush succeeded (`P1-09`)
+        // Commit state ONLY after SlateDB flush succeeded
         self.next_chunk_seq.store(new_seq, Ordering::Release);
         if wrote_checkpoint {
             self.last_checkpoint_seq.store(new_seq, Ordering::Release);

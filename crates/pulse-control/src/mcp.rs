@@ -66,7 +66,7 @@ impl JsonRpcResponse {
 /// Built-in Model Context Protocol (MCP) JSON-RPC 2.0 handler (`initialize`, `tools/list`, `tools/call`).
 ///
 /// Strictly bound to `bound_project_id` of the authenticated principal; any attempt to override
-/// `project_id` in tool arguments to a different project is rejected (`P0-04`).
+/// `project_id` in tool arguments to a different project is rejected.
 pub async fn handle_mcp_request(
     req: JsonRpcRequest,
     bound_project_id: &str,

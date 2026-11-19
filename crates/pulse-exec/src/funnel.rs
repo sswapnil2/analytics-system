@@ -327,7 +327,7 @@ impl FunnelEngine {
             query.time_range.start_ts_ms
         };
 
-        // Lock-free parallel shard execution via Rayon (`P3-05`):
+        // Lock-free parallel shard execution via Rayon:
         // Every shard uses a local breakdown interner + deterministic 64-bit hold hash (`0 == HOLD_MISSING`),
         // with zero cross-thread `Mutex` contention.
         let shard_outputs: Vec<(ShardSummary, Vec<String>, Vec<UserEvent>)> =
@@ -562,7 +562,7 @@ impl FunnelEngine {
                 .collect();
             raw_entries.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then_with(|| a.0.cmp(&b.0)));
 
-            // Cap breakdown cardinality to top `MAX_FUNNEL_BREAKDOWN_GROUPS` + `"$other"` (`P3-02`)
+            // Cap breakdown cardinality to top `MAX_FUNNEL_BREAKDOWN_GROUPS` + `"$other"`
             if raw_entries.len() > MAX_FUNNEL_BREAKDOWN_GROUPS {
                 let overflow = raw_entries.split_off(MAX_FUNNEL_BREAKDOWN_GROUPS);
                 let mut other_counts = vec![0u64; k];
@@ -592,7 +592,7 @@ impl FunnelEngine {
 
         let time_to_convert = build_ttc_stats(&final_summary.ttc_values);
 
-        // Materialize dropped sample sessions with `session_id`, `distinct_id`, `replay_offset_kb`, and `has_replay` (`PR-1`)
+        // Materialize dropped sample sessions with `session_id`, `distinct_id`, `replay_offset_kb`, and `has_replay`
         let mut dropped_sample_sessions = Vec::with_capacity(final_summary.dropped_samples.len());
         for (dropped_before_step, ev) in final_summary.dropped_samples {
             let chunk = &chunks[ev.chunk_idx as usize];

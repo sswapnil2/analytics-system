@@ -10,12 +10,12 @@ use pulse_wire::WireBatch;
 
 use crate::error::{Result, StorageError};
 
-/// V2 WAL frame magic covering `(epoch || seq || len || payload)` under CRC32 (`P1-04`).
+/// V2 WAL frame magic covering `(epoch || seq || len || payload)` under CRC32.
 pub const WAL_MAGIC: [u8; 4] = *b"PWL2";
 pub const WAL_HEADER_LEN: usize = 28;
 
 /// Durable per-bucket Write-Ahead Log backed by `ObjectStore` with header+payload CRC32 verification,
-/// writer-epoch fencing, transient GET retries, and corrupt-frame quarantine (`P1-04`).
+/// writer-epoch fencing, transient GET retries, and corrupt-frame quarantine.
 pub struct BucketWal {
     project_id: String,
     bucket_id: u8,
@@ -141,7 +141,7 @@ impl BucketWal {
     }
 
     /// Replays all unfenced WAL frames with `seq > committed_seq` in deterministic `(epoch, seq)` order,
-    /// verifying header+payload CRC32 checksums and quarantining corrupt frames (`P1-04`).
+    /// verifying header+payload CRC32 checksums and quarantining corrupt frames.
     pub async fn recover(&self, committed_seq: u64) -> Result<Vec<(u64, WireBatch)>> {
         let min_epoch = self.min_valid_epoch.load(Ordering::Acquire);
         let prefix = ObjectPath::from(format!(
