@@ -9,4 +9,3 @@ Internal records from Pulse's first build-out (November 2026), kept for context.
 | [PRODUCT_REVIEW.md](PRODUCT_REVIEW.md) | Product and engineering review (17 Nov 2026) |
 | [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md) | Web, iOS and Android SDK integration test report (17 Nov 2026) |
 
-The later PM review and its fixes are in [`product-review/`](../../product-review/) and [`product-improvements/`](../../product-improvements/).
