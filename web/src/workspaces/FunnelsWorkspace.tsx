@@ -32,6 +32,7 @@ import {
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
+import { PropertyPicker } from "../components/PropertyPicker";
 
 interface Props {
   projectId: string;
@@ -370,17 +371,14 @@ export const FunnelsWorkspace: React.FC<Props> = ({
             </select>
           </label>
           <CompareControl main={rangeFor(range)} value={compare} onChange={setCompare} />
-          <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Split by</span>
-            <select value={breakdownBy} onChange={(e) => setBreakdownBy(e.target.value)} className={field}>
-              <option value="">No split</option>
-              {propOptions.map((p) => (
-                <option key={p} value={p}>
-                  {humanizeEvent(p)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <PropertyPicker
+            label="Split by"
+            value={breakdownBy}
+            onChange={setBreakdownBy}
+            noneLabel="No split"
+            recentKey={`pulse.recent-props.${projectId}`}
+            options={propOptions.map((p) => ({ value: p, label: humanizeEvent(p), group: "Properties" }))}
+          />
         </div>
       </Panel>
         </>}
@@ -567,16 +565,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                     </div>
                   ))}
                 </dl>
-                <div className="flex h-32 items-end gap-1.5" role="img" aria-label="Distribution of time to complete">
-                  {result.time_to_convert.histogram_bins.map(([lo, hi, cnt], i, bins) => {
-                    const maxBin = Math.max(1, ...bins.map((b) => b[2]));
-                    return (
-                      <div key={i} className="flex h-full flex-1 flex-col justify-end" title={`${formatDuration(lo)}–${formatDuration(hi)}: ${formatCount(cnt)} users`}>
-                        <div className="w-full rounded-t bg-info/70" style={{ height: `${Math.max(2, (cnt / maxBin) * 100)}%` }} />
-                      </div>
-                    );
-                  })}
-                </div>
+                <TimeHistogram bins={result.time_to_convert.histogram_bins} />
                 <div className="mt-1 flex justify-between text-xs text-faint tabular">
                   <span>{formatDuration(result.time_to_convert.histogram_bins[0]?.[0] ?? 0)}</span>
                   <span>
@@ -684,13 +673,13 @@ const DropOffDrawer: React.FC<{
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
-      <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-ink/40" tabIndex={-1} />
+      <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-ink/40 motion-safe:animate-fade-in" tabIndex={-1} />
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="dropoff-title"
-        className="relative flex h-full w-full max-w-5xl flex-col border-l border-line bg-canvas shadow-2xl"
+        className="relative flex h-full w-full max-w-5xl flex-col border-l border-line bg-canvas shadow-2xl motion-safe:animate-slide-in-right"
       >
         <div className="flex items-start justify-between gap-4 border-b border-line bg-panel px-5 py-4">
           <div className="min-w-0">
@@ -800,7 +789,45 @@ const DropOffDrawer: React.FC<{
   );
 };
 
-const SEG_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn))", "rgb(var(--ink-2))"];
+// Shared series palette; never orange, which means drop-offs here.
+/** Time-to-complete bars; hovering one shows its range and count. */
+const TimeHistogram: React.FC<{ bins: [number, number, number][] }> = ({ bins }) => {
+  const [hover, setHover] = useState<number | null>(null);
+  const maxBin = Math.max(1, ...bins.map((b) => b[2]));
+  const text = ([lo, hi, cnt]: [number, number, number]) => `${formatDuration(lo)}–${formatDuration(hi)}: ${formatCount(cnt)} users`;
+  return (
+    <div className="relative">
+      <div
+        className="flex h-32 items-end gap-1.5"
+        role="img"
+        aria-label={`Distribution of time to complete. ${bins.map(text).join("; ")}`}
+        onMouseLeave={() => setHover(null)}
+      >
+        {bins.map((b, i) => (
+          <div key={i} className="flex h-full flex-1 flex-col justify-end" onMouseEnter={() => setHover(i)}>
+            <div
+              className={`w-full rounded-t transition-opacity duration-150 ${hover !== null && hover !== i ? "opacity-50" : ""}`}
+              style={{ height: `${Math.max(2, (b[2] / maxBin) * 100)}%`, background: "rgb(var(--chart-2) / 0.7)" }}
+            />
+          </div>
+        ))}
+      </div>
+      {hover !== null && bins[hover] && (
+        <div
+          className="pointer-events-none absolute -top-2 z-10 -translate-y-full whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop"
+          style={(hover + 0.5) / bins.length > 0.6 ? { right: `${100 - ((hover + 1) / bins.length) * 100}%` } : { left: `${(hover / bins.length) * 100}%` }}
+        >
+          <p className="font-semibold text-ink">
+            {formatDuration(bins[hover][0])}–{formatDuration(bins[hover][1])}
+          </p>
+          <p className="tabular text-ink-2">{formatCount(bins[hover][2])} users</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SEG_COLORS = [1, 2, 3, 4].map((i) => `rgb(var(--chart-${i}))`);
 
 type SegKey = "segment" | "started" | "completed" | "rate";
 

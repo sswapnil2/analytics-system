@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { api, Dashboard, DashboardCard, SavedReport } from "../api/client";
 import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, Skeleton } from "../components/ui";
+import { Menu } from "../components/Menu";
 import { errorMessage, formatCount } from "../lib/format";
 import { KIND_LABEL, RangePresets, RangeSel, rangeLabel, ReportCardBody } from "./ReportCard";
 import { useAccess } from "../auth/access";
@@ -62,111 +63,6 @@ function ago(ms: number): string {
   const min = Math.round((Date.now() - ms) / 60_000);
   return min < 1 ? "just now" : min < 60 ? `${min} min ago` : `${Math.round(min / 60)} h ago`;
 }
-
-/** Small dropdown menu: closes on outside click or Escape. */
-const Menu: React.FC<{
-  label: string;
-  trigger: React.ReactNode;
-  triggerClass: string;
-  items: { label: string; onSelect?: () => void; href?: string; danger?: boolean; disabled?: boolean }[];
-}> = ({ label, trigger, triggerClass, items }) => {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const close = (refocus: boolean) => {
-    setOpen(false);
-    if (refocus) triggerRef.current?.focus();
-  };
-  const menuItems = () =>
-    Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? []);
-  // Arrow keys move through items, Home/End jump, Escape returns focus to the button.
-  const onMenuKey = (e: React.KeyboardEvent) => {
-    const list = menuItems();
-    const i = list.indexOf(document.activeElement as HTMLElement);
-    const go = (n: number) => {
-      e.preventDefault();
-      list[(n + list.length) % list.length]?.focus();
-    };
-    if (e.key === "ArrowDown") go(i + 1);
-    else if (e.key === "ArrowUp") go(i - 1);
-    else if (e.key === "Home") go(0);
-    else if (e.key === "End") go(list.length - 1);
-    else if (e.key === "Escape") {
-      e.preventDefault();
-      close(true);
-    } else if (e.key === "Tab") close(false);
-  };
-  useEffect(() => {
-    if (open) menuItems()[0]?.focus();
-  }, [open]);
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    const onDown = (e: MouseEvent) => ref.current && !ref.current.contains(e.target as Node) && setOpen(false);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("mousedown", onDown);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onDown);
-    };
-  }, [open]);
-  const itemClass = (danger?: boolean) =>
-    `block w-full whitespace-nowrap rounded-md px-3 py-2 text-left text-sm outline-none disabled:opacity-40 ${
-      danger ? "text-destructive hover:bg-destructive-soft focus:bg-destructive-soft" : "text-ink hover:bg-hover focus:bg-hover"
-    }`;
-  return (
-    <div className="relative" ref={ref}>
-      <button
-        ref={triggerRef}
-        type="button"
-        className={triggerClass}
-        aria-label={label}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        onKeyDown={(e) => {
-          if (e.key === "ArrowDown" && !open) {
-            e.preventDefault();
-            setOpen(true);
-          }
-        }}
-      >
-        {trigger}
-      </button>
-      {open && (
-        <div ref={menuRef} role="menu" aria-label={label} onKeyDown={onMenuKey} className="absolute right-0 top-full z-40 mt-1 min-w-[12rem] rounded-xl border border-line-strong bg-panel p-1 shadow-[0_12px_32px_rgb(0_0_0/0.16)]">
-          {items.map((it) =>
-            it.href ? (
-              <a key={it.label} role="menuitem" tabIndex={-1} href={it.href} className={itemClass(it.danger)} onClick={() => setOpen(false)}>
-                {it.label}
-              </a>
-            ) : (
-              <button
-                key={it.label}
-                type="button"
-                role="menuitem"
-                tabIndex={-1}
-                disabled={it.disabled}
-                className={itemClass(it.danger)}
-                onClick={() => {
-                  close(true);
-                  it.onSelect?.();
-                  // Removing a card unmounts this menu's button; keep keyboard focus on the page.
-                  requestAnimationFrame(() => {
-                    if (!triggerRef.current?.isConnected) document.getElementById("main")?.focus();
-                  });
-                }}
-              >
-                {it.label}
-              </button>
-            ),
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
 
 function formatWhen(ms: number | null | undefined): string {
   if (!ms) return "";
@@ -867,7 +763,7 @@ const SharePopover: React.FC<{ dashboardId: string; onClose: () => void }> = ({ 
       ref={ref}
       role="dialog"
       aria-label="Share dashboard"
-      className="absolute right-0 top-full z-40 mt-2 w-[min(22.5rem,calc(100vw-2rem))] space-y-3 rounded-xl border border-line-strong bg-panel p-4 shadow-[0_12px_32px_rgb(0_0_0/0.16)]"
+      className="absolute right-0 top-full z-40 mt-2 w-[min(22.5rem,calc(100vw-2rem))] space-y-3 rounded-xl border border-line-strong bg-panel p-4 shadow-pop motion-safe:animate-pop"
     >
       <h2 className="text-[0.9375rem] font-semibold">Share this dashboard</h2>
       <p className="text-[0.8125rem] leading-relaxed text-ink-2">

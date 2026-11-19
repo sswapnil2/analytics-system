@@ -143,3 +143,7 @@ export function formatTime(ts: number): string {
     timeZoneName: "short",
   });
 }
+
+/** A cohort split comes back as in_cohort / not_in_cohort; say it in words. */
+export const segmentName = (k: string): string =>
+  k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k;

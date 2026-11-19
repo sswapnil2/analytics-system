@@ -97,7 +97,7 @@ export const SaveToDashboard: React.FC<{
         <div
           role="dialog"
           aria-label="Save to dashboard"
-          className="absolute right-0 top-full z-40 mt-2 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-line-strong bg-panel p-4 shadow-[0_12px_32px_rgb(0_0_0/0.16)]"
+          className="absolute right-0 top-full z-40 mt-2 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-line-strong bg-panel p-4 shadow-pop motion-safe:animate-pop"
         >
           {savedTo ? (
             <div className="space-y-3 text-sm" role="status">
