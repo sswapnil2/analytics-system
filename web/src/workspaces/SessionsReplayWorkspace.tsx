@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, RefreshCw, Search, Video, Zap } from "lucide-react";
-import { api, SessionSearchResult, SessionSummaryItem } from "../api/client";
+import { api, isAbortError, SessionSearchResult, SessionSummaryItem } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { btn, EmptyState, ErrorNotice, field, fieldLabel, PageHeader, Panel, ListSkeleton } from "../components/ui";
 import { displayUserId, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
@@ -56,28 +56,41 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
     [availableEvents, eventFilter],
   );
 
+  const searchAbortRef = useRef<AbortController | null>(null);
+
   const runSearch = useCallback(async () => {
+    searchAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    searchAbortRef.current = ctrl;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.searchSessions(projectId, {
-        event_name: eventFilter || null,
-        only_rage_tap: onlyRage,
-        only_errors: onlyErrors,
-        only_with_replay: onlyRecorded,
-        limit: 30,
-      });
+      const res = await api.searchSessions(
+        projectId,
+        {
+          event_name: eventFilter || null,
+          only_rage_tap: onlyRage,
+          only_errors: onlyErrors,
+          only_with_replay: onlyRecorded,
+          limit: 30,
+        },
+        ctrl.signal,
+      );
+      if (ctrl.signal.aborted) return;
       setSearchRes(res);
       setSelected(res.sessions[0] ?? null);
     } catch (err) {
-      setError(errorMessage(err));
+      if (!isAbortError(err) && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (!ctrl.signal.aborted) setLoading(false);
     }
   }, [projectId, eventFilter, onlyRage, onlyErrors, onlyRecorded]);
 
   useEffect(() => {
     void runSearch();
+    return () => {
+      searchAbortRef.current?.abort();
+    };
   }, [runSearch, refreshToken]);
 
   const sessions = searchRes?.sessions ?? [];

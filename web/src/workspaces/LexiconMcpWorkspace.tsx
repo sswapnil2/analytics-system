@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, Copy, KeyRound, Play, Plus } from "lucide-react";
 import { api, ApiKeyRecord, LexiconEvent, LexiconProperty } from "../api/client";
 import { BatchImportExportPanel } from "../components/BatchImportExportPanel";
@@ -60,6 +60,13 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
   const [newKeyRole, setNewKeyRole] = useState("ingest_and_flags");
   const [mintedKey, setMintedKey] = useState<string | null>(null);
   const [copiedMinted, setCopiedMinted] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    },
+    [],
+  );
   const [creatingKey, setCreatingKey] = useState(false);
   const [lexLoading, setLexLoading] = useState(true);
   const [lexError, setLexError] = useState<string | null>(null);
@@ -126,7 +133,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
     try {
       const [res, keys] = await Promise.all([
         api.getLexicon(projectId),
-        api.listApiKeys(projectId).catch(() => []),
+        canAdmin ? api.listApiKeys(projectId).catch(() => []) : Promise.resolve([]),
       ]);
       setEvents(res.events);
       setProps(res.properties);
@@ -136,7 +143,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
     } finally {
       setLexLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, canAdmin]);
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -192,7 +199,12 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
   const runMcpTool = async (tool = selectedTool, rawArgs = argsJson) => {
     let parsedArgs: Record<string, unknown>;
     try {
-      parsedArgs = rawArgs.trim() ? JSON.parse(rawArgs) : {};
+      const parsed: unknown = rawArgs.trim() ? JSON.parse(rawArgs) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setMcpError("Arguments must be a JSON object.");
+        return;
+      }
+      parsedArgs = parsed as Record<string, unknown>;
     } catch {
       setMcpError("Arguments must be valid JSON.");
       return;
@@ -202,7 +214,7 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
     try {
       const res = await api.callMcp("tools/call", {
         name: tool,
-        arguments: { project_id: projectId, ...parsedArgs },
+        arguments: { ...parsedArgs, project_id: projectId },
       });
       if (res.error) setMcpError(res.error.message);
       setMcpOutput(JSON.stringify(maskUserIds(res.result ?? res), null, 2));
@@ -364,7 +376,8 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
                       try {
                         await navigator.clipboard.writeText(mintedKey);
                         setCopiedMinted(true);
-                        window.setTimeout(() => setCopiedMinted(false), 2000);
+                        if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+                        copyTimerRef.current = window.setTimeout(() => setCopiedMinted(false), 2000);
                       } catch {
                         // ignore
                       }

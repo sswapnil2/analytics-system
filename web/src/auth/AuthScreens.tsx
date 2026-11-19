@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { api, ApiAuthError, AuthConfig, getStoredAdminToken, setStoredAdminToken } from "../api/client";
+import { api, ApiAuthError, AuthConfig, hasStoredSession, setStoredAdminToken } from "../api/client";
 import { btn, field } from "../components/ui";
 import { errorMessage } from "../lib/format";
 
@@ -158,6 +158,10 @@ export const SignInScreen: React.FC<{ onSignedIn: () => void; reason?: string; g
   const [error, setError] = useState<string | null>(
     reason ?? (googleError ? GOOGLE_ERRORS[googleError] ?? "Google sign-in didn't work. Try again." : null),
   );
+
+  useEffect(() => {
+    if (reason) setError(reason);
+  }, [reason]);
 
   const accountsAvailable = cfg?.password !== false;
   const showToken = mode === "token" || (cfg !== null && !accountsAvailable);
@@ -536,7 +540,7 @@ export const AuthCallback: React.FC<{ code: string | null; onSignedIn: () => voi
         if (cancelled) return;
         setStoredAdminToken(session.token);
         // Drop the code from the address bar and history.
-        window.history.replaceState(null, "", "#/funnels");
+        window.history.replaceState(null, "", "#/dashboards");
         onSignedIn();
       })
       .catch((err) => !cancelled && setError(errorMessage(err)));
@@ -599,7 +603,7 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
 
   useEffect(() => {
     api.getInvite(token).then(setInfo).catch((err) => setLoadError(errorMessage(err)));
-    if (getStoredAdminToken())
+    if (hasStoredSession())
       api
         .getMe()
         .then((u) => setMe(u.email))
@@ -668,7 +672,7 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
                   You're signed in as {me}. This invite is for {info.email}.
                 </p>
               )}
-              <a href={`#/signin?next=invite/${token}`} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+              <a href={`#/signin?next=invite/${encodeURIComponent(token)}`} className={`${btn.primary} h-11 text-[0.9375rem]`}>
                 Sign in as {info.email}
               </a>
             </>
@@ -775,7 +779,7 @@ export const ForgotPasswordScreen: React.FC = () => {
   );
 };
 
-export const ResetPasswordScreen: React.FC<{ token: string }> = ({ token }) => {
+export const ResetPasswordScreen: React.FC<{ token: string; onSignedOut?: () => void }> = ({ token, onSignedOut }) => {
   const [password, setPassword] = useState("");
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -789,6 +793,7 @@ export const ResetPasswordScreen: React.FC<{ token: string }> = ({ token }) => {
     try {
       await api.resetPassword({ token, new_password: password });
       setStoredAdminToken("");
+      onSignedOut?.();
       setDone(true);
     } catch (err) {
       setError(errorMessage(err));

@@ -7,6 +7,7 @@ import { Panel, field, fieldLabel } from "./ui";
 /** Who a report counts: property conditions (all must match) and, optionally, a saved cohort. */
 type Op = "eq" | "neq" | "contains" | "gt" | "lt" | "is_set";
 export interface FilterRow {
+  id?: string;
   prop: string;
   op: Op;
   value: string;
@@ -46,10 +47,25 @@ export function toGlobalFilter(d: FilterDraft) {
 
 /** Reads a saved report's `global_filter` back into the editor. */
 export function fromGlobalFilter(gf: unknown): FilterDraft {
-  const g = gf as { predicates?: { prop_name: string; filter: { op: Op; val?: unknown } }[]; cohort?: { cohort_id?: string } | null };
+  const g = gf as {
+    predicates?: Array<{ prop_name?: unknown; filter?: { op?: unknown; val?: unknown } | null }>;
+    cohort?: { cohort_id?: unknown } | null;
+  };
+  const validOps = new Set<Op>(["eq", "neq", "contains", "gt", "lt", "is_set"]);
+  const rows: FilterRow[] = [];
+  for (const p of g?.predicates ?? []) {
+    if (!p || typeof p.prop_name !== "string" || !p.filter || typeof p.filter.op !== "string") continue;
+    if (!validOps.has(p.filter.op as Op)) continue;
+    rows.push({
+      id: nextRowId(),
+      prop: p.prop_name,
+      op: p.filter.op as Op,
+      value: p.filter.val == null ? "" : String(p.filter.val),
+    });
+  }
   return {
-    rows: (g?.predicates ?? []).map((p) => ({ prop: p.prop_name, op: p.filter.op, value: p.filter.val == null ? "" : String(p.filter.val) })),
-    cohortId: g?.cohort?.cohort_id ?? "",
+    rows,
+    cohortId: typeof g?.cohort?.cohort_id === "string" ? g.cohort.cohort_id : "",
   };
 }
 
@@ -62,14 +78,47 @@ export function describeFilter(d: FilterDraft, cohortName?: string): string {
   return parts.join(", ");
 }
 
-/** Saved cohorts for the picker, loaded once per project. */
+let filterRowSeq = 0;
+const nextRowId = () => `fr_${++filterRowSeq}`;
+
+const CACHE_TTL_MS = 60_000;
+const cohortCache = new Map<string, { ts: number; data: { id: string; name: string }[] }>();
+const topValuesCache = new Map<string, { ts: number; promise: Promise<string[]> }>();
+
+/** Clears cached filter metadata for one project or all projects (call on sign-out, account switch, or cohort creation). */
+export function clearFilterCaches(projectId?: string): void {
+  if (!projectId) {
+    cohortCache.clear();
+    topValuesCache.clear();
+    return;
+  }
+  cohortCache.delete(projectId);
+  const prefix = `${projectId}\u0000`;
+  for (const key of topValuesCache.keys()) {
+    if (key.startsWith(prefix)) topValuesCache.delete(key);
+  }
+}
+
+/** Saved cohorts for the picker, cached briefly per project. */
 export function useCohortNames(projectId: string) {
-  const [cohorts, setCohorts] = useState<{ id: string; name: string }[]>([]);
+  const [cohorts, setCohorts] = useState<{ id: string; name: string }[]>(() => {
+    const hit = cohortCache.get(projectId);
+    return hit && Date.now() - hit.ts < CACHE_TTL_MS ? hit.data : [];
+  });
   useEffect(() => {
+    const hit = cohortCache.get(projectId);
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
+      setCohorts(hit.data);
+      return;
+    }
     let alive = true;
     api
       .getCohorts(projectId)
-      .then((list) => alive && setCohorts(list.map((c) => ({ id: c.id, name: c.name }))))
+      .then((list) => {
+        const mapped = list.map((c) => ({ id: c.id, name: c.name }));
+        cohortCache.set(projectId, { ts: Date.now(), data: mapped });
+        if (alive) setCohorts(mapped);
+      })
       .catch(() => alive && setCohorts([]));
     return () => {
       alive = false;
@@ -78,20 +127,29 @@ export function useCohortNames(projectId: string) {
   return cohorts;
 }
 
-/** Most common values of `prop` on `anchorEvent` over the last 30 days, busiest first. */
+/** Most common values of `prop` on `anchorEvent` over the last 30 days, busiest first (cached 60s). */
 export async function topValues(projectId: string, anchorEvent: string, prop: string, limit = 50): Promise<string[]> {
+  const key = `${projectId}\u0000${anchorEvent}\u0000${prop}\u0000${limit}`;
+  const hit = topValuesCache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.promise;
   const end = Date.now();
-  const res = await api.queryInsights(projectId, {
-    time_range: { start_ts_ms: end - 30 * 86_400_000, end_ts_ms: end },
-    interval: "day",
-    series: [{ label: "A", event_name: anchorEvent, metric: { type: "totals" }, filters: [] }],
-    breakdown_by: [prop],
-  });
-  return res.series
-    .filter((s) => s.breakdown_key && s.breakdown_key !== "(none)")
-    .sort((a, b) => (b.overall_value ?? 0) - (a.overall_value ?? 0))
-    .slice(0, limit)
-    .map((s) => s.breakdown_key);
+  const promise = api
+    .queryInsights(projectId, {
+      time_range: { start_ts_ms: end - 30 * 86_400_000, end_ts_ms: end },
+      interval: "day",
+      series: [{ label: "A", event_name: anchorEvent, metric: { type: "totals" }, filters: [] }],
+      breakdown_by: [prop],
+    })
+    .then((res) =>
+      res.series
+        .filter((s) => s.breakdown_key && s.breakdown_key !== "(none)")
+        .sort((a, b) => (b.overall_value ?? 0) - (a.overall_value ?? 0))
+        .slice(0, limit)
+        .map((s) => s.breakdown_key),
+    );
+  topValuesCache.set(key, { ts: Date.now(), promise });
+  promise.catch(() => topValuesCache.delete(key));
+  return promise;
 }
 
 function useTopValues(projectId: string, anchorEvent: string, prop: string) {
@@ -201,7 +259,7 @@ export const FilterPanel: React.FC<{
           <ul className="space-y-2">
             {value.rows.map((r, i) => (
               <Row
-                key={i}
+                key={r.id ?? `${r.prop}-${i}`}
                 projectId={projectId}
                 anchorEvent={anchorEvent}
                 row={r}
@@ -215,7 +273,7 @@ export const FilterPanel: React.FC<{
         {props.length > 0 && (
           <button
             type="button"
-            onClick={() => onChange({ ...value, rows: [...value.rows, { prop: props[0], op: "eq", value: "" }] })}
+            onClick={() => onChange({ ...value, rows: [...value.rows, { id: nextRowId(), prop: props[0], op: "eq", value: "" }] })}
             className="inline-flex items-center gap-1 text-sm font-medium text-brand hover:underline"
           >
             <Plus className="h-3.5 w-3.5" />

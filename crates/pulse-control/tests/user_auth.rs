@@ -644,3 +644,271 @@ async fn first_owner_names_the_default_org_and_project() {
         "ShopNest App"
     );
 }
+
+async fn send_with_headers(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (k, v) in extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    let req_body = match body {
+        Some(b) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(&b).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(builder.body(req_body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let val = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    (status, headers, val)
+}
+
+#[tokio::test]
+async fn session_cookie_issuance_auth_csrf_and_logout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _ctrl, _meta) = setup_app(tmp.path()).await;
+
+    // 1. Signup on plain HTTP issues HttpOnly SameSite=Lax cookie without Secure.
+    let (s, hdrs, body) = send_with_headers(
+        &app,
+        "POST",
+        "/v1/auth/signup",
+        &[],
+        Some(json!({
+            "email": "cookie@example.com",
+            "password": "correct horse battery",
+            "name": "Cookie User",
+            "setup_code": ROOT
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let tok = body["token"].as_str().unwrap().to_string();
+    let set_cookie = hdrs
+        .get(header::SET_COOKIE)
+        .expect("signup must set pulse_session cookie")
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.starts_with(&format!("pulse_session={tok};")));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Lax"));
+    assert!(set_cookie.contains("Path=/"));
+    assert!(set_cookie.contains("Max-Age=2592000"));
+    assert!(
+        !set_cookie.contains("Secure"),
+        "plain HTTP must not set Secure: {set_cookie}"
+    );
+
+    // 2. Login over X-Forwarded-Proto: https adds `; Secure`.
+    let (s, hdrs, body) = send_with_headers(
+        &app,
+        "POST",
+        "/v1/auth/login",
+        &[("x-forwarded-proto", "https")],
+        Some(json!({
+            "email": "cookie@example.com",
+            "password": "correct horse battery"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let login_tok = body["token"].as_str().unwrap().to_string();
+    let login_cookie_hdr = hdrs
+        .get(header::SET_COOKIE)
+        .expect("login must set pulse_session cookie")
+        .to_str()
+        .unwrap();
+    assert!(login_cookie_hdr.starts_with(&format!("pulse_session={login_tok};")));
+    assert!(
+        login_cookie_hdr.contains("; Secure"),
+        "HTTPS login must set Secure: {login_cookie_hdr}"
+    );
+
+    let cookie_header = format!("other=1; pulse_session={login_tok}");
+
+    // 3. Cookie auth works for GET without Authorization header.
+    let (s, _, me) = send_with_headers(
+        &app,
+        "GET",
+        "/v1/auth/me",
+        &[("cookie", &cookie_header)],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{me}");
+    assert_eq!(me["email"], "cookie@example.com");
+
+    // Active sessions marks the cookie-authenticated session as current.
+    let (s, _, sessions) = send_with_headers(
+        &app,
+        "GET",
+        "/v1/auth/sessions",
+        &[("cookie", &cookie_header)],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{sessions}");
+    assert!(sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["current"] == true));
+
+    // 4. Non-session token (e.g. root admin token) in cookie is rejected with 401.
+    let root_cookie = format!("pulse_session={ROOT}");
+    let (s, _, _) = send_with_headers(
+        &app,
+        "GET",
+        "/v1/status",
+        &[("cookie", &root_cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // 5. CSRF protection for cookie-authenticated mutations:
+    // Missing Sec-Fetch-Site and Origin -> 403
+    let (s, _, _) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[("cookie", &cookie_header)],
+        Some(json!({"name": "Cross Site"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Cross-site Sec-Fetch-Site -> 403
+    let (s, _, _) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[
+            ("cookie", &cookie_header),
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://evil.example"),
+        ],
+        Some(json!({"name": "Cross Site"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Mismatched Origin (without Sec-Fetch-Site) -> 403
+    let (s, _, _) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[
+            ("cookie", &cookie_header),
+            ("origin", "https://evil.example"),
+        ],
+        Some(json!({"name": "Cross Site"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Same-origin Sec-Fetch-Site -> 200
+    let (s, _, updated) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[
+            ("cookie", &cookie_header),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        Some(json!({"name": "Same Origin"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{updated}");
+    assert_eq!(updated["name"], "Same Origin");
+
+    // Matching Origin header (without Sec-Fetch-Site) -> 200
+    let (s, _, updated) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[("cookie", &cookie_header), ("origin", PUBLIC_URL)],
+        Some(json!({"name": "Origin Match"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{updated}");
+    assert_eq!(updated["name"], "Origin Match");
+
+    // Matching Host + Origin header (e.g. ephemeral localhost port) -> 200
+    let (s, _, updated) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[
+            ("cookie", &cookie_header),
+            ("host", "127.0.0.1:41234"),
+            ("origin", "http://127.0.0.1:41234"),
+        ],
+        Some(json!({"name": "Host Match"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{updated}");
+    assert_eq!(updated["name"], "Host Match");
+
+    // 6. Bearer auth mutations remain unaffected (no Origin / Sec-Fetch-Site required).
+    let bearer_hdr = format!("Bearer {login_tok}");
+    let (s, _, updated) = send_with_headers(
+        &app,
+        "PATCH",
+        "/v1/auth/me",
+        &[("authorization", &bearer_hdr)],
+        Some(json!({"name": "Bearer Still Works"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{updated}");
+    assert_eq!(updated["name"], "Bearer Still Works");
+
+    // 7. Logout via cookie clears the cookie (Max-Age=0) and revokes the session in DB.
+    let (s, hdrs, _) = send_with_headers(
+        &app,
+        "POST",
+        "/v1/auth/logout",
+        &[
+            ("cookie", &cookie_header),
+            ("sec-fetch-site", "same-origin"),
+            ("x-forwarded-proto", "https"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let cleared = hdrs
+        .get(header::SET_COOKIE)
+        .expect("logout must clear pulse_session cookie")
+        .to_str()
+        .unwrap();
+    assert!(cleared.starts_with("pulse_session=;"));
+    assert!(cleared.contains("HttpOnly"));
+    assert!(cleared.contains("SameSite=Lax"));
+    assert!(cleared.contains("Path=/"));
+    assert!(cleared.contains("Max-Age=0"));
+    assert!(cleared.contains("; Secure"));
+
+    // Revoked session cookie can no longer authenticate.
+    let (s, _, _) = send_with_headers(
+        &app,
+        "GET",
+        "/v1/auth/me",
+        &[("cookie", &cookie_header)],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}

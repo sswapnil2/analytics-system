@@ -169,7 +169,10 @@ const encodeQuery = (q: Record<string, unknown>): string => {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
 
-const decodeQuery = (raw: string): Record<string, unknown> | null => {
+const MAX_QUERY_PARAM_LEN = 32_768;
+
+export const decodeQuery = (raw: string): Record<string, unknown> | null => {
+  if (!raw || raw.length > MAX_QUERY_PARAM_LEN) return null;
   try {
     const bin = atob(raw.replace(/-/g, "+").replace(/_/g, "/"));
     const v: unknown = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0))));

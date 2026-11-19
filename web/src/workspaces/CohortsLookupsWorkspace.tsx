@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Download, Plus, Upload, Users, X } from "lucide-react";
-import { api } from "../api/client";
+import { api, isAbortError } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
+import { clearFilterCaches } from "../components/FilterPanel";
 import { useAccess } from "../auth/access";
 import { downloadTextFile, errorMessage, formatCount, humanizeEvent } from "../lib/format";
 
@@ -91,8 +92,13 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   const [conds, setConds] = useState<Cond[]>(() => [{ ...newCond(), minCount: 2, days: 0 }]);
   const [match, setMatch] = useState<"and" | "or">("and");
   const setCond = (i: number, patch: Partial<Cond>) => setConds((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
-  const definition = cohortDefinition(conds, match);
-  const defKey = JSON.stringify(definition);
+  // Stable key independent of Date.now() so rolling-day conditions never trigger an infinite preview loop.
+  const defStableKey = useMemo(() => JSON.stringify({ conds, match }), [conds, match]);
+  const condsRef = useRef(conds);
+  condsRef.current = conds;
+  const matchRef = useRef(match);
+  matchRef.current = match;
+  const previewAbortRef = useRef<AbortController | null>(null);
   const [preview, setPreview] = useState<{ count: number; us: number } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -175,37 +181,48 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   }, [loadAll]);
 
   const runPreview = useCallback(async () => {
-    const def = defKey === "null" ? null : JSON.parse(defKey);
+    const def = cohortDefinition(condsRef.current, matchRef.current);
+    previewAbortRef.current?.abort();
     if (!def) {
       setPreview(null);
+      setPreviewError(null);
+      setPreviewLoading(false);
       return;
     }
+    const ctrl = new AbortController();
+    previewAbortRef.current = ctrl;
     setPreviewLoading(true);
     setPreviewError(null);
     try {
-      const res = await api.previewCohort(projectId, def);
-      setPreview({ count: res.user_count, us: res.exec_time_us });
+      const res = await api.previewCohort(projectId, def, ctrl.signal);
+      if (!ctrl.signal.aborted) setPreview({ count: res.user_count, us: res.exec_time_us });
     } catch (err) {
-      setPreviewError(errorMessage(err));
+      if (!isAbortError(err) && !ctrl.signal.aborted) setPreviewError(errorMessage(err));
     } finally {
-      setPreviewLoading(false);
+      if (!ctrl.signal.aborted) setPreviewLoading(false);
     }
-  }, [projectId, defKey]);
+  }, [projectId, defStableKey]);
 
   useEffect(() => {
-    void runPreview();
+    const timer = window.setTimeout(() => void runPreview(), 200);
+    return () => {
+      window.clearTimeout(timer);
+      previewAbortRef.current?.abort();
+    };
   }, [runPreview]);
 
   const saveCohort = () =>
     withFeedback(setCohortFeedback, setSavingCohort, `Saved "${cohortName.trim()}".`, async () => {
+      const def = cohortDefinition(conds, match);
       if (!cohortName.trim()) throw new Error("Give the cohort a name.");
-      if (!definition) throw new Error("Add at least one condition.");
+      if (!def) throw new Error("Add at least one condition.");
       const text = conds.map(condText).join(match === "and" ? ", and " : ", or ");
       await api.createCohort(projectId, {
         name: cohortName.trim(),
         description: text.charAt(0).toUpperCase() + text.slice(1),
-        definition,
+        definition: def,
       });
+      clearFilterCaches(projectId);
       await loadAll();
       onCatalogChanged();
     });

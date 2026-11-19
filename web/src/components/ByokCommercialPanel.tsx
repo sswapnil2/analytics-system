@@ -241,6 +241,8 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
         config_json,
       });
       setDraftSecret((prev) => ({ ...prev, [cat.category]: "" }));
+      if (cat.category === "webhook") setDraftSigningSecret("");
+      if (cat.category === "storage") setDraftStorageAccessKey("");
       await loadState();
       setNotice(`Saved sealed BYOK ${cat.category.toUpperCase()} credential.`);
     } catch (err) {
@@ -624,6 +626,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                     {cat.category === "webhook" && (
                       <input
                         type="password"
+                        autoComplete="off"
                         value={draftSigningSecret}
                         disabled={!isCommercial || busy}
                         onChange={(e) => setDraftSigningSecret(e.target.value)}
@@ -636,6 +639,7 @@ export const ByokCommercialPanel: React.FC<{ projectId: string }> = ({
                     <div className="flex items-center gap-2">
                       <input
                         type="password"
+                        autoComplete="off"
                         value={draftSecret[cat.category] ?? ""}
                         disabled={!isCommercial || busy}
                         onChange={(e) =>

@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, InsightsResult, SeriesOutput } from "../api/client";
-import { errorMessage, formatDate, formatDateTime, humanizeEvent } from "../lib/format";
+import { api, InsightsResult, isAbortError, SeriesOutput } from "../api/client";
+import { buildCsv } from "../lib/csv";
+import { downloadTextFile, errorMessage, formatDate, formatDateTime, humanizeEvent } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { AnnotationsList, useAnnotations } from "../components/Annotations";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
@@ -55,6 +56,19 @@ const METRIC_OPTIONS: [string, string][] = [
 ];
 const PROP_METRICS = ["sum", "avg", "p50", "p90", "p99"];
 const CURRENCIES = ["USD", "EUR", "GBP", "INR", "JPY", "AUD", "CAD", "SGD", "BRL"];
+
+function sanitizeCurrency(raw: unknown): string {
+  return typeof raw === "string" && CURRENCIES.includes(raw) ? raw : "";
+}
+
+function nextSeriesLabel(existing: SeriesDraft[]): string {
+  const used = new Set(existing.map((s) => s.label));
+  for (let i = 0; i < 26; i++) {
+    const ch = String.fromCharCode(65 + i);
+    if (!used.has(ch)) return ch;
+  }
+  return `S${existing.length + 1}`;
+}
 
 /** Inverse of buildMetricSpec, for opening a saved report. */
 function metricKindOf(m: { type?: string; quantile?: number } | undefined): string {
@@ -147,12 +161,18 @@ export const InsightsWorkspace: React.FC<Props> = ({
     defaultSeriesFromCatalog(availableEvents, numericProps),
   );
   const [formula, setFormula] = useState<string>("");
+  const [debouncedFormula, setDebouncedFormula] = useState<string>("");
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedFormula(formula), 350);
+    return () => window.clearTimeout(t);
+  }, [formula]);
   const [currency, setCurrency] = useState<string>("");
+  const safeCurrency = sanitizeCurrency(currency);
   // Currency only dresses property sums/averages; counts of users stay plain numbers.
-  const money = currency && series.every((s) => PROP_METRICS.includes(s.metricKind));
+  const money = Boolean(safeCurrency) && series.every((s) => PROP_METRICS.includes(s.metricKind));
   const fmt = (v: number | null | undefined, digits = 2) =>
     money && v !== null && v !== undefined && Number.isFinite(v)
-      ? v.toLocaleString(undefined, { style: "currency", currency, maximumFractionDigits: digits > 0 ? 2 : 0 })
+      ? v.toLocaleString(undefined, { style: "currency", currency: safeCurrency, maximumFractionDigits: digits > 0 ? 2 : 0 })
       : formatValue(v, digits);
   const [breakdown, setBreakdown] = useState<string>("");
   const [interval, setInterval_] = useState<Interval>("day");
@@ -172,26 +192,30 @@ export const InsightsWorkspace: React.FC<Props> = ({
   }, [availableEvents, numericProps]);
 
   const buildQuery = useCallback(
-    () => ({
-      interval,
-      series: series.map((s) => ({
-        label: s.label,
-        event_name: s.eventName,
-        metric: buildMetricSpec(s.metricKind, s.propName),
-        filters: [],
-      })),
-      breakdown_by: breakdown ? [breakdown] : [],
-      compare_previous_period: comparePrev,
-      formula: formula.trim() ? formula.trim() : null,
-      global_filter: toGlobalFilter(filter),
-      // Display only; the engine ignores it.
-      display_currency: currency || undefined,
-    }),
-    [interval, series, formula, breakdown, comparePrev, filter, currency],
+    (formulaOverride?: string) => {
+      const f = (formulaOverride ?? formula).trim();
+      return {
+        interval,
+        series: series.map((s) => ({
+          label: s.label,
+          event_name: s.eventName,
+          metric: buildMetricSpec(s.metricKind, s.propName),
+          filters: [],
+        })),
+        breakdown_by: breakdown ? [breakdown] : [],
+        compare_previous_period: comparePrev,
+        formula: f ? f : null,
+        global_filter: toGlobalFilter(filter),
+        // Display only; the engine ignores it.
+        display_currency: safeCurrency || undefined,
+      };
+    },
+    [interval, series, formula, breakdown, comparePrev, filter, safeCurrency],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const queryAbortRef = useRef<AbortController | null>(null);
   const openError = useSavedReport(
     projectId,
     (q) => {
@@ -199,45 +223,60 @@ export const InsightsWorkspace: React.FC<Props> = ({
         breakdown_by?: string[]; compare_previous_period?: boolean; formula?: string | null };
       if (s.series?.length)
         setSeries(s.series.map((x) => ({ label: x.label, eventName: x.event_name, metricKind: metricKindOf(x.metric), propName: x.metric?.prop ?? numericProps[0] ?? "" })));
-      setCurrency((q as { display_currency?: string }).display_currency ?? "");
+      setCurrency(sanitizeCurrency((q as { display_currency?: unknown }).display_currency));
       setBreakdown(s.breakdown_by?.[0] ?? "");
       const iv = (q as { interval?: string }).interval;
       setInterval_(iv === "hour" || iv === "week" || iv === "month" ? iv : "day");
       setComparePrev(!!s.compare_previous_period);
-      setFormula(s.formula ?? "");
+      const nextFormula = s.formula ?? "";
+      setFormula(nextFormula);
+      setDebouncedFormula(nextFormula);
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
     },
     setRange,
     { query: buildQuery, range },
   );
 
+  const buildQueryRef = useRef(buildQuery);
+  buildQueryRef.current = buildQuery;
+
   const runQuery = useCallback(async () => {
     if (series.length === 0 || series.some((s) => !s.eventName)) {
       setResult(null);
       return;
     }
+    queryAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    queryAbortRef.current = ctrl;
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryInsights(projectId, { time_range: rangeFor(range), ...buildQuery() });
+      const res = await api.queryInsights(
+        projectId,
+        { time_range: rangeFor(range), ...buildQueryRef.current(debouncedFormula) },
+        ctrl.signal,
+      );
       // A cohort split comes back as in_cohort / not_in_cohort; the summary names the cohort.
       const cohortKey = (k: string) => (k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k);
-      if (id === reqId.current)
+      if (id === reqId.current && !ctrl.signal.aborted)
         setResult({
           ...res,
           series: res.series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
           previous_series: res.previous_series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
         });
     } catch (err) {
-      if (id === reqId.current) setError(errorMessage(err));
+      if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
-      if (id === reqId.current) setLoading(false);
+      if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, buildQuery, range, series]);
+  }, [projectId, interval, series, debouncedFormula, breakdown, comparePrev, filter, safeCurrency, range]);
 
   useEffect(() => {
     void runQuery();
+    return () => {
+      queryAbortRef.current?.abort();
+    };
   }, [runQuery, refreshToken]);
 
   const updateSeries = (idx: number, patch: Partial<SeriesDraft>) =>
@@ -262,14 +301,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         ...s.points.map((p) => (p.value === null ? "" : p.value.toFixed(2))),
       ]);
     }
-    const csv = rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `trends_${projectId}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadTextFile(`trends_${projectId}.csv`, buildCsv(rows), "text/csv;charset=utf-8");
   };
 
   const displayedSeries = result
@@ -366,7 +398,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
               setSeries([
                 ...series,
                 {
-                  label: String.fromCharCode(65 + series.length),
+                  label: nextSeriesLabel(series),
                   eventName: eventOptions[0] ?? "",
                   metricKind: "uniques",
                   propName: numericProps[0] ?? "",

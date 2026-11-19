@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
@@ -14,8 +15,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::auth::{
-    hash_password, normalize_email, now_ms, random_hex, user_json, verify_password, SignupOrg,
-    PENDING_ORG,
+    extract_session_cookie, hash_password, normalize_email, now_ms, random_hex, user_json,
+    verify_password, SignupOrg, PENDING_ORG,
 };
 use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, CtrlError};
 use crate::db::OrgInvite;
@@ -168,7 +169,9 @@ fn parse_role(s: &str) -> Result<Role, CtrlError> {
 }
 
 fn current_hash(headers: &HeaderMap) -> Option<String> {
-    extract_admin_bearer(headers).map(sha256_hex)
+    extract_admin_bearer(headers)
+        .or_else(|| extract_session_cookie(headers))
+        .map(sha256_hex)
 }
 
 impl ControlPlaneService {
@@ -672,8 +675,9 @@ struct AcceptInviteReq {
 async fn handle_accept_invite(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<AcceptInviteReq>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     check_password(&req.password)?;
     let now = now_ms();
     let inv = ctrl
@@ -734,7 +738,7 @@ async fn handle_accept_invite(
         json!({ "invite_id": inv.id, "email": inv.email, "role": inv.role }),
     )
     .await;
-    ctrl.session_response(&user, &headers).await
+    ctrl.session_response(&user, &headers, &uri).await
 }
 
 // ------------------- Password reset -------------------
@@ -834,8 +838,9 @@ struct TokenReq {
 async fn handle_verify_email(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<TokenReq>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let gone = || {
         CtrlError(
             StatusCode::GONE,
@@ -888,7 +893,7 @@ async fn handle_verify_email(
         role,
         ..user
     };
-    ctrl.session_response(&user, &headers).await
+    ctrl.session_response(&user, &headers, &uri).await
 }
 
 /// A signed-in account accepts an invite addressed to its email and moves to that organisation.

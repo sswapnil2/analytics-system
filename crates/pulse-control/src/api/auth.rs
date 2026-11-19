@@ -6,7 +6,7 @@ use std::time::Duration;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -23,6 +23,8 @@ use super::{extract_admin_bearer, ApiRes, AuthPrincipal, ControlPlaneService, Ct
 use crate::models::{sha256_bytes, sha256_hex, Role, User};
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_SECS: i64 = SESSION_TTL_MS / 1000;
+pub(super) const SESSION_COOKIE_NAME: &str = "pulse_session";
 const GOOGLE_STATE_TTL_MS: i64 = 10 * 60 * 1000;
 const LOGIN_CODE_TTL_MS: i64 = 60 * 1000;
 const LOGIN_FAILURE_WINDOW_MS: i64 = 15 * 60 * 1000;
@@ -266,7 +268,12 @@ impl ControlPlaneService {
         Ok(token)
     }
 
-    pub(super) async fn session_response(&self, user: &User, headers: &HeaderMap) -> ApiRes<Value> {
+    pub(super) async fn session_response(
+        &self,
+        user: &User,
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> std::result::Result<Response, CtrlError> {
         let token = self.create_session(&user.id, headers).await?;
         self.record_enterprise_audit(
             &format!("user:{}", user.id),
@@ -275,8 +282,71 @@ impl ControlPlaneService {
             json!({ "email": user.email }),
         )
         .await;
-        Ok(Json(json!({ "token": token, "user": user_json(user) })))
+        let cookie = build_session_cookie(&token, is_https_request(headers, Some(uri)));
+        let mut resp = Json(json!({ "token": token, "user": user_json(user) })).into_response();
+        if let Ok(val) = HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Ok(resp)
     }
+}
+
+pub(super) fn is_https_request(headers: &HeaderMap, uri: Option<&Uri>) -> bool {
+    if uri.is_some_and(|u| u.scheme_str() == Some("https")) {
+        return true;
+    }
+    if headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|first| first.trim().eq_ignore_ascii_case("https"))
+    {
+        return true;
+    }
+    if headers
+        .get(header::FORWARDED)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .next()
+                .unwrap_or("")
+                .split(';')
+                .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
+        })
+    {
+        return true;
+    }
+    false
+}
+
+pub(super) fn build_session_cookie(token: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}{secure_attr}"
+    )
+}
+
+pub(super) fn build_clear_session_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_attr}")
+}
+
+pub(super) fn extract_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    for val in headers.get_all(header::COOKIE) {
+        let Ok(raw) = val.to_str() else {
+            continue;
+        };
+        for part in raw.split(';') {
+            let trimmed = part.trim();
+            if let Some(v) = trimmed.strip_prefix("pulse_session=") {
+                let tok = v.trim();
+                if !tok.is_empty() {
+                    return Some(tok);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Placeholder organisation for sign-ups that haven't verified their email. It has no projects.
@@ -446,8 +516,9 @@ struct SignupReq {
 async fn handle_signup(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<SignupReq>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let email =
         normalize_email(&req.email).ok_or_else(|| CtrlError::bad("enter a valid email address"))?;
     let pw_len = req.password.chars().count();
@@ -522,7 +593,7 @@ async fn handle_signup(
             .await
             .map_err(CtrlError::meta)?
             .ok_or_else(|| CtrlError::internal("account vanished"))?;
-        return ctrl.session_response(&user, &headers).await;
+        return ctrl.session_response(&user, &headers, &uri).await;
     }
 
     // Everyone else proves the address first. Pulse has no mailer: the link goes to the node log.
@@ -543,9 +614,7 @@ async fn handle_signup(
     let url = format!("{}/#/verify/{token}", ctrl.auth_cfg.read().public_url);
     // ponytail: the outbox file is the mailer. Add SMTP when someone needs links delivered.
     ctrl.deliver_link("verify", &user.email, &url);
-    Ok(Json(
-        json!({ "verification_required": true, "email": user.email }),
-    ))
+    Ok(Json(json!({ "verification_required": true, "email": user.email })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -557,8 +626,9 @@ struct LoginReq {
 async fn handle_login(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<LoginReq>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let email = req.email.trim().to_lowercase();
     let now = now_ms();
     let failures = &ctrl.auth_state.login_failures;
@@ -599,7 +669,7 @@ async fn handle_login(
         }
         Some(user) if matched && has_password => {
             failures.remove(&email);
-            ctrl.session_response(&user, &headers).await
+            ctrl.session_response(&user, &headers, &uri).await
         }
         _ => {
             if failures.len() >= MAX_PENDING_ENTRIES {
@@ -633,8 +703,9 @@ struct ExchangeReq {
 async fn handle_exchange(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<ExchangeReq>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let invalid = || CtrlError::unauthorized("Sign-in code is invalid or expired");
     let user_id = take_pending(&ctrl.auth_state.login_codes, &req.code).ok_or_else(invalid)?;
     let user = ctrl
@@ -643,7 +714,7 @@ async fn handle_exchange(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(invalid)?;
-    ctrl.session_response(&user, &headers).await
+    ctrl.session_response(&user, &headers, &uri).await
 }
 
 pub(super) async fn handle_me(
@@ -667,14 +738,23 @@ pub(super) async fn handle_me(
 pub(super) async fn handle_logout(
     State(ctrl): State<Arc<ControlPlaneService>>,
     headers: HeaderMap,
-) -> ApiRes<Value> {
-    if let Some(token) = extract_admin_bearer(&headers).filter(|t| t.starts_with("ps_")) {
+    uri: Uri,
+) -> std::result::Result<Response, CtrlError> {
+    if let Some(token) = extract_admin_bearer(&headers)
+        .or_else(|| extract_session_cookie(&headers))
+        .filter(|t| t.starts_with("ps_"))
+    {
         ctrl.meta
             .delete_session(&sha256_hex(token))
             .await
             .map_err(CtrlError::meta)?;
     }
-    Ok(Json(json!({ "status": "ok" })))
+    let clear_cookie = build_clear_session_cookie(is_https_request(&headers, Some(&uri)));
+    let mut resp = Json(json!({ "status": "ok" })).into_response();
+    if let Ok(val) = HeaderValue::from_str(&clear_cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, val);
+    }
+    Ok(resp)
 }
 
 async fn handle_google_start(State(ctrl): State<Arc<ControlPlaneService>>) -> Response {

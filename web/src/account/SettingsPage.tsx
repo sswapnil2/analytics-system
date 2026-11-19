@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, FolderPlus, KeyRound, Plus, RotateCw, UserPlus } from "lucide-react";
 import {
   api,
@@ -13,32 +13,21 @@ import {
   roleAtLeast,
   ROLES,
 } from "../api/client";
-import { btn, EmptyState, ErrorNotice, field, fieldLabel, ListSkeleton, PageHeader, Panel } from "../components/ui";
+import { btn, EmptyState, ErrorNotice, field, fieldLabel, ListSkeleton, PageHeader, Panel, ROLE_HELP, RoleBadge } from "../components/ui";
 import { errorMessage, formatTimestamp } from "../lib/format";
 
-const ROLE_HELP: Record<Role, string> = {
-  viewer: "Reads reports and dashboards",
-  member: "Also creates and edits reports, dashboards, cohorts and flags",
-  admin: "Also manages members, invites and API keys",
-  owner: "Also renames the organisation and manages owners",
-};
-
 const label = (r: Role) => r[0].toUpperCase() + r.slice(1);
-
-export const RoleBadge: React.FC<{ role: Role }> = ({ role }) => (
-  <span
-    title={ROLE_HELP[role]}
-    className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-      role === "owner" || role === "admin" ? "bg-brand-soft text-brand" : "border border-line-strong text-ink-2"
-    }`}
-  >
-    {label(role)}
-  </span>
-);
 
 /** A one-time link or key with a Copy button. */
 const OneTimeValue: React.FC<{ title: string; value: string }> = ({ title, value }) => {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    },
+    [],
+  );
   return (
     <div
       className="flex items-center justify-between gap-2 rounded-lg border border-ok/30 bg-ok-soft px-3 py-2 text-xs text-ink"
@@ -54,7 +43,8 @@ const OneTimeValue: React.FC<{ title: string; value: string }> = ({ title, value
           try {
             await navigator.clipboard.writeText(value);
             setCopied(true);
-            window.setTimeout(() => setCopied(false), 2000);
+            if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+            timerRef.current = window.setTimeout(() => setCopied(false), 2000);
           } catch {
             // clipboard blocked: the value is still selectable
           }
@@ -147,7 +137,7 @@ export const SettingsPage: React.FC<{
       const token = inv.invite_url?.split("/").pop() ?? "";
       setNotice({
         title: `Invite link for ${inv.email}. Send it to them; it works once and expires in 7 days.`,
-        value: `${window.location.origin}/#/invite/${token}`,
+        value: `${window.location.origin}${window.location.pathname}#/invite/${encodeURIComponent(token)}`,
       });
       setInviteEmail("");
     });
@@ -206,7 +196,7 @@ export const SettingsPage: React.FC<{
       const token = r.reset_url.split("/").pop() ?? "";
       setNotice({
         title: `Password reset link for ${m.email}. It works once and expires in an hour.`,
-        value: `${window.location.origin}/#/reset/${token}`,
+        value: `${window.location.origin}${window.location.pathname}#/reset/${encodeURIComponent(token)}`,
       });
     });
 
