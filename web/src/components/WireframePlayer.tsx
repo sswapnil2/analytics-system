@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Pause, Play, RotateCcw, ShieldCheck, VideoOff, WifiOff, Zap } from "lucide-react";
-import { api, ReplayChunk, WireNode } from "../api/client";
+import { api, isAbortError, ReplayChunk, WireNode } from "../api/client";
 import { errorMessage, formatDuration, isNotFound } from "../lib/format";
 import { EmptyState, ErrorNotice, Spinner, btn } from "./ui";
 
@@ -52,20 +52,20 @@ export const SessionReplay: React.FC<{
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
+    const ctrl = new AbortController();
     setState({ kind: "loading" });
     api
-      .getReplay(projectId, sessionId, offsetKb)
+      .getReplay(projectId, sessionId, offsetKb, ctrl.signal)
       .then((res) => {
-        if (cancelled) return;
+        if (ctrl.signal.aborted) return;
         setState(res.chunks.length > 0 ? { kind: "ready", chunks: res.chunks } : { kind: "missing" });
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (isAbortError(err) || ctrl.signal.aborted) return;
         setState(isNotFound(err) ? { kind: "missing" } : { kind: "error", message: errorMessage(err) });
       });
     return () => {
-      cancelled = true;
+      ctrl.abort();
     };
   }, [projectId, sessionId, offsetKb, attempt]);
 
@@ -181,17 +181,14 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
     if (!playing) return;
     const step = 50;
     const id = setInterval(() => {
-      setCursorMs((prev) => {
-        const next = prev + step * speed;
-        if (next >= durationMs) {
-          setPlaying(false);
-          return durationMs;
-        }
-        return next;
-      });
+      setCursorMs((prev) => Math.min(durationMs, prev + step * speed));
     }, step);
     return () => clearInterval(id);
   }, [playing, speed, durationMs]);
+
+  useEffect(() => {
+    if (playing && cursorMs >= durationMs) setPlaying(false);
+  }, [playing, cursorMs, durationMs]);
 
   const { activeNodes, activePointers } = useMemo(() => {
     const nodeMap = new Map<number, WireNode>();
@@ -234,7 +231,8 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
   // Web recordings are landscape (e.g. 1024×768): show them in a browser-style frame stacked above
   // the controls, and shrink any recording to fit the available width instead of clipping it.
   const landscape = viewport.w > viewport.h;
-  const scale = Math.min(0.72, (fitW - 12) / viewport.w);
+  const availableW = Number.isFinite(fitW) && fitW > 60 ? fitW - 12 : viewport.w * 0.72;
+  const scale = Math.max(0.15, Math.min(0.72, availableW / Math.max(1, viewport.w)));
   const frameW = Math.round(viewport.w * scale);
   const frameH = Math.round(viewport.h * scale);
 

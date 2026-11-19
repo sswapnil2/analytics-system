@@ -219,6 +219,60 @@ impl RunningNode {
     }
 }
 
+/// Content-Security-Policy for Pulse Studio (`web/dist`) and admin/control API routes.
+/// The SHA-256 hash matches the inline theme-init script in `web/index.html` (which prevents FOUC);
+/// once that script is extracted to `/theme-init.js`, `script-src` can be tightened to `'self'`.
+const STUDIO_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self' 'sha256-CHRePUA+2hu8+7Fc1MQN0Ox3SoQuGEleoBo20ZdmAyU='; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data:; ",
+    "font-src 'self'; ",
+    "connect-src 'self'; ",
+    "frame-ancestors 'none'; ",
+    "base-uri 'self'; ",
+    "form-action 'self'"
+);
+
+async fn security_headers_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_https = req.uri().scheme_str() == Some("https")
+        || req
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .is_some_and(|first| first.trim().eq_ignore_ascii_case("https"));
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(STUDIO_CSP),
+    );
+    if is_https {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    res
+}
+
 fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
     let parsed: Vec<HeaderValue> = origins
         .iter()
@@ -226,6 +280,7 @@ fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
         .collect();
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
+        .allow_credentials(true)
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -441,6 +496,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     }
     if config.role.serves_query_and_admin() {
         let admin_router = build_admin_control_router(control.clone())
+            .layer(axum::middleware::from_fn(security_headers_middleware))
             .layer(build_admin_cors_layer(&config.allowed_origins));
         api_router = api_router.merge(admin_router);
     }
@@ -479,14 +535,16 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                 )
             }))
         };
-        let spa_router = spa_router.layer(axum::middleware::from_fn(
-            |req: axum::extract::Request, next: axum::middleware::Next| async move {
-                if req.uri().path().starts_with("/v1/") {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-                next.run(req).await
-            },
-        ));
+        let spa_router = spa_router
+            .layer(axum::middleware::from_fn(security_headers_middleware))
+            .layer(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if req.uri().path().starts_with("/v1/") {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    next.run(req).await
+                },
+            ));
         api_router.fallback_service(spa_router)
     } else {
         api_router
@@ -1220,6 +1278,117 @@ mod tests {
         let draining = http.get(format!("{base}/readyz")).send().await.unwrap();
         assert_eq!(draining.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert!(draining.text().await.unwrap().contains("draining"));
+
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_spa_and_admin_without_breaking_public_sdk() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let web_dir = tmp_dir.path().join("dist");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(
+            web_dir.join("index.html"),
+            "<!doctype html><html><body>Pulse Studio</body></html>",
+        )
+        .unwrap();
+
+        let node = start_pulse_node(NodeConfig {
+            role: NodeRole::All,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: tmp_dir.path().join("node_data"),
+            web_dist_dir: web_dir,
+            default_project_id: "proj_sec".to_string(),
+            default_api_key: String::new(),
+            admin_token: None,
+            allowed_origins: vec!["http://localhost:5173".to_string()],
+            auto_seed: false,
+            num_buckets: 4,
+        })
+        .await
+        .expect("start pulse-node");
+
+        let ingest_key = node
+            .bootstrap_credentials
+            .generated_ingest_key
+            .clone()
+            .expect("ingest key");
+        let base = format!("http://{}", node.http_addr);
+        let http = reqwest::Client::new();
+
+        // 1. Web UI (SPA) responses carry all browser security headers.
+        let spa = http.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(spa.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            spa.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(spa.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            spa.headers().get("referrer-policy").unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(
+            spa.headers().get("permissions-policy").unwrap(),
+            "camera=(), microphone=(), geolocation=()"
+        );
+        let csp = spa
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("base-uri 'self'"), "{csp}");
+        assert!(csp.contains("form-action 'self'"), "{csp}");
+        assert!(
+            spa.headers().get("strict-transport-security").is_none(),
+            "plain HTTP must not send HSTS"
+        );
+
+        // 2. HTTPS (X-Forwarded-Proto: https) adds HSTS.
+        let spa_https = http
+            .get(format!("{base}/"))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            spa_https
+                .headers()
+                .get("strict-transport-security")
+                .unwrap(),
+            "max-age=31536000; includeSubDomains"
+        );
+
+        // 3. Admin/control API routes carry security headers too.
+        let auth_cfg = http
+            .get(format!("{base}/v1/auth/config"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(auth_cfg.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            auth_cfg.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(auth_cfg.headers().get("x-frame-options").unwrap(), "DENY");
+        assert!(auth_cfg.headers().get("content-security-policy").is_some());
+
+        // 4. Public SDK route keeps permissive CORS and works from any customer origin.
+        let flags = http
+            .get(format!("{base}/v1/flags/{ingest_key}"))
+            .header("origin", "https://customer-app.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(flags.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            flags.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
 
         node.shutdown().await;
     }

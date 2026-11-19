@@ -1052,12 +1052,130 @@ fn extract_admin_bearer(headers: &HeaderMap) -> Option<&str> {
     None
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthSource {
+    Header,
+    Cookie,
+}
+
+fn is_state_changing_method(method: &axum::http::Method) -> bool {
+    matches!(
+        *method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
+}
+
+fn origin_matches_request(
+    origin: &str,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    public_url: &str,
+) -> bool {
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let pub_trimmed = public_url.trim().trim_end_matches('/');
+    if !pub_trimmed.is_empty() && origin.eq_ignore_ascii_case(pub_trimmed) {
+        return true;
+    }
+    let scheme = if auth::is_https_request(headers, Some(uri)) {
+        "https"
+    } else {
+        "http"
+    };
+    let host_candidates = [
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim),
+        headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim),
+    ];
+    for host in host_candidates.into_iter().flatten() {
+        if host.is_empty() {
+            continue;
+        }
+        if origin.eq_ignore_ascii_case(&format!("{scheme}://{host}")) {
+            return true;
+        }
+        if let Some(stripped) =
+            host.strip_suffix(if scheme == "https" { ":443" } else { ":80" })
+        {
+            if origin.eq_ignore_ascii_case(&format!("{scheme}://{stripped}")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn verify_cookie_csrf(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    public_url: &str,
+) -> std::result::Result<(), CtrlError> {
+    if let Some(sfs) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !sfs.eq_ignore_ascii_case("same-origin") {
+            return Err(CtrlError::forbidden(
+                "cross-site cookie-authenticated mutation rejected",
+            ));
+        }
+        if let Some(origin) = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !origin_matches_request(origin, headers, uri, public_url) {
+                return Err(CtrlError::forbidden(
+                    "cross-site cookie-authenticated mutation rejected",
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if origin_matches_request(origin, headers, uri, public_url) {
+            return Ok(());
+        }
+        return Err(CtrlError::forbidden(
+            "cross-site cookie-authenticated mutation rejected",
+        ));
+    }
+
+    Err(CtrlError::forbidden(
+        "missing Sec-Fetch-Site or Origin header for cookie-authenticated mutation",
+    ))
+}
+
 async fn require_admin_auth(
     State(ctrl): State<Arc<ControlPlaneService>>,
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, CtrlError> {
-    let Some(token) = extract_admin_bearer(req.headers()) else {
+    let (token, auth_source) = if let Some(tok) = extract_admin_bearer(req.headers()) {
+        (tok, AuthSource::Header)
+    } else if let Some(tok) = auth::extract_session_cookie(req.headers()) {
+        (tok, AuthSource::Cookie)
+    } else {
         return Err(CtrlError::unauthorized(
             "missing Authorization: Bearer <sk_...> header",
         ));
@@ -1071,8 +1189,8 @@ async fn require_admin_auth(
         None
     };
     let now = Utc::now().timestamp_millis();
-    let principal = match session_user {
-        Some(su) => {
+    let principal = match (auth_source, session_user) {
+        (_, Some(su)) => {
             // Last-seen for the active-sessions list, written at most once a minute per session.
             if now - su.last_seen_ms > 60_000 {
                 let _ = ctrl.meta.touch_session(&sha256_hex(token), now).await;
@@ -1083,8 +1201,15 @@ async fn require_admin_auth(
                 role: su.role,
             }
         }
-        None => ctrl.verify_admin_token(token)?,
+        (AuthSource::Cookie, None) => {
+            return Err(CtrlError::unauthorized("invalid or expired session cookie"));
+        }
+        (AuthSource::Header, None) => ctrl.verify_admin_token(token)?,
     };
+    if auth_source == AuthSource::Cookie && is_state_changing_method(req.method()) {
+        let public_url = ctrl.auth_cfg.read().public_url.clone();
+        verify_cookie_csrf(req.headers(), req.uri(), &public_url)?;
+    }
     let path = req
         .extensions()
         .get::<MatchedPath>()

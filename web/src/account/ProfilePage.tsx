@@ -1,9 +1,8 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Laptop } from "lucide-react";
 import { ActiveSession, api, AuthUser } from "../api/client";
-import { btn, EmptyState, ErrorNotice, field, fieldLabel, ListSkeleton, PageHeader, Panel } from "../components/ui";
+import { btn, EmptyState, ErrorNotice, field, fieldLabel, ListSkeleton, PageHeader, Panel, RoleBadge } from "../components/ui";
 import { errorMessage, formatTimestamp } from "../lib/format";
-import { RoleBadge } from "./SettingsPage";
 
 /** "Chrome on macOS" from a user agent; the raw string is in the row's title. */
 function describeAgent(ua: string | null): string {

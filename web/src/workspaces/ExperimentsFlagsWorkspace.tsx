@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
 import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch } from "../api/client";
 import { useCohortNames } from "../components/FilterPanel";
@@ -154,7 +154,22 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const baseline = useBaseline(projectId, expFormOpen ? expMetric : "");
   const [expCreating, setExpCreating] = useState(false);
 
+  const selectedExpIdRef = useRef(selectedExpId);
+  selectedExpIdRef.current = selectedExpId;
+  const resultsSeqRef = useRef(0);
+  const rolloutTimersRef = useRef<Map<string, number>>(new Map());
+  const [rolloutDrafts, setRolloutDrafts] = useState<Record<string, number>>({});
+
+  useEffect(
+    () => () => {
+      for (const id of rolloutTimersRef.current.values()) window.clearTimeout(id);
+      rolloutTimersRef.current.clear();
+    },
+    [],
+  );
+
   const loadAll = useCallback(async () => {
+    const seq = ++resultsSeqRef.current;
     setLoading(true);
     setLoadError(null);
     try {
@@ -164,32 +179,83 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       ]);
       setFlags(fList);
       setExperiments(eList);
-      const targetExp = selectedExpId || eList[0]?.id || "";
-      if (targetExp) {
+      const cur = selectedExpIdRef.current;
+      const targetExp = eList.some((e) => e.id === cur) ? cur : eList[0]?.id || "";
+      if (targetExp !== cur) {
+        selectedExpIdRef.current = targetExp;
         setSelectedExpId(targetExp);
+      }
+      if (targetExp) {
         const res = await api.getExperimentResults(projectId, targetExp);
-        setExpResults(res);
+        if (resultsSeqRef.current === seq && selectedExpIdRef.current === targetExp) setExpResults(res);
+      } else if (resultsSeqRef.current === seq) {
+        setExpResults(null);
       }
     } catch (err) {
-      setLoadError(errorMessage(err));
+      if (resultsSeqRef.current === seq) setLoadError(errorMessage(err));
     } finally {
-      setLoading(false);
-      setLoaded(true);
+      if (resultsSeqRef.current === seq) {
+        setLoading(false);
+        setLoaded(true);
+      }
     }
-  }, [projectId, selectedExpId]);
+  }, [projectId]);
 
   useEffect(() => {
     void loadAll();
   }, [loadAll, refreshToken]);
 
-  const patchFlag = async (flag: FeatureFlag, body: FlagPatch) => {
+  const handleSelectExperiment = async (expId: string) => {
+    selectedExpIdRef.current = expId;
+    setSelectedExpId(expId);
+    const seq = ++resultsSeqRef.current;
+    if (!expId) {
+      setExpResults(null);
+      return;
+    }
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const res = await api.getExperimentResults(projectId, expId);
+      if (resultsSeqRef.current === seq && selectedExpIdRef.current === expId) setExpResults(res);
+    } catch (err) {
+      if (resultsSeqRef.current === seq && selectedExpIdRef.current === expId) setLoadError(errorMessage(err));
+    } finally {
+      if (resultsSeqRef.current === seq) setLoading(false);
+    }
+  };
+
+  const clearDraftIfIdle = useCallback((flagId: string) => {
+    if (rolloutTimersRef.current.has(flagId)) return;
+    setRolloutDrafts((prev) => {
+      if (!(flagId in prev)) return prev;
+      const next = { ...prev };
+      delete next[flagId];
+      return next;
+    });
+  }, []);
+
+  const patchFlag = useCallback(async (flag: FeatureFlag, body: FlagPatch) => {
     setFlagError(null);
     try {
       const updated = await api.patchFlag(projectId, flag.id, body);
       setFlags((prev) => prev.map((f) => (f.id === flag.id ? updated : f)));
+      if (body.rollout_pct !== undefined) clearDraftIfIdle(flag.id);
     } catch (err) {
+      if (body.rollout_pct !== undefined) clearDraftIfIdle(flag.id);
       setFlagError(`Couldn't update ${flag.key}: ${errorMessage(err)}`);
     }
+  }, [projectId, clearDraftIfIdle]);
+
+  const scheduleRolloutPatch = (flag: FeatureFlag, pctValue: number) => {
+    setRolloutDrafts((prev) => ({ ...prev, [flag.id]: pctValue }));
+    const prevTimer = rolloutTimersRef.current.get(flag.id);
+    if (prevTimer !== undefined) window.clearTimeout(prevTimer);
+    const id = window.setTimeout(() => {
+      rolloutTimersRef.current.delete(flag.id);
+      void patchFlag(flag, { rollout_pct: pctValue });
+    }, 250);
+    rolloutTimersRef.current.set(flag.id, id);
   };
 
   const createExperiment = async () => {
@@ -221,7 +287,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       setExpName("");
       setExpHypothesis("");
       setExpGuardrail("");
-      setSelectedExpId(created.id); // reloads results via loadAll's dependency
+      setSelectedExpId(created.id);
+      selectedExpIdRef.current = created.id;
+      await loadAll();
     } catch (e) {
       setExpError(`Couldn't create experiment: ${errorMessage(e)}`);
     } finally {
@@ -427,7 +495,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               <select
                 id="experiment-select"
                 value={selectedExpId}
-                onChange={(e) => setSelectedExpId(e.target.value)}
+                onChange={(e) => void handleSelectExperiment(e.target.value)}
                 className={field}
               >
                 {experiments.map((ex) => (
@@ -671,7 +739,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           ) : (
             <ul className="space-y-3">
               {flags.map((f) => {
-                const pct = Math.round(f.rollout_pct);
+                const pct = Math.round(rolloutDrafts[f.id] ?? f.rollout_pct);
                 const sliderId = `rollout-${f.id}`;
                 return (
                   <li
@@ -727,7 +795,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         value={pct}
                         aria-valuetext={`${pct}% of users`}
                         disabled={!canEdit}
-                        onChange={(e) => void patchFlag(f, { rollout_pct: Number(e.target.value) })}
+                        onChange={(e) => scheduleRolloutPatch(f, Number(e.target.value))}
                         className="w-full accent-brand sm:w-40"
                       />
                       <span className="tabular w-20 text-right text-sm font-medium text-ink">{pct}% of users</span>

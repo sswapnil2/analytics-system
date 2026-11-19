@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useId, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
+import type { Role } from "../api/client";
 import { formatRunTime } from "../lib/format";
 
 /** Page title plus a one-line description of what the page answers. */
@@ -111,6 +112,7 @@ export const ReportLayout: React.FC<{ query: React.ReactNode; summary: string; c
 }) => {
   // Below 1280px the query collapses to a one-line summary so results stay on screen.
   const [open, setOpen] = useState(false);
+  const queryId = useId();
   return (
     <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_20rem]">
       <div className="xl:hidden">
@@ -118,7 +120,7 @@ export const ReportLayout: React.FC<{ query: React.ReactNode; summary: string; c
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          aria-controls="report-query"
+          aria-controls={queryId}
           className="flex w-full items-center gap-3 rounded-xl border border-line bg-panel px-4 py-3 text-left"
         >
           <span className="min-w-0 flex-1 truncate text-sm text-ink-2">{summary}</span>
@@ -126,7 +128,7 @@ export const ReportLayout: React.FC<{ query: React.ReactNode; summary: string; c
         </button>
       </div>
       <aside
-        id="report-query"
+        id={queryId}
         aria-label="Query"
         className={`space-y-5 xl:sticky xl:top-4 xl:order-2 xl:block ${open ? "block" : "hidden"}`}
       >
@@ -209,4 +211,22 @@ export const ListSkeleton: React.FC<{ rows?: number }> = ({ rows = 4 }) => (
       <Skeleton key={i} className="h-10" />
     ))}
   </div>
+);
+
+export const ROLE_HELP: Record<Role, string> = {
+  viewer: "Reads reports and dashboards",
+  member: "Also creates and edits reports, dashboards, cohorts and flags",
+  admin: "Also manages members, invites and API keys",
+  owner: "Also renames the organisation and manages owners",
+};
+
+export const RoleBadge: React.FC<{ role: Role }> = ({ role }) => (
+  <span
+    title={ROLE_HELP[role]}
+    className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+      role === "owner" || role === "admin" ? "bg-brand-soft text-brand" : "border border-line-strong text-ink-2"
+    }`}
+  >
+    {role[0].toUpperCase() + role.slice(1)}
+  </span>
 );

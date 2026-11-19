@@ -324,10 +324,12 @@ export interface ExperimentResults {
   }[];
 }
 
-const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
+export const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
+/** Non-secret hint that an HttpOnly `pulse_session` cookie is active (used for boot & cross-tab sync). */
+export const SESSION_HINT_STORAGE_KEY = "pulse_has_session";
 
-// Signed-in user sessions (ps_ tokens) last 30 days, so they live in localStorage.
-// Pasted admin tokens stay in sessionStorage and die with the tab.
+// User sessions (`ps_` tokens) are held exclusively in the server-set HttpOnly `pulse_session` cookie
+// (never persisted to JS-readable localStorage). Pasted admin tokens stay in sessionStorage and die with the tab.
 function storages(): Storage[] {
   try {
     return [window.sessionStorage, window.localStorage];
@@ -340,12 +342,24 @@ export function getStoredAdminToken(): string {
   for (const st of storages()) {
     try {
       const v = st.getItem(ADMIN_TOKEN_STORAGE_KEY);
-      if (v) return v;
+      if (v && !v.startsWith("ps_")) return v;
     } catch {
       // storage blocked
     }
   }
   return "";
+}
+
+export function hasCookieSessionHint(): boolean {
+  try {
+    return window.localStorage.getItem(SESSION_HINT_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function hasStoredSession(): boolean {
+  return Boolean(getStoredAdminToken()) || hasCookieSessionHint();
 }
 
 export function setStoredAdminToken(token: string): void {
@@ -357,12 +371,26 @@ export function setStoredAdminToken(token: string): void {
       // storage blocked
     }
   }
-  if (!value) return;
+  if (!value) {
+    try {
+      window.localStorage.removeItem(SESSION_HINT_STORAGE_KEY);
+    } catch {
+      // storage blocked
+    }
+    return;
+  }
+  if (value.startsWith("ps_")) {
+    // Secret session token lives in HttpOnly `pulse_session` cookie; only store a non-secret boolean hint.
+    try {
+      window.localStorage.setItem(SESSION_HINT_STORAGE_KEY, "1");
+    } catch {
+      // Ignore storage quota / sandbox restrictions
+    }
+    return;
+  }
   try {
-    (value.startsWith("ps_") ? window.localStorage : window.sessionStorage).setItem(
-      ADMIN_TOKEN_STORAGE_KEY,
-      value,
-    );
+    window.localStorage.removeItem(SESSION_HINT_STORAGE_KEY);
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, value);
   } catch {
     // Ignore storage quota / sandbox restrictions
   }
@@ -600,12 +628,50 @@ export interface CopilotResponse {
   exec_time_ms: number;
 }
 
+let unauthorizedHandler: (() => void) | null = null;
+
+/** Registers a callback fired whenever a protected API call receives HTTP 401. */
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  unauthorizedHandler = fn;
+}
+
+/** True when a fetch rejection came from an AbortController cancellation. */
+export function isAbortError(err: unknown): boolean {
+  return (err instanceof DOMException || err instanceof Error) && err.name === "AbortError";
+}
+
+// Credential-submission and auth-action endpoints where 401 means invalid credentials/token rather than an expired session.
+const CREDENTIAL_AUTH_PATHS = new Set([
+  "/v1/auth/login",
+  "/v1/auth/signup",
+  "/v1/auth/password",
+  "/v1/auth/password-reset",
+  "/v1/auth/exchange",
+  "/v1/auth/verify-email",
+  "/v1/auth/invites/accept",
+  "/v1/auth/join-org",
+  "/v1/auth/logout",
+]);
+
+function notifyIfSessionExpired(url: string, status: number, hadToken: boolean): void {
+  if (status !== 401 || !hadToken) return;
+  const path = url.split("?")[0];
+  if (CREDENTIAL_AUTH_PATHS.has(path)) return;
+  unauthorizedHandler?.();
+}
+
+export function projectPath(projectId: string, suffix = ""): string {
+  return `/v1/projects/${encodeURIComponent(projectId)}${suffix}`;
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAdminToken();
+  const hadAuth = Boolean(token) || hasCookieSessionHint();
   const authHeaders: Record<string, string> = token
     ? { Authorization: `Bearer ${token}` }
     : {};
   const res = await fetch(url, {
+    credentials: "same-origin",
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -616,20 +682,28 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
     if (res.status === 401 || res.status === 403) {
+      notifyIfSessionExpired(url, res.status, hadAuth);
       throw new ApiAuthError(res.status, text || `HTTP ${res.status}`);
     }
     throw new Error(text || `HTTP ${res.status}`);
   }
   const body = await res.text();
-  return (body ? JSON.parse(body) : null) as T;
+  if (!body) return null as T;
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error("Server returned an unexpected response format.");
+  }
 }
 
 async function fetchText(url: string, init?: RequestInit): Promise<string> {
   const token = getStoredAdminToken();
+  const hadAuth = Boolean(token) || hasCookieSessionHint();
   const authHeaders: Record<string, string> = token
     ? { Authorization: `Bearer ${token}` }
     : {};
   const res = await fetch(url, {
+    credentials: "same-origin",
     ...init,
     headers: {
       ...authHeaders,
@@ -639,6 +713,7 @@ async function fetchText(url: string, init?: RequestInit): Promise<string> {
   if (!res.ok) {
     const text = await res.text();
     if (res.status === 401 || res.status === 403) {
+      notifyIfSessionExpired(url, res.status, hadAuth);
       throw new ApiAuthError(res.status, text || `HTTP ${res.status}`);
     }
     throw new Error(text || `HTTP ${res.status}`);
@@ -792,52 +867,59 @@ export const api = {
       method: "POST",
     }),
 
-  queryInsights: (projectId: string, body: unknown) =>
-    fetchJson<InsightsResult>(`/v1/projects/${encodeURIComponent(projectId)}/query/insights`, {
+  queryInsights: (projectId: string, body: unknown, signal?: AbortSignal) =>
+    fetchJson<InsightsResult>(projectPath(projectId, "/query/insights"), {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
 
   /** CSV of every user who stopped before funnel step `step` (0-based index of the step not reached). */
   exportFunnelDropped: (projectId: string, body: unknown, step: number) =>
-    fetchText(`/v1/projects/${encodeURIComponent(projectId)}/query/funnel/dropped?step=${step}`, {
+    fetchText(projectPath(projectId, `/query/funnel/dropped?step=${step}`), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
 
-  queryFunnel: (projectId: string, body: unknown) =>
-    fetchJson<FunnelResult>(`/v1/projects/${encodeURIComponent(projectId)}/query/funnel`, {
+  queryFunnel: (projectId: string, body: unknown, signal?: AbortSignal) =>
+    fetchJson<FunnelResult>(projectPath(projectId, "/query/funnel"), {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
 
-  queryFlows: (projectId: string, body: unknown) =>
-    fetchJson<FlowsResult>(`/v1/projects/${encodeURIComponent(projectId)}/query/flows`, {
+  queryFlows: (projectId: string, body: unknown, signal?: AbortSignal) =>
+    fetchJson<FlowsResult>(projectPath(projectId, "/query/flows"), {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
 
-  queryRetention: (projectId: string, body: unknown) =>
-    fetchJson<RetentionResult>(`/v1/projects/${encodeURIComponent(projectId)}/query/retention`, {
+  queryRetention: (projectId: string, body: unknown, signal?: AbortSignal) =>
+    fetchJson<RetentionResult>(projectPath(projectId, "/query/retention"), {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
 
-  searchSessions: (projectId: string, body: unknown) =>
-    fetchJson<SessionSearchResult>(`/v1/projects/${encodeURIComponent(projectId)}/sessions`, {
+  searchSessions: (projectId: string, body: unknown, signal?: AbortSignal) =>
+    fetchJson<SessionSearchResult>(projectPath(projectId, "/sessions"), {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
 
-  getReplay: (projectId: string, sessionId: string, offsetKb = 0) =>
+  getReplay: (projectId: string, sessionId: string, offsetKb = 0, signal?: AbortSignal) =>
     fetchJson<ReplayStreamResponse>(
-      `/v1/projects/${encodeURIComponent(projectId)}/replay/${encodeURIComponent(sessionId)}?offset_kb=${offsetKb}`,
+      projectPath(projectId, `/replay/${encodeURIComponent(sessionId)}?offset_kb=${offsetKb}`),
+      { signal },
     ),
 
-  getLexicon: (projectId: string) =>
+  getLexicon: (projectId: string, signal?: AbortSignal) =>
     fetchJson<{ events: LexiconEvent[]; properties: LexiconProperty[] }>(
-      `/v1/projects/${encodeURIComponent(projectId)}/lexicon`,
+      projectPath(projectId, "/lexicon"),
+      { signal },
     ),
 
   updateLexiconEvent: (
@@ -877,12 +959,13 @@ export const api = {
       }>
     >(`/v1/projects/${encodeURIComponent(projectId)}/cohorts`),
 
-  previewCohort: (projectId: string, definition: unknown) =>
+  previewCohort: (projectId: string, definition: unknown, signal?: AbortSignal) =>
     fetchJson<{ user_count: number; exec_time_us: number }>(
-      `/v1/projects/${encodeURIComponent(projectId)}/cohorts/preview`,
+      projectPath(projectId, "/cohorts/preview"),
       {
         method: "POST",
         body: JSON.stringify({ definition }),
+        signal,
       },
     ),
 
@@ -899,7 +982,7 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  getSchemaExtensions: (projectId: string) =>
+  getSchemaExtensions: (projectId: string, signal?: AbortSignal) =>
     fetchJson<{
       custom_events: Array<{ name: string; source_events: string[] }>;
       custom_properties: Array<{ name: string; sql_expr: string }>;
@@ -912,7 +995,7 @@ export const api = {
       }>;
       /** Profile property keys; use them as `user.<key>` in filters and splits. */
       user_properties?: string[];
-    }>(`/v1/projects/${encodeURIComponent(projectId)}/schema-extensions`),
+    }>(projectPath(projectId, "/schema-extensions"), { signal }),
 
   uploadLookupTable: (
     projectId: string,
@@ -987,28 +1070,30 @@ export const api = {
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results`,
     ),
 
-  listUsers: (projectId: string, search = "", limit = 100, offset = 0) =>
+  listUsers: (projectId: string, search = "", limit = 100, offset = 0, signal?: AbortSignal) =>
     fetchJson<UserProfileItem[]>(
-      `/v1/projects/${projectId}/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
+      projectPath(projectId, `/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`),
+      { signal },
     ),
 
-  getUserDetail: (projectId: string, distinctId: string, canonicalUid?: number) =>
+  getUserDetail: (projectId: string, distinctId: string, canonicalUid?: number, signal?: AbortSignal) =>
     fetchJson<UserDetailResponse>(
-      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}${canonicalUid ? `?uid=${canonicalUid}` : ""}`,
+      projectPath(projectId, `/users/${encodeURIComponent(distinctId)}${canonicalUid ? `?uid=${canonicalUid}` : ""}`),
+      { signal },
     ),
 
   deleteUserDpdp: (projectId: string, distinctId: string) =>
     fetchJson<DeletionAuditRecord>(
-      `/v1/projects/${projectId}/users/${encodeURIComponent(distinctId)}`,
+      projectPath(projectId, `/users/${encodeURIComponent(distinctId)}`),
       { method: "DELETE" },
     ),
 
-  listDeletionAudit: (projectId: string) =>
-    fetchJson<DeletionAuditRecord[]>(`/v1/projects/${projectId}/deletions`),
+  listDeletionAudit: (projectId: string, signal?: AbortSignal) =>
+    fetchJson<DeletionAuditRecord[]>(projectPath(projectId, "/deletions"), { signal }),
 
   exportCohortCsv: (projectId: string, cohortId: string) =>
     fetchText(
-      `/v1/projects/${projectId}/cohorts/${encodeURIComponent(cohortId)}/export?format=csv`,
+      projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}/export?format=csv`),
     ),
 
   importEvents: (
@@ -1016,7 +1101,7 @@ export const api = {
     body: string,
     contentType: "application/json" | "application/x-ndjson" | "text/csv",
   ) =>
-    fetchJson<BatchImportResponse>(`/v1/projects/${projectId}/import`, {
+    fetchJson<BatchImportResponse>(projectPath(projectId, "/import"), {
       method: "POST",
       headers: { "Content-Type": contentType },
       body,
@@ -1028,7 +1113,7 @@ export const api = {
     limit = 2000,
   ) =>
     fetchText(
-      `/v1/projects/${projectId}/export?format=${format}&limit=${limit}`,
+      projectPath(projectId, `/export?format=${encodeURIComponent(format)}&limit=${limit}`),
     ),
 
   getEncryptionStatus: () =>

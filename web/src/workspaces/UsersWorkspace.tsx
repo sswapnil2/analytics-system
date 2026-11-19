@@ -1,13 +1,15 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, ChevronLeft, ChevronRight, Download, PlayCircle, Search, Trash2, Users } from "lucide-react";
-import { api, DeletionAuditRecord, UserDetailResponse, UserEventItem, UserProfileItem } from "../api/client";
+import { api, DeletionAuditRecord, isAbortError, UserDetailResponse, UserEventItem, UserProfileItem } from "../api/client";
 import { useAccess } from "../auth/access";
 import { SessionReplay } from "../components/WireframePlayer";
 import { EmptyState, ErrorNotice, ListSkeleton, PageHeader, Panel, Spinner, btn, field } from "../components/ui";
-import { errorMessage, formatCount, formatDate, formatTime, formatTimestamp, humanizeEvent } from "../lib/format";
+import { buildCsv } from "../lib/csv";
+import { downloadTextFile, errorMessage, formatCount, formatDate, formatTime, formatTimestamp, humanizeEvent } from "../lib/format";
 
 const PAGE = 50;
 const TIMELINE_STEP = 50;
+const MAX_EXPORT_USERS = 50_000;
 
 function formatPropValue(v: unknown): string {
   if (v === null || v === undefined || v === "") return "—";
@@ -60,34 +62,54 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
   const [eraseNotice, setEraseNotice] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
 
+  const listAbortRef = useRef<AbortController | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+
   const load = useCallback(async () => {
+    listAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    listAbortRef.current = ctrl;
     setLoading(true);
     setLoadError(null);
     try {
       const [list, audit] = await Promise.all([
-        api.listUsers(projectId, query.trim(), PAGE, offset),
-        api.listDeletionAudit(projectId),
+        api.listUsers(projectId, query.trim(), PAGE, offset, ctrl.signal),
+        api.listDeletionAudit(projectId, ctrl.signal),
       ]);
+      if (ctrl.signal.aborted) return;
       setUsers(list);
       setDeletions(audit);
     } catch (err) {
-      setLoadError(errorMessage(err));
+      if (!isAbortError(err) && !ctrl.signal.aborted) setLoadError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (!ctrl.signal.aborted) setLoading(false);
     }
   }, [projectId, query, offset]);
 
   useEffect(() => {
     void load();
+    return () => {
+      listAbortRef.current?.abort();
+    };
   }, [load]);
 
   useEffect(() => {
+    detailAbortRef.current?.abort();
+    exportAbortRef.current?.abort();
     setSelectedId(null);
     setDetail(null);
     setOffset(0);
+    return () => {
+      detailAbortRef.current?.abort();
+      exportAbortRef.current?.abort();
+    };
   }, [projectId]);
 
   const open = async (distinctId: string) => {
+    detailAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    detailAbortRef.current = ctrl;
     setSelectedId(distinctId);
     setDetailLoading(true);
     setDetailError(null);
@@ -96,12 +118,15 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
     setShownEvents(TIMELINE_STEP);
     setReplay(null);
     try {
-      setDetail(await api.getUserDetail(projectId, distinctId));
+      const res = await api.getUserDetail(projectId, distinctId, undefined, ctrl.signal);
+      if (!ctrl.signal.aborted) setDetail(res);
     } catch (err) {
-      setDetail(null);
-      setDetailError(errorMessage(err));
+      if (!isAbortError(err) && !ctrl.signal.aborted) {
+        setDetail(null);
+        setDetailError(errorMessage(err));
+      }
     } finally {
-      setDetailLoading(false);
+      if (!ctrl.signal.aborted) setDetailLoading(false);
     }
   };
 
@@ -125,32 +150,44 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
     }
   };
 
-  // Every profile matching the search, page by page, as CSV.
+  // Every profile matching the search, page by page, as CSV (capped to protect browser memory).
   const exportCsv = async () => {
+    exportAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    exportAbortRef.current = ctrl;
     setExporting(true);
     try {
       const all: UserProfileItem[] = [];
+      let truncated = false;
       // The API returns at most 500 per page.
-      for (let off = 0; ; off += 500) {
-        const page = await api.listUsers(projectId, query.trim(), 500, off);
+      for (let off = 0; off < MAX_EXPORT_USERS; off += 500) {
+        const page = await api.listUsers(projectId, query.trim(), 500, off, ctrl.signal);
+        if (ctrl.signal.aborted) return;
         all.push(...page);
         if (page.length < 500) break;
+        if (all.length >= MAX_EXPORT_USERS) {
+          truncated = true;
+          break;
+        }
       }
+      if (ctrl.signal.aborted) return;
       const keys = Array.from(new Set(all.flatMap((u) => Object.keys(u.props ?? {})))).sort();
-      const rows = [["distinct_id", "total_revenue", "updated_at", ...keys]];
+      const rows: string[][] = [["distinct_id", "total_revenue", "updated_at", ...keys]];
       for (const u of all)
-        rows.push([u.distinct_id, String(u.total_revenue), new Date(u.updated_at_ms).toISOString(), ...keys.map((k) => (u.props?.[k] === undefined ? "" : formatPropValue(u.props[k])))]);
-      const csv = rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(",")).join("\n");
-      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `users-${projectId}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+        rows.push([
+          u.distinct_id,
+          String(u.total_revenue),
+          new Date(u.updated_at_ms).toISOString(),
+          ...keys.map((k) => (u.props?.[k] === undefined ? "" : formatPropValue(u.props[k]))),
+        ]);
+      downloadTextFile(`users-${projectId}.csv`, buildCsv(rows), "text/csv;charset=utf-8");
+      if (truncated) {
+        setEraseNotice(`Exported the first ${formatCount(MAX_EXPORT_USERS)} matching users. Narrow your search to export a smaller slice.`);
+      }
     } catch (err) {
-      setLoadError(`Couldn't export users: ${errorMessage(err)}`);
+      if (!isAbortError(err) && !ctrl.signal.aborted) setLoadError(`Couldn't export users: ${errorMessage(err)}`);
     } finally {
-      setExporting(false);
+      if (!ctrl.signal.aborted) setExporting(false);
     }
   };
 

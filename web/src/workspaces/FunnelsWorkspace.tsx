@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
-import { api, DroppedSessionSample, FunnelResult } from "../api/client";
+import { api, DroppedSessionSample, FunnelResult, isAbortError } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { useAccess } from "../auth/access";
 import { typicalOrder } from "../lib/eventOrder";
@@ -31,7 +31,7 @@ import {
   useSort,
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
-import { displayUserId, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
+import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
 
 interface Props {
   projectId: string;
@@ -137,6 +137,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const funnelAbortRef = useRef<AbortController | null>(null);
   const openError = useSavedReport(
     projectId,
     (q) => {
@@ -163,6 +164,9 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       setResult(null);
       return;
     }
+    funnelAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    funnelAbortRef.current = ctrl;
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -170,22 +174,25 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       const main = rangeFor(range);
       const cmp = compareRangeFor(main, compare);
       const [res, prev] = await Promise.all([
-        api.queryFunnel(projectId, { time_range: main, ...buildQuery() }),
-        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery() }) : Promise.resolve(null),
+        api.queryFunnel(projectId, { time_range: main, ...buildQuery() }, ctrl.signal),
+        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery() }, ctrl.signal) : Promise.resolve(null),
       ]);
-      if (id === reqId.current) {
+      if (id === reqId.current && !ctrl.signal.aborted) {
         setResult(res);
         setPrevResult(prev);
       }
     } catch (err) {
-      if (id === reqId.current) setError(errorMessage(err));
+      if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
-      if (id === reqId.current) setLoading(false);
+      if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
   }, [projectId, buildQuery, range, steps.length, compare]);
 
   useEffect(() => {
     void runFunnel();
+    return () => {
+      funnelAbortRef.current?.abort();
+    };
   }, [runFunnel, refreshToken]);
 
   const overall = result?.overall_steps ?? [];
@@ -632,12 +639,7 @@ const DropOffDrawer: React.FC<{
     setDownloadError(null);
     try {
       const csv = await api.exportFunnelDropped(projectId, query, step);
-      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `dropped-before-${toEvent}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadTextFile(`dropped-before-${toEvent}.csv`, csv, "text/csv;charset=utf-8");
     } catch (err) {
       setDownloadError(`Couldn't download the list: ${errorMessage(err)}`);
     } finally {

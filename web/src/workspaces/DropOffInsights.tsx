@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { UsersRound } from "lucide-react";
 import { api, UserEventItem } from "../api/client";
 import { useAccess } from "../auth/access";
+import { clearFilterCaches } from "../components/FilterPanel";
 import { btn, Spinner } from "../components/ui";
 import { errorMessage, formatCount, formatDate, formatTime, humanizeEvent } from "../lib/format";
 
@@ -106,6 +107,7 @@ export const WhyTheyLeft: React.FC<{
         name,
         `Dropped off between ${humanizeEvent(fromEvent)} and ${humanizeEvent(toEvent)}, ${formatDate(range.start_ts_ms)} – ${formatDate(range.end_ts_ms)}. A fixed list saved ${formatDate(Date.now())}.`,
       );
+      clearFilterCaches(projectId);
       setSaved(`Saved "${name}". Use it from the Filter panel on any report.`);
     } catch (err) {
       setSaved(`Couldn't save the cohort: ${errorMessage(err)}`);

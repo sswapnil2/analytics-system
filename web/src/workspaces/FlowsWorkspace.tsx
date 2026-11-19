@@ -3,7 +3,7 @@ import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/Rep
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { fromGlobalFilter } from "../components/FilterPanel";
 import { GitBranch, RefreshCw } from "lucide-react";
-import { api, FlowsResult } from "../api/client";
+import { api, FlowsResult, isAbortError } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import {
   btn,
@@ -67,6 +67,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const flowAbortRef = useRef<AbortController | null>(null);
   const buildQuery = useCallback(
     () => ({ anchor_event: anchorEvent, direction, steps, global_filter: toGlobalFilter(filter) }),
     [anchorEvent, direction, steps, filter],
@@ -89,21 +90,27 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
       setResult(null);
       return;
     }
+    flowAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    flowAbortRef.current = ctrl;
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFlows(projectId, { time_range: rangeFor(range), ...buildQuery() });
-      if (id === reqId.current) setResult(res);
+      const res = await api.queryFlows(projectId, { time_range: rangeFor(range), ...buildQuery() }, ctrl.signal);
+      if (id === reqId.current && !ctrl.signal.aborted) setResult(res);
     } catch (err) {
-      if (id === reqId.current) setError(errorMessage(err));
+      if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
-      if (id === reqId.current) setLoading(false);
+      if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
   }, [projectId, anchorEvent, buildQuery, range]);
 
   useEffect(() => {
     void runFlows();
+    return () => {
+      flowAbortRef.current?.abort();
+    };
   }, [runFlows, refreshToken]);
 
   const sankey = useMemo(() => {

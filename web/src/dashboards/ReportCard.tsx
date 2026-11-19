@@ -4,6 +4,7 @@ import {
   FlowsResult,
   FunnelResult,
   InsightsResult,
+  isAbortError,
   RetentionResult,
   SavedReport,
   TimeRange,
@@ -61,8 +62,10 @@ export function rangeFor(sel: RangeSel): TimeRange {
   if (sel === "today") return { start_ts_ms: startOfToday(), end_ts_ms: now + 3_600_000 };
   if (sel === "yesterday") return { start_ts_ms: addDays(startOfToday(), -1), end_ts_ms: startOfToday() };
   const c = customRange(sel);
-  if (c) return c;
-  return { start_ts_ms: now - Number(sel) * DAY_MS, end_ts_ms: now + 3_600_000 };
+  if (c && Number.isFinite(c.start_ts_ms) && Number.isFinite(c.end_ts_ms) && c.start_ts_ms < c.end_ts_ms) return c;
+  const days = Number(sel);
+  const safeDays = Number.isFinite(days) && days > 0 ? Math.min(days, 3650) : 14;
+  return { start_ts_ms: now - safeDays * DAY_MS, end_ts_ms: now + 3_600_000 };
 }
 
 /** Length of the range in days, for picking day or week buckets. */
@@ -206,31 +209,35 @@ export const ReportCardBody: React.FC<{
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const latest = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const run = useCallback(async () => {
     // Only the newest request may write, so a slow 90D reply can't land under a 7D label.
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     const id = ++latest.current;
-    const set = <T,>(fn: (v: T) => void) => (v: T) => id === latest.current && fn(v);
+    const set = <T,>(fn: (v: T) => void) => (v: T) => id === latest.current && !ctrl.signal.aborted && fn(v);
     setLoading(true);
     setError(null);
     const body = { ...report.query_json, time_range: rangeFor(range) };
     try {
       if (report.report_kind === "funnel") {
-        set(setResult)({ kind: "funnel", data: await api.queryFunnel(projectId, body) });
+        set(setResult)({ kind: "funnel", data: await api.queryFunnel(projectId, body, ctrl.signal) });
       } else if (report.report_kind === "insights") {
         set(setResult)({
           kind: "insights",
-          data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }),
+          data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }, ctrl.signal),
         });
       } else if (report.report_kind === "retention") {
-        set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body) });
+        set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body, ctrl.signal) });
       } else {
-        set(setResult)({ kind: "flows", data: await api.queryFlows(projectId, body) });
+        set(setResult)({ kind: "flows", data: await api.queryFlows(projectId, body, ctrl.signal) });
       }
     } catch (err) {
-      set(setError)(errorMessage(err));
+      if (!isAbortError(err)) set(setError)(errorMessage(err));
     } finally {
-      if (id === latest.current) {
+      if (id === latest.current && !ctrl.signal.aborted) {
         setLoading(false);
         onLoaded?.();
       }
@@ -240,6 +247,9 @@ export const ReportCardBody: React.FC<{
 
   useEffect(() => {
     void run();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, [run, refreshKey]);
 
   if (error) {

@@ -24,7 +24,12 @@ import { useAccess } from "../auth/access";
 /** `#/dashboards` lists them; `#/dashboards/<id>` opens one. */
 export function dashboardIdFromHash(): string | null {
   const m = window.location.hash.match(/^#\/?dashboards\/([^/?#]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
 }
 
 const REPORT_PAGE: Record<SavedReport["report_kind"], string> = {
@@ -340,7 +345,8 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
   const [tv, setTv] = useState(false);
   const boardRef = useRef<HTMLDivElement>(null);
 
-  const refresh = () => setTick((t) => t + 1);
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  const handleCardLoaded = useCallback(() => setRefreshedAt(Date.now()), []);
 
   // Keep "Updated N min ago" honest, and refresh every 5 minutes in TV mode.
   useEffect(() => {
@@ -642,7 +648,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                       report={report}
                       range={range}
                       refreshKey={tick}
-                      onLoaded={() => setRefreshedAt(Date.now())}
+                      onLoaded={handleCardLoaded}
                     />
                   ) : (
                     <p className="text-sm text-muted">Remove this card or add the report again.</p>

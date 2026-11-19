@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
-import { api, RetentionResult } from "../api/client";
+import { api, isAbortError, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
 import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
@@ -127,6 +127,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
+  const retAbortRef = useRef<AbortController | null>(null);
   const openError = useSavedReport(
     projectId,
     (q) => {
@@ -149,6 +150,9 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       setResult(null);
       return;
     }
+    retAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    retAbortRef.current = ctrl;
     const id = ++reqId.current;
     setLoading(true);
     setError(null);
@@ -156,41 +160,49 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
       const body = { time_range: rangeFor(range), ...buildQuery() };
       const cmp = compareRangeFor(body.time_range, compare);
       const [res, prev] = await Promise.all([
-        api.queryRetention(projectId, body),
-        cmp ? api.queryRetention(projectId, { ...body, time_range: cmp }) : Promise.resolve(null),
+        api.queryRetention(projectId, body, ctrl.signal),
+        cmp ? api.queryRetention(projectId, { ...body, time_range: cmp }, ctrl.signal) : Promise.resolve(null),
       ]);
-      if (id === reqId.current) {
+      if (id === reqId.current && !ctrl.signal.aborted) {
         setResult(res);
         setPrevResult(prev);
       }
       if (!splitBy) {
-        setSegments(null);
+        if (!ctrl.signal.aborted) setSegments(null);
       } else {
         // One retention query per common value, each with the split added to the filter.
         const values = await topValues(projectId, startEvent === ANY ? returnEvent : startEvent, splitBy, 6);
+        if (ctrl.signal.aborted) return;
         const rows = await Promise.all(
           values.map(async (value) => ({
             value,
-            result: await api.queryRetention(projectId, {
-              ...body,
-              global_filter: {
-                ...body.global_filter,
-                predicates: [...body.global_filter.predicates, { prop_name: splitBy, filter: { op: "eq", val: value } }],
+            result: await api.queryRetention(
+              projectId,
+              {
+                ...body,
+                global_filter: {
+                  ...body.global_filter,
+                  predicates: [...body.global_filter.predicates, { prop_name: splitBy, filter: { op: "eq", val: value } }],
+                },
               },
-            }),
+              ctrl.signal,
+            ),
           })),
         );
-        if (id === reqId.current) setSegments(rows);
+        if (id === reqId.current && !ctrl.signal.aborted) setSegments(rows);
       }
     } catch (err) {
-      if (id === reqId.current) setError(errorMessage(err));
+      if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
-      if (id === reqId.current) setLoading(false);
+      if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
   }, [projectId, buildQuery, range, startEvent, returnEvent, splitBy, compare]);
 
   useEffect(() => {
     void runRetention();
+    return () => {
+      retAbortRef.current?.abort();
+    };
   }, [runRetention, refreshToken]);
 
   const eventOptions = Array.from(

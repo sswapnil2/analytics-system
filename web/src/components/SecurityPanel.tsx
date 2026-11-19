@@ -183,6 +183,8 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
         config_json,
       });
       setDraftSecret((prev) => ({ ...prev, [cat.category]: "" }));
+      if (cat.category === "webhook") setDraftSigningSecret("");
+      if (cat.category === "storage") setDraftStorageAccessKey("");
       await loadState();
       setNotice(`Saved ${cat.title}.`);
     } catch (err) {
@@ -449,6 +451,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                     {cat.category === "webhook" && (
                       <input
                         type="password"
+                        autoComplete="off"
                         value={draftSigningSecret}
                         disabled={busy}
                         onChange={(e) => setDraftSigningSecret(e.target.value)}
@@ -461,6 +464,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                     <div className="flex items-center gap-2">
                       <input
                         type="password"
+                        autoComplete="off"
                         value={draftSecret[cat.category] ?? ""}
                         disabled={busy}
                         onChange={(e) =>

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   Copy,
@@ -22,13 +22,18 @@ import {
   X,
 } from "lucide-react";
 import {
+  ADMIN_TOKEN_STORAGE_KEY,
   api,
   ApiAuthError,
   AuthUser,
   getStoredAdminToken,
+  hasStoredSession,
+  isAbortError,
   NodeStatus,
   roleAtLeast,
+  SESSION_HINT_STORAGE_KEY,
   setStoredAdminToken,
+  setUnauthorizedHandler,
 } from "./api/client";
 import {
   AcceptInviteScreen,
@@ -41,23 +46,32 @@ import {
   VerifyEmailScreen,
   SignUpScreen,
 } from "./auth/AuthScreens";
-import { ProfilePage } from "./account/ProfilePage";
-import { SettingsPage } from "./account/SettingsPage";
-import { btn, EmptyState, ErrorNotice, Panel } from "./components/ui";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { clearFilterCaches } from "./components/FilterPanel";
+import { btn, EmptyState, ErrorNotice, Panel, Spinner } from "./components/ui";
 import { errorMessage, formatCount, isNotFound, setProjectTimeZone } from "./lib/format";
 import { projectFromHash as projectInHash, withProject } from "./lib/projectUrl";
-import { CohortsLookupsWorkspace } from "./workspaces/CohortsLookupsWorkspace";
-import { ExperimentsFlagsWorkspace } from "./workspaces/ExperimentsFlagsWorkspace";
-import { FlowsWorkspace } from "./workspaces/FlowsWorkspace";
-import { FunnelsWorkspace } from "./workspaces/FunnelsWorkspace";
-import { InsightsWorkspace } from "./workspaces/InsightsWorkspace";
-import { LexiconMcpWorkspace } from "./workspaces/LexiconMcpWorkspace";
-import { RetentionWorkspace } from "./workspaces/RetentionWorkspace";
-import { SessionsReplayWorkspace } from "./workspaces/SessionsReplayWorkspace";
-import { UsersWorkspace } from "./workspaces/UsersWorkspace";
-import { DashboardsWorkspace } from "./dashboards/DashboardsWorkspace";
-import { SecurityPanel } from "./components/SecurityPanel";
 import { AccessContext } from "./auth/access";
+
+// Route-level code splitting: each workspace loads on demand.
+const ProfilePage = lazy(() => import("./account/ProfilePage").then((m) => ({ default: m.ProfilePage })));
+const SettingsPage = lazy(() => import("./account/SettingsPage").then((m) => ({ default: m.SettingsPage })));
+const DashboardsWorkspace = lazy(() => import("./dashboards/DashboardsWorkspace").then((m) => ({ default: m.DashboardsWorkspace })));
+const InsightsWorkspace = lazy(() => import("./workspaces/InsightsWorkspace").then((m) => ({ default: m.InsightsWorkspace })));
+const FunnelsWorkspace = lazy(() => import("./workspaces/FunnelsWorkspace").then((m) => ({ default: m.FunnelsWorkspace })));
+const FlowsWorkspace = lazy(() => import("./workspaces/FlowsWorkspace").then((m) => ({ default: m.FlowsWorkspace })));
+const RetentionWorkspace = lazy(() => import("./workspaces/RetentionWorkspace").then((m) => ({ default: m.RetentionWorkspace })));
+const SessionsReplayWorkspace = lazy(() => import("./workspaces/SessionsReplayWorkspace").then((m) => ({ default: m.SessionsReplayWorkspace })));
+const UsersWorkspace = lazy(() => import("./workspaces/UsersWorkspace").then((m) => ({ default: m.UsersWorkspace })));
+const CohortsLookupsWorkspace = lazy(() => import("./workspaces/CohortsLookupsWorkspace").then((m) => ({ default: m.CohortsLookupsWorkspace })));
+const ExperimentsFlagsWorkspace = lazy(() => import("./workspaces/ExperimentsFlagsWorkspace").then((m) => ({ default: m.ExperimentsFlagsWorkspace })));
+const LexiconMcpWorkspace = lazy(() => import("./workspaces/LexiconMcpWorkspace").then((m) => ({ default: m.LexiconMcpWorkspace })));
+const SecurityPanel = lazy(() => import("./components/SecurityPanel").then((m) => ({ default: m.SecurityPanel })));
+
+/** Escapes a string for safe embedding inside single-quoted POSIX shell literals. */
+function shellSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
 type WorkspaceId =
   | "dashboards"
@@ -164,7 +178,7 @@ function applyTheme(t: ThemePref) {
 // ---------------------------------------------------------------------------
 
 export const App: React.FC = () => {
-  const [signedIn, setSignedIn] = useState<boolean>(() => !!getStoredAdminToken());
+  const [signedIn, setSignedIn] = useState<boolean>(() => hasStoredSession());
   const [authRoute, setAuthRoute] = useState(parseAuthHash);
   const [signInReason, setSignInReason] = useState<string | undefined>();
   const [activeTab, setActiveTab] = useState<WorkspaceId>(tabFromHash);
@@ -189,6 +203,31 @@ export const App: React.FC = () => {
 
   useEffect(() => applyTheme(theme), [theme]);
 
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
+  const lastStatusJsonRef = useRef<string>("");
+  const catalogAbortRef = useRef<AbortController | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  const showNotice = useCallback((msg: string, durationMs = 6000) => {
+    setNotice(msg);
+    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimerRef.current = null;
+    }, durationMs);
+  }, []);
+
+  useEffect(
+    () => () => {
+      catalogAbortRef.current?.abort();
+      if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    },
+    [],
+  );
+
   // Reports pick their defaults from the catalog, so wait for the new project's.
   // `fresh`: picked by hand, so drop the report built for the old project from the URL.
   const switchProject = useCallback((id: string, fresh = false) => {
@@ -204,6 +243,7 @@ export const App: React.FC = () => {
     setCatalogLoaded(false);
     setAvailableEvents([]);
     setAvailableProps([]);
+    setMintedIngestKey("");
     setRefreshToken((n) => n + 1);
   }, []);
 
@@ -212,7 +252,7 @@ export const App: React.FC = () => {
       setActiveTab(tabFromHash());
       setAuthRoute(parseAuthHash());
       const p = projectFromHash();
-      if (p) setProjectId((cur) => (cur === p ? cur : (switchProject(p), p)));
+      if (p && p !== projectIdRef.current) switchProject(p);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
@@ -220,27 +260,62 @@ export const App: React.FC = () => {
 
   // Only say a session "ended" if this tab had one; a leftover token from another install just signs out.
   const hadSession = useRef(false);
-  const signOut = useCallback((reason?: string) => {
+  const signOut = useCallback((reason?: string, navigate = true) => {
     hadSession.current = false;
+    lastStatusJsonRef.current = "";
+    catalogAbortRef.current?.abort();
+    clearFilterCaches();
     setStoredAdminToken("");
     setStatus(null);
     setUser(null);
     setProjectId("");
-    setSignInReason(reason);
+    setMintedIngestKey("");
+    setSignInReason((prev) => reason ?? prev);
     setSignedIn(false);
-    window.history.replaceState(null, "", "#/signin");
-    setAuthRoute(parseAuthHash());
+    if (navigate) {
+      window.history.replaceState(null, "", "#/signin");
+      setAuthRoute(parseAuthHash());
+    }
   }, []);
-  const sessionEnded = useCallback(
-    () => signOut(hadSession.current ? "Your session ended. Sign in again to continue." : undefined),
-    [signOut],
-  );
+  const sessionEnded = useCallback(() => {
+    if (!hadSession.current && !hasStoredSession()) return;
+    signOut(hadSession.current ? "Your session ended. Sign in again to continue." : undefined);
+  }, [signOut]);
+
+  // Global 401 handler (active only when signed in, so SignInScreen probes never trigger signOut)
+  // + cross-tab sign-out & account-switch sync.
+  useEffect(() => {
+    if (signedIn) setUnauthorizedHandler(sessionEnded);
+    else setUnauthorizedHandler(null);
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== null && e.key !== ADMIN_TOKEN_STORAGE_KEY && e.key !== SESSION_HINT_STORAGE_KEY) return;
+      if (!e.newValue) {
+        if (hadSession.current) signOut("You were signed out in another tab.");
+      } else if (signedIn && e.newValue !== e.oldValue) {
+        // Another tab signed in as a different user/session: reset local state to avoid cross-account UI mismatch.
+        clearFilterCaches();
+        lastStatusJsonRef.current = "";
+        setUser(null);
+        setStatus(null);
+        setMintedIngestKey("");
+        setRefreshToken((n) => n + 1);
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => {
+      setUnauthorizedHandler(null);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [signedIn, sessionEnded, signOut]);
 
   const handleSignedIn = useCallback(() => {
     // An invite can sign a different account in over an existing one: drop the old account's state.
+    clearFilterCaches();
+    lastStatusJsonRef.current = "";
     setUser(null);
     setStatus(null);
     setProjectId(initialProject());
+    setMintedIngestKey("");
     setSignInReason(undefined);
     setSignedIn(true);
     setRefreshToken((n) => n + 1);
@@ -261,26 +336,34 @@ export const App: React.FC = () => {
     try {
       const s = await api.getStatus(projectId || undefined);
       hadSession.current = true;
-      setStatus(s);
+      const serialized = JSON.stringify(s);
+      if (serialized !== lastStatusJsonRef.current) {
+        lastStatusJsonRef.current = serialized;
+        setStatus(s);
+      }
       if (!projectId && s.active_project_id) setProjectId(s.active_project_id);
     } catch (err) {
-      if (err instanceof ApiAuthError && err.status === 401) sessionEnded();
+      if (err instanceof ApiAuthError && err.status === 401) return;
       // A link or remembered project this account can't open (deleted, other org).
-      else if (projectId && ((err instanceof ApiAuthError && err.status === 403) || isNotFound(err))) {
+      if (projectId && ((err instanceof ApiAuthError && err.status === 403) || isNotFound(err))) {
         switchProject("");
-        setNotice("That project isn't available to you, so Pulse opened your default project.");
+        showNotice("That project isn't available to you, so Pulse opened your default project.", 8000);
       }
     }
-  }, [projectId, sessionEnded, switchProject]);
+  }, [projectId, switchProject, showNotice]);
 
   const loadCatalog = useCallback(async () => {
     if (!projectId) return;
+    catalogAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    catalogAbortRef.current = ctrl;
     setCatalogError(null);
     try {
       const [lex, ext] = await Promise.all([
-        api.getLexicon(projectId),
-        api.getSchemaExtensions(projectId),
+        api.getLexicon(projectId, ctrl.signal),
+        api.getSchemaExtensions(projectId, ctrl.signal),
       ]);
+      if (ctrl.signal.aborted) return;
       // Busiest events first: reports default to them and pickers list them on top.
       const sortedLex = [...lex.events]
         .filter((ev) => ev.status !== "dropped" && ev.status !== "hidden" && !ev.name.startsWith("$"))
@@ -303,10 +386,11 @@ export const App: React.FC = () => {
       );
       setCatalogLoaded(true);
     } catch (err) {
-      if (err instanceof ApiAuthError && err.status === 401) sessionEnded();
-      else setCatalogError(errorMessage(err));
+      if (isAbortError(err) || ctrl.signal.aborted) return;
+      if (err instanceof ApiAuthError && err.status === 401) return;
+      setCatalogError(errorMessage(err));
     }
-  }, [projectId, sessionEnded]);
+  }, [projectId]);
 
   // Poll status only while signed in and the tab is visible.
   useEffect(() => {
@@ -349,10 +433,17 @@ export const App: React.FC = () => {
     const prev = lastTotal.current;
     lastTotal.current = { pid, total: totalEvents };
     if (prev?.pid === pid && prev.total === 0 && totalEvents > 0) {
-      setNotice(`First event received: ${formatCount(totalEvents)} so far. Reports update as more arrive.`);
-      window.setTimeout(() => setNotice(null), 8000);
+      showNotice(`First event received: ${formatCount(totalEvents)} so far. Reports update as more arrive.`, 8000);
     }
-  }, [status, totalEvents]);
+  }, [status, totalEvents, showNotice]);
+
+  // Explicit admin-token sessions (sk_ / non-ps_ tokens) act as admins; user sessions (ps_ / cookie)
+  // fail closed to viewer until /v1/auth/me resolves so viewers never flash admin UI.
+  const storedToken = getStoredAdminToken();
+  const isAdminTokenSession = Boolean(storedToken) && !storedToken.startsWith("ps_");
+  const canManageKeys = isAdminTokenSession || (user !== null && roleAtLeast(user.role, "admin"));
+  const canEdit = isAdminTokenSession || (user !== null && roleAtLeast(user.role, "member"));
+  const access = useMemo(() => ({ canEdit, canAdmin: canManageKeys }), [canEdit, canManageKeys]);
 
   // Every Studio URL carries its project (`p=`), so reloads and shared links open the
   // same project; the last one used is remembered for bare URLs.
@@ -398,14 +489,14 @@ export const App: React.FC = () => {
       const res = await api.flushStorage();
       await loadStatus();
       setRefreshToken((n) => n + 1);
-      setNotice(
+      showNotice(
         `Saved buffered events to storage (${res.segments_flushed} file${res.segments_flushed === 1 ? "" : "s"}).`,
+        5000,
       );
     } catch (err) {
-      setNotice(`Couldn't save buffered events: ${errorMessage(err)}`);
+      showNotice(`Couldn't save buffered events: ${errorMessage(err)}`, 5000);
     } finally {
       setFlushing(false);
-      window.setTimeout(() => setNotice(null), 5000);
     }
   };
 
@@ -414,7 +505,12 @@ export const App: React.FC = () => {
     return <AcceptInviteScreen token={authRoute.token} onSignedIn={handleSignedIn} />;
   }
   if (authRoute.view === "reset") {
-    return <ResetPasswordScreen token={authRoute.token} />;
+    return (
+      <ResetPasswordScreen
+        token={authRoute.token}
+        onSignedOut={() => signOut(undefined, false)}
+      />
+    );
   }
   if (authRoute.view === "verify") {
     return <VerifyEmailScreen token={authRoute.token} onSignedIn={handleSignedIn} />;
@@ -453,42 +549,52 @@ export const App: React.FC = () => {
       .map((w) => w[0]?.toUpperCase())
       .join("") || "A";
 
-  // Admin tokens have no user and act as admins; signed-in users by their role.
-  const canManageKeys = !user || roleAtLeast(user.role, "admin");
-  const access = { canEdit: !user || roleAtLeast(user.role, "member"), canAdmin: canManageKeys };
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const showQuickstart = quickstartOpen || (status !== null && totalEvents === 0 && !quickstartDismissed);
   const sampleEvent = availableEvents.find((e) => !e.startsWith("$")) ?? "page_viewed";
   const sampleProp = availableProps[0] ?? "plan";
   const keyText = mintedIngestKey || "<PASTE_OR_GENERATE_INGEST_KEY>";
+  const originJson = JSON.stringify(origin);
+  const keyJson = JSON.stringify(keyText);
+  const eventJson = JSON.stringify(sampleEvent);
+  const propsJson = JSON.stringify({ [sampleProp]: "pro" });
+  const httpBody = JSON.stringify(
+    { event: sampleEvent, userId: "user_1", properties: { [sampleProp]: "pro" } },
+    null,
+    2,
+  );
   const quickstartSnippets: Record<string, string> = {
-    Web: `npm install @pulse-analytics/ts-web
-
-import { PulseWebClient } from "@pulse-analytics/ts-web";
-
-const pulse = new PulseWebClient({ endpointUrl: "${origin}", apiKey: "${keyText}" });
-pulse.identify("user_1");
-pulse.track("${sampleEvent}", { ${sampleProp}: "pro" });`,
-    Android: `// Kotlin, with the generated bindings (see docs/mobile-core.md)
-val pulse = PulseClient(SdkConfig(
-    endpointUrl = "${origin}", apiKey = "${keyText}",
-    storageDir = context.filesDir.path, flushBatchSize = 50u, flushIntervalMs = 10_000u))
-pulse.identify("user_1")
-pulse.track("${sampleEvent}", """{"${sampleProp}": "pro"}""")`,
-    iOS: `// Swift, with the generated bindings (see docs/mobile-core.md)
-let pulse = try PulseClient(config: SdkConfig(
-    endpointUrl: "${origin}", apiKey: "${keyText}",
-    storageDir: NSTemporaryDirectory(), flushBatchSize: 50, flushIntervalMs: 10_000))
-try pulse.identify(userId: "user_1")
-try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro"}"#)`,
-    HTTP: `curl -X POST "${origin}/v1/ingest" \\
-  -H "Content-Type: application/json" \\
-  -H "x-pulse-key: ${keyText}" \\
-  -d '{
-    "event": "${sampleEvent}",
-    "userId": "user_1",
-    "properties": { "${sampleProp}": "pro" }
-  }'`,
+    Web: [
+      "npm install @pulse-analytics/ts-web",
+      "",
+      'import { PulseWebClient } from "@pulse-analytics/ts-web";',
+      "",
+      `const pulse = new PulseWebClient({ endpointUrl: ${originJson}, apiKey: ${keyJson} });`,
+      'pulse.identify("user_1");',
+      `pulse.track(${eventJson}, ${propsJson});`,
+    ].join("\n"),
+    Android: [
+      "// Kotlin, with the generated bindings (see docs/mobile-core.md)",
+      "val pulse = PulseClient(SdkConfig(",
+      `    endpointUrl = ${originJson.replace(/\$/g, "\\$")}, apiKey = ${keyJson.replace(/\$/g, "\\$")},`,
+      "    storageDir = context.filesDir.path, flushBatchSize = 50u, flushIntervalMs = 10_000u))",
+      'pulse.identify("user_1")',
+      `pulse.track(${eventJson.replace(/\$/g, "\\$")}, ${JSON.stringify(propsJson).replace(/\$/g, "\\$")})`,
+    ].join("\n"),
+    iOS: [
+      "// Swift, with the generated bindings (see docs/mobile-core.md)",
+      "let pulse = try PulseClient(config: SdkConfig(",
+      `    endpointUrl = ${originJson}, apiKey = ${keyJson},`,
+      "    storageDir: NSTemporaryDirectory(), flushBatchSize: 50, flushIntervalMs: 10_000))",
+      'try pulse.identify(userId: "user_1")',
+      `try pulse.track(eventName: ${eventJson}, propsJson: ${JSON.stringify(propsJson)})`,
+    ].join("\n"),
+    HTTP: [
+      `curl -X POST ${shellSingleQuote(`${origin}/v1/ingest`)} \\`,
+      "  -H 'Content-Type: application/json' \\",
+      `  -H ${shellSingleQuote(`x-pulse-key: ${keyText}`)} \\`,
+      `  -d ${shellSingleQuote(httpBody)}`,
+    ].join("\n"),
   };
   const curlSnippet = quickstartSnippets[quickstartTab];
 
@@ -499,7 +605,7 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
       const created = await api.createApiKey(activePid, { label: "Quickstart Ingest Key" });
       setMintedIngestKey(created.plaintext_key);
     } catch (err) {
-      setNotice(`Couldn't create API key: ${errorMessage(err)}`);
+      showNotice(`Couldn't create API key: ${errorMessage(err)}`, 6000);
     } finally {
       setMintingKey(false);
     }
@@ -509,7 +615,11 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
     try {
       await navigator.clipboard.writeText(curlSnippet);
       setCopiedQuickstart(true);
-      window.setTimeout(() => setCopiedQuickstart(false), 2000);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedQuickstart(false);
+        copyTimerRef.current = null;
+      }, 2000);
     } catch {
       // Clipboard may be restricted in headless contexts.
     }
@@ -782,120 +892,144 @@ try pulse.track(eventName: "${sampleEvent}", propsJson: #"{"${sampleProp}": "pro
               </div>
             </Panel>
           )}
-            {activeTab === "profile" ? (
-              <ProfilePage user={user} onUserChanged={setUser} />
-            ) : activeTab === "settings" ? (
-              <SettingsPage
-                user={user}
-                projectId={activePid}
-                projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
-                projects={projects}
-                onProjectCreated={(id) => switchProject(id, true)}
-                onProjectsChanged={() => void loadStatus()}
-              />
-            ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
-              <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
-            ) : !activePid || (!catalogLoaded && NEEDS_EVENTS.includes(activeTab)) ? (
-              <p className="text-sm text-muted" role="status">
-                Loading your workspace…
-              </p>
-            ) : availableEvents.length === 0 && NEEDS_EVENTS.includes(activeTab) ? (
-              <EmptyState
-                title="No events in this project yet"
-                body="Reports fill in once your app sends its first event."
-                action={
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setQuickstartDismissed(false);
-                      setQuickstartOpen(true);
-                    }}
-                    className={btn.primary}
-                  >
-                    Show how to send events
-                  </button>
+            <ErrorBoundary resetKey={`${activeTab}:${activePid}`}>
+              <Suspense
+                fallback={
+                  <div className="py-12">
+                    <Spinner label="Loading workspace…" />
+                  </div>
                 }
-              />
-            ) : (
-              <AccessContext.Provider key={activePid} value={access}>
-                {activeTab === "dashboards" && (
-                  <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
-                )}
-                {activeTab === "trends" && (
-                  <InsightsWorkspace
+              >
+                {activeTab === "profile" ? (
+                  <ProfilePage user={user} onUserChanged={setUser} />
+                ) : activeTab === "settings" ? (
+                  <SettingsPage
+                    user={user}
                     projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    numericProps={numericProps}
-                    refreshToken={refreshToken}
+                    projectName={projects.find((p) => p.id === activePid)?.name ?? activePid}
+                    projects={projects}
+                    onProjectCreated={(id) => switchProject(id, true)}
+                    onProjectsChanged={() => void loadStatus()}
                   />
-                )}
-                {activeTab === "funnels" && (
-                  <FunnelsWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    refreshToken={refreshToken}
+                ) : catalogError && NEEDS_EVENTS.includes(activeTab) ? (
+                  <ErrorNotice message={catalogError} onRetry={() => void loadCatalog()} />
+                ) : !activePid || (!catalogLoaded && NEEDS_EVENTS.includes(activeTab)) ? (
+                  <p className="text-sm text-muted" role="status">
+                    Loading your workspace…
+                  </p>
+                ) : availableEvents.length === 0 && NEEDS_EVENTS.includes(activeTab) ? (
+                  <EmptyState
+                    title="No events in this project yet"
+                    body="Reports fill in once your app sends its first event."
+                    action={
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setQuickstartDismissed(false);
+                          setQuickstartOpen(true);
+                        }}
+                        className={btn.primary}
+                      >
+                        Show how to send events
+                      </button>
+                    }
                   />
+                ) : (
+                  <AccessContext.Provider key={activePid} value={access}>
+                    {activeTab === "dashboards" && (
+                      <DashboardsWorkspace projectId={activePid} refreshToken={refreshToken} />
+                    )}
+                    {activeTab === "trends" && (
+                      <InsightsWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        numericProps={numericProps}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "funnels" && (
+                      <FunnelsWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "journeys" && (
+                      <FlowsWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "retention" && (
+                      <RetentionWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "replays" && (
+                      <SessionsReplayWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "users" && <UsersWorkspace projectId={activePid} />}
+                    {activeTab === "cohorts" && (
+                      <CohortsLookupsWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        onCatalogChanged={() => {
+                          void loadCatalog();
+                          setRefreshToken((n) => n + 1);
+                        }}
+                      />
+                    )}
+                    {activeTab === "experiments" && (
+                      <ExperimentsFlagsWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        refreshToken={refreshToken}
+                      />
+                    )}
+                    {activeTab === "events" && (
+                      <LexiconMcpWorkspace
+                        projectId={activePid}
+                        availableEvents={availableEvents}
+                        availableProps={availableProps}
+                        onLexiconChanged={() => {
+                          void loadCatalog();
+                          setRefreshToken((n) => n + 1);
+                        }}
+                      />
+                    )}
+                    {activeTab === "security" &&
+                      (canManageKeys ? (
+                        <SecurityPanel projectId={activePid} />
+                      ) : (
+                        <Panel>
+                          <EmptyState
+                            icon={Lock}
+                            title="Admin access required"
+                            body="Encryption, BYOK keys, and audit logs are restricted to workspace admins and owners."
+                            action={
+                              <button type="button" onClick={() => go("dashboards")} className={btn.secondary}>
+                                Back to Dashboards
+                              </button>
+                            }
+                          />
+                        </Panel>
+                      ))}
+                  </AccessContext.Provider>
                 )}
-                {activeTab === "journeys" && (
-                  <FlowsWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    refreshToken={refreshToken}
-                  />
-                )}
-                {activeTab === "retention" && (
-                  <RetentionWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    refreshToken={refreshToken}
-                  />
-                )}
-                {activeTab === "replays" && (
-                  <SessionsReplayWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    refreshToken={refreshToken}
-                  />
-                )}
-                {activeTab === "users" && <UsersWorkspace projectId={activePid} />}
-                {activeTab === "cohorts" && (
-                  <CohortsLookupsWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    onCatalogChanged={() => {
-                      void loadCatalog();
-                      setRefreshToken((n) => n + 1);
-                    }}
-                  />
-                )}
-                {activeTab === "experiments" && (
-                  <ExperimentsFlagsWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    refreshToken={refreshToken}
-                  />
-                )}
-                {activeTab === "events" && (
-                  <LexiconMcpWorkspace
-                    projectId={activePid}
-                    availableEvents={availableEvents}
-                    availableProps={availableProps}
-                    onLexiconChanged={() => {
-                      void loadCatalog();
-                      setRefreshToken((n) => n + 1);
-                    }}
-                  />
-                )}
-                {activeTab === "security" && canManageKeys && (
-                  <SecurityPanel projectId={activePid} />
-                )}
-              </AccessContext.Provider>
-            )}
+              </Suspense>
+            </ErrorBoundary>
         </div>
       </main>
     </div>
