@@ -10,51 +10,18 @@ use axum::routing::post;
 use axum::Router;
 use chrono::Utc;
 use object_store::ObjectStore;
-use pulse_control::{
-    build_control_router, sign_license_ed25519, CommercialFeature, ControlPlaneService,
-    EditionTier, LicenseClaims, MetaStore,
-};
+use pulse_control::{build_control_router, ControlPlaneService, MetaStore};
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, IngestService};
 use pulse_storage::{build_from_url, EncryptedObjectStore, StorageConfig, StorageEngine};
 use pulse_wire::{InteractionKind, ReplayChunk, WireframeOp};
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-const ROOT: &str = "sk_root_test_byok_license_0123456789";
-const INGEST_KEY: &str = "pk_test_byok_license_key_0123456789";
-
-struct TestVendorKeys {
-    pkcs8: Vec<u8>,
-}
-
-impl TestVendorKeys {
-    fn generate() -> Self {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pubkey_hex = hex::encode(key_pair.public_key().as_ref());
-        std::env::set_var("PULSE_LICENSE_PUBKEY_HEX", pubkey_hex);
-        Self {
-            pkcs8: pkcs8.as_ref().to_vec(),
-        }
-    }
-
-    fn mint(&self, org: &str, expires_at_ms: i64) -> String {
-        let claims = LicenseClaims {
-            license_id: format!("lic_test_{}", Utc::now().timestamp_millis()),
-            customer_org: org.to_string(),
-            edition: EditionTier::CommercialByok,
-            features: CommercialFeature::all_names(),
-            issued_at_ms: Utc::now().timestamp_millis() - 1000,
-            expires_at_ms,
-        };
-        sign_license_ed25519(&self.pkcs8, &claims).unwrap()
-    }
-}
+const ROOT: &str = "sk_root_test_byok_vault_00123456789";
+const INGEST_KEY: &str = "pk_test_byok_vault_ingest_0123456789";
 
 async fn setup_full(
     tmp: &std::path::Path,
@@ -216,19 +183,12 @@ async fn mock_llm_handler(axum::Json(req): axum::Json<Value>) -> impl IntoRespon
 }
 
 #[tokio::test]
-// PULSE_LICENSE_PUBKEY_HEX (the test signing key) is honoured only in debug builds; release
-// builds verify against the embedded production key, so the signed test licenses are rejected.
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "test license key override is debug-only"
-)]
-async fn test_full_oss_and_commercial_suite() {
-    let vendor = TestVendorKeys::generate();
+async fn test_full_encryption_and_byok_suite() {
     let tmp = tempfile::tempdir().unwrap();
     let (ctrl_app, ingest_app, ctrl, storage, enc_store) = setup_full(tmp.path(), ROOT, None).await;
 
     // =========================================================================
-    // 1. OPEN-SOURCE ENCRYPTION AT REST (Available in Community without license)
+    // 1. ENCRYPTION AT REST
     // =========================================================================
     let (st, enc_status) = send_admin_json(&ctrl_app, "GET", "/v1/system/encryption", None).await;
     assert_eq!(st, StatusCode::OK);
@@ -383,74 +343,7 @@ async fn test_full_oss_and_commercial_suite() {
     assert_eq!(funnel["overall_steps"][1]["entered_users"], 2);
 
     // =========================================================================
-    // 3. OFFLINE ED25519 LICENSE GATE & 14-DAY GRACE PERIOD VERIFICATION
-    // =========================================================================
-    // Self-serve trial minting is REJECTED
-    let (st, trial_err) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/license",
-        Some(json!({ "trial": true })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
-    assert!(trial_err["message"]
-        .as_str()
-        .unwrap()
-        .contains("trial key minting is disabled"));
-
-    // Tampered Ed25519 signature is REJECTED
-    let valid_lic_key = vendor.mint("Acme Fintech VPC", now_ms + 30 * 86_400_000);
-    let mut tampered_key = valid_lic_key.clone();
-    tampered_key.push('A');
-    let (st, _) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/license",
-        Some(json!({ "license_key": tampered_key })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
-
-    // Expired license outside 14-day grace period is REJECTED
-    let ancient_key = vendor.mint("Acme Expired", now_ms - 20 * 86_400_000);
-    let (st, _) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/license",
-        Some(json!({ "license_key": ancient_key })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
-
-    // Expired license WITHIN 14-day grace period is ACCEPTED with GracePeriod health
-    let grace_key = vendor.mint("Acme Grace Corp", now_ms - 2 * 86_400_000);
-    let (st, grace_res) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/license",
-        Some(json!({ "license_key": grace_key })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(grace_res["health"], "grace_period");
-    assert_eq!(grace_res["in_grace_period"], true);
-    assert_eq!(grace_res["is_commercial"], true);
-
-    // Activate fresh valid license
-    let (st, lic_ok) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/license",
-        Some(json!({ "license_key": valid_lic_key })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(lic_ok["health"], "active");
-    assert_eq!(lic_ok["in_grace_period"], false);
-
-    // =========================================================================
-    // 4. BYOK VAULT (SSRF Protection & Config Sanitization)
+    // 3. BYOK VAULT (SSRF Protection & Config Sanitization)
     // =========================================================================
     // file:// URLs are rejected by SSRF guard
     let (st, ssrf_err) = send_admin_json(
@@ -494,7 +387,7 @@ async fn test_full_oss_and_commercial_suite() {
     assert_eq!(cred_res["config_json"]["region"], "ap-south-1");
 
     // =========================================================================
-    // 5. SIGNED WEBHOOK VERIFY WITH REAL LOCAL HTTP RECEIVER
+    // 4. SIGNED WEBHOOK VERIFY WITH REAL LOCAL HTTP RECEIVER
     // =========================================================================
     let webhook_state = MockWebhookState {
         received_count: Arc::new(AtomicUsize::new(0)),
@@ -573,7 +466,7 @@ async fn test_full_oss_and_commercial_suite() {
     assert_eq!(fired, vec!["Opens above one"]);
 
     // =========================================================================
-    // 6. REAL CLOUD WAREHOUSE EXPORT (NDJSON)
+    // 5. REAL CLOUD WAREHOUSE EXPORT (NDJSON)
     // =========================================================================
     let (st, wh_res) = send_admin_json(
         &ctrl_app,
@@ -588,7 +481,7 @@ async fn test_full_oss_and_commercial_suite() {
     assert!(wh_res["bytes_written"].as_u64().unwrap() > 0);
 
     // =========================================================================
-    // 7. REAL BYOK AI COPILOT WITH MOCK LLM SERVER & 502 ON FAILURE
+    // 6. REAL BYOK AI COPILOT WITH MOCK LLM SERVER & 502 ON FAILURE
     // =========================================================================
     let llm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let llm_port = llm_listener.local_addr().unwrap().port();
@@ -673,7 +566,7 @@ async fn test_full_oss_and_commercial_suite() {
     assert_eq!(st, StatusCode::BAD_GATEWAY);
 
     // =========================================================================
-    // 8. ENTERPRISE AUDIT LOGS
+    // 7. AUDIT LOGS
     // =========================================================================
     let (st, audit_logs) = send_admin_json(&ctrl_app, "GET", "/v1/audit-logs", None).await;
     assert_eq!(st, StatusCode::OK);
@@ -682,46 +575,9 @@ async fn test_full_oss_and_commercial_suite() {
         .iter()
         .any(|l| l["action"] == "encryption.rotate_key"));
     assert!(logs_arr.iter().any(|l| l["action"] == "warehouse.export"));
-    assert!(logs_arr.iter().any(|l| l["action"] == "license.activate"));
 
     // =========================================================================
-    // 9. DEACTIVATION & NODE RESTART WITH DIFFERENT ADMIN TOKEN (Zero Data Lockout)
-    // =========================================================================
-    // Deactivating license clears commercial features
-    let (st, deact_res) = send_admin_json(&ctrl_app, "DELETE", "/v1/license", None).await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(deact_res["is_commercial"], false);
-
-    // Paid feature is now 402 Payment Required
-    let (st, _) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/projects/proj_byok/export/warehouse",
-        Some(json!({})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::PAYMENT_REQUIRED);
-
-    // But query and decryption of all historical data continues to work flawlessly!
-    let (st, funnel_after) = send_admin_json(
-        &ctrl_app,
-        "POST",
-        "/v1/projects/proj_byok/query/funnel",
-        Some(json!({
-            "time_range": { "start_ts_ms": now_ms - 30_000, "end_ts_ms": now_ms + 30_000 },
-            "steps": [
-                { "event_name": "App_Open" },
-                { "event_name": "KYC_PAN_Submitted" }
-            ],
-            "conversion_window_ms": 86_400_000
-        })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(funnel_after["overall_steps"][0]["entered_users"], 2);
-
-    // =========================================================================
-    // 10. RESTART NODE WITH DIFFERENT PULSE_ADMIN_TOKEN (C3 verification)
+    // 8. RESTART NODE WITH DIFFERENT PULSE_ADMIN_TOKEN (C3 verification)
     // =========================================================================
     let new_admin_token = "sk_root_restarted_node_new_admin_token_0123456789";
     std::env::set_var("PULSE_ADMIN_TOKEN", new_admin_token);

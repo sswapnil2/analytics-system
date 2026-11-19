@@ -35,9 +35,9 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) and create the first account
 
 To explore with demo data instead, add `--seed`. It loads a sample fintech app (`PULSE_DEFAULT_PROJECT=proj_fintech_in` names its project).
 
-### Community and commercial features
+### Open source
 
-Analytics, replay, flags, cohorts, privacy tools and the MCP server are Apache-2.0 with no event or seat limits. The built-in AI Copilot, warehouse export, enterprise audit log and webhook alerts check for a commercial licence key (`POST /v1/license`) and return HTTP 402 without one.
+Everything is Apache-2.0, with no licence key and no event or seat limits: analytics, replay, flags, cohorts, privacy tools, the MCP server, the AI Copilot, warehouse export, the audit log and webhook alerts.
 
 ## High-Availability & Node Roles
 

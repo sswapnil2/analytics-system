@@ -22,7 +22,7 @@ for AI agents.
 | Root admin token | `sk_root_…` (or whatever you set in `PULSE_ADMIN_TOKEN`) | Written to `root_admin_token` in the data directory, or set by you | Everything: all projects, creating projects and keys, `/v1/mcp` |
 | Project admin key | `sk_live_…` | `POST /v1/projects/:id/api-keys` with `"role": "admin"` | Admin, query and MCP routes for **one** project |
 | Ingest key | `pk_live_…` | Startup log on first boot, or `POST /v1/projects/:id/api-keys` (default role) | SDKs and `/v1/ingest`-style routes; safe to ship in a browser |
-| Studio session | `ps_…` | `POST /v1/auth/login` / `signup` (the Studio does this for you) | The projects in the user's organisation only. Not encryption keys, the licence or the audit log |
+| Studio session | `ps_…` | `POST /v1/auth/login` / `signup` (the Studio does this for you) | The projects in the user's organisation only. Not encryption keys or the audit log |
 
 ## Accounts and organisations
 
