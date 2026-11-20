@@ -443,4 +443,177 @@ mod tests {
 
         id_router.close_all().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn search_sessions_merges_l0_and_multiple_l1_segments_and_applies_rage_tap_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(StorageConfig::default(), store, id_router.clone());
+        let gov = InMemoryGovernance::new();
+        let ingest = IngestService::new(storage.clone(), gov);
+        let catalogs = CatalogRegistry::new();
+        let qengine = QueryEngine::new(
+            storage.clone(),
+            64 * 1024 * 1024,
+            None,
+            64 * 1024 * 1024,
+            catalogs,
+        )
+        .await
+        .unwrap();
+
+        let base_ts: i64 = 1_760_000_000_000;
+        let mk_ev = |seq: u8, uid: &str, sid: &str, name: &str, ts: i64| WireEvent {
+            event_uuid: [seq, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, seq],
+            routing_seed: uid.to_string(),
+            distinct_id: uid.to_string(),
+            session_id: sid.to_string(),
+            event_name: name.to_string(),
+            client_event_ts_ms: ts,
+            client_sent_ts_ms: ts + 5,
+            props: Vec::new(),
+            replay_offset_kb: 0,
+        };
+
+        // Flush segment 1 with early events for both sessions
+        ingest
+            .ingest_for_project(
+                "proj_sess_merge",
+                WireBatch::new(vec![
+                    mk_ev(1, "user_a", "sess_multi", "App_Open", base_ts),
+                    mk_ev(2, "user_b", "sess_calm", "App_Open", base_ts + 100),
+                ]),
+                base_ts + 500,
+            )
+            .await
+            .unwrap();
+        storage.flush_all_projects().await.unwrap();
+
+        // Flush segment 2 with mid-session event for sess_multi
+        ingest
+            .ingest_for_project(
+                "proj_sess_merge",
+                WireBatch::new(vec![mk_ev(
+                    3,
+                    "user_a",
+                    "sess_multi",
+                    "Checkout_Tap",
+                    base_ts + 2_000,
+                )]),
+                base_ts + 2_500,
+            )
+            .await
+            .unwrap();
+        storage.flush_all_projects().await.unwrap();
+
+        // Leave a 3rd event in hot L0 for sess_multi
+        ingest
+            .ingest_for_project(
+                "proj_sess_merge",
+                WireBatch::new(vec![mk_ev(
+                    4,
+                    "user_a",
+                    "sess_multi",
+                    "Checkout_Done",
+                    base_ts + 5_000,
+                )]),
+                base_ts + 5_500,
+            )
+            .await
+            .unwrap();
+
+        // Record replay chunks: sess_multi has a rage tap; sess_calm does not.
+        storage
+            .append_replay_chunk(&pulse_wire::ReplayChunk {
+                project_id: "proj_sess_merge".into(),
+                session_id: "sess_multi".into(),
+                chunk_start_ts_ms: base_ts,
+                ops: vec![pulse_wire::WireframeOp::PointerInteraction {
+                    ts_offset_ms: 2_100,
+                    x: 120,
+                    y: 420,
+                    kind: pulse_wire::InteractionKind::RageTap { count: 4 },
+                }],
+            })
+            .await
+            .unwrap();
+        storage
+            .append_replay_chunk(&pulse_wire::ReplayChunk {
+                project_id: "proj_sess_merge".into(),
+                session_id: "sess_calm".into(),
+                chunk_start_ts_ms: base_ts + 100,
+                ops: vec![pulse_wire::WireframeOp::PointerInteraction {
+                    ts_offset_ms: 500,
+                    x: 80,
+                    y: 200,
+                    kind: pulse_wire::InteractionKind::Tap,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let all = qengine
+            .search_sessions(
+                "proj_sess_merge",
+                &SessionSearchQuery {
+                    time_range: None,
+                    event_name: None,
+                    only_rage_tap: false,
+                    only_dead_tap: false,
+                    only_errors: false,
+                    only_with_replay: true,
+                    limit: Some(20),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            all.sessions.len(),
+            2,
+            "each session must appear exactly once, never split across L0/L1 segments"
+        );
+        let multi = all
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "sess_multi")
+            .unwrap();
+        assert_eq!(multi.event_count, 3);
+        assert_eq!(multi.start_ts_ms, base_ts);
+        assert_eq!(multi.end_ts_ms, base_ts + 5_000);
+        assert_eq!(multi.duration_ms, 5_000);
+        assert!(multi.has_rage_tap);
+        assert!(multi.has_replay);
+
+        let calm = all
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "sess_calm")
+            .unwrap();
+        assert_eq!(calm.event_count, 1);
+        assert!(!calm.has_rage_tap);
+        assert!(calm.has_replay);
+
+        let rage_only = qengine
+            .search_sessions(
+                "proj_sess_merge",
+                &SessionSearchQuery {
+                    time_range: None,
+                    event_name: None,
+                    only_rage_tap: true,
+                    only_dead_tap: false,
+                    only_errors: false,
+                    only_with_replay: true,
+                    limit: Some(20),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rage_only.sessions.len(), 1);
+        assert_eq!(rage_only.sessions[0].session_id, "sess_multi");
+
+        id_router.close_all().await.unwrap();
+    }
 }

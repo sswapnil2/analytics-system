@@ -487,3 +487,256 @@ test("URL privacy: strips query strings, fragments, userinfo, and mailto/tel fro
   assert.ok(!raw.includes("reset_999") && !raw.includes("oauth_secret_123") && !raw.includes("private@example.com") && !raw.includes("alice:secret"));
   sdk.shutdown();
 });
+
+test("Fetch timeout: hung requests abort, requeue events, and never stall subsequent flushes", async () => {
+  let attempt = 0;
+  let aborted = false;
+  const delivered = [];
+  browserEnv({
+    fetchImpl: (url, init) => {
+      attempt += 1;
+      if (attempt === 1) {
+        // Simulate a hung mobile socket that never resolves unless aborted.
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(new Error("aborted"));
+          });
+        });
+      }
+      if (String(url).endsWith("/v1/ingest")) {
+        delivered.push(...JSON.parse(init.body).events);
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}), headers: { get: () => null } });
+    },
+  });
+
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://pulse.test",
+    apiKey: "pk_timeout",
+    flushIntervalMs: 0,
+    fetchTimeoutMs: 40,
+  });
+
+  sdk.track("CheckoutStarted");
+  const t0 = Date.now();
+  await sdk.flush();
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed < 1000, `flush should abort promptly, took ${elapsed}ms`);
+  assert.equal(aborted, true, "AbortController signal should be aborted on timeout");
+  assert.equal(sdk.getQueuedEventCount(), 1, "timed-out batch must be re-queued");
+
+  // Clear backoff and verify the next flush succeeds cleanly without wedging.
+  sdk.clearBackoffForRetry();
+  await sdk.flush();
+  assert.equal(sdk.getQueuedEventCount(), 0);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].event_name, "CheckoutStarted");
+  sdk.shutdown();
+});
+
+test("Pluggable async storage, custom randomBytes, and non-browser safety", async () => {
+  const savedWindow = globalThis.window;
+  const savedDocument = globalThis.document;
+  const savedLocalStorage = globalThis.localStorage;
+  const savedFetch = globalThis.fetch;
+
+  const backing = new Map();
+  const asyncStorage = {
+    async getItem(k) {
+      await new Promise((r) => setTimeout(r, 5));
+      return backing.get(k) ?? null;
+    },
+    async setItem(k, v) {
+      backing.set(k, v);
+    },
+    async removeItem(k) {
+      backing.delete(k);
+    },
+  };
+
+  let randCounter = 1;
+  const deterministicBytes = (len) => {
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) out[i] = (randCounter++ * 17) & 0xff;
+    return out;
+  };
+
+  const sent = [];
+  // Simulate a non-browser / React Native global where document & localStorage do not exist
+  // and window is an object without addEventListener.
+  globalThis.window = {};
+  globalThis.document = undefined;
+  globalThis.localStorage = undefined;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/v1/ingest")) sent.push(...JSON.parse(init.body).events);
+    return { ok: true, status: 200, json: async () => ({}), headers: { get: () => null } };
+  };
+
+  try {
+    const first = new PulseWebClient({
+      endpointUrl: "http://pulse.test",
+      apiKey: "pk_rn_storage",
+      flushIntervalMs: 0,
+      storage: asyncStorage,
+      randomBytes: deterministicBytes,
+      contextProvider: () => ({ $os: "iOS", $app_version: "2.4.0" }),
+    });
+    await first.ready();
+    const anon1 = first.getDistinctId();
+    assert.ok(anon1.startsWith("anon_") && anon1.length === 21);
+    first.track("AppOpened");
+    await first.flush();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].props.$os, "iOS");
+    assert.equal(sent[0].props.$app_version, "2.4.0");
+    first.shutdown();
+
+    // Second instance hydrates the same anonId from async storage.
+    const second = new PulseWebClient({
+      endpointUrl: "http://pulse.test",
+      apiKey: "pk_rn_storage",
+      flushIntervalMs: 0,
+      storage: asyncStorage,
+      randomBytes: deterministicBytes,
+    });
+    await second.ready();
+    assert.equal(second.getDistinctId(), anon1);
+    second.shutdown();
+  } finally {
+    globalThis.window = savedWindow;
+    globalThis.document = savedDocument;
+    globalThis.localStorage = savedLocalStorage;
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("Public replay API and incremental wireframe snapshot diffing", async () => {
+  const replayChunks = [];
+  const events = [];
+  browserEnv({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/v1/replay/chunk")) {
+        replayChunks.push(JSON.parse(init.body));
+        return { ok: true, status: 200, json: async () => ({ replay_offset_kb: 1 }), headers: { get: () => null } };
+      }
+      if (String(url).endsWith("/v1/ingest")) {
+        events.push(...JSON.parse(init.body).events);
+      }
+      return { ok: true, status: 200, json: async () => ({}), headers: { get: () => null } };
+    },
+  });
+
+  const sdk = new PulseWebClient({
+    endpointUrl: "http://pulse.test",
+    apiKey: "pk_replay_diff",
+    flushIntervalMs: 0,
+    enableWireframeReplay: true,
+  });
+
+  const makeTree = (buttonY = 400, includeFooter = true, extraNode = null) => {
+    const nodes = [
+      { node_id: 1, parent_id: 0, kind: "screen", x: 0, y: 0, w: 390, h: 844, bg_rgba: 0x090d16ff, masked_label: "Home" },
+    ];
+    for (let i = 2; i <= 15; i++) {
+      nodes.push({
+        node_id: i,
+        parent_id: 1,
+        kind: i === 5 ? "masked_input" : "text",
+        x: 16,
+        y: i * 32,
+        w: 358,
+        h: 24,
+        bg_rgba: 0x162033ff,
+        masked_label: i === 5 ? "secret-pin-1234" : `row-${i}`,
+      });
+    }
+    nodes.push({
+      node_id: 20,
+      parent_id: 1,
+      kind: "button",
+      x: 16,
+      y: buttonY,
+      w: 358,
+      h: 48,
+      bg_rgba: 0x3b82f6ff,
+      masked_label: "Pay",
+    });
+    if (includeFooter) {
+      nodes.push({
+        node_id: 21,
+        parent_id: 1,
+        kind: "text",
+        x: 16,
+        y: 780,
+        w: 358,
+        h: 24,
+        bg_rgba: 0x162033ff,
+        masked_label: "Footer",
+      });
+    }
+    if (extraNode) nodes.push(extraNode);
+    return nodes;
+  };
+
+  // 1. Initial snapshot -> full_snapshot (with masked_input sanitized!)
+  sdk.recordWireframeSnapshot(390, 844, makeTree(400, true));
+  // 2. Identical snapshot -> 0 ops emitted!
+  sdk.recordWireframeSnapshot(390, 844, makeTree(400, true));
+  // 3. Small change: move button, remove footer, add bottom sheet container -> incremental diff!
+  sdk.recordWireframeSnapshot(
+    390,
+    844,
+    makeTree(420, false, {
+      node_id: 30,
+      parent_id: 1,
+      kind: "container",
+      x: 0,
+      y: 500,
+      w: 390,
+      h: 344,
+      bg_rgba: 0xffffffff,
+      masked_label: "",
+    }),
+  );
+  // 4. Viewport resize -> full_snapshot
+  sdk.recordWireframeSnapshot(844, 390, makeTree(200, true));
+
+  // 5. Public tap + rage-tap API
+  sdk.recordTap(120, 420, true);
+  sdk.recordTap(122, 421, true);
+  sdk.recordTap(119, 419, true); // triggers rage_tap + $rage_tap event
+
+  await sdk.flush();
+
+  assert.equal(replayChunks.length, 1);
+  const ops = replayChunks[0].ops;
+  const fullSnapshots = ops.filter((o) => o.op === "full_snapshot");
+  const initialCustom = fullSnapshots.find((o) => o.width === 390 && o.height === 844);
+  assert.ok(initialCustom, "initial custom full_snapshot should be present");
+  const maskedInput = initialCustom.nodes.find((n) => n.node_id === 5);
+  assert.equal(maskedInput.masked_label, "████", "masked_input must be sanitized unconditionally");
+
+  // Incremental diff ops (2 upserts + 1 remove, NO second full_snapshot for the small change)
+  const diffUpserts = ops.filter((o) => o.op === "node_upsert");
+  const diffRemoves = ops.filter((o) => o.op === "node_remove");
+  assert.equal(diffUpserts.length, 2, "only moved button + added sheet should be upserted");
+  assert.deepEqual(
+    diffUpserts.map((o) => o.node_id).sort((a, b) => a - b),
+    [20, 30],
+  );
+  assert.equal(diffRemoves.length, 1, "only removed footer should be emitted");
+  assert.equal(diffRemoves[0].node_id, 21);
+
+  // Only 1 full_snapshot for 390x844 and 1 for 844x390 (not 4!)
+  assert.equal(fullSnapshots.filter((o) => o.width === 390 && o.height === 844).length, 1);
+  assert.equal(fullSnapshots.filter((o) => o.width === 844 && o.height === 390).length, 1);
+
+  // Rage tap emitted via public recordTap
+  const rageOp = ops.find((o) => o.op === "pointer_interaction" && o.kind.type === "rage_tap");
+  assert.ok(rageOp, "recordTap should detect rage tap");
+  assert.ok(events.some((e) => e.event_name === "$rage_tap"));
+
+  sdk.shutdown();
+});

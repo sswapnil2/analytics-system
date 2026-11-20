@@ -38,7 +38,7 @@ export interface WireNode {
 export type WireframeOp =
   | { op: "full_snapshot"; ts_offset_ms: number; width: number; height: number; nodes: WireNode[] }
   | ({ op: "node_upsert"; ts_offset_ms: number } & WireNode)
-  | { op: "node_remove"; node_id: number }
+  | { op: "node_remove"; ts_offset_ms?: number; node_id: number }
   | {
       op: "pointer_interaction";
       ts_offset_ms: number;
@@ -58,6 +58,13 @@ export type WireframeOp =
       status_code: number;
       duration_ms: number;
     };
+
+/** Pluggable key-value storage backend (supports sync `localStorage`/MMKV and async `AsyncStorage`). */
+export interface PulseStorage {
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): void | Promise<void>;
+  removeItem(key: string): void | Promise<void>;
+}
 
 export interface AutocaptureConfig {
   pageviews?: boolean;
@@ -101,6 +108,23 @@ export interface PulseWebConfig {
   captureNetwork?: boolean;
   /** Log every tracked event and each send result to the console. */
   debug?: boolean;
+  /**
+   * Abort and retry hung HTTP requests after this many milliseconds (default `10_000`).
+   * Set to `0` to disable timeouts. Prevents stalled send queues on flaky mobile networks.
+   */
+  fetchTimeoutMs?: number;
+  /**
+   * Custom key-value storage backend (sync or async, e.g. React Native AsyncStorage or MMKV).
+   * Falls back to `localStorage` in browsers and an in-memory map elsewhere.
+   */
+  storage?: PulseStorage;
+  /**
+   * Cryptographic random byte provider for environments without `crypto.randomUUID` /
+   * `crypto.getRandomValues` (such as Hermes on React Native).
+   */
+  randomBytes?: (length: number) => Uint8Array;
+  /** Optional platform context provider merged into every tracked event. */
+  contextProvider?: () => EventProperties;
 }
 
 export interface EdgeFlagRule {
@@ -154,6 +178,7 @@ function visibleAlertBox(message: string): { x: number; y: number; w: number; h:
 }
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 2_000;
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 const MAX_QUEUED_REPLAY_PACKETS = 64;
 const SNAPSHOT_THROTTLE_MS = 1_000;
 
@@ -216,13 +241,92 @@ export function evaluateEdgeFlag(rule: EdgeFlagRule, distinctId: string): string
   return rule.variants[rule.variants.length - 1]?.key ?? null;
 }
 
-function randomId(prefix: string): string {
+let fallbackEntropyCounter = 0;
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function randomId(prefix: string, randomBytesFn?: (length: number) => Uint8Array): string {
+  if (randomBytesFn) {
+    try {
+      const bytes = randomBytesFn(8);
+      if (bytes && bytes.length >= 8) {
+        return `${prefix}_${bytesToHex(bytes.subarray(0, 8))}`;
+      }
+    } catch {
+      // Fall through to Web Crypto / PRNG fallback.
+    }
+  }
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   }
-  const r1 = Math.random().toString(36).slice(2, 10);
-  const r2 = Date.now().toString(36);
-  return `${prefix}_${r2}${r1}`;
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return `${prefix}_${bytesToHex(bytes)}`;
+  }
+  // High-entropy fallback for JS engines without Web Crypto (e.g. unpolyfilled Hermes):
+  // mix wall-clock ms, high-res monotonic timer (when available), a monotonic counter, and two PRNG words.
+  fallbackEntropyCounter = (fallbackEntropyCounter + 1) >>> 0;
+  const hiRes =
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? Math.floor(performance.now() * 1000) >>> 0
+      : 0;
+  const w1 = ((Date.now() >>> 0) ^ hiRes ^ ((Math.random() * 0x1_0000_0000) >>> 0)) >>> 0;
+  const w2 =
+    ((Math.imul(fallbackEntropyCounter, 0x9e3779b1) >>> 0) ^
+      ((Math.random() * 0x1_0000_0000) >>> 0)) >>>
+    0;
+  return `${prefix}_${w1.toString(16).padStart(8, "0")}${w2.toString(16).padStart(8, "0")}`;
+}
+
+function isPromiseLike<T>(v: unknown): v is PromiseLike<T> {
+  return Boolean(v) && (typeof v === "object" || typeof v === "function") && typeof (v as PromiseLike<T>).then === "function";
+}
+
+function defaultStorage(): PulseStorage {
+  try {
+    if (typeof localStorage !== "undefined" && typeof localStorage.getItem === "function") {
+      return localStorage;
+    }
+  } catch {
+    // Sandboxed iframes or restricted environments.
+  }
+  const mem = new Map<string, string>();
+  return {
+    getItem: (k) => mem.get(k) ?? null,
+    setItem: (k, v) => {
+      mem.set(k, v);
+    },
+    removeItem: (k) => {
+      mem.delete(k);
+    },
+  };
+}
+
+function wireNodesEqual(a: WireNode, b: WireNode): boolean {
+  return (
+    a.parent_id === b.parent_id &&
+    a.kind === b.kind &&
+    a.x === b.x &&
+    a.y === b.y &&
+    a.w === b.w &&
+    a.h === b.h &&
+    a.bg_rgba === b.bg_rgba &&
+    a.masked_label === b.masked_label
+  );
+}
+
+function sanitizeWireNode(node: WireNode): WireNode {
+  if (node.kind === "masked_input") {
+    return { ...node, masked_label: FIXED_MASK };
+  }
+  return node;
 }
 
 const ATTRIBUTION_PARAMS = [
@@ -289,9 +393,13 @@ export class PulseWebClient {
   private readonly endpoint: string;
   private readonly apiKey: string;
   private readonly storageKey: string;
+  private readonly storage: PulseStorage;
   private readonly flushBatchSize: number;
   private readonly maxQueuedEvents: number;
+  private readonly fetchTimeoutMs: number;
   private readonly cfg: PulseWebConfig;
+  private readonly hydrationPromise: Promise<void>;
+  private userIdSetExplicitly = false;
 
   private routingSeed: string;
   private anonId: string;
@@ -323,6 +431,12 @@ export class PulseWebClient {
   private replayOpsSessionId: string | null = null;
   private chunkStartTsMs: number | null = null;
 
+  /** Incremental wireframe diff state (reset on session rotation / stop / reset). */
+  private lastSnapshotViewport: { w: number; h: number } | null = null;
+  private lastSnapshotNodes: Map<number, WireNode> = new Map();
+  private domNodeIds: WeakMap<object, number> = new WeakMap();
+  private nextDomNodeId = 2;
+
   private recentClicks: Array<{ ts: number; x: number; y: number }> = [];
   private flagsEtag: string | null = null;
   private flagRules: Map<string, EdgeFlagRule> = new Map();
@@ -350,46 +464,52 @@ export class PulseWebClient {
     this.endpoint = cfg.endpointUrl.replace(/\/+$/, "");
     this.apiKey = cfg.apiKey;
     this.storageKey = `pulse_sdk_state_${xxh3_64(cfg.apiKey).toString(16)}`;
+    this.storage = cfg.storage ?? defaultStorage();
     this.flushBatchSize = cfg.flushBatchSize ?? 20;
     this.maxQueuedEvents = cfg.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS;
+    this.fetchTimeoutMs = cfg.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
     this.propertyBlacklist = new Set(cfg.propertyBlacklist ?? []);
     this.replayTriggerSet = new Set(cfg.replayTriggerEvents ?? []);
 
     const now = Date.now();
-    const loaded = this.loadPersistedState();
-    if (loaded) {
-      this.routingSeed = loaded.routingSeed;
-      this.anonId = loaded.anonId;
-      this.userId = loaded.userId;
-      if (now - loaded.lastActivityMs > SESSION_TIMEOUT_MS) {
-        this.sessionId = randomId("sess");
-        this.exposuresSent = new Set();
-      } else {
-        this.sessionId = loaded.sessionId;
-        this.exposuresSent = new Set(loaded.exposuresSent ?? []);
-      }
-      this.lastActivityMs = now;
-      this.explicitOptSet = Boolean(loaded.explicitOptSet);
-      this.optedOut = this.explicitOptSet ? Boolean(loaded.optedOut) : Boolean(cfg.optOutByDefault);
-      this.superProps = loaded.superProps ?? {};
-      this.firstTouchUtms = loaded.firstTouchUtms ?? {};
-      this.lastTouchUtms = loaded.lastTouchUtms ?? {};
-      this.groups = loaded.groups ?? {};
-    } else {
-      this.routingSeed = randomId("dev");
-      this.anonId = randomId("anon");
-      this.sessionId = randomId("sess");
-      this.lastActivityMs = now;
-      this.optedOut = Boolean(cfg.optOutByDefault);
+    // Initialize defaults synchronously; if storage is synchronous, apply immediately,
+    // otherwise hydrate asynchronously and expose via `ready()`.
+    this.routingSeed = this.newId("dev");
+    this.anonId = this.newId("anon");
+    this.sessionId = this.newId("sess");
+    this.lastActivityMs = now;
+    this.optedOut = Boolean(cfg.optOutByDefault);
+
+    let stateMaybe: string | null | Promise<string | null> = null;
+    try {
+      stateMaybe = this.storage.getItem(this.storageKey);
+    } catch {
+      stateMaybe = null;
     }
 
-    this.captureUrlAttribution();
-    this.initReplaySamplingState();
-    this.persistState();
-    // Events left unsent by a previous page (closed tab, offline, crash). Their ids are stable,
-    // so ones that did arrive are dropped by server-side dedup.
-    const pending = this.loadPersistedQueue();
-    if (pending.length > 0) this.enqueueEventsBounded(pending);
+    if (isPromiseLike<string | null>(stateMaybe)) {
+      this.initReplaySamplingState();
+      this.hydrationPromise = this.hydrateAsync(stateMaybe, now);
+    } else {
+      const loaded = this.parsePersistedState(stateMaybe);
+      if (loaded) this.applyLoadedState(loaded, now);
+      this.captureUrlAttribution();
+      this.initReplaySamplingState();
+      this.persistState();
+      const pendingMaybe = this.readQueueRaw();
+      if (isPromiseLike<string | null>(pendingMaybe)) {
+        this.hydrationPromise = Promise.resolve(pendingMaybe)
+          .then((raw) => {
+            const pending = this.parsePersistedQueue(raw);
+            if (pending.length > 0) this.enqueueEventsBounded(pending, true);
+          })
+          .catch(() => {});
+      } else {
+        const pending = this.parsePersistedQueue(pendingMaybe);
+        if (pending.length > 0) this.enqueueEventsBounded(pending);
+        this.hydrationPromise = Promise.resolve();
+      }
+    }
 
     const interval = cfg.flushIntervalMs ?? 5000;
     if (interval > 0) {
@@ -398,7 +518,11 @@ export class PulseWebClient {
       }, interval);
     }
 
-    if (typeof window !== "undefined" && typeof document !== "undefined") {
+    if (
+      typeof window !== "undefined" &&
+      typeof document !== "undefined" &&
+      typeof window.addEventListener === "function"
+    ) {
       // Unconditional visibilitychange listener so both events and replay ops flush on page hide!
       this.boundVisibilityListener = () => {
         if (document.visibilityState === "hidden") {
@@ -421,6 +545,66 @@ export class PulseWebClient {
         this.attachAutocaptureListeners(cfg.autocapture);
       }
     }
+  }
+
+  private newId(prefix: string): string {
+    return randomId(prefix, this.cfg.randomBytes);
+  }
+
+  /** Resolves once async storage hydration (e.g. React Native AsyncStorage) has completed. */
+  public ready(): Promise<void> {
+    return this.hydrationPromise;
+  }
+
+  private async hydrateAsync(
+    statePromise: PromiseLike<string | null>,
+    now: number,
+  ): Promise<void> {
+    try {
+      const rawState = await statePromise;
+      const loaded = this.parsePersistedState(rawState);
+      if (loaded) {
+        this.applyLoadedState(loaded, now, true);
+      }
+      this.captureUrlAttribution();
+      this.initReplaySamplingState();
+      this.persistState();
+
+      const rawQueue = await Promise.resolve(this.readQueueRaw());
+      const pending = this.parsePersistedQueue(rawQueue);
+      if (pending.length > 0) {
+        this.enqueueEventsBounded(pending, true);
+      }
+    } catch {
+      // Keep in-memory defaults if async storage fails.
+      this.initReplaySamplingState();
+    }
+  }
+
+  private applyLoadedState(loaded: PersistedWebState, now: number, mergeLive = false): void {
+    this.routingSeed = loaded.routingSeed;
+    this.anonId = loaded.anonId;
+    if (!mergeLive || !this.userIdSetExplicitly) {
+      this.userId = loaded.userId;
+    }
+    if (now - loaded.lastActivityMs > SESSION_TIMEOUT_MS) {
+      this.sessionId = this.newId("sess");
+      this.exposuresSent = new Set();
+    } else {
+      this.sessionId = loaded.sessionId;
+      this.exposuresSent = new Set([...(loaded.exposuresSent ?? []), ...this.exposuresSent]);
+    }
+    this.lastActivityMs = Math.max(now, this.lastActivityMs);
+    if (!mergeLive || !this.explicitOptSet) {
+      this.explicitOptSet = Boolean(loaded.explicitOptSet);
+      this.optedOut = this.explicitOptSet
+        ? Boolean(loaded.optedOut)
+        : Boolean(this.cfg.optOutByDefault);
+    }
+    this.superProps = { ...(loaded.superProps ?? {}), ...this.superProps };
+    this.firstTouchUtms = { ...(loaded.firstTouchUtms ?? {}), ...this.firstTouchUtms };
+    this.lastTouchUtms = { ...(loaded.lastTouchUtms ?? {}), ...this.lastTouchUtms };
+    this.groups = { ...(loaded.groups ?? {}), ...this.groups };
   }
 
   private initReplaySamplingState(): void {
@@ -641,10 +825,8 @@ export class PulseWebClient {
     }
   }
 
-  private loadPersistedState(): PersistedWebState | null {
+  private parsePersistedState(raw: string | null): PersistedWebState | null {
     try {
-      if (typeof localStorage === "undefined") return null;
-      const raw = localStorage.getItem(this.storageKey);
       if (!raw) return null;
       const parsed = JSON.parse(raw) as Partial<PersistedWebState>;
       if (
@@ -669,7 +851,7 @@ export class PulseWebClient {
         };
       }
     } catch {
-      // Ignore storage quota / SecurityError in sandboxed contexts.
+      // Ignore malformed state JSON.
     }
     return null;
   }
@@ -678,10 +860,16 @@ export class PulseWebClient {
     return `${this.storageKey}_queue`;
   }
 
-  private loadPersistedQueue(): Array<Record<string, unknown>> {
+  private readQueueRaw(): string | null | Promise<string | null> {
     try {
-      if (typeof localStorage === "undefined") return [];
-      const raw = localStorage.getItem(this.queueKey);
+      return this.storage.getItem(this.queueKey);
+    } catch {
+      return null;
+    }
+  }
+
+  private parsePersistedQueue(raw: string | null): Array<Record<string, unknown>> {
+    try {
       const parsed = raw ? (JSON.parse(raw) as unknown) : [];
       return Array.isArray(parsed)
         ? parsed.filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
@@ -694,14 +882,15 @@ export class PulseWebClient {
   /** Saves unsent and in-flight events so a reload or crash does not lose them. */
   private persistQueue(): void {
     try {
-      if (typeof localStorage === "undefined") return;
       const all = [...this.inFlightEvents, ...this.eventQueue];
       if (all.length === 0) {
-        localStorage.removeItem(this.queueKey);
+        const res = this.storage.removeItem(this.queueKey);
+        if (isPromiseLike(res)) Promise.resolve(res).catch(() => {});
         return;
       }
       // ponytail: whole-queue rewrite per change; fine at the default 2,000-event cap.
-      localStorage.setItem(this.queueKey, JSON.stringify(all.slice(-this.maxQueuedEvents)));
+      const res = this.storage.setItem(this.queueKey, JSON.stringify(all.slice(-this.maxQueuedEvents)));
+      if (isPromiseLike(res)) Promise.resolve(res).catch(() => {});
     } catch {
       // Quota or SecurityError: the in-memory queue still works.
     }
@@ -713,7 +902,6 @@ export class PulseWebClient {
 
   private persistState(): void {
     try {
-      if (typeof localStorage === "undefined") return;
       const payload: PersistedWebState = {
         routingSeed: this.routingSeed,
         anonId: this.anonId,
@@ -728,7 +916,8 @@ export class PulseWebClient {
         groups: this.groups,
         exposuresSent: Array.from(this.exposuresSent),
       };
-      localStorage.setItem(this.storageKey, JSON.stringify(payload));
+      const res = this.storage.setItem(this.storageKey, JSON.stringify(payload));
+      if (isPromiseLike(res)) Promise.resolve(res).catch(() => {});
     } catch {
       // Ignore storage quota / SecurityError.
     }
@@ -765,11 +954,17 @@ export class PulseWebClient {
     this.replayQueue.push({ sessionId, chunkStartTsMs, ops });
   }
 
+  private resetSnapshotDiffState(): void {
+    this.lastSnapshotViewport = null;
+    this.lastSnapshotNodes.clear();
+  }
+
   private touchSession(now: number): void {
     if (now > this.lastActivityMs && now - this.lastActivityMs > SESSION_TIMEOUT_MS) {
       // Seal pending replay ops under the outgoing session BEFORE rotating!
       this.sealPendingReplayOps();
-      this.sessionId = randomId("sess");
+      this.resetSnapshotDiffState();
+      this.sessionId = this.newId("sess");
       this.replayOffsetKb = 0;
     }
     if (now > this.lastActivityMs) {
@@ -861,6 +1056,7 @@ export class PulseWebClient {
 
     const merged: EventProperties = {
       ...collectDefaultContext(),
+      ...(this.cfg.contextProvider ? this.cfg.contextProvider() : {}),
       ...this.firstTouchUtms,
       ...this.lastTouchUtms,
       ...this.superProps,
@@ -913,6 +1109,7 @@ export class PulseWebClient {
     this.touchSession(now);
     const prevAnon = this.anonId;
     this.userId = userId;
+    this.userIdSetExplicitly = true;
     this.persistState();
 
     const bodyPayload: Record<string, unknown> = {
@@ -924,7 +1121,7 @@ export class PulseWebClient {
       bodyPayload.user_properties = userProps;
     }
 
-    const res = await fetch(`${this.endpoint}/v1/identify`, {
+    const res = await this.fetchWithTimeout(`${this.endpoint}/v1/identify`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -947,7 +1144,7 @@ export class PulseWebClient {
       ...ops,
     };
     try {
-      const res = await fetch(`${this.endpoint}/v1/engage`, {
+      const res = await this.fetchWithTimeout(`${this.endpoint}/v1/engage`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1012,7 +1209,7 @@ export class PulseWebClient {
     if (this.optedOut) return;
     this.groups[groupType] = groupId;
     this.persistState();
-    await fetch(`${this.endpoint}/v1/groups`, {
+    await this.fetchWithTimeout(`${this.endpoint}/v1/groups`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1056,9 +1253,11 @@ export class PulseWebClient {
    */
   public reset(): void {
     this.sealPendingReplayOps();
+    this.resetSnapshotDiffState();
     this.userId = null;
-    this.anonId = randomId("anon");
-    this.sessionId = randomId("sess");
+    this.userIdSetExplicitly = false;
+    this.anonId = this.newId("anon");
+    this.sessionId = this.newId("sess");
     this.replayOffsetKb = 0;
     this.recentClicks = [];
     this.exposuresSent.clear();
@@ -1115,7 +1314,7 @@ export class PulseWebClient {
     try {
       const headers: Record<string, string> = {};
       if (this.flagsEtag) headers["If-None-Match"] = this.flagsEtag;
-      const res = await fetch(`${this.endpoint}/v1/flags/${encodeURIComponent(this.apiKey)}`, {
+      const res = await this.fetchWithTimeout(`${this.endpoint}/v1/flags/${encodeURIComponent(this.apiKey)}`, {
         headers,
       });
       if (res.status === 304 || !res.ok) return;
@@ -1142,6 +1341,7 @@ export class PulseWebClient {
     this.recordingActive = false;
     this.recordingPaused = false;
     this.sealPendingReplayOps();
+    this.resetSnapshotDiffState();
   }
 
   public pauseSessionRecording(): void {
@@ -1206,22 +1406,232 @@ export class PulseWebClient {
   }
 
   /**
-   * Walks live DOM bounding boxes and emits a default-deny masked wireframe snapshot.
+   * Public API for pushing a single wireframe replay op (e.g. from custom or React Native recorders).
+   * Enforces privacy masking on `masked_input` nodes.
    */
-  public captureDomWireframeSnapshot(): void {
+  public recordWireframeOp(op: WireframeOp): void {
     if (this.optedOut || !this.isRecordingSession()) return;
-    if (typeof window === "undefined" || typeof document === "undefined") return;
     const now = Date.now();
     this.touchSession(now);
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    if (op.op === "full_snapshot") {
+      this.replayOps.push({
+        ...op,
+        nodes: op.nodes.map(sanitizeWireNode),
+      });
+    } else if (op.op === "node_upsert") {
+      this.replayOps.push({
+        ...sanitizeWireNode(op),
+        op: "node_upsert",
+        ts_offset_ms: op.ts_offset_ms,
+      });
+    } else {
+      this.replayOps.push(op);
+    }
+  }
+
+  /** Public API for pushing multiple wireframe replay ops in order. */
+  public recordWireframeOps(ops: WireframeOp[]): void {
+    if (ops.length === 0 || this.optedOut || !this.isRecordingSession()) return;
+    for (const op of ops) {
+      this.recordWireframeOp(op);
+    }
+  }
+
+  /**
+   * Records a wireframe screen snapshot with automatic incremental diffing.
+   *
+   * On the first snapshot (or when the viewport dimensions change, `forceFull` is set, or the diff
+   * would not save ops over a full snapshot), emits a `full_snapshot`. On subsequent snapshots,
+   * emits only `node_upsert` for added/changed nodes and `node_remove` for removed nodes (or
+   * nothing at all if the wireframe is unchanged).
+   */
+  public recordWireframeSnapshot(
+    width: number,
+    height: number,
+    nodes: WireNode[],
+    options?: { forceFull?: boolean },
+  ): void {
+    if (this.optedOut || !this.isRecordingSession()) return;
+    const now = Date.now();
+    this.touchSession(now);
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    const tsOffsetMs = Math.max(0, now - this.chunkStartTsMs);
+
+    const vpW = Math.min(65535, Math.max(1, Math.round(width)));
+    const vpH = Math.min(65535, Math.max(1, Math.round(height)));
+    const sanitized = nodes.map(sanitizeWireNode);
+    const nextMap = new Map<number, WireNode>();
+    for (const n of sanitized) {
+      nextMap.set(n.node_id, n);
+    }
+
+    const canDiff =
+      !options?.forceFull &&
+      this.lastSnapshotViewport !== null &&
+      this.lastSnapshotViewport.w === vpW &&
+      this.lastSnapshotViewport.h === vpH &&
+      this.lastSnapshotNodes.size > 0;
+
+    if (canDiff) {
+      const upserts: WireNode[] = [];
+      const removes: number[] = [];
+
+      for (const [id, nextNode] of nextMap) {
+        const prev = this.lastSnapshotNodes.get(id);
+        if (!prev || !wireNodesEqual(prev, nextNode)) {
+          upserts.push(nextNode);
+        }
+      }
+      for (const prevId of this.lastSnapshotNodes.keys()) {
+        if (!nextMap.has(prevId)) {
+          removes.push(prevId);
+        }
+      }
+
+      // No visual changes since the last snapshot: emit nothing (0 bytes).
+      if (upserts.length === 0 && removes.length === 0) {
+        return;
+      }
+
+      // Emit incremental diff whenever it is smaller than a full snapshot.
+      if (upserts.length + removes.length < sanitized.length) {
+        for (const node of upserts) {
+          this.replayOps.push({
+            op: "node_upsert",
+            ts_offset_ms: tsOffsetMs,
+            ...node,
+          });
+        }
+        for (const nodeId of removes) {
+          this.replayOps.push({
+            op: "node_remove",
+            ts_offset_ms: tsOffsetMs,
+            node_id: nodeId,
+          });
+        }
+        this.lastSnapshotNodes = nextMap;
+        return;
+      }
+    }
+
+    this.replayOps.push({
+      op: "full_snapshot",
+      ts_offset_ms: tsOffsetMs,
+      width: vpW,
+      height: vpH,
+      nodes: sanitized,
+    });
+    this.lastSnapshotViewport = { w: vpW, h: vpH };
+    this.lastSnapshotNodes = nextMap;
+  }
+
+  /** Public API to record a pointer interaction (`tap`, `dead_tap`, `scroll`, or `rage_tap`). */
+  public recordPointerInteraction(
+    x: number,
+    y: number,
+    kind:
+      | "tap"
+      | "dead_tap"
+      | "scroll"
+      | { type: "tap" }
+      | { type: "dead_tap" }
+      | { type: "scroll" }
+      | { type: "rage_tap"; count: number } = "tap",
+  ): void {
+    if (this.optedOut || !this.isRecordingSession()) return;
+    const now = Date.now();
+    this.touchSession(now);
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    const resolvedKind = typeof kind === "string" ? ({ type: kind } as const) : kind;
+    this.replayOps.push({
+      op: "pointer_interaction",
+      ts_offset_ms: Math.max(0, now - this.chunkStartTsMs),
+      x: Math.max(0, Math.min(65535, Math.round(x))),
+      y: Math.max(0, Math.min(65535, Math.round(y))),
+      kind: resolvedKind,
+    });
+  }
+
+  /**
+   * Public tap helper with built-in rage-tap detection (3+ taps within 800ms & 40px radius).
+   * Useful for React Native touch handlers as well as web click listeners.
+   */
+  public recordTap(x: number, y: number, interactive = true): void {
+    if (this.optedOut || !this.isRecordingSession()) return;
+    const now = Date.now();
+    this.touchSession(now);
+    const rx = Math.max(0, Math.min(65535, Math.round(x)));
+    const ry = Math.max(0, Math.min(65535, Math.round(y)));
+
+    this.recentClicks = this.recentClicks.filter((c) => now - c.ts <= 800);
+    this.recentClicks.push({ ts: now, x: rx, y: ry });
+    const cluster = this.recentClicks.filter((c) => {
+      const dx = c.x - rx;
+      const dy = c.y - ry;
+      return dx * dx + dy * dy <= 1600;
+    });
+
+    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
+    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
+    const offset = Math.max(0, now - this.chunkStartTsMs);
+
+    if (cluster.length >= 3) {
+      this.recentClicks = [];
+      this.replayOps.push({
+        op: "pointer_interaction",
+        ts_offset_ms: offset,
+        x: rx,
+        y: ry,
+        kind: { type: "rage_tap", count: cluster.length },
+      });
+      this.track("$rage_tap", { x: rx, y: ry, tap_count: cluster.length });
+    } else if (!interactive) {
+      this.replayOps.push({
+        op: "pointer_interaction",
+        ts_offset_ms: offset,
+        x: rx,
+        y: ry,
+        kind: { type: "dead_tap" },
+      });
+    } else {
+      this.replayOps.push({
+        op: "pointer_interaction",
+        ts_offset_ms: offset,
+        x: rx,
+        y: ry,
+        kind: { type: "tap" },
+      });
+    }
+  }
+
+  private getDomNodeId(el: Element): number {
+    let id = this.domNodeIds.get(el);
+    if (id === undefined) {
+      id = this.nextDomNodeId++;
+      this.domNodeIds.set(el, id);
+    }
+    return id;
+  }
+
+  /**
+   * Walks live DOM bounding boxes and emits a default-deny masked wireframe snapshot
+   * (incrementally diffed against the previous snapshot using stable per-element node IDs).
+   */
+  public captureDomWireframeSnapshot(options?: { forceFull?: boolean }): void {
+    if (this.optedOut || !this.isRecordingSession()) return;
+    if (typeof window === "undefined" || typeof document === "undefined") return;
 
     const nodes: WireNode[] = [];
-    let nextId = 1;
     const vpW = Math.min(65535, Math.max(320, window.innerWidth));
     const vpH = Math.min(65535, Math.max(480, window.innerHeight));
 
     const docUnmasked = Boolean(document.documentElement?.hasAttribute("data-pulse-unmask"));
     nodes.push({
-      node_id: nextId++,
+      node_id: 1,
       parent_id: 0,
       kind: "screen",
       x: 0,
@@ -1281,7 +1691,7 @@ export class PulseWebClient {
       }
 
       nodes.push({
-        node_id: nextId++,
+        node_id: this.getDomNodeId(el),
         parent_id: 1,
         kind,
         x: Math.max(0, Math.round(rect.left)),
@@ -1293,72 +1703,46 @@ export class PulseWebClient {
       });
     }
 
-    if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
-    if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
-    this.replayOps.push({
-      op: "full_snapshot",
-      ts_offset_ms: Math.max(0, now - this.chunkStartTsMs),
-      width: vpW,
-      height: vpH,
-      nodes,
-    });
+    this.recordWireframeSnapshot(vpW, vpH, nodes, options);
   }
 
   private attachReplayClickListener(): void {
     this.boundClickListener = (ev: MouseEvent) => {
       if (this.optedOut || !this.isRecordingSession()) return;
-      const now = Date.now();
-      this.touchSession(now);
-      const x = Math.max(0, Math.round(ev.clientX));
-      const y = Math.max(0, Math.round(ev.clientY));
-
-      this.recentClicks = this.recentClicks.filter((c) => now - c.ts <= 800);
-      this.recentClicks.push({ ts: now, x, y });
-      const cluster = this.recentClicks.filter((c) => {
-        const dx = c.x - x;
-        const dy = c.y - y;
-        return dx * dx + dy * dy <= 1600;
-      });
-
       const target = ev.target as HTMLElement | null;
       const interactive = Boolean(
         target?.closest("button, a, input, select, textarea, [role='button']"),
       );
-
-      if (this.chunkStartTsMs === null) this.chunkStartTsMs = now;
-      if (this.replayOpsSessionId === null) this.replayOpsSessionId = this.sessionId;
-      const offset = Math.max(0, now - this.chunkStartTsMs);
-
-      if (cluster.length >= 3) {
-        // Clear click history immediately after rage-tap detection!
-        this.recentClicks = [];
-        this.replayOps.push({
-          op: "pointer_interaction",
-          ts_offset_ms: offset,
-          x,
-          y,
-          kind: { type: "rage_tap", count: cluster.length },
-        });
-        this.track("$rage_tap", { x, y, tap_count: cluster.length });
-      } else if (!interactive) {
-        this.replayOps.push({
-          op: "pointer_interaction",
-          ts_offset_ms: offset,
-          x,
-          y,
-          kind: { type: "dead_tap" },
-        });
-      } else {
-        this.replayOps.push({
-          op: "pointer_interaction",
-          ts_offset_ms: offset,
-          x,
-          y,
-          kind: { type: "tap" },
-        });
-      }
+      this.recordTap(ev.clientX, ev.clientY, interactive);
     };
     window.addEventListener("click", this.boundClickListener);
+  }
+
+  /**
+   * Executes `fetch` with a hard timeout (`fetchTimeoutMs`, default 10s) using `AbortController`
+   * plus a `Promise.race` safeguard so hung sockets on mobile networks never stall the send queue.
+   */
+  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+    const timeoutMs = this.fetchTimeoutMs;
+    if (timeoutMs <= 0) {
+      return fetch(url, init);
+    }
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ctrl?.abort();
+        reject(new Error(`Pulse request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      const req = fetch(url, ctrl ? { ...init, signal: ctrl.signal } : init);
+      // Suppress unhandled rejection if the underlying fetch rejects after timeoutPromise wins.
+      req.catch(() => {});
+      return await Promise.race([req, timeoutPromise]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1385,6 +1769,7 @@ export class PulseWebClient {
   }
 
   private async flushInternal(): Promise<void> {
+    await this.hydrationPromise;
     this.sealPendingReplayOps();
     if (Date.now() < this.backoffUntilMs) {
       return;
@@ -1393,7 +1778,7 @@ export class PulseWebClient {
     while (this.replayQueue.length > 0) {
       const pkt = this.replayQueue.shift()!;
       try {
-        const res = await fetch(`${this.endpoint}/v1/replay/chunk`, {
+        const res = await this.fetchWithTimeout(`${this.endpoint}/v1/replay/chunk`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1430,7 +1815,7 @@ export class PulseWebClient {
     if (this.engageQueue.length > 0) {
       const engageBatch = this.engageQueue.splice(0, this.engageQueue.length);
       try {
-        const res = await fetch(`${this.endpoint}/v1/engage`, {
+        const res = await this.fetchWithTimeout(`${this.endpoint}/v1/engage`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1452,7 +1837,7 @@ export class PulseWebClient {
       const sentNow = Date.now();
       const wireBatch = batch.map((ev) => ({ ...ev, client_sent_ts_ms: sentNow }));
       try {
-        const res = await fetch(`${this.endpoint}/v1/ingest`, {
+        const res = await this.fetchWithTimeout(`${this.endpoint}/v1/ingest`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1567,7 +1952,7 @@ export class PulseWebClient {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
-    if (typeof window !== "undefined") {
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       if (this.boundClickListener) {
         window.removeEventListener("click", this.boundClickListener);
         this.boundClickListener = null;

@@ -1,0 +1,48 @@
+{
+  "name": "@pulse-analytics/react-native",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "React Native SDK for Pulse Analytics with native iOS/Android wireframe replay (colors, clipping, bottom sheets), pluggable storage, Hermes crypto, ErrorUtils capture, and fetch timeouts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sswapnil2/analytics-system.git",
+    "directory": "sdks/react-native"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "ios",
+    "android",
+    "PulseReactNative.podspec",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test test/rn.test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@pulse-analytics/ts-web": "file:../ts-web"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-native": ">=0.72.0"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true },
+    "react-native": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
