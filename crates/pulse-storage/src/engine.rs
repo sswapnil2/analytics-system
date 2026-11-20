@@ -10,7 +10,7 @@ use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
-use pulse_identity::{IdentityRouter, ProjectIdentityGraph};
+use pulse_identity::{open_once, IdentityRouter, OpenLocks, ProjectIdentityGraph};
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
 use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -1091,9 +1091,9 @@ pub struct StorageEngine {
     profile_router: Arc<crate::ProfileRouter>,
     segment_reader: Arc<VortexSegmentReader>,
     replay_store: Arc<ReplayStore>,
-    projects: DashMap<String, Arc<ProjectStorage>>,
-    erased: DashMap<String, Arc<ErasedUids>>,
-    open_lock: AsyncMutex<()>,
+    projects: Arc<DashMap<String, Arc<ProjectStorage>>>,
+    erased: Arc<DashMap<String, Arc<ErasedUids>>>,
+    open_locks: OpenLocks,
 }
 
 impl StorageEngine {
@@ -1127,9 +1127,9 @@ impl StorageEngine {
             profile_router,
             segment_reader,
             replay_store,
-            projects: DashMap::new(),
-            erased: DashMap::new(),
-            open_lock: AsyncMutex::new(()),
+            projects: Arc::default(),
+            erased: Arc::default(),
+            open_locks: OpenLocks::default(),
         })
     }
 
@@ -1195,23 +1195,33 @@ impl StorageEngine {
         if let Some(p) = self.projects.get(project_id) {
             return Ok(p.clone());
         }
-        let _guard = self.open_lock.lock().await;
-        if let Some(p) = self.projects.get(project_id) {
-            return Ok(p.clone());
-        }
-        let ps = ProjectStorage::open_and_recover(
-            project_id,
+        let (pid, config, store, router, erased) = (
+            project_id.to_string(),
             self.config.clone(),
             self.object_store.clone(),
-            &self.identity_router,
-        )
-        .await?;
-        self.projects.insert(project_id.to_string(), ps.clone());
+            self.identity_router.clone(),
+            self.erased.clone(),
+        );
+        let key = pid.clone();
         // After the insert, so a concurrent `set_erased` is seen by one side or the other.
-        if let Some(e) = self.erased.get(project_id) {
-            ps.set_erased(e.clone());
-        }
-        Ok(ps)
+        let on_insert = move |ps: &Arc<ProjectStorage>| {
+            if let Some(e) = erased.get(&key) {
+                ps.set_erased(e.clone());
+            }
+        };
+        open_once(
+            &self.projects,
+            &self.open_locks,
+            project_id,
+            on_insert,
+            async move { ProjectStorage::open_and_recover(&pid, config, store, &router).await },
+        )
+        .await
+    }
+
+    /// True once `project_id` has finished opening on this node.
+    pub fn is_project_open(&self, project_id: &str) -> bool {
+        self.projects.contains_key(project_id)
     }
 
     /// Sets a project's erasure tombstones without opening its storage; applied on open.

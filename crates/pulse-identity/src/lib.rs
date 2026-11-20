@@ -297,14 +297,19 @@ impl PagedStrings {
         }
     }
 
-    fn from_vec(mut items: Vec<String>) -> Self {
+    /// Moves `items` into fixed-size pages in O(n). (`split_off` here used to copy the remaining tail
+    /// on every page and keep the full capacity per page: O(n^2) memory, OOM at ~10M users, #67.)
+    fn from_vec(items: Vec<String>) -> Self {
         let len = items.len();
         let mut pages = Vec::with_capacity(len.div_ceil(EXTERNAL_ID_PAGE_SIZE));
-        while !items.is_empty() {
-            let split_at = items.len().min(EXTERNAL_ID_PAGE_SIZE);
-            let rest = items.split_off(split_at);
-            pages.push(Arc::new(items));
-            items = rest;
+        let mut iter = items.into_iter();
+        loop {
+            let mut page = Vec::with_capacity(EXTERNAL_ID_PAGE_SIZE.min(iter.len()));
+            page.extend(iter.by_ref().take(EXTERNAL_ID_PAGE_SIZE));
+            if page.is_empty() {
+                break;
+            }
+            pages.push(Arc::new(page));
         }
         Self { pages, len }
     }
@@ -421,6 +426,14 @@ impl CheckpointSnapshot {
         out.extend_from_slice(&compressed);
         Ok(out)
     }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| IdentityError::CorruptedRecord("identity restore task panicked"))?
 }
 
 fn decode_checkpoint(bytes: &[u8]) -> Result<IdentityCheckpoint> {
@@ -582,6 +595,8 @@ pub struct ProjectIdentityGraph {
     next_chunk_seq: AtomicU64,
     last_checkpoint_seq: AtomicU64,
     mutations_since_checkpoint: AtomicU64,
+    /// Guards against two checkpoints running at once (see `checkpoint_if_due`).
+    checkpointing: AtomicBool,
     mutation_epoch: AtomicU64,
     flushed_epoch: AtomicU64,
     pending_mutations: Mutex<Vec<MutationEntry>>,
@@ -744,14 +759,19 @@ impl ProjectIdentityGraph {
             None => 0,
         };
 
-        let fast_lookup: DashMap<String, (u32, u8)> = DashMap::new();
+        let mut fast_lookup: DashMap<String, (u32, u8)> = DashMap::new();
         let mut state = GraphState::new();
         let mut start_seq = 0u64;
 
-        // Restore compacted checkpoint if available
+        // Restore runs are CPU-bound for millions of users: keep them off async workers so request
+        // deadlines and other tasks keep running during a cold open (#68).
         if let Some(cp_bytes) = db.get(META_CHECKPOINT_KEY).await? {
-            let cp = decode_checkpoint(&cp_bytes)?;
-            start_seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
+            (state, fast_lookup, start_seq) = run_blocking(move || {
+                let cp = decode_checkpoint(&cp_bytes)?;
+                let seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
+                Ok((state, fast_lookup, seq))
+            })
+            .await?;
         }
 
         // Replay remaining log chunks strictly (`P1-11`: fail loudly on missing chunk or dangling ref!)
@@ -763,12 +783,22 @@ impl ProjectIdentityGraph {
                     "missing identity mutation log chunk",
                 ));
             };
-            let entries = decode_mutation_chunk(&bytes)?;
-            replayed_mutations = replayed_mutations.saturating_add(entries.len() as u64);
-            apply_mutation_entries(&mut state, &fast_lookup, entries)?;
+            let n;
+            (state, fast_lookup, n) = run_blocking(move || {
+                let entries = decode_mutation_chunk(&bytes)?;
+                let n = entries.len() as u64;
+                apply_mutation_entries(&mut state, &fast_lookup, entries)?;
+                Ok((state, fast_lookup, n))
+            })
+            .await?;
+            replayed_mutations = replayed_mutations.saturating_add(n);
         }
 
-        let initial_snap = state.compress_all_and_build_snapshot();
+        let (state, initial_snap) = run_blocking(move || {
+            let snap = state.compress_all_and_build_snapshot();
+            Ok((state, snap))
+        })
+        .await?;
 
         Ok(Arc::new(Self {
             project_id,
@@ -781,6 +811,7 @@ impl ProjectIdentityGraph {
             next_chunk_seq: AtomicU64::new(chunk_count),
             last_checkpoint_seq: AtomicU64::new(start_seq),
             mutations_since_checkpoint: AtomicU64::new(replayed_mutations),
+            checkpointing: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
@@ -806,6 +837,7 @@ impl ProjectIdentityGraph {
             next_chunk_seq: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
             mutations_since_checkpoint: AtomicU64::new(0),
+            checkpointing: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
@@ -1126,34 +1158,46 @@ impl ProjectIdentityGraph {
     ///
     /// Uses epoch-based group-commit coalescing so concurrent callers share a single SlateDB flush,
     /// and retains `pending_mutations` and `next_chunk_seq` unchanged if the write or flush fails.
+    /// Only writes small log chunks: checkpoints run separately in [`Self::checkpoint_if_due`] so
+    /// ingest never waits on an O(users) checkpoint (#70).
     pub async fn flush(&self) -> Result<()> {
+        self.flush_chunks(false).await.map(|_| ())
+    }
+
+    /// Writes pending mutations as log chunks. With `snapshot`, also returns a checkpoint snapshot
+    /// taken atomically with the drained entries, so it covers exactly the chunks `< seq`, plus the
+    /// `mutations_since_checkpoint` count it covers.
+    async fn flush_chunks(&self, snapshot: bool) -> Result<Option<(CheckpointSnapshot, u64, u64)>> {
         if self.read_only {
-            return Ok(());
+            return Ok(None);
         }
         let target_epoch = self.mutation_epoch.load(Ordering::Acquire);
-        if self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
-            return Ok(());
+        if !snapshot && self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
+            return Ok(None);
         }
 
         let mut db_guard = self.db.lock().await;
-        if self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
-            return Ok(());
+        if !snapshot && self.flushed_epoch.load(Ordering::Acquire) >= target_epoch {
+            return Ok(None);
         }
 
         let base_seq = self.next_chunk_seq.load(Ordering::Acquire);
-        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
-        let muts_since = self.mutations_since_checkpoint.load(Ordering::Acquire);
-        let pending_hint = self.pending_mutations.lock().len() as u64;
-        if pending_hint == 0 {
-            let ep = self.mutation_epoch.load(Ordering::Acquire);
-            self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-            return Ok(());
+        // Acquire `state.read()` BEFORE `pending_mutations.lock()` (same lock order as writers).
+        let (staged, batch_epoch, cp_snap) = {
+            let st = snapshot.then(|| self.state.read());
+            let guard = self.pending_mutations.lock();
+            (
+                guard.clone(),
+                self.mutation_epoch.load(Ordering::Acquire),
+                st.as_ref().map(|s| s.snapshot_for_checkpoint()),
+            )
+        };
+        if staged.is_empty() {
+            self.flushed_epoch.fetch_max(batch_epoch, Ordering::AcqRel);
+            let muts = self.mutations_since_checkpoint.load(Ordering::Acquire);
+            return Ok(cp_snap.map(|c| (c, base_seq, muts)));
         }
-
-        let user_count = self.user_count() as u64;
-        let mutation_threshold = CHECKPOINT_MIN_MUTATIONS.max(user_count / 2);
-        let should_checkpoint = muts_since.saturating_add(pending_hint) >= mutation_threshold
-            || base_seq.saturating_sub(prev_cp) >= CHECKPOINT_MAX_CHUNKS;
+        let flushed_len = staged.len();
 
         if db_guard.is_none() {
             let reopened = open_slatedb_handle(&self.project_id, &self.object_store).await?;
@@ -1161,64 +1205,16 @@ impl ProjectIdentityGraph {
         }
         let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
 
-        let (batch, new_seq, flushed_len, batch_epoch, wrote_checkpoint) = if should_checkpoint {
-            // Acquire `state.read()` BEFORE `pending_mutations.lock()` (same lock order as writers,
-            // deadlock-free, and never blocks concurrent readers or fast_lookup hits).
-            let (cp_snap, flushed_len, batch_epoch) = {
-                let st = self.state.read();
-                let guard = self.pending_mutations.lock();
-                if guard.is_empty() {
-                    let ep = self.mutation_epoch.load(Ordering::Acquire);
-                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-                    return Ok(());
-                }
-                (
-                    st.snapshot_for_checkpoint(),
-                    guard.len(),
-                    self.mutation_epoch.load(Ordering::Acquire),
-                )
-            };
-
-            let new_seq = base_seq + 1;
-            let cp_bytes = tokio::task::spawn_blocking(move || cp_snap.encode(new_seq))
-                .await
-                .map_err(|_| {
-                    IdentityError::CorruptedRecord("checkpoint serialization task panicked")
-                })??;
-
-            let mut batch = WriteBatch::new();
-            batch.put(META_CHECKPOINT_KEY, &cp_bytes);
-            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
-            for old_seq in prev_cp..base_seq {
-                let old_key = format!("log/chunk_{old_seq:012}");
-                batch.delete(old_key.as_bytes());
-            }
-            (batch, new_seq, flushed_len, batch_epoch, true)
-        } else {
-            let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
-                let guard = self.pending_mutations.lock();
-                if guard.is_empty() {
-                    let ep = self.mutation_epoch.load(Ordering::Acquire);
-                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-                    return Ok(());
-                }
-                (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
-            };
-            let flushed_len = staged.len();
-
-            const CHUNK_SIZE: usize = 32_768;
-            let mut new_seq = base_seq;
-            let mut batch = WriteBatch::new();
-
-            for slice in staged.chunks(CHUNK_SIZE) {
-                let chunk_key = format!("log/chunk_{new_seq:012}");
-                let chunk_bytes = encode_mutation_chunk(slice);
-                batch.put(chunk_key.as_bytes(), &chunk_bytes);
-                new_seq += 1;
-            }
-            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
-            (batch, new_seq, flushed_len, batch_epoch, false)
-        };
+        const CHUNK_SIZE: usize = 32_768;
+        let mut new_seq = base_seq;
+        let mut batch = WriteBatch::new();
+        for slice in staged.chunks(CHUNK_SIZE) {
+            let chunk_key = format!("log/chunk_{new_seq:012}");
+            let chunk_bytes = encode_mutation_chunk(slice);
+            batch.put(chunk_key.as_bytes(), &chunk_bytes);
+            new_seq += 1;
+        }
+        batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
 
         let write_opts = WriteOptions {
             await_durable: false,
@@ -1235,15 +1231,76 @@ impl ProjectIdentityGraph {
 
         // Commit state ONLY after SlateDB flush succeeded
         self.next_chunk_seq.store(new_seq, Ordering::Release);
-        if wrote_checkpoint {
-            self.last_checkpoint_seq.store(new_seq, Ordering::Release);
-            self.mutations_since_checkpoint.store(0, Ordering::Release);
-        } else {
-            self.mutations_since_checkpoint
-                .fetch_add(flushed_len as u64, Ordering::AcqRel);
-        }
+        let muts = self
+            .mutations_since_checkpoint
+            .fetch_add(flushed_len as u64, Ordering::AcqRel)
+            + flushed_len as u64;
         self.pending_mutations.lock().drain(..flushed_len);
         self.flushed_epoch.fetch_max(batch_epoch, Ordering::AcqRel);
+        Ok(cp_snap.map(|c| (c, new_seq, muts)))
+    }
+
+    /// Compacts the mutation log into `meta/checkpoint` once enough history has built up, bounding
+    /// reopen cost. The O(users) encode runs with no lock held, so concurrent `flush()` calls (the
+    /// ingest path) keep writing chunks; only the final small batch write takes the db lock.
+    /// Returns `true` if a checkpoint was written.
+    pub async fn checkpoint_if_due(&self) -> Result<bool> {
+        if self.read_only {
+            return Ok(false);
+        }
+        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
+        let muts = self.mutations_since_checkpoint.load(Ordering::Acquire)
+            + self.pending_mutations.lock().len() as u64;
+        let threshold = CHECKPOINT_MIN_MUTATIONS.max(self.user_count() as u64 / 2);
+        let chunks = self
+            .next_chunk_seq
+            .load(Ordering::Acquire)
+            .saturating_sub(prev_cp);
+        if muts < threshold && chunks < CHECKPOINT_MAX_CHUNKS {
+            return Ok(false);
+        }
+        if self.checkpointing.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        let res = self.write_checkpoint().await;
+        self.checkpointing.store(false, Ordering::Release);
+        res.map(|()| true)
+    }
+
+    async fn write_checkpoint(&self) -> Result<()> {
+        let Some((cp_snap, seq, covered_muts)) = self.flush_chunks(true).await? else {
+            return Ok(());
+        };
+        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
+        let cp_bytes = run_blocking(move || cp_snap.encode(seq)).await?;
+
+        let mut db_guard = self.db.lock().await;
+        if db_guard.is_none() {
+            let reopened = open_slatedb_handle(&self.project_id, &self.object_store).await?;
+            *db_guard = Some(reopened);
+        }
+        let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
+        // Chunks `>= seq` (written by flushes since the snapshot) stay, and so does `chunk_count`.
+        let mut batch = WriteBatch::new();
+        batch.put(META_CHECKPOINT_KEY, &cp_bytes);
+        for old_seq in prev_cp..seq {
+            let old_key = format!("log/chunk_{old_seq:012}");
+            batch.delete(old_key.as_bytes());
+        }
+        let write_opts = WriteOptions {
+            await_durable: false,
+        };
+        if let Err(e) = db.write_with_options(batch, &write_opts).await {
+            let _ = db_guard.take();
+            return Err(IdentityError::SlateDb(e));
+        }
+        if let Err(e) = db.flush().await {
+            let _ = db_guard.take();
+            return Err(IdentityError::SlateDb(e));
+        }
+        self.last_checkpoint_seq.store(seq, Ordering::Release);
+        self.mutations_since_checkpoint
+            .fetch_sub(covered_muts, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1253,6 +1310,7 @@ impl ProjectIdentityGraph {
             return Ok(());
         }
         self.flush().await?;
+        self.checkpoint_if_due().await?;
         let mut db_guard = self.db.lock().await;
         if let Some(db) = db_guard.take() {
             db.close().await?;
@@ -1261,12 +1319,51 @@ impl ProjectIdentityGraph {
     }
 }
 
+/// Per-key locks for [`open_once`].
+pub type OpenLocks = DashMap<String, Arc<tokio::sync::Mutex<()>>>;
+
+/// Returns `map[key]`, opening it with `open` if absent. The open runs in a spawned task holding a
+/// per-key lock and caches its own result, so a caller that gives up (a query deadline) neither
+/// aborts a half-done open nor makes the next caller start over, and opening one project never
+/// blocks another (#68). `on_insert` runs right after the value is cached.
+pub async fn open_once<T, E>(
+    map: &Arc<DashMap<String, Arc<T>>>,
+    locks: &OpenLocks,
+    key: &str,
+    on_insert: impl FnOnce(&Arc<T>) + Send + 'static,
+    open: impl std::future::Future<Output = std::result::Result<Arc<T>, E>> + Send + 'static,
+) -> std::result::Result<Arc<T>, E>
+where
+    T: Send + Sync + 'static,
+    E: Send + 'static,
+{
+    if let Some(v) = map.get(key) {
+        return Ok(v.clone());
+    }
+    let lock = locks.entry(key.to_string()).or_default().clone();
+    let (map, key) = (map.clone(), key.to_string());
+    let task = tokio::spawn(async move {
+        let _guard = lock.lock_owned().await;
+        if let Some(v) = map.get(&key) {
+            return Ok(v.clone());
+        }
+        let v = open.await?;
+        map.insert(key, v.clone());
+        on_insert(&v);
+        Ok(v)
+    });
+    match task.await {
+        Ok(res) => res,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
 /// Multi-tenant registry managing `ProjectIdentityGraph` instances over shared object storage.
 pub struct IdentityRouter {
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
-    graphs: DashMap<String, Arc<ProjectIdentityGraph>>,
-    init_lock: tokio::sync::Mutex<()>,
+    graphs: Arc<DashMap<String, Arc<ProjectIdentityGraph>>>,
+    open_locks: OpenLocks,
 }
 
 impl IdentityRouter {
@@ -1274,8 +1371,8 @@ impl IdentityRouter {
         Self {
             object_store,
             read_only: false,
-            graphs: DashMap::new(),
-            init_lock: tokio::sync::Mutex::new(()),
+            graphs: Arc::default(),
+            open_locks: OpenLocks::default(),
         }
     }
 
@@ -1283,8 +1380,8 @@ impl IdentityRouter {
         Self {
             object_store,
             read_only: true,
-            graphs: DashMap::new(),
-            init_lock: tokio::sync::Mutex::new(()),
+            graphs: Arc::default(),
+            open_locks: OpenLocks::default(),
         }
     }
 
@@ -1296,18 +1393,25 @@ impl IdentityRouter {
         if let Some(g) = self.graphs.get(project_id) {
             return Ok(g.clone());
         }
-        let _guard = self.init_lock.lock().await;
-        if let Some(g) = self.graphs.get(project_id) {
-            return Ok(g.clone());
-        }
-        let g = if self.read_only {
-            ProjectIdentityGraph::open_read_only(project_id.to_string(), self.object_store.clone())
-                .await?
-        } else {
-            ProjectIdentityGraph::open(project_id.to_string(), self.object_store.clone()).await?
-        };
-        self.graphs.insert(project_id.to_string(), g.clone());
-        Ok(g)
+        let (store, read_only, pid) = (
+            self.object_store.clone(),
+            self.read_only,
+            project_id.to_string(),
+        );
+        open_once(
+            &self.graphs,
+            &self.open_locks,
+            project_id,
+            |_| {},
+            async move {
+                if read_only {
+                    ProjectIdentityGraph::open_read_only(pid, store).await
+                } else {
+                    ProjectIdentityGraph::open(pid, store).await
+                }
+            },
+        )
+        .await
     }
 
     pub async fn refresh_all(&self) -> Result<usize> {
@@ -1327,6 +1431,8 @@ impl IdentityRouter {
             self.graphs.iter().map(|e| e.value().clone()).collect();
         for g in graphs {
             g.flush().await?;
+            // Background maintenance is the only regular checkpoint trigger (ingest only flushes).
+            g.checkpoint_if_due().await?;
         }
         Ok(())
     }
@@ -1349,6 +1455,176 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     use super::*;
+
+    #[test]
+    fn paged_strings_from_vec_is_linear_and_keeps_order() {
+        let n = EXTERNAL_ID_PAGE_SIZE * 3 + 17;
+        let paged = PagedStrings::from_vec((0..n).map(|i| i.to_string()).collect());
+        assert_eq!(paged.len(), n);
+        assert_eq!(paged.pages.len(), 4);
+        // #67: every page used to keep the capacity of the whole remaining tail.
+        assert!(paged
+            .pages
+            .iter()
+            .all(|p| p.capacity() <= EXTERNAL_ID_PAGE_SIZE));
+        assert!(paged.iter().enumerate().all(|(i, s)| s == i.to_string()));
+    }
+
+    /// #70: flushes that land while a checkpoint is encoding must survive reopen (chunks `>= seq`
+    /// are kept), and the checkpoint must not replay or drop anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flushes_during_a_background_checkpoint_survive_reopen() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).expect("local fs"));
+        let graph = ProjectIdentityGraph::open("proj_cp", store.clone())
+            .await
+            .expect("open");
+        for i in 0..300_000u32 {
+            graph.get_or_intern(&format!("u{i}"), (i % 256) as u8);
+        }
+        graph.flush().await.expect("flush");
+        let cp = {
+            let g = graph.clone();
+            tokio::spawn(async move { g.checkpoint_if_due().await })
+        };
+        for batch in 0..50u32 {
+            for i in 0..1_000u32 {
+                let id = 300_000 + batch * 1_000 + i;
+                graph.get_or_intern(&format!("u{id}"), (id % 256) as u8);
+            }
+            graph.flush().await.expect("flush during checkpoint");
+        }
+        assert!(cp.await.expect("join").expect("checkpoint"));
+        assert!(graph.last_checkpoint_seq.load(Ordering::Acquire) > 0);
+        // Close without a second checkpoint: reopen must use checkpoint + trailing chunks.
+        graph.flush().await.expect("flush");
+        graph
+            .db
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .close()
+            .await
+            .expect("close db");
+        drop(graph);
+
+        let reopened = ProjectIdentityGraph::open("proj_cp", store)
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.user_count(), 350_000);
+        for id in [0u32, 299_999, 300_000, 349_999] {
+            assert_eq!(reopened.lookup_raw(&format!("u{id}")), Some(id));
+        }
+    }
+
+    /// #68: a caller that times out must not abort the open or cause a second one, and a slow open
+    /// of one project must not block another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_once_survives_caller_timeout_and_is_per_key() {
+        let map: Arc<DashMap<String, Arc<u32>>> = Arc::default();
+        let locks = OpenLocks::default();
+        let opens = Arc::new(AtomicU64::new(0));
+        let slow = |opens: Arc<AtomicU64>, v: u32, ms: u64| async move {
+            opens.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok::<_, ()>(Arc::new(v))
+        };
+
+        let t = Instant::now();
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(50),
+            open_once(&map, &locks, "big", |_| {}, slow(opens.clone(), 1, 400)),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        assert!(t.elapsed() < Duration::from_millis(200));
+
+        let t = Instant::now();
+        let other = open_once(&map, &locks, "small", |_| {}, slow(opens.clone(), 2, 0))
+            .await
+            .unwrap();
+        assert_eq!(*other, 2);
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "blocked behind 'big'"
+        );
+
+        let big = open_once(&map, &locks, "big", |_| {}, slow(opens.clone(), 9, 0))
+            .await
+            .unwrap();
+        assert_eq!(*big, 1, "second caller must get the first open's result");
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+    }
+
+    fn rss_mb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+            / 1024
+    }
+
+    /// Scale check for #67/#70: `PULSE_ID_BENCH_USERS=10000000 cargo test --release -p pulse-identity
+    /// -- --ignored --nocapture identity_scale`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn identity_scale_ingest_flush_latency_and_reopen_memory() {
+        let n: u32 = std::env::var("PULSE_ID_BENCH_USERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000_000);
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).expect("local fs"));
+        {
+            let graph = ProjectIdentityGraph::open("proj_scale", store.clone())
+                .await
+                .expect("open");
+            let mut lat = Vec::new();
+            let mut worst_cp = Duration::ZERO;
+            for batch in 0..n.div_ceil(1_000) {
+                for i in batch * 1_000..((batch + 1) * 1_000).min(n) {
+                    graph.get_or_intern(&format!("user-{i:010}-device"), (i % 256) as u8);
+                }
+                let t = Instant::now();
+                graph.flush().await.expect("flush");
+                lat.push(t.elapsed());
+                if batch % 1_000 == 999 {
+                    let t = Instant::now();
+                    graph.checkpoint_if_due().await.expect("checkpoint");
+                    worst_cp = worst_cp.max(t.elapsed());
+                }
+            }
+            lat.sort();
+            println!(
+                "users={n} flush p50={:?} p99={:?} max={:?} worst_checkpoint={worst_cp:?} rss={}MB",
+                lat[lat.len() / 2],
+                lat[lat.len() * 99 / 100],
+                lat[lat.len() - 1],
+                rss_mb()
+            );
+            graph.close().await.expect("close");
+        }
+        let before = rss_mb();
+        let t = Instant::now();
+        let graph = ProjectIdentityGraph::open("proj_scale", store.clone())
+            .await
+            .expect("reopen");
+        let _ = graph.snapshot();
+        println!(
+            "reopen users={} took={:?} rss_before={before}MB rss_after={}MB",
+            graph.user_count(),
+            t.elapsed(),
+            rss_mb()
+        );
+        assert_eq!(graph.user_count(), n as usize);
+    }
 
     #[tokio::test]
     async fn gate1_250k_interns_50k_merges_slatedb_recovery_and_sub_5ms_snapshot() {
