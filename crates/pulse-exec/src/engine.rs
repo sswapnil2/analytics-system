@@ -629,17 +629,18 @@ impl QueryEngine {
                     {
                         continue;
                     }
-                    let entry = merged
-                        .entry(r.session_id.clone())
-                        .or_insert_with(|| MergedSession {
-                            canonical_uid: canon_uid,
-                            flags: ps.session_flags_for(&r.session_id),
-                            bloom: 0,
-                            start_ts_ms: r.event_ts_ms,
-                            end_ts_ms: r.event_ts_ms,
-                            l0_events: Vec::new(),
-                            l1_slices: Vec::new(),
-                        });
+                    let entry =
+                        merged
+                            .entry(r.session_id.clone())
+                            .or_insert_with(|| MergedSession {
+                                canonical_uid: canon_uid,
+                                flags: ps.session_flags_for(&r.session_id),
+                                bloom: 0,
+                                start_ts_ms: r.event_ts_ms,
+                                end_ts_ms: r.event_ts_ms,
+                                l0_events: Vec::new(),
+                                l1_slices: Vec::new(),
+                            });
                     entry.canonical_uid = canon_uid;
                     entry.flags |= r.session_flags;
                     entry.bloom |= SessionHeader::event_bit(r.event_id);
@@ -720,13 +721,12 @@ impl QueryEngine {
 
             // Order newest-first so we only materialize Tier A for top `limit` sessions.
             candidates.sort_by(|(sid_a, a), (sid_b, b)| {
-                b.end_ts_ms
-                    .cmp(&a.end_ts_ms)
-                    .then_with(|| sid_a.cmp(sid_b))
+                b.end_ts_ms.cmp(&a.end_ts_ms).then_with(|| sid_a.cmp(sid_b))
             });
 
             // 4. Materialize Tier A events only for surviving top-`limit` sessions
-            let mut sessions: Vec<SessionSummaryItem> = Vec::with_capacity(limit.min(candidates.len()));
+            let mut sessions: Vec<SessionSummaryItem> =
+                Vec::with_capacity(limit.min(candidates.len()));
             for (session_id, ms) in candidates {
                 if sessions.len() >= limit {
                     break;
