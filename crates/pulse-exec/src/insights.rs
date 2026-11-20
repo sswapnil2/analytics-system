@@ -1,25 +1,26 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono_tz::Tz;
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
 use pulse_identity::IdentitySnapshot;
-use pulse_storage::{ProjectStorage, StorageSnapshot};
+use pulse_storage::{ProjectStorage, SegmentMeta, StorageSnapshot, StoredRow};
 use pulse_wire::PropValue;
-use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
 
 use crate::ast::{
-    InsightsMetric, InsightsQuery, InsightsResult, InsightsSeriesSpec, SeriesOutput, TimeInterval,
-    TimePoint, TimeRange,
+    InsightsMetric, InsightsQuery, InsightsResult, InsightsSeriesSpec, PropPredicate, SeriesOutput,
+    TimeInterval, TimePoint, TimeRange,
 };
 use crate::cache::SegmentBlockCache;
-use crate::catalog::VirtualCatalog;
+use crate::catalog::{evaluate_custom_property, UserFilterMask, VirtualCatalog};
 use crate::scanner::{
-    align_floor_tz_cached, evaluate_cohort, load_project_chunks_with_id,
-    precompute_segment_row_mask, resolve_event_target, resolve_global_cohort_bitmap,
-    row_matches_predicates, ExecError, Result,
+    align_floor_tz_cached, evaluate_cohort, parallel_segments,
+    precompute_segment_row_mask_for_meta, resolve_event_target, resolve_global_cohort_bitmap,
+    segment_can_match_preds, ts_to_date_floor, ExecError, ResolvedEventTarget, Result,
 };
 
 pub const MAX_TIME_BUCKETS: usize = 10_000;
@@ -164,6 +165,37 @@ fn build_time_buckets_tz(range: TimeRange, interval: TimeInterval, tz: Tz) -> Re
     Ok(out)
 }
 
+type BreakdownGroup = (BucketAccum, BTreeMap<i64, BucketAccum>);
+
+/// Approximate working memory charged per newly created `(breakdown_key, time_bucket)` slot.
+const ACCUM_SLOT_EST_BYTES: u64 = 192;
+
+struct SeriesPlan<'a> {
+    spec: &'a InsightsSeriesSpec,
+    tgt: ResolvedEventTarget,
+    is_rolling: bool,
+    align_unit: TimeInterval,
+    metric_mask: MetricMask,
+    metric_prop: Option<&'a str>,
+    /// Non-`user.*` series-specific predicates (series filters + custom event extra_filter).
+    event_preds: Vec<PropPredicate>,
+    /// Pre-evaluated `user.*` series-specific predicates (if any).
+    user_mask: Option<UserFilterMask>,
+}
+
+fn split_user_and_event_preds(preds: &[PropPredicate]) -> (Vec<PropPredicate>, Vec<PropPredicate>) {
+    let mut user_preds = Vec::new();
+    let mut event_preds = Vec::new();
+    for p in preds {
+        if p.prop_name.starts_with("user.") {
+            user_preds.push(p.clone());
+        } else {
+            event_preds.push(p.clone());
+        }
+    }
+    (user_preds, event_preds)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_window(
     query: &InsightsQuery,
@@ -176,6 +208,8 @@ async fn evaluate_window(
     cache: &SegmentBlockCache,
     catalog: &VirtualCatalog,
 ) -> Result<Vec<SeriesOutput>> {
+    crate::budget::check_current()?;
+
     let max_lookback_ms = query
         .series
         .iter()
@@ -202,9 +236,21 @@ async fn evaluate_window(
         catalog,
     )
     .await?;
+    crate::budget::check_current()?;
 
-    let mut breakdown_cohort_bitmaps: HashMap<String, RoaringBitmap> = HashMap::new();
+    // Pre-evaluate global `user.*` predicates once against `ColumnarProfileIndex` (0 segment I/O).
+    let (global_user_preds, global_event_preds) =
+        split_user_and_event_preds(&query.global_filter.predicates);
+    let mut global_user_mask = catalog.evaluate_user_predicates(&global_user_preds);
+    if let Some(cohort) = eligible_cohort {
+        global_user_mask = Some(match global_user_mask {
+            Some(m) => m.intersect_cohort(&cohort),
+            None => UserFilterMask::Include(cohort),
+        });
+    }
+
     let breakdown_dims: Vec<String> = query.breakdown_by.clone();
+    let mut breakdown_cohort_bitmaps: HashMap<String, RoaringBitmap> = HashMap::new();
     for bdim in &breakdown_dims {
         if let Some(cid) = bdim.strip_prefix("$cohort:") {
             if let Some(cdef) = catalog.saved_cohorts.get(cid) {
@@ -217,77 +263,1000 @@ async fn evaluate_window(
             }
         }
     }
+    crate::budget::check_current()?;
 
-    let mut props_needed: HashSet<String> = HashSet::new();
-    for p in &query.global_filter.predicates {
-        props_needed.insert(p.prop_name.clone());
-    }
-    for b in &breakdown_dims {
-        if !b.starts_with("$cohort:") {
-            props_needed.insert(b.clone());
-        }
-    }
-    let mut combined_bloom = 0u64;
-    let mut resolved_targets = Vec::with_capacity(query.series.len());
+    // Build per-series execution plans.
+    let dict = ps.dictionary();
+    let mut plans: Vec<SeriesPlan<'_>> = Vec::with_capacity(query.series.len());
     for spec in &query.series {
-        let tgt = resolve_event_target(&spec.event_name, ps.dictionary(), catalog);
-        combined_bloom |= tgt.bloom_mask_64;
-        for rp in tgt.required_props() {
-            props_needed.insert(rp);
-        }
-        for fp in &spec.filters {
-            props_needed.insert(fp.prop_name.clone());
-        }
-        match &spec.metric {
+        let tgt = resolve_event_target(&spec.event_name, dict, catalog);
+        let is_rolling = matches!(spec.metric, InsightsMetric::Wau | InsightsMetric::Mau);
+        let align_unit = if is_rolling {
+            TimeInterval::Day
+        } else {
+            query.interval
+        };
+        let metric_mask = MetricMask::from_metric(&spec.metric);
+        let metric_prop = match &spec.metric {
             InsightsMetric::PropSum { prop }
             | InsightsMetric::PropAvg { prop }
             | InsightsMetric::PropMin { prop }
             | InsightsMetric::PropMax { prop }
-            | InsightsMetric::PropPercentile { prop, .. } => {
-                props_needed.insert(prop.clone());
-            }
-            _ => {}
+            | InsightsMetric::PropPercentile { prop, .. } => Some(prop.as_str()),
+            _ => None,
+        };
+        let mut raw_series_preds = spec.filters.clone();
+        if let Some(ef) = &tgt.extra_filter {
+            raw_series_preds.push(ef.clone());
         }
-        resolved_targets.push(tgt);
-    }
-
-    let props_vec: Vec<String> = props_needed.into_iter().collect();
-    let chunks = load_project_chunks_with_id(
-        ps,
-        snap,
-        cache,
-        catalog,
-        Some(scan_range),
-        &props_vec,
-        (combined_bloom != 0).then_some(combined_bloom),
-        Some(id_snap),
-    )
-    .await?;
-
-    let mut all_outputs = Vec::new();
-    for (s_idx, spec) in query.series.iter().enumerate() {
-        let tgt = &resolved_targets[s_idx];
-        let mut series_out = evaluate_single_series(
+        let (s_user_preds, s_event_preds) = split_user_and_event_preds(&raw_series_preds);
+        let user_mask = catalog.evaluate_user_predicates(&s_user_preds);
+        plans.push(SeriesPlan {
             spec,
             tgt,
+            is_rolling,
+            align_unit,
+            metric_mask,
+            metric_prop,
+            event_preds: s_event_preds,
+            user_mask,
+        });
+    }
+
+    let mut series_groups: Vec<BTreeMap<String, BreakdownGroup>> =
+        (0..plans.len()).map(|_| BTreeMap::new()).collect();
+
+    // Short-circuit immediately with 0 segment I/O if the global user/cohort filter is empty.
+    if global_user_mask
+        .as_ref()
+        .is_some_and(UserFilterMask::is_definitely_empty)
+    {
+        return finalize_series_outputs(
+            &plans,
+            series_groups,
             range,
             query.interval,
             buckets,
             tz,
             &breakdown_dims,
-            &breakdown_cohort_bitmaps,
-            &query.global_filter.predicates,
-            eligible_cohort.as_ref(),
-            &chunks,
-            ps,
-            id_snap,
-            cache,
-            catalog,
-        )
-        .await?;
-        all_outputs.append(&mut series_out);
+        );
     }
 
+    let erased = ps.erased_snapshot();
+    let has_any_non_empty_target = plans.iter().any(|p| !p.tgt.event_ids.is_empty());
+    if !has_any_non_empty_target {
+        return finalize_series_outputs(
+            &plans,
+            series_groups,
+            range,
+            query.interval,
+            buckets,
+            tz,
+            &breakdown_dims,
+        );
+    }
+
+    // Determine which Tier A columns and non-`user.*` properties are needed when scanning.
+    let need_uid = !erased.is_empty()
+        || global_user_mask.is_some()
+        || !breakdown_cohort_bitmaps.is_empty()
+        || breakdown_dims
+            .iter()
+            .any(|b| b.starts_with("user.") || catalog.has_user_prop(b))
+        || plans.iter().any(|p| {
+            p.metric_mask.users
+                || p.user_mask.is_some()
+                || p.metric_prop
+                    .is_some_and(|mp| mp.starts_with("user.") || catalog.has_user_prop(mp))
+                || p.event_preds
+                    .iter()
+                    .any(|pr| catalog.has_user_prop(&pr.prop_name))
+        })
+        || global_event_preds
+            .iter()
+            .any(|pr| catalog.has_user_prop(&pr.prop_name));
+    let need_session = plans.iter().any(|p| p.metric_mask.sessions);
+
+    let mut non_user_props_needed: HashSet<String> = HashSet::new();
+    for p in &global_event_preds {
+        non_user_props_needed.insert(p.prop_name.clone());
+    }
+    for b in &breakdown_dims {
+        if !b.starts_with("$cohort:") && !b.starts_with("user.") {
+            non_user_props_needed.insert(b.clone());
+        }
+    }
+    for plan in &plans {
+        for p in &plan.event_preds {
+            non_user_props_needed.insert(p.prop_name.clone());
+        }
+        if let Some(mp) = plan.metric_prop {
+            if !mp.starts_with("user.") {
+                non_user_props_needed.insert(mp.to_string());
+            }
+        }
+    }
+
+    // 1. Collect & prune L1 segments using footer metadata (0 I/O).
+    let start_date = ts_to_date_floor(scan_range.start_ts_ms);
+    let end_date = ts_to_date_floor(scan_range.end_ts_ms);
+    let all_segments = snap.segments_for_range(start_date, end_date, None);
+
+    let all_series_footer_totals_eligible = erased.is_empty()
+        && breakdown_dims.is_empty()
+        && global_event_preds.is_empty()
+        && global_user_mask.is_none()
+        && plans.iter().all(|p| {
+            matches!(p.spec.metric, InsightsMetric::Totals)
+                && p.event_preds.is_empty()
+                && p.user_mask.is_none()
+                && !p.is_rolling
+        });
+
+    let mut scan_segments: Vec<SegmentMeta> = Vec::new();
+    for seg in all_segments {
+        if seg.footer.max_ts_ms < scan_range.start_ts_ms
+            || seg.footer.min_ts_ms > scan_range.end_ts_ms
+        {
+            continue;
+        }
+        let any_series_event = plans.iter().any(|p| {
+            p.tgt.event_ids.first().is_some()
+                && seg
+                    .footer
+                    .may_contain_any_event_ids(&p.tgt.event_ids, p.tgt.bloom_mask_64)
+        });
+        if !any_series_event {
+            continue;
+        }
+        if !segment_can_match_preds(&seg, &global_event_preds, dict, catalog) {
+            continue;
+        }
+
+        // Zero-I/O footer fast path: unfiltered `Totals` where every row in `seg` lands in the
+        // exact same time bucket inside `range` and `seg.footer.event_counts` is populated.
+        if all_series_footer_totals_eligible
+            && seg.footer.min_ts_ms >= range.start_ts_ms
+            && seg.footer.max_ts_ms <= range.end_ts_ms
+        {
+            let b_min = query.interval.align_floor_tz(seg.footer.min_ts_ms, tz);
+            let b_max = query.interval.align_floor_tz(seg.footer.max_ts_ms, tz);
+            if b_min == b_max {
+                let mut exact_counts: Option<Vec<u64>> = Some(Vec::with_capacity(plans.len()));
+                for p in &plans {
+                    let mut sum = 0u64;
+                    for &eid in &p.tgt.event_ids {
+                        if let Some(c) = seg.footer.exact_event_count(eid) {
+                            sum += u64::from(c);
+                        } else {
+                            exact_counts = None;
+                            break;
+                        }
+                    }
+                    if let Some(ref mut v) = exact_counts {
+                        v.push(sum);
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(counts) = exact_counts {
+                    for (s_idx, cnt) in counts.into_iter().enumerate() {
+                        if cnt == 0 {
+                            continue;
+                        }
+                        let entry = series_groups[s_idx]
+                            .entry("overall".to_string())
+                            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
+                        entry.0.totals += cnt;
+                        entry.1.entry(b_min).or_insert_with(BucketAccum::new).totals += cnt;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        scan_segments.push(seg);
+    }
+
+    // Charge row budget only for segments we actually need to scan.
+    if let Some(ctx) = crate::budget::current() {
+        ctx.check()?;
+        let rows_to_scan: u64 = scan_segments
+            .iter()
+            .map(|s| u64::from(s.footer.row_count))
+            .sum();
+        ctx.charge_rows(rows_to_scan)?;
+    }
+
+    // 2. Streaming bounded-concurrency single-pass execution over L1 segments.
+    if !scan_segments.is_empty() {
+        let est_bpr = 10
+            + usize::from(need_uid) * 4
+            + usize::from(need_session) * 8
+            + non_user_props_needed.len() * 48;
+        let concurrency = parallel_segments(&scan_segments, est_bpr);
+        let plans_ref = &plans;
+        let global_event_preds_ref = &global_event_preds;
+        let global_user_mask_ref = &global_user_mask;
+        let breakdown_dims_ref = &breakdown_dims;
+        let breakdown_cohorts_ref = &breakdown_cohort_bitmaps;
+        let non_user_props_ref = &non_user_props_needed;
+        let erased_ref = &erased;
+
+        let mut seg_stream = stream::iter(scan_segments.into_iter())
+            .map(|seg| async move {
+                process_l1_segment_streaming(
+                    &seg,
+                    plans_ref,
+                    range,
+                    tz,
+                    global_event_preds_ref,
+                    global_user_mask_ref.as_ref(),
+                    breakdown_dims_ref,
+                    breakdown_cohorts_ref,
+                    non_user_props_ref,
+                    need_uid,
+                    need_session,
+                    dict,
+                    erased_ref,
+                    id_snap,
+                    cache,
+                    catalog,
+                )
+                .await
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(seg_res) = seg_stream.next().await {
+            crate::budget::check_current()?;
+            let per_series_local = seg_res?;
+            for (s_idx, local_map) in per_series_local.into_iter().enumerate() {
+                merge_breakdown_maps(&mut series_groups[s_idx], local_map)?;
+            }
+        }
+    }
+
+    // 3. Single-pass scan over hot L0 `MemBucket`s.
+    let props_vec: Vec<String> = non_user_props_needed.iter().cloned().collect();
+    for b in 0..ps.config().num_buckets {
+        crate::budget::check_current()?;
+        let bucket_id = b as u8;
+        let l0_rows: Vec<StoredRow> = ps
+            .snapshot_l0_bucket(snap, bucket_id)
+            .into_iter()
+            .filter(|r| {
+                scan_range.contains(r.event_ts_ms)
+                    && (erased.is_empty()
+                        || !(erased.hides(r.uid_internal, r.event_ts_ms)
+                            || erased.hides(id_snap.resolve(r.uid_internal), r.event_ts_ms)))
+            })
+            .collect();
+        if l0_rows.is_empty() {
+            continue;
+        }
+        let n = l0_rows.len();
+        let mut uid_internal = Vec::with_capacity(n);
+        let mut session_hash = Vec::with_capacity(n);
+        let mut event_id = Vec::with_capacity(n);
+        let mut event_ts_ms = Vec::with_capacity(n);
+        for r in &l0_rows {
+            uid_internal.push(r.uid_internal);
+            session_hash.push(r.session_hash);
+            event_id.push(r.event_id);
+            event_ts_ms.push(r.event_ts_ms);
+        }
+
+        let mut base_map: HashMap<String, Arc<Vec<PropValue>>> = HashMap::new();
+        for p in &props_vec {
+            if let Some(pk) = dict.lookup_prop_key(p) {
+                let mut col = Vec::with_capacity(n);
+                for r in &l0_rows {
+                    let v = r
+                        .props
+                        .iter()
+                        .find(|(k, _)| *k == pk)
+                        .map(|(_, pv)| pv.clone())
+                        .unwrap_or(PropValue::Null);
+                    col.push(v);
+                }
+                base_map.insert(p.clone(), Arc::new(col));
+            } else if let Some(cp) = catalog.custom_properties.get(p) {
+                for dep in cp.referenced_columns() {
+                    if !dep.starts_with("user.") && !base_map.contains_key(&dep) {
+                        if let Some(pk) = dict.lookup_prop_key(&dep) {
+                            let mut col = Vec::with_capacity(n);
+                            for r in &l0_rows {
+                                let v = r
+                                    .props
+                                    .iter()
+                                    .find(|(k, _)| *k == pk)
+                                    .map(|(_, pv)| pv.clone())
+                                    .unwrap_or(PropValue::Null);
+                                col.push(v);
+                            }
+                            base_map.insert(dep, Arc::new(col));
+                        }
+                    }
+                }
+            } else if let Some((lt, _)) = catalog.resolve_lookup_column(p) {
+                if !base_map.contains_key(&lt.join_prop) {
+                    if let Some(pk) = dict.lookup_prop_key(&lt.join_prop) {
+                        let mut col = Vec::with_capacity(n);
+                        for r in &l0_rows {
+                            let v = r
+                                .props
+                                .iter()
+                                .find(|(k, _)| *k == pk)
+                                .map(|(_, pv)| pv.clone())
+                                .unwrap_or(PropValue::Null);
+                            col.push(v);
+                        }
+                        base_map.insert(lt.join_prop.clone(), Arc::new(col));
+                    }
+                }
+            }
+        }
+        let prop_cols = materialize_props_for_rows(
+            n,
+            Some(&uid_internal),
+            &base_map,
+            &props_vec,
+            catalog,
+            id_snap,
+        )?;
+
+        let per_series_local = aggregate_rows_multi_series(
+            n,
+            Some(&uid_internal),
+            Some(&session_hash),
+            &event_id,
+            &event_ts_ms,
+            &prop_cols,
+            &global_event_preds,
+            global_user_mask.as_ref(),
+            &plans,
+            range,
+            tz,
+            &breakdown_dims,
+            &breakdown_cohort_bitmaps,
+            id_snap,
+            catalog,
+            &crate::budget::Stop::current(),
+        )?;
+        for (s_idx, local_map) in per_series_local.into_iter().enumerate() {
+            merge_breakdown_maps(&mut series_groups[s_idx], local_map)?;
+        }
+    }
+
+    finalize_series_outputs(
+        &plans,
+        series_groups,
+        range,
+        query.interval,
+        buckets,
+        tz,
+        &breakdown_dims,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_l1_segment_streaming(
+    seg: &SegmentMeta,
+    plans: &[SeriesPlan<'_>],
+    range: TimeRange,
+    tz: Tz,
+    global_event_preds: &[PropPredicate],
+    global_user_mask: Option<&UserFilterMask>,
+    breakdown_dims: &[String],
+    breakdown_cohorts: &HashMap<String, RoaringBitmap>,
+    non_user_props_needed: &HashSet<String>,
+    need_uid: bool,
+    need_session: bool,
+    dict: &pulse_storage::ProjectDictionary,
+    erased: &pulse_storage::ErasedUids,
+    id_snap: &IdentitySnapshot,
+    cache: &SegmentBlockCache,
+    catalog: &VirtualCatalog,
+) -> Result<Vec<BTreeMap<String, BreakdownGroup>>> {
+    crate::budget::check_current()?;
+    let empty_res = || {
+        (0..plans.len())
+            .map(|_| BTreeMap::new())
+            .collect::<Vec<_>>()
+    };
+
+    // Step 1: Inverted-index pruning *before* touching Vortex bytes.
+    let (inv_mask, satisfied_global_idx) =
+        precompute_segment_row_mask_for_meta(seg, global_event_preds, dict, catalog, cache).await?;
+    if inv_mask.as_ref().is_some_and(RoaringBitmap::is_empty) {
+        return Ok(empty_res());
+    }
+
+    let mut remaining_global_preds: Vec<PropPredicate> = Vec::new();
+    for (idx, p) in global_event_preds.iter().enumerate() {
+        if !satisfied_global_idx.contains(&idx) {
+            remaining_global_preds.push(p.clone());
+        }
+    }
+
+    // Build initial surviving row indices if inverted index pruned rows.
+    let mut selected_rows: Option<Vec<u64>> = inv_mask.map(|bm| bm.iter().map(u64::from).collect());
+
+    // Step 2: Late materialization for `user.*` / cohort filters: decode ONLY `uid_internal` first!
+    let mut preloaded_uid: Option<Vec<u32>> = None;
+    if let Some(umask) = global_user_mask {
+        crate::budget::check_current()?;
+        let uid_sub = cache
+            .get_tier_a_subset(seg, true, false, false, false, selected_rows.as_deref())
+            .await?;
+        let uids = uid_sub.uid_internal.unwrap_or_default();
+        let mut next_indices = Vec::new();
+        let mut next_uids = Vec::new();
+        match &selected_rows {
+            Some(prev) => {
+                for (&orig_row, &raw_uid) in prev.iter().zip(uids.iter()) {
+                    if umask.contains(id_snap.resolve(raw_uid)) {
+                        next_indices.push(orig_row);
+                        next_uids.push(raw_uid);
+                    }
+                }
+            }
+            None => {
+                for (row_idx, &raw_uid) in uids.iter().enumerate() {
+                    if umask.contains(id_snap.resolve(raw_uid)) {
+                        next_indices.push(row_idx as u64);
+                        next_uids.push(raw_uid);
+                    }
+                }
+            }
+        }
+        if next_indices.is_empty() {
+            return Ok(empty_res());
+        }
+        selected_rows = Some(next_indices);
+        preloaded_uid = Some(next_uids);
+    }
+
+    // Step 3: Project ONLY the needed Tier A columns (skipping already-loaded `uid_internal` and unused `session_hash`/`replay_offset_kb`).
+    crate::budget::check_current()?;
+    let fetch_uid = need_uid && preloaded_uid.is_none();
+    let tier_a = cache
+        .get_tier_a_subset(
+            seg,
+            fetch_uid,
+            need_session,
+            true,
+            true,
+            selected_rows.as_deref(),
+        )
+        .await?;
+    let mut uid_vec = preloaded_uid.or(tier_a.uid_internal);
+    let mut shash_vec = tier_a.session_hash;
+    let mut ev_vec = tier_a.event_id.unwrap_or_default();
+    let mut ts_vec = tier_a.event_ts_ms.unwrap_or_default();
+    let n_before_erasure = ev_vec.len();
+    if n_before_erasure == 0 {
+        return Ok(empty_res());
+    }
+
+    // Step 4: Determine which non-`user.*` properties still need to be decoded (skipping properties
+    // only used by predicates already 100% satisfied by the inverted index!).
+    let mut needed_final_props: HashSet<String> = HashSet::new();
+    for p in &remaining_global_preds {
+        needed_final_props.insert(p.prop_name.clone());
+    }
+    for b in breakdown_dims {
+        if !b.starts_with("$cohort:") && !b.starts_with("user.") {
+            needed_final_props.insert(b.clone());
+        }
+    }
+    for plan in plans {
+        for p in &plan.event_preds {
+            needed_final_props.insert(p.prop_name.clone());
+        }
+        if let Some(mp) = plan.metric_prop {
+            if !mp.starts_with("user.") {
+                needed_final_props.insert(mp.to_string());
+            }
+        }
+    }
+    let _ = non_user_props_needed;
+
+    let mut base_props: HashSet<String> = HashSet::new();
+    for p in &needed_final_props {
+        if dict.lookup_prop_key(p).is_some() {
+            base_props.insert(p.clone());
+        } else if let Some(cp) = catalog.custom_properties.get(p) {
+            for dep in cp.referenced_columns() {
+                if !dep.starts_with("user.") {
+                    base_props.insert(dep);
+                }
+            }
+        } else if let Some((lt, _)) = catalog.resolve_lookup_column(p) {
+            base_props.insert(lt.join_prop.clone());
+        } else if !catalog.has_user_prop(p) {
+            base_props.insert(p.clone());
+        }
+    }
+
+    let mut base_map: HashMap<String, Arc<Vec<PropValue>>> =
+        HashMap::with_capacity(base_props.len());
+    for bp in &base_props {
+        crate::budget::check_current()?;
+        let col = if let Some(pk) = dict.lookup_prop_key(bp) {
+            match &selected_rows {
+                Some(indices) => {
+                    Arc::new(cache.get_property_column_selected(seg, pk, indices).await?)
+                }
+                None => cache.get_property_column(seg, pk).await?,
+            }
+        } else {
+            Arc::new(vec![PropValue::Null; n_before_erasure])
+        };
+        base_map.insert(bp.clone(), col);
+    }
+
+    // Step 5: Apply DPDP erasure filtering if any erased users exist.
+    if !erased.is_empty() {
+        if let Some(ref uids) = uid_vec {
+            let has_hidden = (0..n_before_erasure).any(|r| {
+                let u = uids[r];
+                let ts = ts_vec[r];
+                erased.hides(u, ts) || erased.hides(id_snap.resolve(u), ts)
+            });
+            if has_hidden {
+                let keep: Vec<usize> = (0..n_before_erasure)
+                    .filter(|&r| {
+                        let u = uids[r];
+                        let ts = ts_vec[r];
+                        !(erased.hides(u, ts) || erased.hides(id_snap.resolve(u), ts))
+                    })
+                    .collect();
+                if keep.is_empty() {
+                    return Ok(empty_res());
+                }
+                uid_vec = Some(keep.iter().map(|&i| uids[i]).collect());
+                if let Some(ref sh) = shash_vec {
+                    shash_vec = Some(keep.iter().map(|&i| sh[i]).collect());
+                }
+                ev_vec = keep.iter().map(|&i| ev_vec[i]).collect();
+                ts_vec = keep.iter().map(|&i| ts_vec[i]).collect();
+                for col in base_map.values_mut() {
+                    let compacted: Vec<PropValue> = keep.iter().map(|&i| col[i].clone()).collect();
+                    *col = Arc::new(compacted);
+                }
+            }
+        }
+    }
+
+    let final_props_vec: Vec<String> = needed_final_props.into_iter().collect();
+    let prop_cols = materialize_props_for_rows(
+        ev_vec.len(),
+        uid_vec.as_deref(),
+        &base_map,
+        &final_props_vec,
+        catalog,
+        id_snap,
+    )?;
+
+    let stop = crate::budget::Stop::current();
+    // Global user mask was already applied in Step 2, so pass `None` to avoid re-checking it.
+    aggregate_rows_multi_series(
+        ev_vec.len(),
+        uid_vec.as_deref(),
+        shash_vec.as_deref(),
+        &ev_vec,
+        &ts_vec,
+        &prop_cols,
+        &remaining_global_preds,
+        None,
+        plans,
+        range,
+        tz,
+        breakdown_dims,
+        breakdown_cohorts,
+        id_snap,
+        catalog,
+        &stop,
+    )
+}
+
+fn materialize_props_for_rows(
+    num_rows: usize,
+    uid_internal: Option<&[u32]>,
+    base_map: &HashMap<String, Arc<Vec<PropValue>>>,
+    final_props: &[String],
+    catalog: &VirtualCatalog,
+    id_snap: &IdentitySnapshot,
+) -> Result<HashMap<String, Arc<Vec<PropValue>>>> {
+    let mut out: HashMap<String, Arc<Vec<PropValue>>> = HashMap::with_capacity(final_props.len());
+    for p in final_props {
+        if let Some(col) = base_map.get(p) {
+            if catalog.has_user_prop(p)
+                && uid_internal.is_some()
+                && col.iter().any(|v| matches!(v, PropValue::Null))
+            {
+                let uids = uid_internal.unwrap();
+                let user_col = catalog.resolve_user_prop_column(uids, Some(id_snap), p);
+                let merged: Vec<PropValue> = col
+                    .iter()
+                    .zip(user_col)
+                    .map(|(ev_v, u_v)| {
+                        if matches!(ev_v, PropValue::Null) {
+                            u_v
+                        } else {
+                            ev_v.clone()
+                        }
+                    })
+                    .collect();
+                out.insert(p.clone(), Arc::new(merged));
+            } else {
+                out.insert(p.clone(), col.clone());
+            }
+        } else if let Some(cp) = catalog.custom_properties.get(p) {
+            let computed =
+                evaluate_custom_property(&cp, num_rows, base_map).map_err(ExecError::Expression)?;
+            out.insert(p.clone(), Arc::new(computed));
+        } else if let Some((lt, attr_col)) = catalog.resolve_lookup_column(p) {
+            let join_vals = base_map.get(&lt.join_prop);
+            let mut joined = Vec::with_capacity(num_rows);
+            for r in 0..num_rows {
+                let val = join_vals
+                    .and_then(|v| v.get(r))
+                    .and_then(|pv| {
+                        if matches!(pv, PropValue::Null) {
+                            None
+                        } else {
+                            lt.lookup_attr(&pv.as_str_cow(), &attr_col).cloned()
+                        }
+                    })
+                    .unwrap_or(PropValue::Null);
+                joined.push(val);
+            }
+            out.insert(p.clone(), Arc::new(joined));
+        } else if catalog.has_user_prop(p) {
+            if let Some(uids) = uid_internal {
+                let vals = catalog.resolve_user_prop_column(uids, Some(id_snap), p);
+                out.insert(p.clone(), Arc::new(vals));
+            } else {
+                out.insert(p.clone(), Arc::new(vec![PropValue::Null; num_rows]));
+            }
+        } else {
+            out.insert(p.clone(), Arc::new(vec![PropValue::Null; num_rows]));
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn row_matches_props_map(
+    prop_cols: &HashMap<String, Arc<Vec<PropValue>>>,
+    row_idx: usize,
+    preds: &[PropPredicate],
+) -> bool {
+    for pred in preds {
+        let val = prop_cols.get(&pred.prop_name).and_then(|c| c.get(row_idx));
+        if !pred.matches(val) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_rows_multi_series(
+    n: usize,
+    uid_internal: Option<&[u32]>,
+    session_hash: Option<&[u64]>,
+    event_id: &[u16],
+    event_ts_ms: &[i64],
+    prop_cols: &HashMap<String, Arc<Vec<PropValue>>>,
+    global_event_preds: &[PropPredicate],
+    global_user_mask: Option<&UserFilterMask>,
+    plans: &[SeriesPlan<'_>],
+    range: TimeRange,
+    tz: Tz,
+    breakdown_dims: &[String],
+    breakdown_cohorts: &HashMap<String, RoaringBitmap>,
+    id_snap: &IdentitySnapshot,
+    catalog: &VirtualCatalog,
+    stop: &crate::budget::Stop,
+) -> Result<Vec<BTreeMap<String, BreakdownGroup>>> {
+    let mut per_series: Vec<BTreeMap<String, BreakdownGroup>> =
+        (0..plans.len()).map(|_| BTreeMap::new()).collect();
+    let mut tz_caches: Vec<Option<(i64, i64)>> = vec![None; plans.len()];
+
+    for r in 0..n {
+        if !stop.live_every(r) {
+            break;
+        }
+        let raw_uid = uid_internal.map_or(0, |u| u[r]);
+        let canon_uid = if uid_internal.is_some() {
+            id_snap.resolve(raw_uid)
+        } else {
+            0
+        };
+        if let Some(umask) = global_user_mask {
+            if !umask.contains(canon_uid) {
+                continue;
+            }
+        }
+        if !global_event_preds.is_empty()
+            && !row_matches_props_map(prop_cols, r, global_event_preds)
+        {
+            continue;
+        }
+
+        let eid = event_id[r];
+        let ts = event_ts_ms[r];
+        let shash = session_hash.map_or(0, |s| s[r]);
+
+        for (s_idx, plan) in plans.iter().enumerate() {
+            if !plan.tgt.matches_id(eid) {
+                continue;
+            }
+            if !plan.is_rolling && !range.contains(ts) {
+                continue;
+            }
+            if plan.is_rolling && ts > range.end_ts_ms {
+                continue;
+            }
+            if let Some(ref smask) = plan.user_mask {
+                if !smask.contains(canon_uid) {
+                    continue;
+                }
+            }
+            if !plan.event_preds.is_empty()
+                && !row_matches_props_map(prop_cols, r, &plan.event_preds)
+            {
+                continue;
+            }
+
+            let num_val = plan.metric_prop.and_then(|mp| {
+                if mp.starts_with("user.") {
+                    catalog.get_user_prop_f64(canon_uid, raw_uid, mp)
+                } else {
+                    prop_cols
+                        .get(mp)
+                        .and_then(|c| c.get(r))
+                        .and_then(|pv| pv.as_f64())
+                }
+            });
+
+            let local_groups = &mut per_series[s_idx];
+            let entry = if breakdown_dims.is_empty() {
+                if !local_groups.contains_key("overall") {
+                    if !stop.charge_memory(ACCUM_SLOT_EST_BYTES + 7) {
+                        break;
+                    }
+                    local_groups
+                        .insert("overall".to_string(), (BucketAccum::new(), BTreeMap::new()));
+                }
+                local_groups
+                    .get_mut("overall")
+                    .expect("overall group inserted above")
+            } else if breakdown_dims.len() == 1
+                && !breakdown_cohorts.contains_key(&breakdown_dims[0])
+            {
+                let dim = &breakdown_dims[0];
+                let key_cow: Cow<'_, str> = if dim.starts_with("user.") {
+                    if let Some(arc_s) = catalog.get_user_prop_str_arc(canon_uid, raw_uid, dim) {
+                        Cow::Owned(arc_s.to_string())
+                    } else {
+                        let pv = catalog.get_user_prop(canon_uid, raw_uid, dim);
+                        if matches!(pv, PropValue::Null) {
+                            Cow::Borrowed("(none)")
+                        } else {
+                            Cow::Owned(pv.as_str_cow().into_owned())
+                        }
+                    }
+                } else {
+                    let pv = prop_cols
+                        .get(dim)
+                        .and_then(|c| c.get(r))
+                        .unwrap_or(&PropValue::Null);
+                    if matches!(pv, PropValue::Null) {
+                        Cow::Borrowed("(none)")
+                    } else {
+                        pv.as_str_cow()
+                    }
+                };
+                if !local_groups.contains_key(key_cow.as_ref()) {
+                    let k_len = key_cow.len() as u64;
+                    if !stop.charge_memory(ACCUM_SLOT_EST_BYTES + k_len) {
+                        break;
+                    }
+                    let owned = key_cow.into_owned();
+                    local_groups.insert(owned.clone(), (BucketAccum::new(), BTreeMap::new()));
+                    local_groups
+                        .get_mut(&owned)
+                        .expect("breakdown group inserted above")
+                } else {
+                    local_groups
+                        .get_mut(key_cow.as_ref())
+                        .expect("breakdown group checked above")
+                }
+            } else {
+                let mut parts = Vec::with_capacity(breakdown_dims.len());
+                for dim in breakdown_dims {
+                    if let Some(cbm) = breakdown_cohorts.get(dim) {
+                        parts.push(if cbm.contains(canon_uid) {
+                            "in_cohort".to_string()
+                        } else {
+                            "not_in_cohort".to_string()
+                        });
+                    } else if dim.starts_with("user.") {
+                        let pv = catalog.get_user_prop(canon_uid, raw_uid, dim);
+                        parts.push(if matches!(pv, PropValue::Null) {
+                            "(none)".to_string()
+                        } else {
+                            pv.as_str_cow().into_owned()
+                        });
+                    } else {
+                        let pv = prop_cols
+                            .get(dim)
+                            .and_then(|c| c.get(r))
+                            .unwrap_or(&PropValue::Null);
+                        parts.push(if matches!(pv, PropValue::Null) {
+                            "(none)".to_string()
+                        } else {
+                            pv.as_str_cow().into_owned()
+                        });
+                    }
+                }
+                let bkey = parts.join(" | ");
+                if !local_groups.contains_key(&bkey) {
+                    if !stop.charge_memory(ACCUM_SLOT_EST_BYTES + bkey.len() as u64) {
+                        break;
+                    }
+                    local_groups.insert(bkey.clone(), (BucketAccum::new(), BTreeMap::new()));
+                }
+                local_groups
+                    .get_mut(&bkey)
+                    .expect("breakdown group inserted above")
+            };
+
+            if range.contains(ts) {
+                entry.0.observe(canon_uid, shash, num_val, plan.metric_mask);
+            }
+
+            let b_ts = align_floor_tz_cached(ts, plan.align_unit, tz, &mut tz_caches[s_idx]);
+            if !entry.1.contains_key(&b_ts) {
+                if !stop.charge_memory(ACCUM_SLOT_EST_BYTES) {
+                    break;
+                }
+                entry.1.insert(b_ts, BucketAccum::new());
+            }
+            entry
+                .1
+                .get_mut(&b_ts)
+                .expect("bucket inserted above")
+                .observe(canon_uid, shash, num_val, plan.metric_mask);
+        }
+    }
+
+    crate::budget::check_current()?;
+    Ok(per_series)
+}
+
+fn merge_breakdown_maps(
+    acc: &mut BTreeMap<String, BreakdownGroup>,
+    map: BTreeMap<String, BreakdownGroup>,
+) -> Result<()> {
+    for (idx, (bkey, (ov, pb))) in map.into_iter().enumerate() {
+        if idx & 255 == 0 {
+            crate::budget::check_current()?;
+        }
+        let dst = acc
+            .entry(bkey)
+            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
+        dst.0.merge(ov);
+        for (b_idx, (bts, bucket_acc)) in pb.into_iter().enumerate() {
+            if b_idx & 255 == 0 {
+                crate::budget::check_current()?;
+            }
+            dst.1
+                .entry(bts)
+                .or_insert_with(BucketAccum::new)
+                .merge(bucket_acc);
+        }
+    }
+    Ok(())
+}
+
+fn finalize_series_outputs(
+    plans: &[SeriesPlan<'_>],
+    series_groups: Vec<BTreeMap<String, BreakdownGroup>>,
+    range: TimeRange,
+    interval: TimeInterval,
+    buckets: &[i64],
+    tz: Tz,
+    breakdown_dims: &[String],
+) -> Result<Vec<SeriesOutput>> {
+    let mut all_outputs = Vec::new();
+    for (plan, mut groups) in plans.iter().zip(series_groups.into_iter()) {
+        crate::budget::check_current()?;
+        if breakdown_dims.is_empty() {
+            groups
+                .entry("overall".to_string())
+                .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
+        }
+
+        let mut group_vec: Vec<(String, BreakdownGroup)> = groups.into_iter().collect();
+        if group_vec.len() > MAX_BREAKDOWN_GROUPS {
+            group_vec.sort_by(|a, b| {
+                b.1 .0
+                    .totals
+                    .cmp(&a.1 .0.totals)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let tail = group_vec.split_off(MAX_BREAKDOWN_GROUPS);
+            let mut other_overall = BucketAccum::new();
+            let mut other_per_bucket: BTreeMap<i64, BucketAccum> = BTreeMap::new();
+            for (idx, (_k, (ov, pb))) in tail.into_iter().enumerate() {
+                if idx & 255 == 0 {
+                    crate::budget::check_current()?;
+                }
+                other_overall.merge(ov);
+                for (bts, acc) in pb {
+                    other_per_bucket
+                        .entry(bts)
+                        .or_insert_with(BucketAccum::new)
+                        .merge(acc);
+                }
+            }
+            group_vec.push(("$other".to_string(), (other_overall, other_per_bucket)));
+        }
+
+        for (bkey, (overall_acc, per_bucket)) in group_vec {
+            crate::budget::check_current()?;
+            let mut points = Vec::with_capacity(buckets.len());
+            for &bts in buckets {
+                let val = match plan.spec.metric {
+                    InsightsMetric::Wau | InsightsMetric::Mau => {
+                        let window_days = if matches!(plan.spec.metric, InsightsMetric::Wau) {
+                            7i64
+                        } else {
+                            30i64
+                        };
+                        let bucket_end = interval
+                            .bucket_end_inclusive_tz(bts, tz)
+                            .min(range.end_ts_ms);
+                        let end_day = TimeInterval::Day.align_floor_tz(bucket_end, tz);
+                        let mut union_bm = RoaringBitmap::new();
+                        for d in 0..window_days {
+                            if let Some(day_ts) = TimeInterval::prev_days_tz(end_day, d, tz) {
+                                if let Some(acc) = per_bucket.get(&day_ts) {
+                                    union_bm |= &acc.users;
+                                }
+                            }
+                        }
+                        Some(union_bm.len() as f64)
+                    }
+                    _ => per_bucket
+                        .get(&bts)
+                        .map(|acc| acc.finish(&plan.spec.metric))
+                        .unwrap_or_else(|| empty_metric_value(&plan.spec.metric)),
+                };
+                points.push(TimePoint {
+                    bucket_ts_ms: bts,
+                    value: val,
+                });
+            }
+            let overall_value = if plan.is_rolling {
+                points.last().and_then(|p| p.value).or(Some(0.0))
+            } else {
+                overall_acc.finish(&plan.spec.metric)
+            };
+
+            all_outputs.push(SeriesOutput {
+                label: plan.spec.label.clone(),
+                breakdown_key: bkey,
+                overall_value,
+                points,
+            });
+        }
+    }
     Ok(all_outputs)
 }
 
@@ -463,296 +1432,6 @@ fn empty_metric_value(metric: &InsightsMetric) -> Option<f64> {
         | InsightsMetric::Mau
         | InsightsMetric::PropSum { .. } => Some(0.0),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn evaluate_single_series(
-    spec: &InsightsSeriesSpec,
-    tgt: &crate::scanner::ResolvedEventTarget,
-    range: TimeRange,
-    interval: TimeInterval,
-    buckets: &[i64],
-    tz: Tz,
-    breakdown_dims: &[String],
-    breakdown_cohorts: &HashMap<String, RoaringBitmap>,
-    global_preds: &[crate::ast::PropPredicate],
-    eligible_cohort: Option<&RoaringBitmap>,
-    chunks: &[crate::scanner::DataChunk],
-    ps: &ProjectStorage,
-    id_snap: &IdentitySnapshot,
-    cache: &SegmentBlockCache,
-    catalog: &VirtualCatalog,
-) -> Result<Vec<SeriesOutput>> {
-    let is_rolling = matches!(spec.metric, InsightsMetric::Wau | InsightsMetric::Mau);
-    let metric_mask = MetricMask::from_metric(&spec.metric);
-    let metric_prop = match &spec.metric {
-        InsightsMetric::PropSum { prop }
-        | InsightsMetric::PropAvg { prop }
-        | InsightsMetric::PropMin { prop }
-        | InsightsMetric::PropMax { prop }
-        | InsightsMetric::PropPercentile { prop, .. } => Some(prop.as_str()),
-        _ => None,
-    };
-
-    type BreakdownGroup = (BucketAccum, BTreeMap<i64, BucketAccum>);
-
-    let mut all_preds = Vec::with_capacity(global_preds.len() + spec.filters.len() + 1);
-    all_preds.extend_from_slice(global_preds);
-    all_preds.extend_from_slice(&spec.filters);
-    if let Some(ef) = &tgt.extra_filter {
-        all_preds.push(ef.clone());
-    }
-
-    let mut groups: BTreeMap<String, BreakdownGroup> = if tgt.event_ids.is_empty() {
-        BTreeMap::new()
-    } else {
-        let row_masks = try_join_all(chunks.iter().map(|chunk| {
-            precompute_segment_row_mask(chunk, &all_preds, ps.dictionary(), catalog, cache)
-        }))
-        .await?;
-
-        let align_unit = if is_rolling {
-            TimeInterval::Day
-        } else {
-            interval
-        };
-
-        crate::scanner::run_rayon_compute(|stop| {
-            chunks
-                .par_iter()
-                .zip(row_masks.par_iter())
-                .map(|(chunk, row_mask)| {
-                    let mut local_groups: BTreeMap<String, BreakdownGroup> = BTreeMap::new();
-                    let mut tz_cache: Option<(i64, i64)> = None;
-
-                    for r in 0..chunk.len() {
-                        if !stop.live_every(r) {
-                            break;
-                        }
-                        if let Some(rm) = row_mask {
-                            if !rm.contains(r as u32) {
-                                continue;
-                            }
-                        }
-                        if !tgt.matches_id(chunk.tier_a.event_id[r]) {
-                            continue;
-                        }
-                        let ts = chunk.tier_a.event_ts_ms[r];
-                        if !is_rolling && !range.contains(ts) {
-                            continue;
-                        }
-                        if is_rolling && ts > range.end_ts_ms {
-                            continue;
-                        }
-                        let canon_uid = id_snap.resolve(chunk.tier_a.uid_internal[r]);
-                        if let Some(ec) = eligible_cohort {
-                            if !ec.contains(canon_uid) {
-                                continue;
-                            }
-                        }
-                        if !row_matches_predicates(chunk, r, &all_preds) {
-                            continue;
-                        }
-
-                        let num_val = metric_prop
-                            .and_then(|mp| chunk.prop_cols.get(mp))
-                            .and_then(|c| c.get(r))
-                            .and_then(|pv| pv.as_f64());
-
-                        let entry = if breakdown_dims.is_empty() {
-                            if !local_groups.contains_key("overall") {
-                                local_groups.insert(
-                                    "overall".to_string(),
-                                    (BucketAccum::new(), BTreeMap::new()),
-                                );
-                            }
-                            local_groups
-                                .get_mut("overall")
-                                .expect("overall group inserted above")
-                        } else if breakdown_dims.len() == 1
-                            && !breakdown_cohorts.contains_key(&breakdown_dims[0])
-                        {
-                            let pv = chunk
-                                .prop_cols
-                                .get(&breakdown_dims[0])
-                                .and_then(|c| c.get(r))
-                                .unwrap_or(&PropValue::Null);
-                            let key_cow: std::borrow::Cow<'_, str> =
-                                if matches!(pv, PropValue::Null) {
-                                    std::borrow::Cow::Borrowed("(none)")
-                                } else {
-                                    pv.as_str_cow()
-                                };
-                            if !local_groups.contains_key(key_cow.as_ref()) {
-                                local_groups.insert(
-                                    key_cow.into_owned(),
-                                    (BucketAccum::new(), BTreeMap::new()),
-                                );
-                                // Re-lookup without cloning on repeat hits by looking up last or get_mut via pv again:
-                                let key_str = if matches!(pv, PropValue::Null) {
-                                    std::borrow::Cow::Borrowed("(none)")
-                                } else {
-                                    pv.as_str_cow()
-                                };
-                                local_groups
-                                    .get_mut(key_str.as_ref())
-                                    .expect("breakdown group inserted above")
-                            } else {
-                                local_groups
-                                    .get_mut(key_cow.as_ref())
-                                    .expect("breakdown group checked above")
-                            }
-                        } else {
-                            let mut parts = Vec::with_capacity(breakdown_dims.len());
-                            for dim in breakdown_dims {
-                                if let Some(cbm) = breakdown_cohorts.get(dim) {
-                                    parts.push(if cbm.contains(canon_uid) {
-                                        "in_cohort".to_string()
-                                    } else {
-                                        "not_in_cohort".to_string()
-                                    });
-                                } else {
-                                    let pv = chunk
-                                        .prop_cols
-                                        .get(dim)
-                                        .and_then(|c| c.get(r))
-                                        .unwrap_or(&PropValue::Null);
-                                    parts.push(if matches!(pv, PropValue::Null) {
-                                        "(none)".to_string()
-                                    } else {
-                                        pv.as_str_cow().into_owned()
-                                    });
-                                }
-                            }
-                            let bkey = parts.join(" | ");
-                            local_groups
-                                .entry(bkey)
-                                .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()))
-                        };
-
-                        if range.contains(ts) {
-                            entry.0.observe(
-                                canon_uid,
-                                chunk.tier_a.session_hash[r],
-                                num_val,
-                                metric_mask,
-                            );
-                        }
-
-                        let b_ts = align_floor_tz_cached(ts, align_unit, tz, &mut tz_cache);
-                        entry
-                            .1
-                            .entry(b_ts)
-                            .or_insert_with(BucketAccum::new)
-                            .observe(
-                                canon_uid,
-                                chunk.tier_a.session_hash[r],
-                                num_val,
-                                metric_mask,
-                            );
-                    }
-
-                    local_groups
-                })
-                .reduce(BTreeMap::new, |mut acc, map| {
-                    for (bkey, (ov, pb)) in map {
-                        let dst = acc
-                            .entry(bkey)
-                            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
-                        dst.0.merge(ov);
-                        for (bts, bucket_acc) in pb {
-                            dst.1
-                                .entry(bts)
-                                .or_insert_with(BucketAccum::new)
-                                .merge(bucket_acc);
-                        }
-                    }
-                    acc
-                })
-        })
-    };
-
-    if breakdown_dims.is_empty() {
-        groups
-            .entry("overall".to_string())
-            .or_insert_with(|| (BucketAccum::new(), BTreeMap::new()));
-    }
-
-    // Cap breakdown cardinality to `MAX_BREAKDOWN_GROUPS`, folding tail groups into `"$other"`.
-    let mut group_vec: Vec<(String, BreakdownGroup)> = groups.into_iter().collect();
-    if group_vec.len() > MAX_BREAKDOWN_GROUPS {
-        group_vec.sort_by(|a, b| {
-            b.1 .0
-                .totals
-                .cmp(&a.1 .0.totals)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let tail = group_vec.split_off(MAX_BREAKDOWN_GROUPS);
-        let mut other_overall = BucketAccum::new();
-        let mut other_per_bucket: BTreeMap<i64, BucketAccum> = BTreeMap::new();
-        for (_k, (ov, pb)) in tail {
-            other_overall.merge(ov);
-            for (bts, acc) in pb {
-                other_per_bucket
-                    .entry(bts)
-                    .or_insert_with(BucketAccum::new)
-                    .merge(acc);
-            }
-        }
-        group_vec.push(("$other".to_string(), (other_overall, other_per_bucket)));
-    }
-
-    let mut out = Vec::with_capacity(group_vec.len());
-    for (bkey, (overall_acc, per_bucket)) in group_vec {
-        let mut points = Vec::with_capacity(buckets.len());
-        for &bts in buckets {
-            let val = match spec.metric {
-                InsightsMetric::Wau | InsightsMetric::Mau => {
-                    // Anchor rolling WAU (7d) and MAU (30d) at the END of the interval bucket (`P2-09b`)!
-                    let window_days = if matches!(spec.metric, InsightsMetric::Wau) {
-                        7i64
-                    } else {
-                        30i64
-                    };
-                    let bucket_end = interval
-                        .bucket_end_inclusive_tz(bts, tz)
-                        .min(range.end_ts_ms);
-                    let end_day = TimeInterval::Day.align_floor_tz(bucket_end, tz);
-                    let mut union_bm = RoaringBitmap::new();
-                    for d in 0..window_days {
-                        if let Some(day_ts) = TimeInterval::prev_days_tz(end_day, d, tz) {
-                            if let Some(acc) = per_bucket.get(&day_ts) {
-                                union_bm |= &acc.users;
-                            }
-                        }
-                    }
-                    Some(union_bm.len() as f64)
-                }
-                _ => per_bucket
-                    .get(&bts)
-                    .map(|acc| acc.finish(&spec.metric))
-                    .unwrap_or_else(|| empty_metric_value(&spec.metric)),
-            };
-            points.push(TimePoint {
-                bucket_ts_ms: bts,
-                value: val,
-            });
-        }
-        let overall_value = if is_rolling {
-            points.last().and_then(|p| p.value).or(Some(0.0))
-        } else {
-            overall_acc.finish(&spec.metric)
-        };
-
-        out.push(SeriesOutput {
-            label: spec.label.clone(),
-            breakdown_key: bkey,
-            overall_value,
-            points,
-        });
-    }
-
-    Ok(out)
 }
 
 pub const MAX_FORMULA_LEN: usize = 1_024;

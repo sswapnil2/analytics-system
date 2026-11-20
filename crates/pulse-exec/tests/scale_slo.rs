@@ -805,3 +805,484 @@ async fn scale_latency_percentiles_and_slo_harness() {
         }
     }
 }
+
+fn current_rss_mb() -> f64 {
+    let pid = std::process::id().to_string();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|kb| kb / 1024.0)
+        .unwrap_or(0.0)
+}
+
+async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
+    use chrono::NaiveDate;
+    use futures::stream::{self, StreamExt};
+    use pulse_exec::{CatalogRegistry, ExecError, PropPredicate};
+    use pulse_storage::{
+        write_vortex_segment, Manifest, ManifestStore, ProjectDictionary, StoredRow,
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("object_store");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(&data_dir).unwrap());
+    let project_id = "proj_large_scale";
+
+    let dict = ProjectDictionary::new();
+    let ev_names = [
+        "page_view",
+        "product_viewed",
+        "add_to_cart",
+        "checkout_started",
+        "purchase",
+    ];
+    let ev_ids: Vec<u16> = ev_names
+        .iter()
+        .map(|n| dict.get_or_intern_event(n))
+        .collect();
+    let pk_country = dict.get_or_intern_prop_key("country");
+    let pk_platform = dict.get_or_intern_prop_key("platform");
+    let pk_amount = dict.get_or_intern_prop_key("amount");
+    let countries = ["IN", "US", "GB", "DE", "SG", "JP", "BR", "CA"];
+    let platforms = ["web", "ios", "android", "desktop"];
+
+    let num_days = 30usize;
+    let num_buckets = 16usize;
+    let total_segs = num_days * num_buckets;
+    let rows_per_seg = total_events / total_segs;
+    let base_date = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+    let base_ts_ms = base_date
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    println!(
+        "\n================================================================================\n\
+         LARGE-SCALE BENCHMARK: {}M events ({} segments x {} rows, {} distinct users)\n\
+         ================================================================================",
+        total_events / 1_000_000,
+        total_segs,
+        rows_per_seg,
+        distinct_users
+    );
+
+    let t_build = Instant::now();
+    let tasks: Vec<(usize, usize)> = (0..num_days)
+        .flat_map(|d| (0..num_buckets).map(move |b| (d, b)))
+        .collect();
+
+    let seg_metas: Vec<(NaiveDate, u8, pulse_storage::SegmentMeta)> = stream::iter(tasks)
+        .map(|(day, bucket)| {
+            let store = store.clone();
+            let ev_ids = ev_ids.clone();
+            async move {
+                let date = base_date + chrono::Duration::days(day as i64);
+                let day_start_ms = base_ts_ms + (day as i64) * 86_400_000;
+                let mut rows = Vec::with_capacity(rows_per_seg);
+                let base_idx = ((day * num_buckets + bucket) * rows_per_seg) as u64;
+                for i in 0..rows_per_seg {
+                    let g = base_idx + i as u64;
+                    // Partition users deterministically into this bucket
+                    let u_in_bucket =
+                        ((g * 2654435761) as u32) % (distinct_users / num_buckets as u32).max(1);
+                    let uid = u_in_bucket * num_buckets as u32 + bucket as u32;
+                    let eid = ev_ids[(g as usize) % ev_ids.len()];
+                    let ts = day_start_ms + ((g * 104729) % 86_400_000) as i64;
+                    let c = countries[(uid as usize) % countries.len()];
+                    let p = platforms[((uid >> 3) as usize) % platforms.len()];
+                    let amt = 10 + (g % 500) as i64;
+                    rows.push(StoredRow {
+                        l0_seq: g,
+                        wal_seq: g,
+                        uid_internal: uid,
+                        session_hash: (uid as u64) * 31 + (day as u64),
+                        session_id: format!("s_{uid}_{day}"),
+                        event_uuid_fp: g,
+                        event_id: eid,
+                        event_ts_ms: ts,
+                        replay_offset_kb: 0,
+                        session_flags: 0,
+                        props: vec![
+                            (pk_country, PropValue::Str(c.to_string())),
+                            (pk_platform, PropValue::Str(p.to_string())),
+                            (pk_amount, PropValue::Int(amt)),
+                        ],
+                    });
+                }
+                let seg_id = format!("seg_d{day:02}_b{bucket:02}");
+                let meta =
+                    write_vortex_segment(&store, project_id, date, bucket as u8, &seg_id, rows)
+                        .await
+                        .expect("write_vortex_segment")
+                        .expect("non-empty segment");
+                (date, bucket as u8, meta)
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+
+    let mut manifest = Manifest {
+        epoch: 0,
+        fenced_wal_epoch: 0,
+        active_segments: std::collections::HashMap::new(),
+        committed_wal_seq: std::collections::BTreeMap::new(),
+        committed_l0_seq: std::collections::BTreeMap::new(),
+        dict_snapshot: dict.snapshot(),
+    };
+    let mut total_seg_bytes = 0u64;
+    for (date, bucket, meta) in seg_metas {
+        total_seg_bytes += meta.file_size;
+        manifest
+            .active_segments
+            .entry((date, bucket))
+            .or_default()
+            .push(meta);
+    }
+    let mstore = ManifestStore::new(project_id, store.clone());
+    mstore.commit_next(manifest).await.expect("commit manifest");
+    println!(
+        "Built {}M events ({} Vortex segments, {:.1} MB on disk) in {:.2}s | RSS {:.0} MB",
+        total_events / 1_000_000,
+        total_segs,
+        total_seg_bytes as f64 / (1024.0 * 1024.0),
+        t_build.elapsed().as_secs_f64(),
+        current_rss_mb()
+    );
+
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: num_buckets as u16,
+            l0_flush_row_threshold: 250_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store.clone(),
+        id_router.clone(),
+    );
+    let catalogs = CatalogRegistry::new();
+    let foyer_dir = tmp.path().join("foyer_cache");
+    let qengine = QueryEngine::new(
+        storage.clone(),
+        128 * 1024 * 1024,
+        Some(&foyer_dir),
+        512 * 1024 * 1024,
+        catalogs.clone(),
+    )
+    .await
+    .expect("query engine");
+    qengine.set_max_rows(250_000_000);
+
+    // Populate ColumnarProfileIndex with 1,000,000 user profiles to test user.* bitmap pushdown!
+    let t_prof = Instant::now();
+    let rss_before_prof = current_rss_mb();
+    let cat = catalogs.for_project(project_id);
+    let mut prof_map = std::collections::HashMap::with_capacity(1_000_000);
+    for u in 0..1_000_000u32 {
+        let mut m = std::collections::HashMap::with_capacity(2);
+        let plan = if u % 100 == 0 {
+            "enterprise"
+        } else if u % 10 == 0 {
+            "pro"
+        } else {
+            "free"
+        };
+        m.insert("plan".to_string(), PropValue::Str(plan.to_string()));
+        m.insert("is_paid".to_string(), PropValue::Bool(u % 10 == 0));
+        prof_map.insert(u, m);
+    }
+    cat.set_user_profiles(prof_map);
+    println!(
+        "Loaded 1,000,000 user profiles into ColumnarProfileIndex in {:.2}s | RSS {:.0} -> {:.0} MB",
+        t_prof.elapsed().as_secs_f64(),
+        rss_before_prof,
+        current_rss_mb()
+    );
+
+    let tr30 = TimeRange {
+        start_ts_ms: base_ts_ms,
+        end_ts_ms: base_ts_ms + 30 * 86_400_000,
+    };
+    let tr7 = TimeRange {
+        start_ts_ms: base_ts_ms + 23 * 86_400_000,
+        end_ts_ms: base_ts_ms + 30 * 86_400_000,
+    };
+
+    let run_ins =
+        |name: &str, q: InsightsQuery| {
+            let qe = qengine.clone();
+            let name = name.to_string();
+            async move {
+                let t1 = Instant::now();
+                let r1 = qe.query_insights(project_id, &q).await;
+                let d1 = t1.elapsed().as_secs_f64() * 1000.0;
+                let rss1 = current_rss_mb();
+                let t2 = Instant::now();
+                let r2 = qe.query_insights(project_id, &q).await;
+                let d2 = t2.elapsed().as_secs_f64() * 1000.0;
+                let rss2 = current_rss_mb();
+                println!(
+                "  {:<46} | run1={:7.1}ms ({:?}, RSS {:.0}MB) -> run2={:7.1}ms ({:?}, RSS {:.0}MB)",
+                name,
+                d1,
+                r1.as_ref().map(|x| x.series.first().and_then(|s| s.overall_value)),
+                rss1,
+                d2,
+                r2.as_ref().map(|x| x.series.first().and_then(|s| s.overall_value)),
+                rss2
+            );
+            }
+        };
+
+    run_ins(
+        "totals, 1 event, 30d by day (footer fast path)",
+        InsightsQuery {
+            time_range: tr30,
+            interval: TimeInterval::Day,
+            series: vec![InsightsSeriesSpec {
+                label: "A".into(),
+                event_name: "purchase".into(),
+                metric: InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: GlobalFilter::default(),
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    run_ins(
+        "uniques, 1 event, 30d by day",
+        InsightsQuery {
+            time_range: tr30,
+            interval: TimeInterval::Day,
+            series: vec![InsightsSeriesSpec {
+                label: "A".into(),
+                event_name: "purchase".into(),
+                metric: InsightsMetric::Uniques,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: GlobalFilter::default(),
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    run_ins(
+        "filtered totals (country==IN), 30d",
+        InsightsQuery {
+            time_range: tr30,
+            interval: TimeInterval::Day,
+            series: vec![InsightsSeriesSpec {
+                label: "A".into(),
+                event_name: "purchase".into(),
+                metric: InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: GlobalFilter {
+                predicates: vec![PropPredicate::eq_str("country", "IN")],
+                cohort: None,
+            },
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    run_ins(
+        "user.* filtered totals (user.plan==enterprise), 30d",
+        InsightsQuery {
+            time_range: tr30,
+            interval: TimeInterval::Day,
+            series: vec![InsightsSeriesSpec {
+                label: "A".into(),
+                event_name: "purchase".into(),
+                metric: InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: Vec::new(),
+            global_filter: GlobalFilter {
+                predicates: vec![PropPredicate::eq_str("user.plan", "enterprise")],
+                cohort: None,
+            },
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    run_ins(
+        "breakdown by country, 7d",
+        InsightsQuery {
+            time_range: tr7,
+            interval: TimeInterval::Day,
+            series: vec![InsightsSeriesSpec {
+                label: "A".into(),
+                event_name: "purchase".into(),
+                metric: InsightsMetric::Totals,
+                filters: Vec::new(),
+            }],
+            breakdown_by: vec!["country".into()],
+            global_filter: GlobalFilter::default(),
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    run_ins(
+        "3-series hourly breakdown by platform, 7d",
+        InsightsQuery {
+            time_range: tr7,
+            interval: TimeInterval::Hour,
+            series: vec![
+                InsightsSeriesSpec {
+                    label: "A".into(),
+                    event_name: "page_view".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                },
+                InsightsSeriesSpec {
+                    label: "B".into(),
+                    event_name: "add_to_cart".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                },
+                InsightsSeriesSpec {
+                    label: "C".into(),
+                    event_name: "purchase".into(),
+                    metric: InsightsMetric::Totals,
+                    filters: Vec::new(),
+                },
+            ],
+            breakdown_by: vec!["platform".into()],
+            global_filter: GlobalFilter::default(),
+            formula: None,
+            compare_previous_period: false,
+        },
+    )
+    .await;
+
+    // 4-step funnel, 7d
+    let fq = FunnelQuery {
+        time_range: tr7,
+        steps: vec![
+            FunnelStepSpec {
+                event_name: "page_view".into(),
+                filters: Vec::new(),
+                first_time_ever: false,
+            },
+            FunnelStepSpec {
+                event_name: "product_viewed".into(),
+                filters: Vec::new(),
+                first_time_ever: false,
+            },
+            FunnelStepSpec {
+                event_name: "add_to_cart".into(),
+                filters: Vec::new(),
+                first_time_ever: false,
+            },
+            FunnelStepSpec {
+                event_name: "purchase".into(),
+                filters: Vec::new(),
+                first_time_ever: false,
+            },
+        ],
+        conversion_window_ms: 7 * 86_400_000,
+        order_mode: FunnelOrderMode::LooseOrder,
+        exclusions: Vec::new(),
+        hold_constant_props: Vec::new(),
+        breakdown_by: None,
+        global_filter: GlobalFilter::default(),
+    };
+    let tf1 = Instant::now();
+    let rf1 = qengine.query_funnel(project_id, &fq).await;
+    let df1 = tf1.elapsed().as_secs_f64() * 1000.0;
+    let rss_f1 = current_rss_mb();
+    let tf2 = Instant::now();
+    let rf2 = qengine.query_funnel(project_id, &fq).await;
+    let df2 = tf2.elapsed().as_secs_f64() * 1000.0;
+    let rss_f2 = current_rss_mb();
+    println!(
+        "  {:<46} | run1={:7.1}ms (ok={}, RSS {:.0}MB) -> run2={:7.1}ms (ok={}, RSS {:.0}MB)",
+        "4-step funnel, 7d",
+        df1,
+        rf1.is_ok(),
+        rss_f1,
+        df2,
+        rf2.is_ok(),
+        rss_f2
+    );
+
+    // Deadline enforcement test (#61): 150ms deadline on heavy 30d 3-series hourly breakdown
+    qengine.set_query_timeout(Duration::from_millis(150));
+    let td = Instant::now();
+    let rd = qengine
+        .query_insights(
+            project_id,
+            &InsightsQuery {
+                time_range: tr30,
+                interval: TimeInterval::Hour,
+                series: vec![
+                    InsightsSeriesSpec {
+                        label: "A".into(),
+                        event_name: "page_view".into(),
+                        metric: InsightsMetric::Uniques,
+                        filters: Vec::new(),
+                    },
+                    InsightsSeriesSpec {
+                        label: "B".into(),
+                        event_name: "add_to_cart".into(),
+                        metric: InsightsMetric::Uniques,
+                        filters: Vec::new(),
+                    },
+                    InsightsSeriesSpec {
+                        label: "C".into(),
+                        event_name: "purchase".into(),
+                        metric: InsightsMetric::Uniques,
+                        filters: Vec::new(),
+                    },
+                ],
+                breakdown_by: vec!["country".into()],
+                global_filter: GlobalFilter::default(),
+                formula: None,
+                compare_previous_period: false,
+            },
+        )
+        .await;
+    let dd = td.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  {:<46} | took={:7.1}ms | result={:?}",
+        "deadline check (150ms on 30d 3-series uniques)",
+        dd,
+        rd.as_ref().err()
+    );
+    assert!(
+        matches!(rd, Err(ExecError::QueryTimeout(150))),
+        "expected QueryTimeout(150), got {rd:?}"
+    );
+    assert!(dd < 2000.0, "deadline enforcement took too long: {dd:.1}ms");
+
+    qengine.cache().close().await;
+    drop(qengine);
+    id_router.close_all().await.unwrap();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn bench_50m_and_100m_events() {
+    run_large_scale_milestone(50_000_000, 2_000_000).await;
+    run_large_scale_milestone(100_000_000, 2_000_000).await;
+}

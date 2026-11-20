@@ -122,9 +122,11 @@ impl FlowsEngine {
                     .collect()
             });
 
+        crate::budget::check_current()?;
         let mut timelines: HashMap<u32, Vec<(i64, u16, bool)>> = HashMap::new();
         let mut total_collected = 0usize;
         for batch in chunk_batches {
+            crate::budget::check_current()?;
             for (canon_uid, ts, eid, is_anchor) in batch {
                 total_collected += 1;
                 if total_collected > MAX_FLOWS_SCANNED_EVENTS {

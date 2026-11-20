@@ -505,7 +505,9 @@ impl FunnelEngine {
         let mut coord_bdown_names: Vec<String> = vec!["(none)".to_string()];
         coord_bdown_map.insert("(none)".to_string(), 0);
 
+        crate::budget::check_current()?;
         for (shard_sum, shard_names, mut cross) in shard_outputs {
+            crate::budget::check_current()?;
             if has_breakdown {
                 let mut remap = Vec::with_capacity(shard_names.len());
                 for name in shard_names {
@@ -597,7 +599,7 @@ impl FunnelEngine {
         for (dropped_before_step, ev) in final_summary.dropped_samples {
             let chunk = &chunks[ev.chunk_idx as usize];
             let r_idx = ev.row_idx as usize;
-            let session_id = chunk.session_id_for_row(r_idx);
+            let session_id = chunk.session_id_for_row(r_idx, cache).await;
             let replay_offset_kb = chunk.tier_a.replay_offset_kb[r_idx];
             let has_replay = rstore.has_session(ps.project_id(), &session_id).await;
             let raw_did = id_graph

@@ -89,6 +89,7 @@ pub struct QueryEngine {
     catalogs: Arc<CatalogRegistry>,
     query_timeout_ms: AtomicU64,
     max_rows: AtomicU64,
+    max_memory_bytes: AtomicU64,
     admission: crate::budget::Admission,
     last_query_latency_us: AtomicU64,
     queries_executed: AtomicU64,
@@ -118,6 +119,13 @@ impl QueryEngine {
             .filter(|&ms| ms > 0)
             .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS);
 
+        let max_memory_bytes = std::env::var("PULSE_QUERY_MAX_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(crate::budget::DEFAULT_MAX_MEMORY_BYTES);
+
         Ok(Arc::new(Self {
             storage,
             cache,
@@ -130,6 +138,7 @@ impl QueryEngine {
                     .filter(|&n| n > 0)
                     .unwrap_or(crate::budget::DEFAULT_MAX_ROWS),
             ),
+            max_memory_bytes: AtomicU64::new(max_memory_bytes),
             admission: crate::budget::Admission::from_env(),
             last_query_latency_us: AtomicU64::new(0),
             queries_executed: AtomicU64::new(0),
@@ -150,8 +159,13 @@ impl QueryEngine {
         self.max_rows.store(rows.max(1), Ordering::Relaxed);
     }
 
-    /// Admits the query (per-project and node-wide caps), then runs it under its deadline and row
-    /// budget. Nested calls (a cohort inside a funnel) reuse the outer query's slot and budget.
+    /// Working memory bytes one query may allocate before it fails with `QueryMemoryExceeded`.
+    pub fn set_max_memory_bytes(&self, bytes: u64) {
+        self.max_memory_bytes.store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// Admits the query (per-project and node-wide caps), then runs it under its deadline, row,
+    /// and memory budgets. Nested calls (a cohort inside a funnel) reuse the outer query's slot and budget.
     async fn with_deadline<T, F>(&self, project_id: &str, fut: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
@@ -163,9 +177,10 @@ impl QueryEngine {
         let timeout = Duration::from_millis(timeout_ms);
         // Queue for at most one deadline's worth; past that, tell the caller to back off.
         let _permits = self.admission.acquire(project_id, timeout).await?;
-        let ctx = Arc::new(crate::budget::QueryCtx::new(
+        let ctx = Arc::new(crate::budget::QueryCtx::with_memory_limit(
             timeout,
             self.max_rows.load(Ordering::Relaxed),
+            self.max_memory_bytes.load(Ordering::Relaxed),
         ));
         let out = tokio::time::timeout(timeout, crate::budget::scope(ctx.clone(), fut))
             .await
@@ -510,8 +525,12 @@ impl QueryEngine {
             let cap = limit.clamp(1, 50_000);
             let mut rows = Vec::new();
             for chunk in &chunks {
+                crate::budget::check_current()?;
                 let ta = &chunk.tier_a;
                 for r in 0..chunk.len() {
+                    if r & 1023 == 0 {
+                        crate::budget::check_current()?;
+                    }
                     let ts = ta.event_ts_ms[r];
                     if let Some(tr) = time_range {
                         if !tr.contains(ts) {
@@ -536,7 +555,7 @@ impl QueryEngine {
                         .get(&ta.event_id[r])
                         .cloned()
                         .unwrap_or_else(|| format!("event_{}", ta.event_id[r]));
-                    let session_id = chunk.session_id_for_row(r);
+                    let session_id = chunk.session_id_for_row(r, &self.cache).await;
 
                     let mut props = std::collections::BTreeMap::new();
                     for (pk, col) in &chunk.prop_cols {
@@ -750,6 +769,7 @@ impl QueryEngine {
             segs.sort_by_key(|s| Reverse(s.footer.max_ts_ms));
 
             for seg in &segs {
+                crate::budget::check_current()?;
                 if top_heap.len() >= limit {
                     if let Some(min_top) = top_heap.peek() {
                         if seg.footer.max_ts_ms < min_top.0 .0.end_ts_ms {

@@ -21,6 +21,7 @@ slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

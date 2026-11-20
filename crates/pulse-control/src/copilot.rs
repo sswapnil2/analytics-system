@@ -143,7 +143,7 @@ fn find_biggest_dropoff(funnel: &FunnelResult) -> Option<(String, f64)> {
 /// Fails explicitly (`CopilotError::Upstream`) if the external LLM call fails — never returns fake templated text.
 pub async fn run_byok_copilot(
     qengine: &Arc<QueryEngine>,
-    meta: &MetaStore,
+    _meta: &MetaStore,
     project_id: &str,
     llm_cred: &ByokCredentialRecord,
     llm_api_key: &str,
@@ -393,10 +393,15 @@ pub async fn run_byok_copilot(
         || prompt_lower.contains("ltv")
         || prompt_lower.contains("pay")
     {
-        let (_, paying, total_rev) = meta
-            .user_revenue_summary(project_id)
+        let (_, paying, total_rev) = match qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
             .await
-            .unwrap_or((0, 0, 0.0));
+        {
+            Ok(ps) => ps.revenue_summary().await.unwrap_or((0, 0, 0.0)),
+            Err(_) => (0, 0, 0.0),
+        };
         metrics_map.insert(
             "revenue".to_string(),
             json!({ "total_revenue": total_rev, "paying_users": paying }),

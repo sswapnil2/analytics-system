@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
 use dashmap::DashMap;
+use futures::stream::{self, StreamExt};
 use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -584,9 +585,12 @@ impl ProjectStorage {
                 Ok(committed) => {
                     let arc = Arc::new(committed);
                     *self.manifest.write() = arc.clone();
-                    // ponytail: one LIST per commit; batch every N commits if LIST cost shows up.
+                    // Throttle manifest GC to every 16 commits so bursty flushes/compactions do
+                    // not issue an object-store LIST on every single epoch write.
                     // Best effort: a failed GC only leaves extra epoch files behind.
-                    let _ = self.manifest_store.gc_old_epochs().await;
+                    if arc.epoch % 16 == 0 {
+                        let _ = self.manifest_store.gc_old_epochs().await;
+                    }
                     return Ok(Some(arc));
                 }
                 Err(StorageError::ManifestConflict) if attempt < 7 => {
@@ -600,11 +604,24 @@ impl ProjectStorage {
         Err(StorageError::ManifestConflict)
     }
 
-    pub async fn flush_all(&self) -> Result<usize> {
+    /// Flushes the specified `bucket_ids` concurrently (bounded to 16 parallel segment writes)
+    /// and publishes all resulting L1 segments in a single MVCC Manifest commit.
+    pub async fn flush_buckets(&self, bucket_ids: &[u8]) -> Result<usize> {
+        let mut sorted: Vec<u8> = bucket_ids
+            .iter()
+            .copied()
+            .filter(|&b| (b as u16) < self.config.num_buckets)
+            .collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.is_empty() {
+            return Ok(0);
+        }
+
         self.id_graph.flush().await?;
-        let mut guards = Vec::with_capacity(self.bucket_flush_locks.len());
-        for lock in &self.bucket_flush_locks {
-            guards.push(lock.lock().await);
+        let mut guards = Vec::with_capacity(sorted.len());
+        for &b in &sorted {
+            guards.push(self.bucket_flush_locks[b as usize].lock().await);
         }
 
         struct StagedBucket {
@@ -618,9 +635,8 @@ impl ProjectStorage {
         let mut staged_buckets = Vec::new();
         {
             let mf = self.manifest.read();
-            for b in 0..self.config.num_buckets {
-                let bucket_id = b as u8;
-                let b_idx = b as usize;
+            for &bucket_id in &sorted {
+                let b_idx = bucket_id as usize;
                 let floor_l0 = mf.committed_l0_seq.get(&bucket_id).copied().unwrap_or(0);
                 if let Some((max_l0, max_wal, staged_rows)) =
                     self.mem_buckets[b_idx].stage_flush(floor_l0)
@@ -711,6 +727,23 @@ impl ProjectStorage {
         Ok(written_segments.len())
     }
 
+    /// Flushes all buckets that have crossed their row or age threshold in a single manifest commit.
+    pub async fn flush_due_buckets(&self) -> Result<usize> {
+        let due: Vec<u8> = (0..self.config.num_buckets)
+            .map(|b| b as u8)
+            .filter(|&bid| self.should_flush_bucket(bid))
+            .collect();
+        if due.is_empty() {
+            return Ok(0);
+        }
+        self.flush_buckets(&due).await
+    }
+
+    pub async fn flush_all(&self) -> Result<usize> {
+        let all: Vec<u8> = (0..self.config.num_buckets).map(|b| b as u8).collect();
+        self.flush_buckets(&all).await
+    }
+
     /// Background/manual Late-Data Compactor: merges any `(date, bucket)` partition with `>= min_segments`
     /// overlapping L1 segments into a single sorted Vortex segment under a per-partition lock.
     pub async fn compact_overdue(&self, reader: &VortexSegmentReader) -> Result<usize> {
@@ -719,102 +752,186 @@ impl ProjectStorage {
     }
 
     /// Merges any `(date, bucket)` partition with `>= min_segments` overlapping L1 segments into a
-    /// single sorted Vortex segment (`EN-3`).
+    /// single sorted Vortex segment (`EN-3`), compacting up to 32 partitions per manifest commit
+    /// with bounded concurrency to avoid O(P * M) manifest write amplification.
     pub async fn compact_min_segments(
         &self,
         reader: &VortexSegmentReader,
         min_segments: usize,
     ) -> Result<usize> {
+        const COMPACTION_COMMIT_BATCH: usize = 32;
+        const COMPACTION_CONCURRENCY: usize = 8;
+
         let min_segments = min_segments.max(2);
-        let candidates = self
+        let mut candidates = self
             .manifest
             .read()
             .partitions_needing_compaction(min_segments);
+        candidates.sort_unstable();
+
+        struct PreparedCompaction {
+            date: NaiveDate,
+            bucket_id: u8,
+            source_ids: HashSet<String>,
+            superseded_paths: Vec<String>,
+            new_meta: SegmentMeta,
+        }
 
         let mut compacted_partitions = 0usize;
-        for (date, bucket_id) in candidates {
-            let part_lock = self
-                .compaction_locks
-                .entry((date, bucket_id))
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone();
-            let _part_guard = part_lock.lock().await;
+        for chunk in candidates.chunks(COMPACTION_COMMIT_BATCH) {
+            // Acquire per-partition locks in strictly ascending `(date, bucket_id)` order.
+            let mut part_guards = Vec::with_capacity(chunk.len());
+            for &(date, bucket_id) in chunk {
+                let part_lock = self
+                    .compaction_locks
+                    .entry((date, bucket_id))
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone();
+                part_guards.push(part_lock.lock_owned().await);
+            }
 
-            let source_segments = {
+            let work_items: Vec<(NaiveDate, u8, Vec<SegmentMeta>)> = {
                 let mf = self.manifest.read();
-                match mf.active_segments.get(&(date, bucket_id)) {
-                    Some(segs) if segs.len() >= min_segments => segs.clone(),
-                    _ => continue,
-                }
+                chunk
+                    .iter()
+                    .filter_map(|&(date, bucket_id)| {
+                        mf.active_segments
+                            .get(&(date, bucket_id))
+                            .filter(|segs| segs.len() >= min_segments)
+                            .map(|segs| (date, bucket_id, segs.clone()))
+                    })
+                    .collect()
             };
-
-            let source_ids: HashSet<String> = source_segments
-                .iter()
-                .map(|s| s.segment_id.clone())
-                .collect();
-
-            let mut merged_rows = Vec::new();
-            for seg in &source_segments {
-                let mut rows = reader.read_all_rows(seg).await?;
-                merged_rows.append(&mut rows);
+            if work_items.is_empty() {
+                continue;
             }
-            // Erased users' rows are dropped for good here, not just hidden at query time.
+
             let erased = self.erased_snapshot();
-            if !erased.is_empty() {
-                merged_rows.retain(|r| !erased.hides(r.uid_internal, r.event_ts_ms));
-            }
+            let results: Vec<Result<Option<PreparedCompaction>>> = stream::iter(work_items)
+                .map(|(date, bucket_id, source_segments)| {
+                    let erased = erased.clone();
+                    async move {
+                        let source_ids: HashSet<String> = source_segments
+                            .iter()
+                            .map(|s| s.segment_id.clone())
+                            .collect();
+                        let superseded_paths: Vec<String> = source_segments
+                            .iter()
+                            .map(|s| s.object_path.clone())
+                            .collect();
 
-            let compacted_id = format!("seg_cmp_{}", Uuid::new_v4().simple());
-            let Some(new_meta) = write_vortex_segment(
-                &self.object_store,
-                &self.project_id,
-                date,
-                bucket_id,
-                &compacted_id,
-                merged_rows,
-            )
-            .await?
-            else {
-                continue;
-            };
+                        let mut merged_rows = Vec::new();
+                        for seg in &source_segments {
+                            let mut rows = reader.read_all_rows(seg).await?;
+                            merged_rows.append(&mut rows);
+                        }
+                        // Erased users' rows are dropped for good here, not just hidden at query time.
+                        if !erased.is_empty() {
+                            merged_rows.retain(|r| !erased.hides(r.uid_internal, r.event_ts_ms));
+                        }
 
-            let superseded_paths: Vec<String> = source_segments
-                .iter()
-                .map(|s| s.object_path.clone())
-                .collect();
+                        let compacted_id = format!("seg_cmp_{}", Uuid::new_v4().simple());
+                        let Some(new_meta) = write_vortex_segment(
+                            &self.object_store,
+                            &self.project_id,
+                            date,
+                            bucket_id,
+                            &compacted_id,
+                            merged_rows,
+                        )
+                        .await?
+                        else {
+                            return Ok(None);
+                        };
 
-            let committed_ok = self
-                .commit_manifest_cas(|next_manifest| {
-                    let entry = next_manifest
-                        .active_segments
-                        .entry((date, bucket_id))
-                        .or_default();
-
-                    // Verify ALL `source_ids` are still active before replacing them.
-                    let active_ids: HashSet<&str> =
-                        entry.iter().map(|s| s.segment_id.as_str()).collect();
-                    if !source_ids
-                        .iter()
-                        .all(|sid| active_ids.contains(sid.as_str()))
-                    {
-                        return false;
+                        Ok(Some(PreparedCompaction {
+                            date,
+                            bucket_id,
+                            source_ids,
+                            superseded_paths,
+                            new_meta,
+                        }))
                     }
-                    entry.retain(|s| !source_ids.contains(&s.segment_id));
-                    entry.push(new_meta.clone());
-                    next_manifest.dict_snapshot = self.dictionary.snapshot();
-                    true
                 })
-                .await?
-                .is_some();
+                .buffer_unordered(COMPACTION_CONCURRENCY)
+                .collect()
+                .await;
 
-            if !committed_ok {
-                let orphan = ObjectPath::from(new_meta.object_path.as_str());
-                let _ = self.object_store.delete(&orphan).await;
-                continue;
+            let mut prepared = Vec::new();
+            let mut first_err: Option<StorageError> = None;
+            for res in results {
+                match res {
+                    Ok(Some(item)) => prepared.push(item),
+                    Ok(None) => {}
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
             }
 
-            self.pending_gc.lock().extend(superseded_paths);
-            compacted_partitions += 1;
+            if !prepared.is_empty() {
+                let mut accepted_flags = vec![false; prepared.len()];
+                let committed_ok = self
+                    .commit_manifest_cas(|next_manifest| {
+                        let mut any_accepted = false;
+                        for (idx, item) in prepared.iter().enumerate() {
+                            let entry = next_manifest
+                                .active_segments
+                                .entry((item.date, item.bucket_id))
+                                .or_default();
+                            // Verify ALL `source_ids` for this partition are still active before replacing them.
+                            let active_ids: HashSet<&str> =
+                                entry.iter().map(|s| s.segment_id.as_str()).collect();
+                            if item
+                                .source_ids
+                                .iter()
+                                .all(|sid| active_ids.contains(sid.as_str()))
+                            {
+                                entry.retain(|s| !item.source_ids.contains(&s.segment_id));
+                                entry.push(item.new_meta.clone());
+                                accepted_flags[idx] = true;
+                                any_accepted = true;
+                            } else {
+                                accepted_flags[idx] = false;
+                            }
+                        }
+                        if !any_accepted {
+                            return false;
+                        }
+                        next_manifest.dict_snapshot = self.dictionary.snapshot();
+                        true
+                    })
+                    .await?
+                    .is_some();
+
+                if committed_ok {
+                    let mut gc_batch = Vec::new();
+                    for (item, accepted) in prepared.into_iter().zip(accepted_flags) {
+                        if accepted {
+                            gc_batch.extend(item.superseded_paths);
+                            compacted_partitions += 1;
+                        } else {
+                            let orphan = ObjectPath::from(item.new_meta.object_path.as_str());
+                            let _ = self.object_store.delete(&orphan).await;
+                        }
+                    }
+                    if !gc_batch.is_empty() {
+                        self.pending_gc.lock().extend(gc_batch);
+                    }
+                } else {
+                    for item in prepared {
+                        let orphan = ObjectPath::from(item.new_meta.object_path.as_str());
+                        let _ = self.object_store.delete(&orphan).await;
+                    }
+                }
+            }
+
+            drop(part_guards);
+            if let Some(err) = first_err {
+                return Err(err);
+            }
         }
 
         self.run_gc().await?;
@@ -966,6 +1083,7 @@ pub struct StorageEngine {
     encrypted_store: Arc<EncryptedObjectStore>,
     object_store: Arc<dyn ObjectStore>,
     identity_router: Arc<IdentityRouter>,
+    profile_router: Arc<crate::ProfileRouter>,
     segment_reader: Arc<VortexSegmentReader>,
     replay_store: Arc<ReplayStore>,
     projects: DashMap<String, Arc<ProjectStorage>>,
@@ -991,18 +1109,27 @@ impl StorageEngine {
         let wrapped_store: Arc<dyn ObjectStore> = encrypted_store.clone();
         let segment_reader = Arc::new(VortexSegmentReader::new(wrapped_store.clone()));
         let replay_store = Arc::new(ReplayStore::new(wrapped_store.clone()));
+        let profile_router = Arc::new(crate::ProfileRouter::new(
+            wrapped_store.clone(),
+            identity_router.is_read_only(),
+        ));
         Arc::new(Self {
             maintenance_errors: MaintenanceErrors::default(),
             config,
             encrypted_store,
             object_store: wrapped_store,
             identity_router,
+            profile_router,
             segment_reader,
             replay_store,
             projects: DashMap::new(),
             erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
         })
+    }
+
+    pub fn profile_router(&self) -> &Arc<crate::ProfileRouter> {
+        &self.profile_router
     }
 
     pub fn maintenance_errors(&self) -> &MaintenanceErrors {
@@ -1178,12 +1305,7 @@ impl StorageEngine {
                         let projects: Vec<Arc<ProjectStorage>> =
                             engine.projects.iter().map(|e| e.value().clone()).collect();
                         for p in projects {
-                            for b in 0..p.config().num_buckets {
-                                let bid = b as u8;
-                                if p.should_flush_bucket(bid) {
-                                    errs.check(MaintenanceKind::Flush, p.flush_bucket(bid).await);
-                                }
-                            }
+                            errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
                             errs.check(
                                 MaintenanceKind::Compaction,
                                 p.compact_overdue(&engine.segment_reader).await,
@@ -1254,5 +1376,86 @@ mod manifest_retention_tests {
             rows += reader.read_all_rows(seg).await.unwrap().len();
         }
         assert_eq!(rows, 20);
+    }
+
+    #[tokio::test]
+    async fn flush_due_buckets_and_batched_compaction_coalesce_manifest_epochs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let router = IdentityRouter::new(store.clone());
+        let cfg = StorageConfig {
+            num_buckets: 10,
+            l0_flush_row_threshold: 100,
+            l0_flush_max_age: Duration::ZERO,
+            compaction_min_segments: 2,
+        };
+        let ps = ProjectStorage::open_and_recover("p_batch", cfg, store.clone(), &router)
+            .await
+            .unwrap();
+
+        let make_ev = |b: u8, wave: i64| WireEvent {
+            event_uuid: WireEvent::deterministic_uuid(
+                &format!("u_{b}"),
+                &format!("s_{b}"),
+                "click",
+                1_790_000_000_000 + wave * 1_000,
+                (b as u64) * 100 + wave as u64,
+            ),
+            routing_seed: format!("u_{b}"),
+            distinct_id: format!("u_{b}"),
+            session_id: format!("s_{b}"),
+            event_name: "click".into(),
+            client_event_ts_ms: 1_790_000_000_000 + wave * 1_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+
+        // Wave 1: append 1 event to each of 10 buckets, flush all due buckets in ONE epoch.
+        for b in 0..10u8 {
+            let guard = ps.lock_bucket_append(b).await;
+            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 1), b as u32 + 1)])
+                .await
+                .unwrap();
+        }
+        let ep0 = ps.snapshot().epoch();
+        let flushed1 = ps.flush_due_buckets().await.unwrap();
+        assert_eq!(flushed1, 10);
+        let ep1 = ps.snapshot().epoch();
+        assert_eq!(
+            ep1,
+            ep0 + 1,
+            "10 due buckets should commit in 1 manifest epoch"
+        );
+
+        // Wave 2: append another event to each of 10 buckets, flush all due buckets in ONE epoch.
+        for b in 0..10u8 {
+            let guard = ps.lock_bucket_append(b).await;
+            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 2), b as u32 + 1)])
+                .await
+                .unwrap();
+        }
+        let flushed2 = ps.flush_due_buckets().await.unwrap();
+        assert_eq!(flushed2, 10);
+        let ep2 = ps.snapshot().epoch();
+        assert_eq!(ep2, ep1 + 1);
+        assert_eq!(ps.snapshot().manifest.total_l1_rows(), 20);
+
+        // Compaction: all 10 partitions now have 2 segments -> compact all 10 in ONE manifest epoch.
+        let reader = VortexSegmentReader::new(store.clone());
+        let compacted = ps.compact_min_segments(&reader, 2).await.unwrap();
+        assert_eq!(compacted, 10);
+        let ep3 = ps.snapshot().epoch();
+        assert_eq!(
+            ep3,
+            ep2 + 1,
+            "10 compacted partitions (< 32 batch size) should commit in 1 manifest epoch"
+        );
+        let snap = ps.snapshot();
+        assert_eq!(snap.manifest.total_l1_rows(), 20);
+        assert!(snap
+            .manifest
+            .active_segments
+            .values()
+            .all(|segs| segs.len() == 1));
     }
 }
