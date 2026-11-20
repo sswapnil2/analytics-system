@@ -401,7 +401,7 @@ async fn evaluate_window(
             continue;
         }
         let any_series_event = plans.iter().any(|p| {
-            p.tgt.event_ids.first().is_some()
+            !p.tgt.event_ids.is_empty()
                 && seg
                     .footer
                     .may_contain_any_event_ids(&p.tgt.event_ids, p.tgt.bloom_mask_64)
@@ -1121,11 +1121,11 @@ fn aggregate_rows_multi_series(
             }
 
             let b_ts = align_floor_tz_cached(ts, plan.align_unit, tz, &mut tz_caches[s_idx]);
-            if !entry.1.contains_key(&b_ts) {
+            if let std::collections::btree_map::Entry::Vacant(e) = entry.1.entry(b_ts) {
                 if !stop.charge_memory(ACCUM_SLOT_EST_BYTES) {
                     break;
                 }
-                entry.1.insert(b_ts, BucketAccum::new());
+                e.insert(BucketAccum::new());
             }
             entry
                 .1
