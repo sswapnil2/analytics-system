@@ -12,8 +12,8 @@ use roaring::RoaringBitmap;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
 
 use crate::ast::{
-    InsightsMetric, InsightsQuery, InsightsResult, InsightsSeriesSpec, PropPredicate, SeriesOutput,
-    TimeInterval, TimePoint, TimeRange,
+    InsightsMetric, InsightsQuery, InsightsResult, InsightsSeriesSpec, PropPredicate, SamplingInfo,
+    SamplingMode, SeriesOutput, TimeInterval, TimePoint, TimeRange,
 };
 use crate::cache::SegmentBlockCache;
 use crate::catalog::{evaluate_custom_property, UserFilterMask, VirtualCatalog};
@@ -21,6 +21,7 @@ use crate::scanner::{
     align_floor_tz_cached, evaluate_cohort, parallel_segments,
     precompute_segment_row_mask_for_meta, resolve_event_target, resolve_global_cohort_bitmap,
     segment_can_match_preds, ts_to_date_floor, ExecError, ResolvedEventTarget, Result,
+    SamplingPlan,
 };
 
 pub const MAX_TIME_BUCKETS: usize = 10_000;
@@ -42,12 +43,14 @@ impl InsightsEngine {
 
         let tz = catalog.timezone();
         let buckets = build_time_buckets_tz(query.time_range, query.interval, tz)?;
+        let sampling_plan = SamplingPlan::resolve(query.sampling, snap, ps, query.time_range);
 
-        let series = evaluate_window(
+        let (series, sampling_info) = evaluate_window(
             query,
             query.time_range,
             &buckets,
             tz,
+            sampling_plan,
             ps,
             snap,
             id_snap,
@@ -59,18 +62,20 @@ impl InsightsEngine {
         let previous_series = if query.compare_previous_period {
             let prev_range = query.time_range.previous_period();
             let prev_buckets = build_time_buckets_tz(prev_range, query.interval, tz)?;
-            evaluate_window(
+            let (prev_out, _) = evaluate_window(
                 query,
                 prev_range,
                 &prev_buckets,
                 tz,
+                sampling_plan,
                 ps,
                 snap,
                 id_snap,
                 cache,
                 catalog,
             )
-            .await?
+            .await?;
+            prev_out
         } else {
             Vec::new()
         };
@@ -92,6 +97,7 @@ impl InsightsEngine {
             series,
             previous_series,
             formula_series,
+            sampling: Some(sampling_info),
         })
     }
 }
@@ -202,12 +208,13 @@ async fn evaluate_window(
     range: TimeRange,
     buckets: &[i64],
     tz: Tz,
+    sampling_plan: SamplingPlan,
     ps: &ProjectStorage,
     snap: &StorageSnapshot,
     id_snap: &IdentitySnapshot,
     cache: &SegmentBlockCache,
     catalog: &VirtualCatalog,
-) -> Result<Vec<SeriesOutput>> {
+) -> Result<(Vec<SeriesOutput>, SamplingInfo)> {
     crate::budget::check_current()?;
 
     let max_lookback_ms = query
@@ -311,6 +318,10 @@ async fn evaluate_window(
         .as_ref()
         .is_some_and(UserFilterMask::is_definitely_empty)
     {
+        let exact_plan = SamplingPlan::exact(
+            sampling_plan.total_buckets,
+            sampling_plan.estimated_total_rows,
+        );
         return finalize_series_outputs(
             &plans,
             series_groups,
@@ -319,12 +330,17 @@ async fn evaluate_window(
             buckets,
             tz,
             &breakdown_dims,
+            exact_plan,
         );
     }
 
     let erased = ps.erased_snapshot();
     let has_any_non_empty_target = plans.iter().any(|p| !p.tgt.event_ids.is_empty());
     if !has_any_non_empty_target {
+        let exact_plan = SamplingPlan::exact(
+            sampling_plan.total_buckets,
+            sampling_plan.estimated_total_rows,
+        );
         return finalize_series_outputs(
             &plans,
             series_groups,
@@ -333,6 +349,7 @@ async fn evaluate_window(
             buckets,
             tz,
             &breakdown_dims,
+            exact_plan,
         );
     }
 
@@ -393,15 +410,33 @@ async fn evaluate_window(
                 && !p.is_rolling
         });
 
+    // Option 1: Unfiltered `Totals` served by the 0-I/O footer fast path is always sub-10ms exact,
+    // so never auto-sample it (explicit `SamplingMode::Rate(_)` still honors the caller's request).
+    let effective_plan =
+        if all_series_footer_totals_eligible && matches!(query.sampling, SamplingMode::Auto) {
+            SamplingPlan::exact(
+                sampling_plan.total_buckets,
+                sampling_plan.estimated_total_rows,
+            )
+        } else {
+            sampling_plan
+        };
+    let bucket_limit = effective_plan.bucket_limit();
+
     let mut scan_segments: Vec<SegmentMeta> = Vec::new();
     for seg in all_segments {
+        if let Some(lim) = bucket_limit {
+            if u16::from(seg.bucket_id) >= lim {
+                continue;
+            }
+        }
         if seg.footer.max_ts_ms < scan_range.start_ts_ms
             || seg.footer.min_ts_ms > scan_range.end_ts_ms
         {
             continue;
         }
         let any_series_event = plans.iter().any(|p| {
-            p.tgt.event_ids.first().is_some()
+            !p.tgt.event_ids.is_empty()
                 && seg
                     .footer
                     .may_contain_any_event_ids(&p.tgt.event_ids, p.tgt.bloom_mask_64)
@@ -518,7 +553,10 @@ async fn evaluate_window(
 
     // 3. Single-pass scan over hot L0 `MemBucket`s.
     let props_vec: Vec<String> = non_user_props_needed.iter().cloned().collect();
-    for b in 0..ps.config().num_buckets {
+    let max_bucket = bucket_limit
+        .unwrap_or(ps.config().num_buckets)
+        .min(ps.config().num_buckets);
+    for b in 0..max_bucket {
         crate::budget::check_current()?;
         let bucket_id = b as u8;
         let l0_rows: Vec<StoredRow> = ps
@@ -636,6 +674,7 @@ async fn evaluate_window(
         buckets,
         tz,
         &breakdown_dims,
+        effective_plan,
     )
 }
 
@@ -1121,11 +1160,11 @@ fn aggregate_rows_multi_series(
             }
 
             let b_ts = align_floor_tz_cached(ts, plan.align_unit, tz, &mut tz_caches[s_idx]);
-            if !entry.1.contains_key(&b_ts) {
+            if let std::collections::btree_map::Entry::Vacant(e) = entry.1.entry(b_ts) {
                 if !stop.charge_memory(ACCUM_SLOT_EST_BYTES) {
                     break;
                 }
-                entry.1.insert(b_ts, BucketAccum::new());
+                e.insert(BucketAccum::new());
             }
             entry
                 .1
@@ -1164,6 +1203,32 @@ fn merge_breakdown_maps(
     Ok(())
 }
 
+#[inline]
+fn scale_metric_value(
+    metric: &InsightsMetric,
+    val: Option<f64>,
+    plan: SamplingPlan,
+) -> Option<f64> {
+    if !plan.is_sampled() {
+        return val;
+    }
+    let v = val?;
+    match metric {
+        InsightsMetric::Uniques
+        | InsightsMetric::Totals
+        | InsightsMetric::Sessions
+        | InsightsMetric::Dau
+        | InsightsMetric::Wau
+        | InsightsMetric::Mau => Some((v * plan.scale_factor()).round()),
+        InsightsMetric::PropSum { .. } => Some(v * plan.scale_factor()),
+        InsightsMetric::PropAvg { .. }
+        | InsightsMetric::PropMin { .. }
+        | InsightsMetric::PropMax { .. }
+        | InsightsMetric::PropPercentile { .. } => Some(v),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finalize_series_outputs(
     plans: &[SeriesPlan<'_>],
     series_groups: Vec<BTreeMap<String, BreakdownGroup>>,
@@ -1172,8 +1237,10 @@ fn finalize_series_outputs(
     buckets: &[i64],
     tz: Tz,
     breakdown_dims: &[String],
-) -> Result<Vec<SeriesOutput>> {
+    sampling_plan: SamplingPlan,
+) -> Result<(Vec<SeriesOutput>, SamplingInfo)> {
     let mut all_outputs = Vec::new();
+    let mut sample_count_basis = 0u64;
     for (plan, mut groups) in plans.iter().zip(series_groups.into_iter()) {
         crate::budget::check_current()?;
         if breakdown_dims.is_empty() {
@@ -1210,9 +1277,14 @@ fn finalize_series_outputs(
 
         for (bkey, (overall_acc, per_bucket)) in group_vec {
             crate::budget::check_current()?;
+            sample_count_basis = sample_count_basis.saturating_add(if plan.metric_mask.users {
+                overall_acc.users.len()
+            } else {
+                overall_acc.totals
+            });
             let mut points = Vec::with_capacity(buckets.len());
             for &bts in buckets {
-                let val = match plan.spec.metric {
+                let raw_val = match plan.spec.metric {
                     InsightsMetric::Wau | InsightsMetric::Mau => {
                         let window_days = if matches!(plan.spec.metric, InsightsMetric::Wau) {
                             7i64
@@ -1240,13 +1312,17 @@ fn finalize_series_outputs(
                 };
                 points.push(TimePoint {
                     bucket_ts_ms: bts,
-                    value: val,
+                    value: scale_metric_value(&plan.spec.metric, raw_val, sampling_plan),
                 });
             }
             let overall_value = if plan.is_rolling {
                 points.last().and_then(|p| p.value).or(Some(0.0))
             } else {
-                overall_acc.finish(&plan.spec.metric)
+                scale_metric_value(
+                    &plan.spec.metric,
+                    overall_acc.finish(&plan.spec.metric),
+                    sampling_plan,
+                )
             };
 
             all_outputs.push(SeriesOutput {
@@ -1257,7 +1333,7 @@ fn finalize_series_outputs(
             });
         }
     }
-    Ok(all_outputs)
+    Ok((all_outputs, sampling_plan.to_info(sample_count_basis)))
 }
 
 #[derive(Clone, Copy)]

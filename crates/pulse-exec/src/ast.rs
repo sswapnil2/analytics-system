@@ -467,6 +467,34 @@ pub struct InsightsSeriesSpec {
     pub filters: Vec<PropPredicate>,
 }
 
+/// Controls whether long/heavy queries may use deterministic entity-bucket sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingMode {
+    /// Exact when fast; automatically samples deterministic entity buckets on large ranges.
+    #[default]
+    Auto,
+    /// Always scan 100% of entity buckets (exact).
+    Exact,
+    /// Explicit target sample rate in `(0.0, 1.0]` (e.g. `{"rate": 0.125}` for 12.5%).
+    Rate(f64),
+}
+
+/// Transparency metadata attached to query responses describing whether sampling was applied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SamplingInfo {
+    pub is_sampled: bool,
+    pub sample_rate: f64,
+    pub sampled_buckets: u16,
+    pub total_buckets: u16,
+    pub scale_factor: f64,
+    pub estimated_total_rows: u64,
+    /// Approximate 95% relative margin of error in percent (e.g. `0.8` means `±0.8%`),
+    /// or `None` when exact or when sample count is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_error_pct: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InsightsQuery {
     pub time_range: TimeRange,
@@ -481,6 +509,8 @@ pub struct InsightsQuery {
     pub compare_previous_period: bool,
     #[serde(default)]
     pub formula: Option<String>,
+    #[serde(default)]
+    pub sampling: SamplingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +535,8 @@ pub struct InsightsResult {
     pub series: Vec<SeriesOutput>,
     pub previous_series: Vec<SeriesOutput>,
     pub formula_series: Vec<SeriesOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingInfo>,
 }
 
 // ======================= FUNNELS =======================
@@ -572,6 +604,8 @@ pub struct FunnelQuery {
     pub breakdown_by: Option<String>,
     #[serde(default)]
     pub global_filter: GlobalFilter,
+    #[serde(default)]
+    pub sampling: SamplingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +658,8 @@ pub struct FunnelResult {
     /// `QueryEngine::query_funnel_dropped_users` turns one step into an id list.
     #[serde(skip)]
     pub dropped_uids_by_step: Vec<roaring::RoaringBitmap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingInfo>,
 }
 
 // ======================= RETENTION =======================
@@ -673,6 +709,8 @@ pub struct RetentionQuery {
     pub num_periods: usize,
     #[serde(default)]
     pub global_filter: GlobalFilter,
+    #[serde(default)]
+    pub sampling: SamplingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,6 +728,8 @@ pub struct RetentionResult {
     pub exec_time_us: u64,
     pub mode: RetentionMode,
     pub cohorts: Vec<RetentionCohortRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingInfo>,
 }
 
 // ======================= FLOWS =======================
@@ -732,6 +772,8 @@ pub struct FlowsQuery {
     pub top_n_per_step: Option<usize>,
     #[serde(default)]
     pub global_filter: GlobalFilter,
+    #[serde(default)]
+    pub sampling: SamplingMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +797,8 @@ pub struct FlowsResult {
     pub exec_time_us: u64,
     pub nodes: Vec<FlowNode>,
     pub links: Vec<FlowLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingInfo>,
 }
 
 // ======================= SESSIONS EXPLORER =======================

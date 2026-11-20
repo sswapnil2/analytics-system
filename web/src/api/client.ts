@@ -65,6 +65,18 @@ export interface SeriesOutput {
   points: TimePoint[];
 }
 
+export type SamplingMode = "auto" | "exact" | { rate: number };
+
+export interface SamplingInfo {
+  is_sampled: boolean;
+  sample_rate: number;
+  sampled_buckets: number;
+  total_buckets: number;
+  scale_factor: number;
+  estimated_total_rows: number;
+  relative_error_pct?: number;
+}
+
 export interface InsightsResult {
   snapshot_epoch: number;
   exec_time_us: number;
@@ -72,6 +84,7 @@ export interface InsightsResult {
   series: SeriesOutput[];
   previous_series: SeriesOutput[];
   formula_series: SeriesOutput[];
+  sampling?: SamplingInfo;
 }
 
 export interface FunnelStepCount {
@@ -112,6 +125,7 @@ export interface FunnelResult {
     histogram_bins: [number, number, number][];
   };
   dropped_sample_sessions: DroppedSessionSample[];
+  sampling?: SamplingInfo;
 }
 
 export interface FlowNode {
@@ -132,6 +146,7 @@ export interface FlowsResult {
   exec_time_us: number;
   nodes: FlowNode[];
   links: FlowLink[];
+  sampling?: SamplingInfo;
 }
 
 export interface RetentionCohortRow {
@@ -147,6 +162,7 @@ export interface RetentionResult {
   exec_time_us: number;
   mode: string;
   cohorts: RetentionCohortRow[];
+  sampling?: SamplingInfo;
 }
 
 export interface SessionSummaryItem {

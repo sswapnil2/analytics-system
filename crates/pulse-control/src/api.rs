@@ -4314,6 +4314,7 @@ async fn handle_get_revenue_summary(
         global_filter: Default::default(),
         compare_previous_period: false,
         formula: None,
+        sampling: Default::default(),
     };
     let ins_opt = ctrl.qengine.query_insights(&id, &iq).await.ok();
 
@@ -4372,6 +4373,7 @@ impl ControlPlaneService {
             global_filter: Default::default(),
             compare_previous_period: false,
             formula: None,
+            sampling: Default::default(),
         };
         self.qengine
             .query_insights(&a.project_id, &iq)

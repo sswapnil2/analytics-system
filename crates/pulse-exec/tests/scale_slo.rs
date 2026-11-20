@@ -350,6 +350,7 @@ async fn scale_latency_percentiles_and_slo_harness() {
         hold_constant_props: vec!["city".to_string()],
         breakdown_by: Some("payment_method".to_string()),
         global_filter: GlobalFilter::default(),
+        sampling: Default::default(),
     };
 
     let insights_query = InsightsQuery {
@@ -376,6 +377,7 @@ async fn scale_latency_percentiles_and_slo_harness() {
         global_filter: GlobalFilter::default(),
         compare_previous_period: false,
         formula: Some("(B / A) * 100".to_string()),
+        sampling: Default::default(),
     };
 
     let retention_query = RetentionQuery {
@@ -386,6 +388,7 @@ async fn scale_latency_percentiles_and_slo_harness() {
         unit: TimeInterval::Day,
         num_periods: 14,
         global_filter: GlobalFilter::default(),
+        sampling: Default::default(),
     };
 
     let flows_query = FlowsQuery {
@@ -395,6 +398,7 @@ async fn scale_latency_percentiles_and_slo_harness() {
         steps: 5,
         top_n_per_step: Some(10),
         global_filter: GlobalFilter::default(),
+        sampling: Default::default(),
     };
 
     // 1. Cold 5-step Funnel (fresh QueryEngine with empty cache per iteration)
@@ -1056,6 +1060,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             global_filter: GlobalFilter::default(),
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1075,6 +1080,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             global_filter: GlobalFilter::default(),
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1097,6 +1103,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             },
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1119,6 +1126,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             },
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1138,6 +1146,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             global_filter: GlobalFilter::default(),
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1171,6 +1180,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
             global_filter: GlobalFilter::default(),
             formula: None,
             compare_previous_period: false,
+            sampling: Default::default(),
         },
     )
     .await;
@@ -1206,6 +1216,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
         hold_constant_props: Vec::new(),
         breakdown_by: None,
         global_filter: GlobalFilter::default(),
+        sampling: Default::default(),
     };
     let tf1 = Instant::now();
     let rf1 = qengine.query_funnel(project_id, &fq).await;
@@ -1259,6 +1270,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
                 global_filter: GlobalFilter::default(),
                 formula: None,
                 compare_previous_period: false,
+                sampling: Default::default(),
             },
         )
         .await;

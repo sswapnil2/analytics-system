@@ -471,6 +471,7 @@ async fn invoke_tool(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     formula: None,
+                    sampling: Default::default(),
                 }
             };
             let known = known_event_names(project_id, meta, qengine).await?;
@@ -532,6 +533,7 @@ async fn invoke_tool(
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 }
             };
             let known = known_event_names(project_id, meta, qengine).await?;
@@ -579,6 +581,7 @@ async fn invoke_tool(
                 unit: TimeInterval::Day,
                 num_periods,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_retention(project_id, &q)
@@ -652,6 +655,7 @@ async fn invoke_tool(
                         .clamp(1, 20) as usize,
                 ),
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_flows(project_id, &q)
@@ -754,6 +758,7 @@ async fn invoke_tool(
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_insights(project_id, &q)

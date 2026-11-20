@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, InsightsResult, isAbortError, SeriesOutput } from "../api/client";
+import { api, InsightsResult, isAbortError, SamplingMode, SeriesOutput } from "../api/client";
 import { buildCsv } from "../lib/csv";
 import { downloadTextFile, errorMessage, formatDate, formatDateTime, humanizeEvent, segmentName } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
@@ -14,8 +14,8 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
   SortHeader,
   useSort,
@@ -237,6 +237,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
     { query: buildQuery, range },
   );
 
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
+
   const buildQueryRef = useRef(buildQuery);
   buildQueryRef.current = buildQuery;
 
@@ -254,7 +256,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
     try {
       const res = await api.queryInsights(
         projectId,
-        { time_range: rangeFor(range), ...buildQueryRef.current(debouncedFormula) },
+        { time_range: rangeFor(range), ...buildQueryRef.current(debouncedFormula), sampling: samplingMode },
         ctrl.signal,
       );
       if (id === reqId.current && !ctrl.signal.aborted)
@@ -268,7 +270,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, interval, series, debouncedFormula, breakdown, comparePrev, filter, safeCurrency, range]);
+  }, [projectId, interval, series, debouncedFormula, breakdown, comparePrev, filter, safeCurrency, range, samplingMode]);
 
   useEffect(() => {
     void runQuery();
@@ -588,7 +590,15 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
       <Panel
         title={kind === "number" ? "For the whole period" : kind === "pie" ? "Share of the whole period" : "Over time"}
-        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        meta={
+          <SamplingMeta
+            sampling={result?.sampling}
+            mode={samplingMode}
+            onChangeMode={setSamplingMode}
+            us={result?.exec_time_us}
+            loading={loading && !!result}
+          />
+        }
         actions={
           <>
             {kind !== "pie" && kind !== "number" && (

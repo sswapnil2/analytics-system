@@ -4,7 +4,7 @@ import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { fromGlobalFilter } from "../components/FilterPanel";
 import { PropertyPicker } from "../components/PropertyPicker";
 import { GitBranch, RefreshCw } from "lucide-react";
-import { api, FlowsResult, isAbortError } from "../api/client";
+import { api, FlowsResult, isAbortError, SamplingMode } from "../api/client";
 import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
 import {
   btn,
@@ -13,8 +13,8 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, toGlobalFilter } from "../components/FilterPanel";
@@ -89,6 +89,8 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
     { query: buildQuery, range },
   );
 
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
+
   const runFlows = useCallback(async () => {
     if (!anchorEvent) {
       setResult(null);
@@ -101,14 +103,14 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
     setLoading(true);
     setError(null);
     try {
-      const res = await api.queryFlows(projectId, { time_range: rangeFor(range), ...buildQuery() }, ctrl.signal);
+      const res = await api.queryFlows(projectId, { time_range: rangeFor(range), ...buildQuery(), sampling: samplingMode }, ctrl.signal);
       if (id === reqId.current && !ctrl.signal.aborted) setResult(res);
     } catch (err) {
       if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, anchorEvent, buildQuery, range]);
+  }, [projectId, anchorEvent, buildQuery, range, samplingMode]);
 
   useEffect(() => {
     void runFlows();
@@ -364,7 +366,15 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
 
       <Panel
         title="Paths"
-        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        meta={
+          <SamplingMeta
+            sampling={result?.sampling}
+            mode={samplingMode}
+            onChangeMode={setSamplingMode}
+            us={result?.exec_time_us}
+            loading={loading && !!result}
+          />
+        }
       >
         {sankey?.onlySystem ? (
           <EmptyState

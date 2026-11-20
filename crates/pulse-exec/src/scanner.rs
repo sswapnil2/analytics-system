@@ -15,7 +15,8 @@ use roaring::RoaringBitmap;
 use thiserror::Error;
 
 use crate::ast::{
-    BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, TimeInterval, TimeRange,
+    BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, SamplingInfo, SamplingMode,
+    TimeInterval, TimeRange,
 };
 use crate::cache::{prop_col_approx_bytes, SegmentBlockCache, TierAColumns};
 use crate::catalog::{evaluate_custom_property, VirtualCatalog};
@@ -253,6 +254,166 @@ pub async fn load_project_chunks(
 /// Variant of `load_project_chunks` carrying `id_snap` so user profile properties (`user.*`)
 /// and DPDP erasure tombstones resolve consistently across pre-login and post-login events (`Gaps 1, 4`).
 #[allow(clippy::too_many_arguments)]
+/// Minimum estimated rows in the queried time range before `SamplingMode::Auto` engages
+/// deterministic entity-bucket sampling. Override with `PULSE_AUTO_SAMPLE_MIN_ROWS`.
+pub const DEFAULT_AUTO_SAMPLE_MIN_ROWS: u64 = 10_000_000;
+
+fn auto_sample_min_rows() -> u64 {
+    std::env::var("PULSE_AUTO_SAMPLE_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_AUTO_SAMPLE_MIN_ROWS)
+}
+
+/// Deterministic entity-bucket sampling plan resolved at query start from manifest metadata.
+///
+/// Because Pulse routes every event for a user to `xxh3_64(routing_seed) % num_buckets`,
+/// scanning buckets `0..sampled_buckets` yields an unbiased, user-consistent sample of
+/// fraction `sampled_buckets / total_buckets` across Insights, Funnels, Retention, and Flows.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingPlan {
+    pub total_buckets: u16,
+    pub sampled_buckets: u16,
+    pub estimated_total_rows: u64,
+}
+
+impl SamplingPlan {
+    pub fn exact(total_buckets: u16, estimated_total_rows: u64) -> Self {
+        let tb = total_buckets.max(1);
+        Self {
+            total_buckets: tb,
+            sampled_buckets: tb,
+            estimated_total_rows,
+        }
+    }
+
+    pub fn resolve(
+        mode: SamplingMode,
+        snap: &StorageSnapshot,
+        ps: &ProjectStorage,
+        time_range: TimeRange,
+    ) -> Self {
+        let total_buckets = ps.config().num_buckets.max(1);
+        let start_date = ts_to_date_floor(time_range.start_ts_ms);
+        let end_date = ts_to_date_floor(time_range.end_ts_ms);
+        let l1_rows: u64 = snap
+            .segments_for_range(start_date, end_date, None)
+            .into_iter()
+            .filter(|seg| {
+                seg.footer.max_ts_ms >= time_range.start_ts_ms
+                    && seg.footer.min_ts_ms <= time_range.end_ts_ms
+            })
+            .map(|seg| u64::from(seg.footer.row_count))
+            .sum();
+        let estimated_total_rows = l1_rows.saturating_add(ps.total_l0_rows() as u64);
+
+        if total_buckets <= 1 {
+            return Self::exact(total_buckets, estimated_total_rows);
+        }
+
+        match mode {
+            SamplingMode::Exact => Self::exact(total_buckets, estimated_total_rows),
+            SamplingMode::Rate(r) => {
+                if !r.is_finite() || r >= 1.0 {
+                    Self::exact(total_buckets, estimated_total_rows)
+                } else {
+                    let clamped = r.clamp(1.0 / (total_buckets as f64), 1.0);
+                    let k = ((total_buckets as f64) * clamped)
+                        .round()
+                        .clamp(1.0, total_buckets as f64) as u16;
+                    Self {
+                        total_buckets,
+                        sampled_buckets: k,
+                        estimated_total_rows,
+                    }
+                }
+            }
+            SamplingMode::Auto => {
+                let min_rows = auto_sample_min_rows();
+                if estimated_total_rows < min_rows {
+                    return Self::exact(total_buckets, estimated_total_rows);
+                }
+                let target_rate = if estimated_total_rows < min_rows.saturating_mul(4) {
+                    0.25
+                } else if estimated_total_rows < min_rows.saturating_mul(10) {
+                    0.125
+                } else {
+                    0.0625
+                };
+                let k = ((total_buckets as f64) * target_rate)
+                    .round()
+                    .clamp(1.0, total_buckets as f64) as u16;
+                Self {
+                    total_buckets,
+                    sampled_buckets: k,
+                    estimated_total_rows,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_sampled(&self) -> bool {
+        self.sampled_buckets < self.total_buckets
+    }
+
+    #[inline]
+    pub fn bucket_limit(&self) -> Option<u16> {
+        self.is_sampled().then_some(self.sampled_buckets)
+    }
+
+    #[inline]
+    pub fn scale_factor(&self) -> f64 {
+        (self.total_buckets as f64) / (self.sampled_buckets.max(1) as f64)
+    }
+
+    #[inline]
+    pub fn sample_rate(&self) -> f64 {
+        (self.sampled_buckets as f64) / (self.total_buckets.max(1) as f64)
+    }
+
+    #[inline]
+    pub fn scale_u64(&self, raw: u64) -> u64 {
+        if !self.is_sampled() {
+            raw
+        } else {
+            ((raw as f64) * self.scale_factor()).round() as u64
+        }
+    }
+
+    #[inline]
+    pub fn scale_f64(&self, raw: f64) -> f64 {
+        if !self.is_sampled() {
+            raw
+        } else {
+            raw * self.scale_factor()
+        }
+    }
+
+    /// Builds response `SamplingInfo` with a finite-population 95% relative margin of error
+    /// computed from `sample_count_basis` (the unscaled count of matching events/users in the sample).
+    pub fn to_info(&self, sample_count_basis: u64) -> SamplingInfo {
+        let p = self.sample_rate();
+        let relative_error_pct = if self.is_sampled() && sample_count_basis > 0 {
+            let moe = 196.0 * ((1.0 - p) / (sample_count_basis as f64)).sqrt();
+            Some((moe * 10.0).round() / 10.0)
+        } else {
+            None
+        };
+        SamplingInfo {
+            is_sampled: self.is_sampled(),
+            sample_rate: p,
+            sampled_buckets: self.sampled_buckets,
+            total_buckets: self.total_buckets,
+            scale_factor: self.scale_factor(),
+            estimated_total_rows: self.estimated_total_rows,
+            relative_error_pct,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn load_project_chunks_with_id(
     ps: &ProjectStorage,
     snap: &StorageSnapshot,
@@ -262,6 +423,32 @@ pub async fn load_project_chunks_with_id(
     requested_props: &[String],
     event_bloom_hint: Option<u64>,
     id_snap: Option<&IdentitySnapshot>,
+) -> Result<Vec<DataChunk>> {
+    load_project_chunks_sampled(
+        ps,
+        snap,
+        cache,
+        catalog,
+        time_range,
+        requested_props,
+        event_bloom_hint,
+        id_snap,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn load_project_chunks_sampled(
+    ps: &ProjectStorage,
+    snap: &StorageSnapshot,
+    cache: &SegmentBlockCache,
+    catalog: &VirtualCatalog,
+    time_range: Option<TimeRange>,
+    requested_props: &[String],
+    event_bloom_hint: Option<u64>,
+    id_snap: Option<&IdentitySnapshot>,
+    bucket_limit: Option<u16>,
 ) -> Result<Vec<DataChunk>> {
     let dict = ps.dictionary();
     let erased = ps.erased_snapshot();
@@ -310,6 +497,11 @@ pub async fn load_project_chunks_with_id(
     let filtered_segments: Vec<SegmentMeta> = segments
         .into_iter()
         .filter(|seg| {
+            if let Some(lim) = bucket_limit {
+                if u16::from(seg.bucket_id) >= lim {
+                    return false;
+                }
+            }
             if let Some(tr) = time_range {
                 if seg.footer.max_ts_ms < tr.start_ts_ms || seg.footer.min_ts_ms > tr.end_ts_ms {
                     return false;
@@ -437,7 +629,10 @@ pub async fn load_project_chunks_with_id(
         .await?;
 
     // Append L0 hot `MemBucket` rows per bucket within MVCC snapshot watermark
-    for b in 0..ps.config().num_buckets {
+    let max_bucket = bucket_limit
+        .unwrap_or(ps.config().num_buckets)
+        .min(ps.config().num_buckets);
+    for b in 0..max_bucket {
         if let Some(ctx) = &ctx_opt {
             ctx.check()?;
         }

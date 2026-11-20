@@ -244,6 +244,7 @@ async fn evaluate_metric_for_experiment(
         hold_constant_props: Vec::new(),
         breakdown_by: Some("variant".to_string()),
         global_filter: pulse_exec::GlobalFilter::default(),
+        sampling: pulse_exec::SamplingMode::Exact,
     };
 
     let mut counts_by_variant: BTreeMap<String, (u64, u64)> = BTreeMap::new();
