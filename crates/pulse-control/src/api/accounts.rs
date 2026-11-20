@@ -982,6 +982,14 @@ mod tests {
             r(Method::POST, "/v1/projects/:id/some-new-write"),
             Role::Member
         );
+        assert_eq!(
+            r(Method::PUT, "/v1/projects/:id/cohorts/:cohort_id"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/cohorts/:cohort_id"),
+            Role::Member
+        );
         assert_eq!(r(Method::GET, "/v1/projects/:id/api-keys"), Role::Admin);
         assert_eq!(
             r(Method::GET, "/v1/projects/:id/cohorts/:cohort_id/export"),
