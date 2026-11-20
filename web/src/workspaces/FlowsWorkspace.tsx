@@ -76,7 +76,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
     () => ({ anchor_event: anchorEvent, direction, steps, global_filter: toGlobalFilter(filter) }),
     [anchorEvent, direction, steps, filter],
   );
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { anchor_event?: string; direction?: "forward" | "reverse"; steps?: number; global_filter?: unknown };
@@ -276,7 +276,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
         actions={
           <>
           <RangePresets value={range} onChange={setRange} />
-          <SaveToDashboard projectId={projectId} kind="flows" defaultName={pageTitle} query={buildQuery} />
+          <SaveToDashboard saved={savedReport} projectId={projectId} kind="flows" defaultName={pageTitle} query={buildQuery} />
           <button type="button" onClick={() => void runFlows()} disabled={loading} className={btn.ghost} aria-label="Refresh results">
             <RefreshCw className={`h-4 w-4 ${loading ? "motion-safe:animate-spin" : ""}`} />
           </button>

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { LayoutDashboard } from "lucide-react";
+import { Check, LayoutDashboard } from "lucide-react";
 import { api, Dashboard, ReportKind } from "../api/client";
 import { btn, field, fieldLabel } from "../components/ui";
 import { errorMessage } from "../lib/format";
@@ -18,7 +18,9 @@ export const SaveToDashboard: React.FC<{
   kind: ReportKind;
   defaultName: string;
   query: () => Record<string, unknown>;
-}> = ({ projectId, kind, defaultName, query }) => {
+  /** The saved report this page was opened from, if any (from `useSavedReport`). */
+  saved?: SavedState | null;
+}> = ({ projectId, kind, defaultName, query, saved }) => {
   const { canEdit } = useAccess();
   const [open, setOpen] = useState(false);
   const [dashboards, setDashboards] = useState<Dashboard[] | null>(null);
@@ -63,8 +65,7 @@ export const SaveToDashboard: React.FC<{
     setBusy(true);
     setError(null);
     try {
-      const { time_range: _omit, ...q } = query();
-      void _omit;
+      const q = withoutRange(query());
       const report = await api.createReport(projectId, { name: name.trim(), report_kind: kind, query_json: q });
       const card = { kind: "report" as const, report_id: report.id, width: 1 as const };
       let dash: Dashboard;
@@ -86,12 +87,19 @@ export const SaveToDashboard: React.FC<{
     }
   };
 
-  if (!canEdit) return null;
+  if (!canEdit) return saved ? <SavedBadge saved={saved} /> : null;
   return (
+    <>
+    {saved && <SavedBadge saved={saved} canEdit />}
     <div className="relative" ref={panelRef}>
-      <button type="button" onClick={() => setOpen((v) => !v)} className={btn.secondary} aria-expanded={open}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={btn.secondary}
+        aria-expanded={open}
+      >
         <LayoutDashboard className="h-4 w-4" />
-        Save to dashboard
+        {saved ? "Save a copy" : "Save to dashboard"}
       </button>
       {open && (
         <div
@@ -159,7 +167,50 @@ export const SaveToDashboard: React.FC<{
         </div>
       )}
     </div>
+    </>
   );
+};
+
+/** "Saved report · Name", or "Unsaved changes" with a Save button that updates it in place. */
+const SavedBadge: React.FC<{ saved: SavedState; canEdit?: boolean }> = ({ saved, canEdit }) => (
+  <div className="flex min-w-0 items-center gap-2 text-sm" role="status">
+    {saved.dirty ? (
+      <>
+        <span className="flex items-center gap-1.5 whitespace-nowrap text-muted">
+          <span className="h-2 w-2 rounded-full bg-warn" aria-hidden="true" />
+          Unsaved changes
+        </span>
+        {canEdit && (
+          <button type="button" className={btn.primary} disabled={saved.saving} onClick={() => void saved.save()}>
+            {saved.saving ? "Saving…" : "Save"}
+          </button>
+        )}
+      </>
+    ) : (
+      <span className="flex min-w-0 items-center gap-1.5 text-muted" title={saved.name}>
+        <Check className="h-4 w-4 shrink-0 text-ok" aria-hidden="true" />
+        <span className="truncate">Saved as {saved.name}</span>
+      </span>
+    )}
+    {saved.error && <span className="text-danger">{saved.error}</span>}
+  </div>
+);
+
+export interface SavedState {
+  id: string;
+  name: string;
+  /** The query differs from what is saved. */
+  dirty: boolean;
+  saving: boolean;
+  error: string | null;
+  save: () => Promise<void>;
+}
+
+/** Saved reports don't keep a date range; the page or dashboard supplies one. */
+const withoutRange = (q: Record<string, unknown>) => {
+  const { time_range: _omit, ...rest } = q;
+  void _omit;
+  return rest;
 };
 
 const encodeQuery = (q: Record<string, unknown>): string => {
@@ -195,13 +246,18 @@ export function useSavedReport(
   apply: (query: Record<string, unknown>) => void,
   setRange: (r: RangeSel) => void,
   current?: { query: () => Record<string, unknown>; range: RangeSel },
-): string | null {
+): { error: string | null; saved: SavedState | null } {
   const [error, setError] = useState<string | null>(null);
+  // The saved report this page was opened from, and its query as this page encodes it.
+  const [report, setReport] = useState<{ id: string; name: string; baseline: string | null } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const applyRef = useRef(apply);
   applyRef.current = apply;
   const restored = useRef(false);
   useEffect(() => {
     restored.current = false;
+    setReport(null);
     const params = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
     const id = params.get("report");
     const range = params.get("range");
@@ -222,8 +278,12 @@ export function useSavedReport(
       .then((list) => {
         if (!live) return;
         const r = list.find((x) => x.id === id);
-        if (r) applyRef.current(r.query_json);
-        else setError("That saved report was deleted. Showing a new report instead.");
+        if (r) {
+          applyRef.current(r.query_json);
+          // The baseline is taken from the page after it applies the query (see below), so
+          // defaults the page fills in don't count as changes.
+          setReport({ id: r.id, name: r.name, baseline: null });
+        } else setError("That saved report was deleted. Showing a new report instead.");
       })
       .catch((err) => live && setError(`Couldn't open the saved report: ${errorMessage(err)}`))
       .finally(() => {
@@ -236,18 +296,41 @@ export function useSavedReport(
   }, [projectId]);
 
   const encoded = current ? encodeQuery(current.query()) : "";
+  const stored = current ? encodeQuery(withoutRange(current.query())) : "";
   const range = current?.range;
+  useEffect(() => {
+    if (report && report.baseline === null && restored.current) setReport({ ...report, baseline: stored });
+  }, [report, stored]);
   useEffect(() => {
     // Wait until a saved report has loaded, or the defaults would replace its id in the URL.
     if (!current || !restored.current) return;
     const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
     const params = new URLSearchParams(search);
-    params.delete("report");
+    // Keep the saved report's id so a reload still knows what "Save" updates.
+    if (report) params.set("report", report.id);
+    else params.delete("report");
     params.set("q", encoded);
     if (range) params.set("range", range);
     const next = `#${path}?${params.toString()}`;
     if (next !== window.location.hash) window.history.replaceState(null, "", next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [encoded, range]);
-  return error;
+  }, [encoded, range, report?.id]);
+
+  const save = async () => {
+    if (!report || !current) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await api.updateReport(projectId, report.id, { name: report.name, query_json: withoutRange(current.query()) });
+      setReport({ ...report, baseline: stored });
+    } catch (err) {
+      setSaveError(`Couldn't save: ${errorMessage(err)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+  const saved: SavedState | null = report
+    ? { id: report.id, name: report.name, dirty: report.baseline !== null && report.baseline !== stored, saving, error: saveError, save }
+    : null;
+  return { error, saved };
 }

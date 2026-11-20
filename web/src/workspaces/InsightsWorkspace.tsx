@@ -210,7 +210,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const queryAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
@@ -381,7 +381,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="insights"
               defaultName={reportTitle}

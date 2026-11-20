@@ -139,7 +139,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const funnelAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { steps?: { event_name: string; filters?: unknown }[]; order_mode?: OrderMode; conversion_window_ms?: number;
@@ -236,7 +236,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="funnel"
               defaultName={reportTitle}

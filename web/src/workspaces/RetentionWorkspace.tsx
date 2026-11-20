@@ -129,7 +129,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const retAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { start_event?: string; return_event?: string; mode?: Mode; num_periods?: number; unit?: Unit; split_by?: string; compare_to?: string };
@@ -227,7 +227,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="retention"
               defaultName={reportTitle}

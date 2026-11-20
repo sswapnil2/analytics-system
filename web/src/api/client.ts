@@ -785,6 +785,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  updateReport: (projectId: string, reportId: string, body: { name: string; query_json: unknown }) =>
+    fetchJson<SavedReport>(
+      `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
   deleteReport: (projectId: string, reportId: string) =>
     fetchJson<unknown>(
       `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
