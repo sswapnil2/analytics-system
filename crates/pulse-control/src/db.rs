@@ -1075,6 +1075,16 @@ impl MetaStore {
         Ok(affected > 0)
     }
 
+    pub async fn delete_cohort(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM cohorts WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
     pub async fn delete_saved_report(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
         let affected = db_exec!(
             self,

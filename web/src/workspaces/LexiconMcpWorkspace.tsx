@@ -71,6 +71,10 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
   const [lexLoading, setLexLoading] = useState(true);
   const [lexError, setLexError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedNote, setSavedNote] = useState<string | null>(null);
+  const [find, setFind] = useState("");
+  const needle = find.trim().toLowerCase();
+  const matches = (name: string) => !needle || name.toLowerCase().includes(needle) || humanizeEvent(name).toLowerCase().includes(needle);
 
   const [selectedTool, setSelectedTool] = useState<string>("get_lexicon_schema");
   const [argsJson, setArgsJson] = useState<string>(JSON.stringify({}, null, 2));
@@ -168,32 +172,49 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
     void loadLexicon();
   }, [loadLexicon]);
 
-  const save = async (action: () => Promise<unknown>) => {
+  const save = async (action: () => Promise<unknown>, note: string) => {
     setSaveError(null);
+    setSavedNote(null);
     try {
       await action();
       await loadLexicon();
       onLexiconChanged();
+      setSavedNote(note);
     } catch (err) {
       setSaveError(errorMessage(err));
     }
   };
 
-  const setEventStatus = (ev: LexiconEvent, status: string) =>
-    save(() =>
-      api.updateLexiconEvent(projectId, ev.name, {
-        status,
-        description: ev.description,
-        owner: ev.owner,
-      }),
+  const setEventStatus = (ev: LexiconEvent, status: string) => {
+    const name = humanizeEvent(ev.name);
+    // Dropped events are thrown away as they arrive; nothing brings them back later.
+    if (
+      status === "dropped" &&
+      !window.confirm(
+        `Drop ${name} at ingest? New ${name} events (about ${formatCount(ev.volume_24h)} in the last 24 hours) will be discarded and can't be recovered. Events already stored stay.`,
+      )
+    )
+      return;
+    const label = { active: "kept", hidden: "hidden from reports", dropped: "dropped at ingest" }[status] ?? status;
+    return save(
+      () =>
+        api.updateLexiconEvent(projectId, ev.name, {
+          status,
+          description: ev.description,
+          owner: ev.owner,
+        }),
+      `${name}: ${label}.`,
     );
+  };
 
   const setPiiMask = (p: LexiconProperty, masked: boolean) =>
-    save(() =>
-      api.updateLexiconProp(projectId, p.name, {
-        pii_masked: masked,
-        status: p.status,
-      }),
+    save(
+      () =>
+        api.updateLexiconProp(projectId, p.name, {
+          pii_masked: masked,
+          status: p.status,
+        }),
+      `${p.name}: ${masked ? "masked" : "shown"}.`,
     );
 
   const runMcpTool = async (tool = selectedTool, rawArgs = argsJson) => {
@@ -247,6 +268,24 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
         description="Control which events are kept and which properties are masked. Includes the AI tools endpoint."
       />
 
+      <div className="mb-5 flex flex-wrap items-center gap-3">
+        <input
+          type="search"
+          value={find}
+          onChange={(e) => setFind(e.target.value)}
+          placeholder="Find an event or property"
+          aria-label="Find an event or property"
+          className={`${field} w-full sm:w-72`}
+        />
+        <p role="status" className="text-sm text-ok">
+          {savedNote && (
+            <span className="inline-flex items-center gap-1.5 motion-safe:animate-fade-in">
+              <Check className="h-4 w-4" aria-hidden="true" /> Saved. {savedNote}
+            </span>
+          )}
+        </p>
+      </div>
+
       {saveError && (
         <div className="mb-5">
           <ErrorNotice message={`Couldn't save the change: ${saveError}`} />
@@ -267,7 +306,12 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-line">
-                    {events.map((ev) => (
+                    {events.filter((ev) => matches(ev.name)).length === 0 && (
+                      <tr>
+                        <td colSpan={3} className="py-3 text-muted">No events match "{find.trim()}".</td>
+                      </tr>
+                    )}
+                    {events.filter((ev) => matches(ev.name)).map((ev) => (
                       <tr key={ev.name}>
                         <td className="py-2 text-ink">{humanizeEvent(ev.name)}</td>
                         <td className="tabular py-2 text-right text-ink-2">{formatCount(ev.volume_24h)}</td>
@@ -308,7 +352,12 @@ export const LexiconMcpWorkspace: React.FC<Props> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-line">
-                    {props.map((p) => (
+                    {props.filter((p) => matches(p.name)).length === 0 && (
+                      <tr>
+                        <td colSpan={3} className="py-3 text-muted">No properties match "{find.trim()}".</td>
+                      </tr>
+                    )}
+                    {props.filter((p) => matches(p.name)).map((p) => (
                       <tr key={p.name}>
                         <td className="py-2 font-mono text-ink">{p.name}</td>
                         <td className="py-2 text-muted">{p.inferred_types}</td>

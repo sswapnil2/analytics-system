@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
 import { api, isAbortError, RetentionResult } from "../api/client";
 import { errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { typicalOrder } from "../lib/eventOrder";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import {
@@ -128,7 +129,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const retAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { start_event?: string; return_event?: string; mode?: Mode; num_periods?: number; unit?: Unit; split_by?: string; compare_to?: string };
@@ -226,7 +227,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="retention"
               defaultName={reportTitle}
@@ -311,17 +312,14 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
             </label>
           </div>
           <CompareControl main={rangeFor(range)} value={compare} onChange={setCompare} />
-          <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Split by</span>
-            <select value={splitBy} onChange={(e) => setSplitBy(e.target.value)} className={field}>
-              <option value="">No split</option>
-              {Array.from(new Set([...availableProps, splitBy].filter(Boolean))).map((p) => (
-                <option key={p} value={p}>
-                  {humanizeEvent(p)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <PropertyPicker
+            label="Split by"
+            value={splitBy}
+            onChange={setSplitBy}
+            noneLabel="No split"
+            recentKey={`pulse.recent-props.${projectId}`}
+            options={propertyOptions(Array.from(new Set([...availableProps, splitBy].filter(Boolean))))}
+          />
         </div>
       </Panel>
         </>}
@@ -546,12 +544,12 @@ const RetentionCurve: React.FC<{
           </text>
         </g>
       ))}
-      <path d={area} fill="rgb(var(--brand) / 0.1)" />
-      {cmpLine && <path d={cmpLine} fill="none" stroke="rgb(var(--info))" strokeWidth={2} strokeDasharray="5 4" strokeLinejoin="round" />}
-      <path d={line} fill="none" stroke="rgb(var(--brand))" strokeWidth={2.5} strokeLinejoin="round" />
+      <path d={area} fill="rgb(var(--chart-1) / 0.1)" />
+      {cmpLine && <path d={cmpLine} fill="none" stroke="rgb(var(--chart-2))" strokeWidth={2} strokeDasharray="5 4" strokeLinejoin="round" />}
+      <path d={line} fill="none" stroke="rgb(var(--chart-1))" strokeWidth={2.5} strokeLinejoin="round" />
       {hv && <line x1={x(hv[0])} x2={x(hv[0])} y1={pad.t} y2={y(0)} stroke="rgb(var(--line-strong))" strokeWidth={1.5} />}
       {known.map(([d, v]) => (
-        <circle key={d} cx={x(d)} cy={y(v)} r={hover === d ? 5 : 3} fill="rgb(var(--brand))" />
+        <circle key={d} cx={x(d)} cy={y(v)} r={hover === d ? 5 : 3} fill="rgb(var(--chart-1))" />
       ))}
       {pts.map((_, d) => (
         <text key={d} x={x(d)} y={H - 6} textAnchor="middle" className="fill-faint text-[11px]">
@@ -561,13 +559,13 @@ const RetentionCurve: React.FC<{
     </svg>
     {hv && (
       <div
-        className="pointer-events-none absolute top-0 rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-[0_8px_24px_rgb(0_0_0/0.12)]"
+        className="pointer-events-none absolute top-0 z-10 rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop"
         style={x(hv[0]) / W > 0.6 ? { right: `${100 - (x(hv[0]) / W) * 100 + 2}%` } : { left: `${(x(hv[0]) / W) * 100 + 2}%` }}
       >
         <p className="font-semibold text-ink">{UNIT_WORD[unit]} {hv[0]}</p>
         <p className="tabular text-ink-2">{hv[1].toFixed(1)}% came back</p>
         {compare && cmpPts[hv[0]] != null && (
-          <p className="tabular text-info">
+          <p className="tabular" style={{ color: "rgb(var(--chart-2))" }}>
             {cmpPts[hv[0]]!.toFixed(1)}% in {compare.label}
           </p>
         )}
@@ -576,10 +574,10 @@ const RetentionCurve: React.FC<{
     {compare && (
       <div className="mt-2 flex flex-wrap gap-4 text-[0.8125rem] text-ink-2">
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-0.5 w-4 bg-brand" aria-hidden="true" /> This range
+          <span className="h-0.5 w-4" style={{ background: "rgb(var(--chart-1))" }} aria-hidden="true" /> This range
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-0.5 w-4 border-t-2 border-dashed border-info" aria-hidden="true" /> {compare.label}
+          <span className="h-0.5 w-4 border-t-2 border-dashed" style={{ borderColor: "rgb(var(--chart-2))" }} aria-hidden="true" /> {compare.label}
         </span>
       </div>
     )}

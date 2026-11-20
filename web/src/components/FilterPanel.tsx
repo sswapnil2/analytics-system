@@ -1,4 +1,5 @@
 import React, { useEffect, useId, useState } from "react";
+import { PropertyPicker, propertyOptions } from "./PropertyPicker";
 import { Plus, X } from "lucide-react";
 import { api } from "../api/client";
 import { humanizeEvent } from "../lib/format";
@@ -152,7 +153,7 @@ export async function topValues(projectId: string, anchorEvent: string, prop: st
   return promise;
 }
 
-function useTopValues(projectId: string, anchorEvent: string, prop: string) {
+export function useTopValues(projectId: string, anchorEvent: string, prop: string) {
   const [values, setValues] = useState<string[]>([]);
   useEffect(() => {
     if (!prop || !anchorEvent) return setValues([]);
@@ -180,18 +181,14 @@ const Row: React.FC<{
   return (
     <li className="space-y-1.5 rounded-lg border border-line bg-sunken p-2">
       <div className="flex items-center gap-1.5">
-        <select
-          aria-label="Property"
+        <PropertyPicker
+          dense
+          label="Property"
           value={row.prop}
-          onChange={(e) => onChange({ ...row, prop: e.target.value, value: "" })}
-          className={`${field} min-w-0 flex-1 py-1`}
-        >
-          {props.map((p) => (
-            <option key={p} value={p}>
-              {humanizeEvent(p)}
-            </option>
-          ))}
-        </select>
+          onChange={(p) => onChange({ ...row, prop: p, value: "" })}
+          recentKey={`pulse.recent-props.${projectId}`}
+          options={propertyOptions(props)}
+        />
         <button
           type="button"
           onClick={onRemove}

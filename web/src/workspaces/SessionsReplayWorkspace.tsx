@@ -78,7 +78,9 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
       );
       if (ctrl.signal.aborted) return;
       setSearchRes(res);
-      setSelected(res.sessions[0] ?? null);
+      setSelected((prev) =>
+        prev ? (res.sessions.find((s) => s.session_id === prev.session_id) ?? res.sessions[0] ?? null) : (res.sessions[0] ?? null),
+      );
     } catch (err) {
       if (!isAbortError(err) && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {

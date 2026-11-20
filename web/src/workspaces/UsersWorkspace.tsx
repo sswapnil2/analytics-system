@@ -64,6 +64,18 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
 
   const listAbortRef = useRef<AbortController | null>(null);
   const detailAbortRef = useRef<AbortController | null>(null);
+  // The profile opens below a long list; bring it into view and move focus to it.
+  const detailRef = useRef<HTMLDivElement>(null);
+  // Bumped on every open; the effect runs after the panel is in the DOM (also on the first open),
+  // and again once loading ends, since the page was too short to scroll the spinner to the top.
+  const [revealAt, setRevealAt] = useState(0);
+  useEffect(() => {
+    const el = detailRef.current;
+    if (!revealAt || !el) return;
+    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ block: "start", behavior: still ? "auto" : "smooth" });
+    el.focus({ preventScroll: true });
+  }, [revealAt, detailLoading]);
   const exportAbortRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
@@ -117,6 +129,7 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
     setEraseNotice(null);
     setShownEvents(TIMELINE_STEP);
     setReplay(null);
+    setRevealAt((n) => n + 1);
     try {
       const res = await api.getUserDetail(projectId, distinctId, undefined, ctrl.signal);
       if (!ctrl.signal.aborted) setDetail(res);
@@ -192,6 +205,8 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
   };
 
   const columns = useMemo(() => commonKeys(users), [users]);
+  // Projects that don't send revenue would see a column of $0.
+  const showRevenue = users.some((u) => u.total_revenue !== 0);
   const timeline = useMemo(() => {
     const days: { day: string; events: UserEventItem[] }[] = [];
     for (const ev of (detail?.events ?? []).slice(0, shownEvents)) {
@@ -225,14 +240,21 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
               setOffset(0);
               setQuery(search);
             }}
-            className="flex items-center gap-2"
+            className="flex w-full items-center gap-2 sm:w-auto"
           >
             <input
               type="search"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                // Clearing the box (or its ×) shows everyone again.
+                if (!e.target.value && query) {
+                  setOffset(0);
+                  setQuery("");
+                }
+              }}
               placeholder="Search id or any property value"
-              className={`${field} w-64`}
+              className={`${field} min-w-0 flex-1 sm:w-64 sm:flex-none`}
               aria-label="Search users"
             />
             <button type="submit" className={btn.secondary}>
@@ -270,7 +292,7 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
                     {columns.map((k) => (
                       <th key={k} className="py-2 pr-3">{humanizeEvent(k)}</th>
                     ))}
-                    <th className="py-2 pr-3 text-right">Revenue</th>
+                    {showRevenue && <th className="py-2 pr-3 text-right">Revenue</th>}
                     <th className="py-2 text-right">Last updated</th>
                   </tr>
                 </thead>
@@ -282,14 +304,14 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
                       className={`cursor-pointer ${selectedId === u.distinct_id ? "bg-brand-soft/40" : "hover:bg-hover/60"}`}
                     >
                       <td className="py-2.5 pr-3">
-                        <button type="button" className="font-mono text-xs text-ink underline-offset-2 hover:underline" onClick={(e) => { e.stopPropagation(); void open(u.distinct_id); }}>
+                        <button type="button" id={`user-${u.distinct_id}`} aria-current={selectedId === u.distinct_id ? "true" : undefined} className="font-mono text-xs text-ink underline-offset-2 hover:underline" onClick={(e) => { e.stopPropagation(); void open(u.distinct_id); }}>
                           {u.distinct_id_masked}
                         </button>
                       </td>
                       {columns.map((k) => (
                         <td key={k} className="max-w-[12rem] truncate py-2.5 pr-3 text-xs text-ink-2">{formatPropValue(u.props?.[k])}</td>
                       ))}
-                      <td className="py-2.5 pr-3 text-right font-mono text-xs tabular-nums text-ink">{formatRevenue(u.total_revenue, u.props)}</td>
+                      {showRevenue && <td className="py-2.5 pr-3 text-right font-mono text-xs tabular-nums text-ink">{formatRevenue(u.total_revenue, u.props)}</td>}
                       <td className="py-2.5 text-right text-xs text-muted">{formatTimestamp(u.updated_at_ms)}</td>
                     </tr>
                   ))}
@@ -309,7 +331,17 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
       </Panel>
 
       {(detailLoading || detailError || detail) && (
-        <Panel title={detail ? detail.distinct_id_masked : "User"}>
+        <div ref={detailRef} tabIndex={-1} aria-label="User profile" className="scroll-mt-4 outline-none motion-safe:animate-fade-in">
+        <Panel
+          title={detail ? detail.distinct_id_masked : "User"}
+          actions={
+            selectedId && (
+              <button type="button" className={btn.ghost} onClick={() => document.getElementById(`user-${selectedId}`)?.focus()}>
+                <ChevronLeft className="h-4 w-4" /> Back to the list
+              </button>
+            )
+          }
+        >
           {detailLoading ? (
             <Spinner label="Loading the user's profile and events" />
           ) : detailError ? (
@@ -319,8 +351,12 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
               <div className="space-y-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <p className="text-sm text-ink-2">
-                    Lifetime revenue{" "}
-                    <span className="font-medium text-ink">{formatRevenue(detail.profile?.total_revenue ?? 0, detail.profile?.props)}</span> ·{" "}
+                    {(detail.profile?.total_revenue ?? 0) !== 0 && (
+                      <>
+                        Lifetime revenue{" "}
+                        <span className="font-medium text-ink">{formatRevenue(detail.profile?.total_revenue ?? 0, detail.profile?.props)}</span> ·{" "}
+                      </>
+                    )}
                     {formatCount(detail.events.length)} recent events · {formatCount(detail.replay_sessions.length)} recorded sessions
                   </p>
                   {canAdmin &&
@@ -421,6 +457,7 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
             )
           )}
         </Panel>
+        </div>
       )}
 
       <Panel title="Erasure log" meta={`${formatCount(deletions.length)} erasures`}>

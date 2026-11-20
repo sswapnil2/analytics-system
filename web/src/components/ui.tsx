@@ -16,7 +16,7 @@ export const PageHeader: React.FC<{
       </h1>
       <p className="mt-1 text-[0.9375rem] text-muted">{description}</p>
     </div>
-    {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+    {actions && <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">{actions}</div>}
   </header>
 );
 

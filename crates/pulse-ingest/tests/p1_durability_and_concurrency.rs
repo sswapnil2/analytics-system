@@ -708,7 +708,10 @@ async fn replay_store_immutable_chunks_survive_midnight_restart_and_reject_trave
         project_id: "proj_r".into(),
         session_id: "sess_midnight_01".into(),
         chunk_start_ts_ms: day2_00_02,
-        ops: vec![WireframeOp::NodeRemove { node_id: 1 }],
+        ops: vec![WireframeOp::NodeRemove {
+            ts_offset_ms: 0,
+            node_id: 1,
+        }],
     };
     let append2 = rstore2.append_chunk(&c2).await.unwrap();
     assert!(
