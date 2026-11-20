@@ -1,6 +1,6 @@
 # Implementation log
 
-All changes are in `web/`. No new dependencies; no backend changes.
+All changes are in `web/`. No new dependencies; no backend changes on this branch (cohort edit/delete endpoints were built separately, see the fourth pass).
 
 | File | Change |
 |---|---|
@@ -39,6 +39,22 @@ All changes are in `web/`. No new dependencies; no backend changes.
 | `src/lib/format.ts` | `propertyOptions`: `user.*` properties listed as "User profile" after "Event properties", without the prefix. Used by every picker. Tests added. |
 | `src/workspaces/UsersWorkspace.tsx` | Opening a user scrolls the profile into view and moves focus to it (from an effect, so it also works on the first open, and again after loading so it reaches the top). "Back to the list" returns focus to that row. Revenue column and lifetime revenue hidden when every user has 0. Clearing the search shows everyone again. Search box fills the width on phones. |
 | `src/workspaces/{Insights,Funnels,Retention}Workspace.tsx` | Pickers use `propertyOptions`. |
+
+### Fourth pass (owner pass: remaining gaps)
+| File | Change |
+|---|---|
+| `src/api/client.ts`, `src/dashboards/SaveToDashboard.tsx` | Save in place. The API already had `PUT /saved-reports/:id`; the earlier "needs backend" note was wrong. An opened report shows "Saved as {name}" or "Unsaved changes" + Save (PUT, then the baseline resets). The other button becomes "Save a copy". Viewers see only the badge. The baseline ignores the time range, so changing the range alone isn't "unsaved". |
+| `src/workspaces/{Insights,Funnels,Retention,Flows}Workspace.tsx` | Wired to the saved state. |
+| `src/workspaces/ExperimentsFlagsWorkspace.tsx` | Conversion and guardrail metrics use the searchable picker, no default (the busiest event usually can't move). Sample estimate explains 100% and 0% base rates instead of showing nonsense. Rollout change shows "Saved" for 2.5 s. "Who" select no longer widens the page at 375. |
+| `src/workspaces/LexiconMcpWorkspace.tsx` | Events and privacy: one search filters both tables, with a no-match row. Saving shows what happened in words. "Drop at ingest" asks first, naming the 24 h volume and saying it can't be undone. |
+| `src/components/SecurityPanel.tsx` | Plain-language encryption copy; turning encryption off asks first. Labels on unlabeled inputs. The audit log shows the licence message on 402 instead of a misleading empty state; removed the unsupported "Cryptographically tracked" claim. Copilot preset buttons wrap at 375. |
+| `src/workspaces/FunnelsWorkspace.tsx` | Step "where" uses the dense picker and suggests real values for that step's event. It starts on "Choose…" instead of the first property alphabetically. Step rows wrap so a where clause fits at 375 (was 612 px wide). Operator and value controls are the picker's height (the "is" text was clipped). |
+| `src/lib/exportChart.ts` (new), `src/workspaces/InsightsWorkspace.tsx` | Trends "Download chart" → PNG (2×) or SVG. The on-screen SVG with computed colours inlined, plus title, date range and legend. Disabled with a reason when there's no data or the kind is Number. |
+| `src/index.css` | Dark `--chart-3` is now golden yellow (248 200 20); the old amber was hard to tell apart from the drop-off orange. Light is unchanged. |
+| `src/lib/chart.ts`, `src/dashboards/ReportCard.tsx` | Dashboard cards use the report's saved interval (`cardInterval`), and coarsen it only when it would make too many buckets (hour > 7 days, day > 90 days). Axis and tooltip labels follow the bucket size. Test added. |
+| `src/workspaces/CohortsLookupsWorkspace.tsx` | Lookup "Match on property" is the picker and starts empty. It used to pre-fill the first property, so typing a key appended to it (found when re-testing the upload). |
+
+Backend (separate branch, not on this one): `claude/cohort-update-delete-api-4c4cc9`, commit `e8c16ab`. It adds `PUT` and `DELETE /v1/projects/:id/cohorts/:cohort_id`; delete returns 409 naming whatever still uses the cohort. The Cohorts edit/delete UI waits for that branch to be merged.
 
 ## Decisions
 - **Hover sync, not row checkboxes.** Rows and series highlight each other; hiding stays on the legend so there is one place to toggle.

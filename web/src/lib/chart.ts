@@ -77,3 +77,14 @@ export function donutSlice(cx: number, cy: number, r: number, inner: number, a0:
   const large = end - a0 > Math.PI ? 1 : 0;
   return `M${pt(r, a0)} A${r},${r} 0 ${large} 1 ${pt(r, end)} L${pt(inner, end)} A${inner},${inner} 0 ${large} 0 ${pt(inner, a0)} Z`;
 }
+
+/**
+ * Interval for a trend on a dashboard card: the report's own when it has one, stepped down only
+ * where a small card would get too many points (hourly past 7 days, daily past 90).
+ */
+export function cardInterval(saved: unknown, rangeDays: number): "hour" | "day" | "week" | "month" {
+  if (saved === "hour") return rangeDays > 7 ? "day" : "hour";
+  if (saved === "day") return rangeDays > 90 ? "week" : "day";
+  if (saved === "week" || saved === "month") return saved;
+  return rangeDays > 30 ? "week" : "day";
+}

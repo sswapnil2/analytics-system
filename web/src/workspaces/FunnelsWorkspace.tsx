@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult, isAbortError } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
@@ -30,7 +30,7 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
-import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
+import { FilterPanel, useTopValues, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
 import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 
@@ -261,7 +261,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       <Panel title="Steps">
         <ol className="flex flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
           {steps.map((st, idx) => (
-            <li key={idx} className="flex items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
+            <li key={idx} className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
               {idx > 0 && <span className="text-xs text-faint xl:pl-2">then</span>}
               <span className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-field py-1 pl-1.5 pr-1">
               <span
@@ -302,6 +302,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
               </span>
               <StepWhereEditor
                 idx={idx}
+                projectId={projectId}
+                event={st}
                 value={stepWhere[idx] ?? null}
                 props={availableProps}
                 onChange={(w) => {
@@ -906,16 +908,21 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
 /** "+ where" on one funnel step: a single property condition, shown inline under the step. */
 const StepWhereEditor: React.FC<{
   idx: number;
+  projectId: string;
+  /** The step's event; value suggestions come from it. */
+  event: string;
   value: StepWhere | null;
   props: string[];
   onChange: (w: StepWhere | null) => void;
-}> = ({ idx, value, props, onChange }) => {
+}> = ({ idx, projectId, event, value, props, onChange }) => {
+  const listId = useId();
+  const suggestions = useTopValues(projectId, value ? event : "", value?.prop ?? "");
   if (!value) {
     return (
       <button
         type="button"
         disabled={props.length === 0}
-        onClick={() => onChange({ prop: props[0] ?? "", op: "eq", value: "" })}
+        onClick={() => onChange({ prop: "", op: "eq", value: "" })}
         className="self-start rounded px-1.5 py-0.5 text-xs text-muted hover:bg-hover hover:text-ink disabled:opacity-50"
         aria-label={`Add a condition to step ${idx + 1}`}
       >
@@ -924,25 +931,21 @@ const StepWhereEditor: React.FC<{
     );
   }
   return (
-    <span className="flex flex-wrap items-center gap-1 pl-1.5 text-xs">
+    <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1 pl-1.5 text-xs">
       <span className="text-faint">where</span>
-      <select
-        aria-label={`Step ${idx + 1} condition property`}
+      <PropertyPicker
+        dense
+        label={`Step ${idx + 1} condition property`}
         value={value.prop}
-        onChange={(e) => onChange({ ...value, prop: e.target.value })}
-        className={`${field} h-7 w-auto py-0 text-xs`}
-      >
-        {Array.from(new Set([value.prop, ...props])).filter(Boolean).map((p) => (
-          <option key={p} value={p}>
-            {humanizeEvent(p)}
-          </option>
-        ))}
-      </select>
+        onChange={(p) => onChange({ ...value, prop: p, value: "" })}
+        recentKey={`pulse.recent-props.${projectId}`}
+        options={propertyOptions(Array.from(new Set([value.prop, ...props])).filter(Boolean))}
+      />
       <select
         aria-label={`Step ${idx + 1} condition operator`}
         value={value.op}
         onChange={(e) => onChange({ ...value, op: e.target.value as StepWhere["op"] })}
-        className={`${field} h-7 w-auto py-0 text-xs`}
+        className={`${field} w-auto py-1 text-xs`}
       >
         <option value="eq">is</option>
         <option value="neq">is not</option>
@@ -953,8 +956,16 @@ const StepWhereEditor: React.FC<{
         value={value.value}
         onChange={(e) => onChange({ ...value, value: e.target.value })}
         placeholder="value"
-        className={`${field} h-7 w-24 py-0 text-xs`}
+        list={suggestions.length ? listId : undefined}
+        className={`${field} w-28 py-1 text-xs`}
       />
+      {suggestions.length > 0 && (
+        <datalist id={listId}>
+          {suggestions.map((v) => (
+            <option key={v} value={v} />
+          ))}
+        </datalist>
+      )}
       <button
         type="button"
         onClick={() => onChange(null)}

@@ -1,20 +1,15 @@
 # Remaining gaps
 
-Done in the second pass (see implementation-log): shared searchable property picker with recents (Trends breakdown, Funnels and Retention split), chart ↔ segment-table hover sync with swatches, interval beside the chart type, Funnels/Retention tooltips and series colours on tokens, fresh-node empty-state pass. Third pass: Journeys hover + step table, Cohorts and filter pickers with profile properties and value suggestions, Users profile focus and revenue column.
+Fixed in the fourth pass: save in place with a saved/unsaved badge, chart export (PNG/SVG), picker and value suggestions in funnel step "where", the Experiments, Events and privacy and Security pass, dark `--chart-3`, dashboard cards using the saved interval, and the lookup join key default. Earlier passes are in the implementation log.
 
 | Gap | Why not now | Size |
 |---|---|---|
-| Saved/unsaved indicator and "Save" in place | Needs an update-saved-report API; Pulse saves copies | M (backend + UI) |
-| Report-type switcher keeping the query | Query shapes differ per report; needs a shared query model | L |
-| Chart export (PNG/SVG) | Out of scope for frontend-only pass as specified; CSV export exists | S |
-| Picker in funnel step `where` clauses; property categories and a details pane | Picker only lists names; types/descriptions would need Lexicon data per property | M |
-| Funnels and Retention charts on `TrendChart` itself | Bespoke visuals with their own semantics (hatch drop-offs, heatmap); only tokens were shared | M |
-| Experiments, Events and privacy, Security: no UX pass | Not in this task | M |
-| Delete or edit a saved cohort | No API for it; not faked | S (backend + UI) |
-| Journeys diagram on a phone scrolls sideways inside its box; touch has no hover (rows can be tapped to focus) | Sankey needs width; the step table carries the same numbers | S |
-| Dark `--chart-3` (amber 230 178 80) is close to dark drop-off orange (244 162 97) | Palette change touches every chart; Funnels already used this amber before | S |
-| Dashboard cards pick interval from the range (day/week), not from the saved report | Existing card behaviour; changing it alters every dashboard | S |
-| Row checkboxes in the segment table | Legend toggling covers visibility | S |
-| Drag-to-rearrange / free resize of dashboard cards | Move up/down + half/full width already work by keyboard | M |
+| Edit or delete a saved cohort | API built on branch `claude/cohort-update-delete-api-4c4cc9` (`e8c16ab`), not merged here. UI follows the merge | S (UI) |
+| Report-type switcher keeping the query | Each report has its own query shape. Only events and the global filter carry over cleanly; a half-kept query would surprise more than help | L |
+| Property categories and a details pane in the picker | Needs per-property type/description data the API doesn't serve | M |
+| Funnels and Retention charts on `TrendChart` | Bespoke visuals (drop-off hatch, heatmap); they share tokens only | M |
+| Journeys diagram scrolls sideways inside its box on a phone | Sankey needs width; the step table has the same numbers | S |
+| Row checkboxes in the segment table | Legend toggles cover visibility | S |
+| Drag-to-rearrange / free resize of dashboard cards | Move up/down and half/full width work by keyboard | M |
 | Horizontal bar kind | Column covers time series | S |
-| Live Mixpanel board observation | The board never finished loading on the reference account | — |
+| Audit log | Needs `PULSE_LICENSE_KEY`; the page says so | — |

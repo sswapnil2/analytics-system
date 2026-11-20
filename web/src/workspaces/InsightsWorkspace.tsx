@@ -22,6 +22,8 @@ import {
 } from "../components/ui";
 import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { ChartKindPicker, ChartSeries, TrendChart } from "../components/TrendChart";
+import { Menu } from "../components/Menu";
+import { downloadChartPng, downloadChartSvg } from "../lib/exportChart";
 import { CHART_KINDS, ChartKind, chartKindBlocker, isAdditive } from "../lib/chart";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, useCohortNames } from "../components/FilterPanel";
 
@@ -372,6 +374,29 @@ export const InsightsWorkspace: React.FC<Props> = ({
             })
             .replace(/\*/g, "×")
         : series.map((s) => humanizeEvent(s.eventName)).join(" and ");
+  const chartBoxRef = useRef<HTMLDivElement>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const canExport = Boolean(result && hasData && kind !== "number");
+  const exportHint = kind === "number" ? "Not for Number" : "Run a report first";
+  const exportChart = async (format: "png" | "svg") => {
+    const svg = chartBoxRef.current?.querySelector<SVGSVGElement>("svg[role=img]");
+    if (!svg) return;
+    setExportError(null);
+    const meta = {
+      title: reportTitle,
+      subtitle: buckets.length
+        ? `${formatDate(buckets[0], { day: "numeric", month: "short", year: "numeric" })} – ${formatDate(buckets[buckets.length - 1], { day: "numeric", month: "short", year: "numeric" })}`
+        : undefined,
+      legend: chartSeries.filter((c) => !hidden.has(c.key)).map((c) => ({ name: c.detail ? `${c.name}, ${c.detail}` : c.name, color: c.color })),
+    };
+    const file = reportTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "chart";
+    try {
+      if (format === "svg") downloadChartSvg(svg, meta, file);
+      else await downloadChartPng(svg, meta, file);
+    } catch (err) {
+      setExportError(errorMessage(err));
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -559,6 +584,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
       {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
+      {exportError && <ErrorNotice message={exportError} />}
 
       <Panel
         title={kind === "number" ? "For the whole period" : kind === "pie" ? "Share of the whole period" : "Over time"}
@@ -579,10 +605,19 @@ export const InsightsWorkspace: React.FC<Props> = ({
               </select>
             )}
             <ChartKindPicker value={kind} onChange={setChartType} blocker={blocker} />
+            <Menu
+              label="Download chart"
+              triggerClass={`${btn.ghost} h-9 w-9 px-0`}
+              trigger={<Download className="h-4 w-4" aria-hidden="true" />}
+              items={[
+                { label: "PNG image", onSelect: () => void exportChart("png"), disabled: !canExport, hint: canExport ? undefined : exportHint },
+                { label: "SVG image", onSelect: () => void exportChart("svg"), disabled: !canExport, hint: canExport ? undefined : exportHint },
+              ]}
+            />
           </>
         }
       >
-        <div aria-busy={loading} className={`transition-opacity duration-200 ${loading && result ? "opacity-60" : ""}`}>
+        <div ref={chartBoxRef} aria-busy={loading} className={`transition-opacity duration-200 ${loading && result ? "opacity-60" : ""}`}>
         {!result ? (
           loading ? (
             <ChartSkeleton />

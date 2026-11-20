@@ -130,7 +130,8 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   >([]);
 
   const [lookupName, setLookupName] = useState<string>("");
-  const [joinProp, setJoinProp] = useState<string>(() => availableProps[0] ?? "");
+  // No default: the first property alphabetically is almost never the key the CSV shares.
+  const [joinProp, setJoinProp] = useState<string>("");
   const [csvText, setCsvText] = useState<string>("");
 
   const [customPropName, setCustomPropName] = useState<string>("");
@@ -141,9 +142,6 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
     if (first) setConds((cs) => cs.map((c) => (c.event ? c : { ...c, event: first })));
   }, [availableEvents]);
 
-  useEffect(() => {
-    if (availableProps.length > 0) setJoinProp((prev) => prev || availableProps[0]);
-  }, [availableProps]);
 
   const [extensions, setExtensions] = useState<{
     custom_events: Array<{ name: string; source_events: string[] }>;
@@ -252,7 +250,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
 
   const uploadLookup = () =>
     withFeedback(setLookupFeedback, setUploadingLookup, `Uploaded ${lookupName.trim()}.`, async () => {
-      if (!lookupName.trim() || !joinProp.trim()) throw new Error("Add a table name and a join key.");
+      if (!lookupName.trim() || !joinProp.trim()) throw new Error("Add a table name and pick the property to match on.");
       await api.uploadLookupTable(projectId, {
         name: lookupName.trim(),
         join_prop: joinProp.trim(),
@@ -485,24 +483,13 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                     className={`${field} w-full font-mono`}
                   />
                 </div>
-                <div className="space-y-1">
-                  <label htmlFor="lookup-key" className={fieldLabel}>
-                    Match on property
-                  </label>
-                  <input
-                    id="lookup-key"
-                    value={joinProp}
-                    onChange={(e) => setJoinProp(e.target.value)}
-                    placeholder={availableProps[0] ?? "item_id"}
-                    list="lookup-key-props"
-                    className={`${field} w-full font-mono`}
-                  />
-                  <datalist id="lookup-key-props">
-                    {availableProps.map((p) => (
-                      <option key={p} value={p} />
-                    ))}
-                  </datalist>
-                </div>
+                <PropertyPicker
+                  label="Match on property"
+                  value={joinProp}
+                  onChange={setJoinProp}
+                  recentKey={`pulse.recent-props.${projectId}`}
+                  options={propertyOptions(availableProps)}
+                />
               </div>
               <div className="space-y-1">
                 <label htmlFor="lookup-csv" className={fieldLabel}>

@@ -10,9 +10,9 @@ import {
   TimeRange,
 } from "../api/client";
 import { btn, ChartSkeleton, field, fieldLabel } from "../components/ui";
-import { errorMessage, formatCount, formatDate, humanizeEvent, segmentName } from "../lib/format";
+import { errorMessage, formatCount, formatDate, formatDateTime, humanizeEvent, segmentName } from "../lib/format";
 import { ChartSeries, TrendChart } from "../components/TrendChart";
-import { CHART_KINDS, chartKindBlocker, isAdditive } from "../lib/chart";
+import { CHART_KINDS, cardInterval, chartKindBlocker, isAdditive } from "../lib/chart";
 
 /**
  * A date range choice: "today", "yesterday", a number of days ("7", "14"…),
@@ -229,7 +229,7 @@ export const ReportCardBody: React.FC<{
       } else if (report.report_kind === "insights") {
         set(setResult)({
           kind: "insights",
-          data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }, ctrl.signal),
+          data: await api.queryInsights(projectId, { ...body, interval: cardInterval(report.query_json.interval, rangeDays(range)) }, ctrl.signal),
         });
       } else if (report.report_kind === "retention") {
         set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body, ctrl.signal) });
@@ -423,7 +423,9 @@ const TrendMini: React.FC<{ data: InsightsResult; query: Record<string, unknown>
   const split = Boolean(q.breakdown_by?.length);
   const buckets = data.buckets_ts_ms;
   const n = buckets.length;
-  const daily = n < 2 || buckets[1] - buckets[0] < 2 * 86_400_000;
+  // Bucket size from the spacing: hours, days, weeks or months.
+  const gap = n < 2 ? 86_400_000 : buckets[1] - buckets[0];
+  const step = gap < 86_400_000 ? "hour" : gap < 2 * 86_400_000 ? "day" : gap < 20 * 86_400_000 ? "week" : "month";
   // "A" → its event name, from the saved query.
   const nameOf = (label: string) => {
     const ev = (query as { series?: { label?: string; event_name?: string }[] }).series?.find((x) => x.label === label)?.event_name;
@@ -456,8 +458,22 @@ const TrendMini: React.FC<{ data: InsightsResult; query: Record<string, unknown>
           kind={kind}
           series={chartSeries}
           buckets={buckets}
-          axisLabel={(ts) => formatDate(ts, { day: "numeric", month: "short" })}
-          bucketTitle={(i) => (daily ? formatDate(buckets[i], { weekday: "short", day: "numeric", month: "short" }) : `Week of ${formatDate(buckets[i], { day: "numeric", month: "short" })}`)}
+          axisLabel={(ts) =>
+            step === "hour"
+              ? formatDateTime(ts, { hour: "numeric" })
+              : step === "month"
+                ? formatDate(ts, { month: "short", year: "2-digit" })
+                : formatDate(ts, { day: "numeric", month: "short" })
+          }
+          bucketTitle={(i) =>
+            step === "hour"
+              ? formatDateTime(buckets[i], { weekday: "short", day: "numeric", month: "short", hour: "numeric" })
+              : step === "day"
+                ? formatDate(buckets[i], { weekday: "short", day: "numeric", month: "short" })
+                : step === "week"
+                  ? `Week of ${formatDate(buckets[i], { day: "numeric", month: "short" })}`
+                  : formatDate(buckets[i], { month: "long", year: "numeric" })
+          }
           fmt={fmt}
           partialLast
           ghost={series.length === 1 && prev ? prev.points.map((p) => p.value) : undefined}

@@ -82,12 +82,31 @@ Fresh node with the SaaS events plus 120 profiles (`plan`, `country`, `company`)
 | Regression: demo Journeys (8,000 per step), Cohorts preview, drop-off drawer, replay plays | demo, light, 1440 | ✅ |
 | `npm --prefix web test` 21/21, build, demo-name grep on changed files | — | ✅ |
 
+### Fourth pass (owner pass), 20 Nov 2026
+| Check | Node | Result |
+|---|---|---|
+| Open saved report → "Saved as App Open"; Column→Line shows Unsaved + Save; back to Column clears it | demo, light, 1440 | ✅ |
+| Line + Save sends PUT; stored query has no time range; reload opens as Line, clean | demo | ✅ |
+| Funnel, retention, daily-active saved reports open clean | demo | ✅ |
+| Experiments: metric picker starts "Choose…"; OTP Verified estimate "about 297 users per variant"; App Open shows the 100% message; rollout 50→51 shows "Saved" (reset to 50) | demo | ✅ |
+| Events and privacy: search "city" filters both tables; hide → note → keep restored; Drop with confirm cancelled stays active | demo | ✅ |
+| Security: licence message for the audit log (no licence key on the node) | demo | ✅ |
+| No horizontal scroll at 375: Security, Events, Experiments | demo, dark | ❌ Security 407 px, Experiments 381 px → fixed → ✅ 375 |
+| Funnel step where: keyboard pick "city" → suggestions Bengaluru, Mumbai, Delhi_NCR, … | demo | ✅ |
+| Funnel step where at 375 | demo | ❌ page 612 px, "is" clipped, property pre-filled → fixed → ✅ 375, starts "Choose…" |
+| Dashboard on 14D: daily card asks for `day`, weekly saved card asks for `week` and draws weekly buckets | demo | ✅ |
+| Trends export: SVG renders standalone (title, range, axes, lines, legend); PNG 1492×712, non-blank | demo, light | ✅ |
+| Cohort CSV export: `…-users.csv`, 85 KB, header `canonical_uid,distinct_id,plan,…` | demo | ✅ |
+| Lookup upload | demo | ❌ join key pre-filled, typed key appended → fixed → ✅ "Matched on city. Adds tier (2 rows)"; re-upload replaced the bad table |
+| `npm test` 22/22, `npm run build`, demo-name grep and secret grep on the diff | — | ✅ |
+
 ## Not checked
 - Reduced motion was not emulated in the browser; it relies on the existing global CSS rule plus `motion-safe:` prefixes.
 - Safari/Firefox: `d` path tweening is Chromium-only by design; not opened in other browsers.
 - Screen reader pass not done (roles/labels were checked in the accessibility tree).
 - Experiments, Events and privacy, Security: opened on both nodes but not exercised in depth.
-- Cohort CSV export and lookup-table upload were not run in the third pass.
+- Chart export in dark mode was not opened as a file (the panel colour is read from the theme, so it exports dark).
+- Fourth-pass checks ran on the demo node only; the fresh node was not revisited.
 - Hover sync and the picker on a touch device: there is no hover on touch; rows are still tappable to focus. Not tried on a real phone.
 - Some interaction steps were driven by in-page script clicks (chart-type menu sweep, one Group by change); the rest used real clicks and keys.
 
