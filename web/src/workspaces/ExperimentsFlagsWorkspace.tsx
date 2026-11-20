@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch } from "../api/client";
+import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection } from "../api/client";
 import { useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
 import { PropertyPicker } from "../components/PropertyPicker";
 import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent } from "../lib/format";
+import { usersPerVariant } from "../lib/power";
 
 interface Props {
   projectId: string;
@@ -21,15 +22,6 @@ const FLAG_KEY_PATTERN = /^[a-z0-9_]+$/;
 function formatLift(pct: number): string {
   const text = formatPercent(pct / 100);
   return pct > 0 ? `+${text}` : text;
-}
-
-/**
- * Users needed per variant to detect a relative lift of `mde` on a base rate
- * `p` (two-sided α = 0.05, 80% power): n ≈ 16·p(1−p) / (p·mde)².
- */
-export function usersPerVariant(p: number, mde: number): number {
-  if (p <= 0 || p >= 1 || mde <= 0) return Infinity;
-  return Math.ceil((16 * p * (1 - p)) / (p * mde) ** 2);
 }
 
 /** Base conversion rate and daily active users for the estimate, from the last 14 days. */
@@ -70,11 +62,12 @@ const SampleEstimate: React.FC<{
   flag: FeatureFlag | undefined;
   days: number;
   event: string;
-}> = ({ baseline, mde, flag, days, event }) => {
+  sequential: boolean;
+}> = ({ baseline, mde, flag, days, event, sequential }) => {
   if (!baseline) return null;
   const name = humanizeEvent(event);
   const variants = Math.max(2, flag?.variants.length ?? 2);
-  const n = usersPerVariant(baseline.rate, mde);
+  const n = usersPerVariant(baseline.rate, mde, { variants, sequential });
   const perDay = baseline.dailyUsers * ((flag?.rollout_pct ?? 100) / 100);
   const need = Math.ceil((n * variants) / Math.max(perDay, 1e-9));
   const short = need > days;
@@ -87,6 +80,7 @@ const SampleEstimate: React.FC<{
           {flag ? ` (${Math.round(flag.rollout_pct)}% rollout)` : ""}, that's about{" "}
           <span className="font-semibold text-ink">{need} days</span>
           {short ? `, longer than the ${days} days you picked.` : "."}
+          {sequential && " Sequential testing needs more users, but you can stop as soon as a result is significant."}
         </>
       ) : (
         baseline.rate >= 1
@@ -159,6 +153,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expMetric, setExpMetric] = useState("");
   const eventOptions = availableEvents.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }));
   const [expGuardrail, setExpGuardrail] = useState("");
+  const [expGuardrailDirection, setExpGuardrailDirection] = useState<MetricDirection>("increase_is_bad");
+  const [expSequential, setExpSequential] = useState(true);
   const [expWindowDays, setExpWindowDays] = useState(7);
   const [expDays, setExpDays] = useState(14);
   const [expError, setExpError] = useState<string | null>(null);
@@ -281,11 +277,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpCreating(true);
     setExpError(null);
     const now = Date.now();
-    const metric = (event_name: string) => ({
+    const metric = (event_name: string, direction: MetricDirection) => ({
       name: humanizeEvent(event_name),
       event_name,
       conversion_window_ms: expWindowDays * DAY_MS,
+      direction,
     });
+    const planned = baseline
+      ? usersPerVariant(baseline.rate, mde / 100, { variants: Math.max(2, flag.variants.length), sequential: expSequential })
+      : Infinity;
     try {
       const created = await api.createExperiment(projectId, {
         name: expName.trim(),
@@ -294,8 +294,13 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         hypothesis: expHypothesis.trim(),
         start_ts_ms: now,
         end_ts_ms: now + expDays * DAY_MS,
-        primary_metric: metric(expMetric),
-        guardrail_metrics: expGuardrail ? [metric(expGuardrail)] : [],
+        primary_metric: metric(expMetric, "decrease_is_bad"),
+        guardrail_metrics: expGuardrail ? [metric(expGuardrail, expGuardrailDirection)] : [],
+        analysis: {
+          sequential: expSequential,
+          alpha: 0.05,
+          planned_users_per_variant: Number.isFinite(planned) ? planned : null,
+        },
       });
       setExpFormOpen(false);
       setExpName("");
@@ -313,7 +318,13 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
   /** Stop the experiment; with `winner`, also give everyone that variant. */
   const conclude = async (exp: Experiment, flag: FeatureFlag | undefined, winner?: string) => {
-    const what = winner ? `Ship ${winner} to all users and stop "${exp.name}"?` : `Stop "${exp.name}"? Results stay available.`;
+    const hurt = winner
+      ? (expResults?.guardrails ?? []).filter((g) => g.regressed_variants.includes(winner)).map((g) => g.metric_name)
+      : [];
+    const warning = hurt.length ? `\n\nWarning: ${winner} made ${hurt.join(", ")} significantly worse.` : "";
+    const what = winner
+      ? `Ship ${winner} to all users and stop "${exp.name}"?${warning}`
+      : `Stop "${exp.name}"? Results stay available.`;
     if (!window.confirm(what)) return;
     setActing(true);
     setActionError(null);
@@ -455,6 +466,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 recentKey={`pulse.recent-events.${projectId}`}
                 options={eventOptions}
               />
+              {expGuardrail && (
+                <label className="flex flex-col gap-1">
+                  <span className={fieldLabel}>Guardrail is bad when it</span>
+                  <select
+                    value={expGuardrailDirection}
+                    onChange={(e) => setExpGuardrailDirection(e.target.value as MetricDirection)}
+                    className={field}
+                  >
+                    <option value="increase_is_bad">Goes up (errors, cancellations)</option>
+                    <option value="decrease_is_bad">Goes down (purchases, retention)</option>
+                  </select>
+                </label>
+              )}
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Conversion window</span>
                 <select value={expWindowDays} onChange={(e) => setExpWindowDays(Number(e.target.value))} className={field}>
@@ -486,7 +510,29 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </select>
               </label>
             </div>
-            <SampleEstimate baseline={baseline} mde={mde / 100} flag={flags.find((f) => f.id === expFlagId)} days={expDays} event={expMetric} />
+            <label className="flex items-start gap-2 text-sm text-ink">
+              <input
+                type="checkbox"
+                checked={expSequential}
+                onChange={(e) => setExpSequential(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                Sequential testing
+                <span className="block text-xs text-muted">
+                  Results stay valid however often you check them, so you can stop early. Turn off only if you'll read the
+                  results once, at the end.
+                </span>
+              </span>
+            </label>
+            <SampleEstimate
+              baseline={baseline}
+              mde={mde / 100}
+              flag={flags.find((f) => f.id === expFlagId)}
+              days={expDays}
+              event={expMetric}
+              sequential={expSequential}
+            />
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setExpFormOpen(false)} className={btn.ghost}>
                 Cancel
@@ -560,6 +606,21 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
+            {!noExposures && expResults.sample_ratio_mismatch && (
+              <div
+                role="alert"
+                className="flex items-start gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3.5 py-3 text-sm text-ink"
+              >
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+                <p>
+                  <span className="font-medium">The traffic split is off, so these results can't be trusted.</span>{" "}
+                  Variants got a different share of users than the flag's weights (p = {formatPValue(expResults.srm_p_value)}).
+                  This usually means exposures are tracked differently per variant, or the weights changed mid-test. No
+                  result is marked significant until it's fixed.
+                </p>
+              </div>
+            )}
+
             {actionError && <ErrorNotice message={`Couldn't update the experiment: ${actionError}`} />}
             {selectedExp && (
               <div className="flex flex-wrap items-center gap-2">
@@ -573,6 +634,12 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     : selectedExp.status === "concluded"
                       ? `Stopped ${new Date(selectedExp.end_ts_ms).toLocaleDateString()}`
                       : "Paused"}
+                </span>
+                <span
+                  className="rounded bg-hover px-2 py-0.5 text-xs font-medium text-muted"
+                  title={expResults.statistical_methodology_note}
+                >
+                  {expResults.sequential ? "Sequential · safe to check any time" : "Fixed horizon · read at the end"}
                 </span>
                 {canEdit && selectedExp.status !== "concluded" && (
                   <>
@@ -626,7 +693,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     <th className="py-2 text-right font-medium">Conversions</th>
                     <th className="py-2 text-right font-medium">Conversion rate</th>
                     <th className="py-2 text-right font-medium">Lift</th>
-                    <th className="px-4 py-2 text-center font-medium">95% range of lift</th>
+                    <th className="px-4 py-2 text-center font-medium">
+                      {Math.round((expResults.confidence_level ?? 0.95) * 100)}% range of lift
+                    </th>
                     <th className="py-2 text-right font-medium">p-value</th>
                     <th className="py-2 text-right font-medium">Chance to beat control</th>
                     <th className="py-2 pl-4 text-left font-medium">Result</th>
@@ -716,20 +785,33 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 <div className="space-y-3">
                   {expResults.guardrails.map((g) => (
                     <div key={g.metric_name}>
-                      <p className="mb-1.5 text-xs text-muted">{g.metric_name}</p>
+                      <p className="mb-1.5 text-xs text-muted">
+                        {g.metric_name} · bad when it {g.direction === "increase_is_bad" ? "goes up" : "goes down"}
+                      </p>
                       <div className="flex flex-wrap gap-2">
-                        {g.variants.map((gv) => (
-                          <div
-                            key={gv.variant_key}
-                            className="rounded-lg border border-line bg-sunken px-3 py-2 text-sm"
-                          >
-                            <span className="text-ink-2">{gv.variant_key}: </span>
-                            <span className="tabular text-ink">
-                              {formatPercent(gv.conversion_rate, 2)} ({formatCount(gv.conversions)} of{" "}
-                              {formatCount(gv.sample_size)})
-                            </span>
-                          </div>
-                        ))}
+                        {g.variants.map((gv) => {
+                          const regressed = g.regressed_variants.includes(gv.variant_key);
+                          return (
+                            <div
+                              key={gv.variant_key}
+                              className={`rounded-lg border px-3 py-2 text-sm ${
+                                regressed ? "border-danger/40 bg-danger-soft" : "border-line bg-sunken"
+                              }`}
+                            >
+                              <span className="text-ink-2">{gv.variant_key}: </span>
+                              <span className="tabular text-ink">
+                                {formatPercent(gv.conversion_rate, 2)} ({formatCount(gv.conversions)} of{" "}
+                                {formatCount(gv.sample_size)})
+                              </span>
+                              {!gv.is_control && (
+                                <span className={`tabular ml-2 text-xs ${regressed ? "font-medium text-danger" : "text-muted"}`}>
+                                  {formatLift(gv.relative_lift_pct)}, p {formatPValue(gv.p_value)}
+                                  {regressed ? " · worse" : gv.statistically_significant ? " · significant" : ""}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   ))}
@@ -737,7 +819,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
-            <p className="text-xs text-faint">Bayesian and frequentist statistics, 20,000 simulations</p>
+            <p className="text-xs text-faint">{expResults.statistical_methodology_note}</p>
           </div>
         )}
       </Panel>

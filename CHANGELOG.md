@@ -4,6 +4,12 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+- Sequential testing for experiments: results stay valid however often you check them, so you can stop a test early. It is on by default for new experiments.
+- Experiments can set their significance level and planned sample size, and the sample-size estimate accounts for sequential testing and extra variants.
+- Guardrails show lift and significance, say which way is bad, and flag variants that made them significantly worse.
+- The Studio warns when an experiment's traffic split doesn't match its flag weights.
+
 ### Changed
 - Internal review codes removed from comments and test names; process logs moved to `docs/history/`.
 - Crate manifests now carry descriptions, repository and homepage.

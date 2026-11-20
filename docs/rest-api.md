@@ -129,7 +129,6 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | POST | `/v1/projects/:id/byok-verify` | Test a stored BYOK configuration |
 | POST | `/v1/projects/:id/export/warehouse` | Trigger an on-demand Parquet export to a configured BYOK S3 bucket |
 | POST | `/v1/projects/:id/ai/copilot` | Run an AI Copilot analytics query using the project's BYOK LLM |
-| PATCH | `/v1/projects/:id/experiments/:exp_id` | Update an existing experiment definition |
 
 ## Operations & health (unauthenticated unless noted)
 
@@ -221,8 +220,9 @@ take simpler arguments.
 |---|---|---|
 | GET, POST | `/v1/projects/:id/flags` | List / create or update a flag |
 | PATCH | `/v1/projects/:id/flags/:flag_id` | Change a flag (enable, rollout, variants) |
-| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag |
-| GET | `/v1/projects/:id/experiments/:exp_id/results` | Lift, p-values (Holm-Bonferroni corrected), Bayesian probability, SRM check |
+| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag. Optional `analysis: { sequential, alpha, planned_users_per_variant }` (defaults: fixed horizon, `0.05`, 10,000); each metric takes an optional `direction` (`decrease_is_bad`, the default, or `increase_is_bad`) |
+| PATCH | `/v1/projects/:id/experiments/:exp_id` | Stop, pause or resume (`status`, `end_ts_ms`) |
+| GET | `/v1/projects/:id/experiments/:exp_id/results` | Lift with absolute and relative intervals, p-values (Holm-Bonferroni corrected; always valid when `sequential`), Bayesian probability, SRM check, and `regressed_variants` per guardrail |
 
 ## MCP (bearer token)
 
