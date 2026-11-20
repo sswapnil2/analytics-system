@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Download, Plus, Upload, Users, X } from "lucide-react";
+import { CheckCircle2, Download, Pencil, Plus, Trash2, Upload, Users, X } from "lucide-react";
 import { api, isAbortError } from "../api/client";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, Spinner, btn, field, fieldLabel, ListSkeleton } from "../components/ui";
 import { clearFilterCaches, useTopValues } from "../components/FilterPanel";
 import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { useAccess } from "../auth/access";
+import { type Cond, cohortDefinition, condsFromDefinition } from "../lib/cohort";
 import { downloadTextFile, errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -16,24 +17,7 @@ interface Props {
 
 type Feedback = { kind: "ok" | "error"; text: string } | null;
 
-/** One line of the cohort builder. `days` 0 means any time. */
-interface Cond {
-  type: "did" | "didnt" | "prop";
-  event: string;
-  minCount: number;
-  days: number;
-  prop: string;
-  value: string;
-}
 const DAY_CHOICES: [number, string][] = [[0, "ever"], [7, "in the last 7 days"], [30, "in the last 30 days"], [90, "in the last 90 days"]];
-
-function condDef(c: Cond) {
-  const now = Date.now();
-  const time_range = c.days ? { start_ts_ms: now - c.days * 86_400_000, end_ts_ms: now } : null;
-  if (c.type === "did") return { kind: "performed_event", event_name: c.event, min_count: c.minCount, time_range, where_clauses: [] };
-  if (c.type === "didnt") return { kind: "not_performed_event", event_name: c.event, time_range };
-  return { kind: "property_match", predicate: { prop_name: c.prop, filter: { op: "eq", val: c.value.trim() } }, time_range };
-}
 
 function condText(c: Cond) {
   // ponytail: windows are fixed dates when saved (TimeRange has no rolling form); add one to the engine if cohorts must roll.
@@ -41,13 +25,6 @@ function condText(c: Cond) {
   if (c.type === "did") return `did ${humanizeEvent(c.event)} ${c.minCount}+ times${when}`;
   if (c.type === "didnt") return `didn't do ${humanizeEvent(c.event)}${when}`;
   return `${humanizeEvent(c.prop)} is ${c.value.trim()}`;
-}
-
-/** The saved definition: one condition as is, several joined with and/or. */
-export function cohortDefinition(conds: Cond[], match: "and" | "or") {
-  const ok = conds.filter((c) => (c.type === "prop" ? c.prop && c.value.trim() : c.event));
-  if (ok.length === 0) return null;
-  return ok.length === 1 ? condDef(ok[0]) : { kind: match, clauses: ok.map(condDef) };
 }
 
 /** Value box for "Has property": suggests the property's most common values. */
@@ -126,8 +103,47 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [cohorts, setCohorts] = useState<
-    Array<{ id: string; name: string; description: string; created_at_ms: number }>
+    Array<{ id: string; name: string; description: string; definition: unknown; created_at_ms: number }>
   >([]);
+  /** The saved cohort loaded into the builder, if any. */
+  const [editing, setEditing] = useState<{ id: string; name: string } | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const resetBuilder = () => {
+    setEditing(null);
+    setCohortName("");
+    setConds([{ ...newCond(), minCount: 2, days: 0 }]);
+    setMatch("and");
+  };
+  const startEdit = (c: { id: string; name: string; definition: unknown }) => {
+    const parsed = condsFromDefinition(c.definition);
+    if (!parsed) return;
+    setEditing({ id: c.id, name: c.name });
+    setCohortName(c.name);
+    setConds(parsed.conds);
+    setMatch(parsed.match);
+    setCohortFeedback(null);
+    nameRef.current?.scrollIntoView({ block: "center" });
+    nameRef.current?.focus();
+  };
+  const deleteCohort = async (c: { id: string; name: string }) => {
+    if (!window.confirm(`Delete the cohort "${c.name}"? This can't be undone.`)) return;
+    setDeletingId(c.id);
+    setCohortExportError(null);
+    try {
+      await api.deleteCohort(projectId, c.id);
+      if (editing?.id === c.id) resetBuilder();
+      clearFilterCaches(projectId);
+      await loadAll();
+      onCatalogChanged();
+    } catch (err) {
+      // 409 names what still uses it ("cohort is still used by report 'X'; remove it there first").
+      const msg = errorMessage(err);
+      setCohortExportError(`Couldn't delete "${c.name}": ${msg}`);
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const [lookupName, setLookupName] = useState<string>("");
   // No default: the first property alphabetically is almost never the key the CSV shares.
@@ -233,16 +249,17 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
   }, [runPreview]);
 
   const saveCohort = () =>
-    withFeedback(setCohortFeedback, setSavingCohort, `Saved "${cohortName.trim()}".`, async () => {
+    withFeedback(setCohortFeedback, setSavingCohort, `${editing ? "Updated" : "Saved"} "${cohortName.trim()}".`, async () => {
       const def = cohortDefinition(conds, match);
       if (!cohortName.trim()) throw new Error("Give the cohort a name.");
       if (!def) throw new Error("Add at least one condition.");
       const text = conds.map(condText).join(match === "and" ? ", and " : ", or ");
-      await api.createCohort(projectId, {
-        name: cohortName.trim(),
-        description: text.charAt(0).toUpperCase() + text.slice(1),
-        definition: def,
-      });
+      const body = { name: cohortName.trim(), description: text.charAt(0).toUpperCase() + text.slice(1), definition: def };
+      if (editing) {
+        await api.updateCohort(projectId, editing.id, body);
+        // Clear the builder so a second click can't save a copy of what was just edited.
+        resetBuilder();
+      } else await api.createCohort(projectId, body);
       clearFilterCaches(projectId);
       await loadAll();
       onCatalogChanged();
@@ -295,6 +312,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
               </label>
               <input
                 id="cohort-name"
+                ref={nameRef}
                 value={cohortName}
                 onChange={(e) => setCohortName(e.target.value)}
                 placeholder="Repeat active users"
@@ -411,9 +429,16 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
             </div>
 
             {canEdit && (
-              <button type="button" onClick={() => void saveCohort()} disabled={savingCohort} className={`${btn.primary} w-full`}>
-                {savingCohort ? "Saving…" : "Save cohort"}
-              </button>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => void saveCohort()} disabled={savingCohort} className={`${btn.primary} flex-1`}>
+                  {savingCohort ? "Saving…" : editing ? `Save changes to "${editing.name}"` : "Save cohort"}
+                </button>
+                {editing && (
+                  <button type="button" onClick={resetBuilder} className={btn.secondary}>
+                    Cancel
+                  </button>
+                )}
+              </div>
             )}
             <FeedbackLine feedback={cohortFeedback} />
           </div>
@@ -435,12 +460,30 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                 {cohortExportError && <ErrorNotice message={cohortExportError} />}
                 <ul className="space-y-2">
                   {cohorts.map((c) => (
-                    <li key={c.id} className="flex items-start justify-between gap-3 rounded-lg border border-line bg-sunken px-3 py-2">
-                      <div className="min-w-0">
+                    <li key={c.id} className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2 rounded-lg border border-line bg-sunken px-3 py-2">
+                      <div className="min-w-0 flex-1 basis-48">
                         <div className="text-sm font-medium text-ink">{c.name}</div>
                         <div className="text-xs text-muted">{c.description}</div>
                         <div className="mt-0.5 text-[11px] text-faint">Saved {formatDate(c.created_at_ms)}</div>
                       </div>
+                      <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {canEdit && condsFromDefinition(c.definition) && (
+                        <button type="button" onClick={() => startEdit(c)} className={btn.secondary} aria-label={`Edit ${c.name}`}>
+                          <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                          Edit
+                        </button>
+                      )}
+                      {canEdit && (
+                        <button
+                          type="button"
+                          disabled={deletingId === c.id}
+                          onClick={() => void deleteCohort(c)}
+                          className="rounded-md p-2 text-faint hover:bg-destructive-soft hover:text-destructive disabled:opacity-50"
+                          aria-label={`Delete ${c.name}`}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                      )}
                       {canAdmin && <button
                         type="button"
                         disabled={exportingCohortId === c.id}
@@ -456,6 +499,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                           </>
                         )}
                       </button>}
+                      </div>
                     </li>
                   ))}
                 </ul>

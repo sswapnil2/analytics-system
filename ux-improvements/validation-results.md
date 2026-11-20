@@ -7,7 +7,7 @@
 | `npm --prefix web run build` (typecheck + Vite) | pass (both passes) |
 | Demo-name grep on new files | no hits |
 
-No backend code changed, so no Rust tests were run. There is no frontend linter configured in `web/`.
+Rust: the cohort API branch's session ran `cargo test -p pulse-control` and the workspace check; here the merged tree built in release. `scripts/verify_e2e.sh` was not run. There is no frontend linter configured in `web/`.
 
 ## In the browser
 Nodes: the release `pulse-node` (backend identical to this branch) serving this branch's `web/dist`. Demo node seeded; fresh node with a SaaS schema (2,380 events over 14 days).
@@ -99,6 +99,14 @@ Fresh node with the SaaS events plus 120 profiles (`plan`, `country`, `company`)
 | Cohort CSV export: `…-users.csv`, 85 KB, header `canonical_uid,distinct_id,plan,…` | demo | ✅ |
 | Lookup upload | demo | ❌ join key pre-filled, typed key appended → fixed → ✅ "Matched on city. Adds tier (2 rows)"; re-upload replaced the bad table |
 | `npm test` 22/22, `npm run build`, demo-name grep and secret grep on the diff | — | ✅ |
+| Cohort edit/delete, on a node built from this branch with the merged API: Edit loads "Did UPI Autopay Mandate Approved 1+ times, ever"; rename + count 2 → Save sends PUT; same id, created date kept, "Updated …" | demo, dark, 1024 | ✅ |
+| After saving an edit the builder still held the cohort under "Save cohort" (a second click would copy it) | demo | ❌ → clears after update → ✅ |
+| Saved cohort row in the narrow panel: name wrapped one word per line | demo | ❌ → buttons wrap under the text → ✅ |
+| Delete while a saved report uses it: confirm shown, then "…still used by report 'Autopay users trend'…", cohort kept | demo | ✅ |
+| Report removed → Delete → list empty, error cleared; Trends no longer offers it | demo | ✅ |
+| New cohort → Edit → Cancel clears the builder; Trends offers the new cohort | demo | ✅ |
+| Cohorts at 375 | demo, dark | ✅ 375 |
+| `npm test` 24/24, build; `cargo build -p pulse-node --release` with the merge | — | ✅ |
 
 ## Not checked
 - Reduced motion was not emulated in the browser; it relies on the existing global CSS rule plus `motion-safe:` prefixes.

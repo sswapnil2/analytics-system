@@ -987,6 +987,16 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  updateCohort: (projectId: string, cohortId: string, body: { name: string; description: string; definition: unknown }) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  /** Refused with 409 while a cohort, flag, saved report or dashboard still uses it. */
+  deleteCohort: (projectId: string, cohortId: string) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), { method: "DELETE" }),
+
   getSchemaExtensions: (projectId: string, signal?: AbortSignal) =>
     fetchJson<{
       custom_events: Array<{ name: string; source_events: string[] }>;

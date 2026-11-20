@@ -1,6 +1,6 @@
 # Implementation log
 
-All changes are in `web/`. No new dependencies; no backend changes on this branch (cohort edit/delete endpoints were built separately, see the fourth pass).
+All changes are in `web/`. No new dependencies; no backend changes written here; the cohort update/delete endpoints were built on their own branch and merged in (see the fourth pass).
 
 | File | Change |
 |---|---|
@@ -54,7 +54,13 @@ All changes are in `web/`. No new dependencies; no backend changes on this branc
 | `src/lib/chart.ts`, `src/dashboards/ReportCard.tsx` | Dashboard cards use the report's saved interval (`cardInterval`), and coarsen it only when it would make too many buckets (hour > 7 days, day > 90 days). Axis and tooltip labels follow the bucket size. Test added. |
 | `src/workspaces/CohortsLookupsWorkspace.tsx` | Lookup "Match on property" is the picker and starts empty. It used to pre-fill the first property, so typing a key appended to it (found when re-testing the upload). |
 
-Backend (separate branch, not on this one): `claude/cohort-update-delete-api-4c4cc9`, commit `e8c16ab`. It adds `PUT` and `DELETE /v1/projects/:id/cohorts/:cohort_id`; delete returns 409 naming whatever still uses the cohort. The Cohorts edit/delete UI waits for that branch to be merged.
+Backend: `claude/cohort-update-delete-api-4c4cc9` (`e8c16ab`), built in a separate session and merged here. It adds `PUT` and `DELETE /v1/projects/:id/cohorts/:cohort_id`; delete returns 409 naming whatever still uses the cohort.
+
+| File | Change |
+|---|---|
+| `src/api/client.ts` | `updateCohort`, `deleteCohort`. |
+| `src/lib/cohort.ts` (new), `src/lib/cohort.test.ts` | Builder lines ↔ saved definition, moved out of the page, plus `condsFromDefinition` to load a saved cohort back. It returns null for definitions the builder can't show: fixed user lists, cohorts of cohorts, conditions with extra where-clauses, and anything but "is". A saved time window reopens as the nearest of 7/30/90 days, re-anchored to today. Round-trip test. |
+| `src/workspaces/CohortsLookupsWorkspace.tsx` | Saved cohorts get Edit and Delete (members and up). Edit appears only on cohorts the builder can show; it loads the cohort into the builder, where the button says "Save changes to …", next to Cancel. Saving clears the builder so a second click can't make a copy. Delete asks first; a 409 shows "Couldn't delete "X": cohort is still used by report 'Y'; remove it there first". Rows wrap their buttons under the text in the narrow panel. |
 
 ## Decisions
 - **Hover sync, not row checkboxes.** Rows and series highlight each other; hiding stays on the legend so there is one place to toggle.
