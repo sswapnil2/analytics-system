@@ -224,6 +224,7 @@ pub async fn run_byok_copilot(
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -266,6 +267,7 @@ pub async fn run_byok_copilot(
                     hold_constant_props: Vec::new(),
                     breakdown_by: None,
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 },
             )
             .await
@@ -314,6 +316,7 @@ pub async fn run_byok_copilot(
                     unit: TimeInterval::Day,
                     num_periods: 14,
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 },
             )
             .await
@@ -350,6 +353,7 @@ pub async fn run_byok_copilot(
                     steps: 4,
                     top_n_per_step: Some(8),
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 },
             )
             .await

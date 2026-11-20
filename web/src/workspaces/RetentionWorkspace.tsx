@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CalendarCheck, RefreshCw } from "lucide-react";
-import { api, isAbortError, RetentionResult } from "../api/client";
+import { api, isAbortError, RetentionResult, SamplingMode } from "../api/client";
 import { errorMessage, formatCount, formatDate, humanizeEvent } from "../lib/format";
 import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 import { typicalOrder } from "../lib/eventOrder";
@@ -23,8 +23,8 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
 } from "../components/ui";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, topValues } from "../components/FilterPanel";
@@ -146,6 +146,8 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     { query: buildQuery, range },
   );
 
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
+
   const runRetention = useCallback(async () => {
     if (!startEvent || !returnEvent) {
       setResult(null);
@@ -158,7 +160,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     setLoading(true);
     setError(null);
     try {
-      const body = { time_range: rangeFor(range), ...buildQuery() };
+      const body = { time_range: rangeFor(range), ...buildQuery(), sampling: samplingMode };
       const cmp = compareRangeFor(body.time_range, compare);
       const [res, prev] = await Promise.all([
         api.queryRetention(projectId, body, ctrl.signal),
@@ -197,7 +199,7 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, buildQuery, range, startEvent, returnEvent, splitBy, compare]);
+  }, [projectId, buildQuery, range, startEvent, returnEvent, splitBy, compare, samplingMode]);
 
   useEffect(() => {
     void runRetention();
@@ -347,7 +349,15 @@ export const RetentionWorkspace: React.FC<Props> = ({ projectId, availableEvents
 
       <Panel
         title="Users who came back, by start date"
-        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        meta={
+          <SamplingMeta
+            sampling={result?.sampling}
+            mode={samplingMode}
+            onChangeMode={setSamplingMode}
+            us={result?.exec_time_us}
+            loading={loading && !!result}
+          />
+        }
       >
         {cohorts.length === 0 ? (
           loading ? (

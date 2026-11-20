@@ -254,6 +254,7 @@ async fn custom_property_preserves_camel_case_identifiers() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -380,6 +381,7 @@ async fn inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_cardin
                     global_filter: GlobalFilter::default(),
                     compare_previous_period: false,
                     formula: None,
+                    sampling: Default::default(),
                 },
             )
             .await
@@ -400,6 +402,7 @@ async fn inverted_index_row_mask_matches_unmasked_on_mixed_types_and_high_cardin
                     hold_constant_props: Vec::new(),
                     breakdown_by: None,
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 },
             )
             .await
@@ -554,6 +557,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -592,6 +596,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await;
@@ -616,6 +621,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -640,6 +646,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -670,6 +677,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await;
@@ -702,6 +710,7 @@ async fn semantics_and_governance_regression_suite() {
                 hold_constant_props: Vec::new(),
                 breakdown_by: None,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await;
@@ -737,6 +746,7 @@ async fn semantics_and_governance_regression_suite() {
                 unit: TimeInterval::Month,
                 num_periods: 1,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -764,6 +774,7 @@ async fn semantics_and_governance_regression_suite() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await;
@@ -795,6 +806,7 @@ async fn semantics_and_governance_regression_suite() {
                 steps: 1,
                 top_n_per_step: Some(1),
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -892,6 +904,7 @@ async fn per_query_deadline_enforces_timeout() {
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await;
@@ -1009,6 +1022,7 @@ async fn pr1_funnel_drop_off_prioritizes_recorded_sessions() {
                 hold_constant_props: Vec::new(),
                 breakdown_by: None,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -1170,6 +1184,7 @@ async fn pr10_flows_hides_system_events_unless_anchored() {
                 steps: 3,
                 top_n_per_step: Some(10),
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -1202,6 +1217,7 @@ async fn pr10_flows_hides_system_events_unless_anchored() {
                 steps: 2,
                 top_n_per_step: Some(10),
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -1280,6 +1296,7 @@ async fn any_event_counts_a_return_through_any_app_event_but_not_system_events()
                 unit: TimeInterval::Day,
                 num_periods: 2,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             },
         )
         .await
@@ -1338,6 +1355,7 @@ fn two_step_funnel(range: TimeRange) -> FunnelQuery {
         hold_constant_props: Vec::new(),
         breakdown_by: None,
         global_filter: GlobalFilter::default(),
+        sampling: Default::default(),
     }
 }
 
@@ -1461,6 +1479,7 @@ async fn budget_memory_limit_rejects_high_cardinality_breakdown() {
         global_filter: GlobalFilter::default(),
         formula: None,
         compare_previous_period: false,
+        sampling: Default::default(),
     };
 
     // Normal budget succeeds.
@@ -1521,6 +1540,7 @@ async fn insights_unfiltered_totals_uses_zero_io_footer_fast_path() {
         global_filter: GlobalFilter::default(),
         formula: None,
         compare_previous_period: false,
+        sampling: Default::default(),
     };
 
     let res = qengine.query_insights("proj_footer", &query).await.unwrap();
@@ -1596,6 +1616,7 @@ async fn insights_user_prop_filter_short_circuits_with_zero_vortex_reads() {
         },
         formula: None,
         compare_previous_period: false,
+        sampling: Default::default(),
     };
     let res_empty = qengine
         .query_insights("proj_uprop", &empty_q)
@@ -1621,6 +1642,234 @@ async fn insights_user_prop_filter_short_circuits_with_zero_vortex_reads() {
     };
     let res_pro = qengine.query_insights("proj_uprop", &pro_q).await.unwrap();
     assert_eq!(res_pro.series[0].overall_value, Some(25.0));
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn deterministic_entity_bucket_sampling_scales_counts_preserves_ratios_and_cuts_io() {
+    use pulse_exec::SamplingMode;
+    use std::sync::atomic::Ordering;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 16,
+            l0_flush_row_threshold: 500_000,
+            l0_flush_max_age: Duration::from_secs(600),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let ingest = IngestService::new(storage.clone(), InMemoryGovernance::new());
+    let qengine = QueryEngine::new(
+        storage.clone(),
+        16 * 1024 * 1024,
+        None,
+        16 * 1024 * 1024,
+        Arc::new(CatalogRegistry::default()),
+    )
+    .await
+    .unwrap();
+    let day0 = 1_790_000_000_000i64 - (1_790_000_000_000i64 % 86_400_000);
+
+    // 1,600 distinct users spread across 16 deterministic entity buckets (~100 users/bucket).
+    // Every user does "signup" on day 0 (amount = 100.0) and half do "purchase" on day 0 + 1h and day 1.
+    let mut events = Vec::with_capacity(3_200);
+    for u in 0..1_600u32 {
+        let did = format!("user_{u:05}");
+        events.push(ev(
+            u as u64,
+            &did,
+            &format!("s0_{u}"),
+            "signup",
+            day0 + 1_000,
+            vec![("amount", PropValue::Float(100.0))],
+        ));
+        if u % 2 == 0 {
+            events.push(ev(
+                u as u64 + 10_000,
+                &did,
+                &format!("s0_{u}"),
+                "purchase",
+                day0 + 3_600_000,
+                vec![("amount", PropValue::Float(50.0))],
+            ));
+            events.push(ev(
+                u as u64 + 20_000,
+                &did,
+                &format!("s1_{u}"),
+                "purchase",
+                day0 + 86_400_000 + 1_000,
+                vec![("amount", PropValue::Float(50.0))],
+            ));
+        }
+    }
+    ingest
+        .ingest_for_project("proj_samp", WireBatch::new(events), day0 + 2 * 86_400_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    let tr = TimeRange {
+        start_ts_ms: day0,
+        end_ts_ms: day0 + 2 * 86_400_000 - 1,
+    };
+
+    // 1. Auto mode on small dataset stays 100% exact.
+    let auto_q = InsightsQuery {
+        time_range: tr,
+        interval: TimeInterval::Day,
+        series: vec![
+            InsightsSeriesSpec {
+                label: "U".into(),
+                event_name: "signup".into(),
+                metric: InsightsMetric::Uniques,
+                filters: vec![],
+            },
+            InsightsSeriesSpec {
+                label: "Avg".into(),
+                event_name: "signup".into(),
+                metric: InsightsMetric::PropAvg {
+                    prop: "amount".into(),
+                },
+                filters: vec![],
+            },
+            InsightsSeriesSpec {
+                label: "Sum".into(),
+                event_name: "signup".into(),
+                metric: InsightsMetric::PropSum {
+                    prop: "amount".into(),
+                },
+                filters: vec![],
+            },
+        ],
+        breakdown_by: vec![],
+        global_filter: GlobalFilter::default(),
+        compare_previous_period: false,
+        formula: None,
+        sampling: SamplingMode::Auto,
+    };
+    let exact_res = qengine.query_insights("proj_samp", &auto_q).await.unwrap();
+    assert!(!exact_res.sampling.as_ref().unwrap().is_sampled);
+    assert_eq!(exact_res.series[0].overall_value, Some(1_600.0));
+    assert_eq!(exact_res.series[1].overall_value, Some(100.0));
+    assert_eq!(exact_res.series[2].overall_value, Some(160_000.0));
+
+    // 2. Explicit 25% sampling (4 of 16 buckets) cuts Vortex reads by ~4x, scales Uniques & PropSum,
+    //    and leaves PropAvg unscaled at exactly 100.0.
+    let qengine_cold = QueryEngine::new(
+        storage.clone(),
+        16 * 1024 * 1024,
+        None,
+        16 * 1024 * 1024,
+        Arc::new(CatalogRegistry::default()),
+    )
+    .await
+    .unwrap();
+    let reads_before = storage
+        .segment_reader()
+        .tier_ab_reads
+        .load(Ordering::Relaxed);
+    let mut samp_q = auto_q.clone();
+    samp_q.sampling = SamplingMode::Rate(0.25);
+    let samp_res = qengine_cold
+        .query_insights("proj_samp", &samp_q)
+        .await
+        .unwrap();
+    let reads_sampled = storage
+        .segment_reader()
+        .tier_ab_reads
+        .load(Ordering::Relaxed)
+        - reads_before;
+    let sinfo = samp_res.sampling.as_ref().unwrap();
+    assert!(sinfo.is_sampled);
+    assert_eq!(sinfo.sampled_buckets, 4);
+    assert_eq!(sinfo.total_buckets, 16);
+    assert_eq!(sinfo.scale_factor, 4.0);
+    assert!(sinfo.relative_error_pct.is_some());
+    assert!(
+        reads_sampled <= 8,
+        "25% bucket sampling should read <= 8 segment Vortex blocks, read {reads_sampled}"
+    );
+    let est_uniques = samp_res.series[0].overall_value.unwrap();
+    assert!(
+        (est_uniques - 1_600.0).abs() < 400.0,
+        "sampled uniques {est_uniques} should be close to 1600"
+    );
+    assert_eq!(
+        samp_res.series[1].overall_value,
+        Some(100.0),
+        "PropAvg must NOT be scaled by sample factor"
+    );
+    let est_sum = samp_res.series[2].overall_value.unwrap();
+    assert!((est_sum - est_uniques * 100.0).abs() < 1.0);
+
+    // 3. Funnel with 25% sampling preserves ~50% conversion rate and scales entered_users.
+    let fq = FunnelQuery {
+        time_range: tr,
+        steps: vec![
+            FunnelStepSpec {
+                event_name: "signup".into(),
+                filters: vec![],
+                first_time_ever: false,
+            },
+            FunnelStepSpec {
+                event_name: "purchase".into(),
+                filters: vec![],
+                first_time_ever: false,
+            },
+        ],
+        order_mode: FunnelOrderMode::LooseOrder,
+        conversion_window_ms: 86_400_000,
+        exclusions: vec![],
+        hold_constant_props: vec![],
+        breakdown_by: None,
+        global_filter: GlobalFilter::default(),
+        sampling: SamplingMode::Rate(0.25),
+    };
+    let fres = qengine.query_funnel("proj_samp", &fq).await.unwrap();
+    assert!(fres.sampling.as_ref().unwrap().is_sampled);
+    assert!(
+        (fres.overall_steps[1].conversion_from_start_pct - 50.0).abs() < 12.0,
+        "sampled funnel conversion {}% should be near 50%",
+        fres.overall_steps[1].conversion_from_start_pct
+    );
+
+    // 4. Retention with 25% sampling preserves ~50% day-1 retention and scales cohort_size.
+    let rq = RetentionQuery {
+        time_range: tr,
+        start_event: "signup".into(),
+        return_event: "purchase".into(),
+        mode: RetentionMode::NDay,
+        unit: TimeInterval::Day,
+        num_periods: 1,
+        global_filter: GlobalFilter::default(),
+        sampling: SamplingMode::Rate(0.25),
+    };
+    let rres = qengine.query_retention("proj_samp", &rq).await.unwrap();
+    assert!(rres.sampling.as_ref().unwrap().is_sampled);
+    assert!(
+        (rres.cohorts[0].retained_pcts[1] - 50.0).abs() < 12.0,
+        "sampled retention {}% should be near 50%",
+        rres.cohorts[0].retained_pcts[1]
+    );
+
+    // 5. Flows with 25% sampling reports sampling metadata and scales anchor node counts.
+    let flq = FlowsQuery {
+        time_range: tr,
+        anchor_event: "signup".into(),
+        direction: FlowDirection::Forward,
+        steps: 2,
+        top_n_per_step: Some(10),
+        global_filter: GlobalFilter::default(),
+        sampling: SamplingMode::Rate(0.25),
+    };
+    let flres = qengine.query_flows("proj_samp", &flq).await.unwrap();
+    assert!(flres.sampling.as_ref().unwrap().is_sampled);
+    assert!(!flres.nodes.is_empty());
 
     id_router.close_all().await.unwrap();
 }

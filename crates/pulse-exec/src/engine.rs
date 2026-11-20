@@ -289,7 +289,9 @@ impl QueryEngine {
                 query.steps.len().saturating_sub(1)
             )));
         }
-        let mut res = self.query_funnel(project_id, query).await?;
+        let mut exact_query = query.clone();
+        exact_query.sampling = crate::ast::SamplingMode::Exact;
+        let mut res = self.query_funnel(project_id, &exact_query).await?;
         Ok(if step < res.dropped_uids_by_step.len() {
             res.dropped_uids_by_step.swap_remove(step)
         } else {

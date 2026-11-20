@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
-import { api, DroppedSessionSample, FunnelResult, isAbortError } from "../api/client";
+import { api, DroppedSessionSample, FunnelResult, isAbortError, SamplingMode } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { useAccess } from "../auth/access";
 import { typicalOrder } from "../lib/eventOrder";
@@ -24,8 +24,8 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
   SortHeader,
   useSort,
@@ -160,6 +160,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
     { query: buildQuery, range },
   );
 
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
+
   const runFunnel = useCallback(async () => {
     if (steps.length < 2) {
       setResult(null);
@@ -175,8 +177,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       const main = rangeFor(range);
       const cmp = compareRangeFor(main, compare);
       const [res, prev] = await Promise.all([
-        api.queryFunnel(projectId, { time_range: main, ...buildQuery() }, ctrl.signal),
-        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery() }, ctrl.signal) : Promise.resolve(null),
+        api.queryFunnel(projectId, { time_range: main, ...buildQuery(), sampling: samplingMode }, ctrl.signal),
+        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery(), sampling: samplingMode }, ctrl.signal) : Promise.resolve(null),
       ]);
       if (id === reqId.current && !ctrl.signal.aborted) {
         setResult(res);
@@ -187,7 +189,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, buildQuery, range, steps.length, compare]);
+  }, [projectId, buildQuery, range, steps.length, compare, samplingMode]);
 
   useEffect(() => {
     void runFunnel();
@@ -412,7 +414,18 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       )}
 
       {result && first && last && (
-        <Panel title="Conversion" meta={<RanIn us={result.exec_time_us} />}>
+        <Panel
+          title="Conversion"
+          meta={
+            <SamplingMeta
+              sampling={result.sampling}
+              mode={samplingMode}
+              onChangeMode={setSamplingMode}
+              us={result.exec_time_us}
+              loading={loading}
+            />
+          }
+        >
           {first.entered_users === 0 ? (
             <EmptyState
               title={`No one did the first step ${rangePhrase(range)}`}

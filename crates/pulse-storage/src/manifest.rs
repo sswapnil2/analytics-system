@@ -478,6 +478,7 @@ mod tests {
                         has_tier_c_column: true,
                         tier_b_columns: vec![],
                         event_counts: vec![(1, 5_000), (2, 5_000)],
+                        event_hlls: vec![],
                     },
                 };
                 big.active_segments

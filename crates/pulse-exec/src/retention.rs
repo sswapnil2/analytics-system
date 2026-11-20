@@ -11,8 +11,8 @@ use crate::ast::{RetentionCohortRow, RetentionMode, RetentionQuery, RetentionRes
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    align_floor_tz_cached, load_project_chunks_with_id, resolve_event_target,
-    resolve_global_cohort_bitmap, row_matches_predicates, ExecError, Result,
+    align_floor_tz_cached, load_project_chunks_sampled, resolve_event_target,
+    resolve_global_cohort_bitmap, row_matches_predicates, ExecError, Result, SamplingPlan,
 };
 
 const MAX_RETENTION_COHORTS: usize = 10_000;
@@ -82,8 +82,9 @@ impl RetentionEngine {
         }
         let props_vec: Vec<String> = props_needed.into_iter().collect();
 
+        let sampling_plan = SamplingPlan::resolve(query.sampling, snap, ps, query.time_range);
         let bloom = start_tgt.bloom_mask_64 | return_tgt.bloom_mask_64;
-        let chunks = load_project_chunks_with_id(
+        let chunks = load_project_chunks_sampled(
             ps,
             snap,
             cache,
@@ -92,6 +93,7 @@ impl RetentionEngine {
             &props_vec,
             (bloom != 0).then_some(bloom),
             Some(id_snap),
+            sampling_plan.bucket_limit(),
         )
         .await?;
 
@@ -207,8 +209,11 @@ impl RetentionEngine {
         }
 
         let mut rows = Vec::with_capacity(cohorts_map.len());
+        let mut sample_basis = 0u64;
         for (cohort_ts, cohort_bm) in cohorts_map {
-            let cohort_size = cohort_bm.len();
+            let raw_cohort_size = cohort_bm.len();
+            sample_basis = sample_basis.saturating_add(raw_cohort_size);
+            let cohort_size = raw_cohort_size;
             let label = DateTime::from_timestamp_millis(cohort_ts)
                 .map(|dt| dt.with_timezone(&tz).format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| cohort_ts.to_string());
@@ -286,11 +291,16 @@ impl RetentionEngine {
                 })
                 .collect();
 
+            let scaled_counts: Vec<u64> = retained_counts
+                .into_iter()
+                .map(|c| sampling_plan.scale_u64(c))
+                .collect();
+
             rows.push(RetentionCohortRow {
                 cohort_start_ts_ms: cohort_ts,
                 cohort_label: label,
-                cohort_size,
-                retained_counts,
+                cohort_size: sampling_plan.scale_u64(cohort_size),
+                retained_counts: scaled_counts,
                 retained_pcts,
             });
         }
@@ -300,6 +310,7 @@ impl RetentionEngine {
             exec_time_us: t0.elapsed().as_micros() as u64,
             mode: query.mode,
             cohorts: rows,
+            sampling: Some(sampling_plan.to_info(sample_basis)),
         })
     }
 }

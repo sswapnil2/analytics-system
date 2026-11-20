@@ -1222,6 +1222,7 @@ async fn assert_case_matches_oracle(case: GeneratedCase) {
             hold_constant_props: hold_props.clone(),
             breakdown_by: None,
             global_filter: exec_global.clone(),
+            sampling: Default::default(),
         };
         let actual_res = qengine.query_funnel("proj_prop", &fq).await.unwrap();
         let actual: Vec<u64> = actual_res
@@ -1292,6 +1293,7 @@ async fn assert_case_matches_oracle(case: GeneratedCase) {
                 global_filter: exec_global,
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             },
         )
         .await
@@ -1355,6 +1357,7 @@ async fn assert_case_matches_oracle(case: GeneratedCase) {
                     unit: TimeInterval::Day,
                     num_periods: 2,
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 },
             )
             .await
