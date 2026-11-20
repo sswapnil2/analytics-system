@@ -493,6 +493,9 @@ pub struct SamplingInfo {
     /// or `None` when exact or when sample count is 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_error_pct: Option<f64>,
+    /// Approximation method when `is_sampled` is true (`"bucket_sample"` or `"hll_sketch"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

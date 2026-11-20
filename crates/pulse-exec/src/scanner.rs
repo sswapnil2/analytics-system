@@ -409,6 +409,21 @@ impl SamplingPlan {
             scale_factor: self.scale_factor(),
             estimated_total_rows: self.estimated_total_rows,
             relative_error_pct,
+            method: self.is_sampled().then(|| "bucket_sample".to_string()),
+        }
+    }
+
+    /// Builds `SamplingInfo` for the zero-I/O footer HyperLogLog fast path.
+    pub fn to_hll_info(&self) -> SamplingInfo {
+        SamplingInfo {
+            is_sampled: true,
+            sample_rate: 1.0,
+            sampled_buckets: self.total_buckets,
+            total_buckets: self.total_buckets,
+            scale_factor: 1.0,
+            estimated_total_rows: self.estimated_total_rows,
+            relative_error_pct: Some(3.2),
+            method: Some("hll_sketch".to_string()),
         }
     }
 }

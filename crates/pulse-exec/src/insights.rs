@@ -6,7 +6,7 @@ use std::time::Instant;
 use chrono_tz::Tz;
 use futures::stream::{self, StreamExt};
 use pulse_identity::IdentitySnapshot;
-use pulse_storage::{ProjectStorage, SegmentMeta, StorageSnapshot, StoredRow};
+use pulse_storage::{HllSketch, ProjectStorage, SegmentMeta, StorageSnapshot, StoredRow};
 use pulse_wire::PropValue;
 use roaring::RoaringBitmap;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
@@ -409,6 +409,42 @@ async fn evaluate_window(
                 && p.user_mask.is_none()
                 && !p.is_rolling
         });
+
+    // Option 3: Zero-I/O footer HyperLogLog fast path for unfiltered `Uniques` / `DAU` / `WAU` / `MAU`
+    // when `SamplingMode::Auto` engages on large ranges (`sampling_plan.is_sampled()`).
+    let all_series_footer_hll_eligible = matches!(query.sampling, SamplingMode::Auto)
+        && sampling_plan.is_sampled()
+        && erased.is_empty()
+        && breakdown_dims.is_empty()
+        && global_event_preds.is_empty()
+        && global_user_mask.is_none()
+        && plans.iter().all(|p| {
+            matches!(
+                p.spec.metric,
+                InsightsMetric::Uniques
+                    | InsightsMetric::Dau
+                    | InsightsMetric::Wau
+                    | InsightsMetric::Mau
+            ) && p.event_preds.is_empty()
+                && p.user_mask.is_none()
+        });
+
+    if all_series_footer_hll_eligible {
+        if let Some(hll_out) = try_footer_hll_fast_path(
+            &all_segments,
+            &plans,
+            range,
+            scan_range,
+            query.interval,
+            buckets,
+            tz,
+            ps,
+            snap,
+            sampling_plan,
+        )? {
+            return Ok(hll_out);
+        }
+    }
 
     // Option 1: Unfiltered `Totals` served by the 0-I/O footer fast path is always sub-10ms exact,
     // so never auto-sample it (explicit `SamplingMode::Rate(_)` still honors the caller's request).
@@ -1203,6 +1239,147 @@ fn merge_breakdown_maps(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_footer_hll_fast_path(
+    all_segments: &[SegmentMeta],
+    plans: &[SeriesPlan<'_>],
+    range: TimeRange,
+    scan_range: TimeRange,
+    interval: TimeInterval,
+    buckets: &[i64],
+    tz: Tz,
+    ps: &ProjectStorage,
+    snap: &StorageSnapshot,
+    sampling_plan: SamplingPlan,
+) -> Result<Option<(Vec<SeriesOutput>, SamplingInfo)>> {
+    let mut per_series_overall: Vec<HllSketch> =
+        (0..plans.len()).map(|_| HllSketch::new()).collect();
+    let mut per_series_buckets: Vec<BTreeMap<i64, HllSketch>> =
+        (0..plans.len()).map(|_| BTreeMap::new()).collect();
+
+    for seg in all_segments {
+        if seg.footer.max_ts_ms < scan_range.start_ts_ms
+            || seg.footer.min_ts_ms > scan_range.end_ts_ms
+        {
+            continue;
+        }
+        // Every overlapping segment must lie completely inside `scan_range` and inside a single
+        // alignment bucket for each series so we never misattribute boundary rows.
+        if seg.footer.min_ts_ms < scan_range.start_ts_ms
+            || seg.footer.max_ts_ms > scan_range.end_ts_ms
+        {
+            return Ok(None);
+        }
+        let in_main_range =
+            seg.footer.min_ts_ms >= range.start_ts_ms && seg.footer.max_ts_ms <= range.end_ts_ms;
+        let overlaps_main =
+            seg.footer.max_ts_ms >= range.start_ts_ms && seg.footer.min_ts_ms <= range.end_ts_ms;
+        if overlaps_main && !in_main_range {
+            return Ok(None);
+        }
+
+        for (s_idx, plan) in plans.iter().enumerate() {
+            if !plan.is_rolling && !in_main_range {
+                continue;
+            }
+            let b_min = plan.align_unit.align_floor_tz(seg.footer.min_ts_ms, tz);
+            let b_max = plan.align_unit.align_floor_tz(seg.footer.max_ts_ms, tz);
+            if b_min != b_max {
+                return Ok(None);
+            }
+            for &eid in &plan.tgt.event_ids {
+                match seg.footer.event_hll(eid) {
+                    Some(Some(compact)) => {
+                        per_series_buckets[s_idx]
+                            .entry(b_min)
+                            .or_default()
+                            .merge_compact(compact);
+                        if in_main_range {
+                            per_series_overall[s_idx].merge_compact(compact);
+                        }
+                    }
+                    Some(None) => {}
+                    None => return Ok(None),
+                }
+            }
+        }
+    }
+
+    // Fold any hot L0 rows directly into the HLL sketches (zero Vortex I/O).
+    for b in 0..ps.config().num_buckets {
+        let l0_rows = ps.snapshot_l0_bucket(snap, b as u8);
+        for r in &l0_rows {
+            if !scan_range.contains(r.event_ts_ms) {
+                continue;
+            }
+            let in_main = range.contains(r.event_ts_ms);
+            for (s_idx, plan) in plans.iter().enumerate() {
+                if !plan.is_rolling && !in_main {
+                    continue;
+                }
+                if plan.tgt.matches_id(r.event_id) {
+                    let b_ts = plan.align_unit.align_floor_tz(r.event_ts_ms, tz);
+                    per_series_buckets[s_idx]
+                        .entry(b_ts)
+                        .or_default()
+                        .observe_uid(r.uid_internal);
+                    if in_main {
+                        per_series_overall[s_idx].observe_uid(r.uid_internal);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(plans.len());
+    for (s_idx, plan) in plans.iter().enumerate() {
+        let per_bucket = &per_series_buckets[s_idx];
+        let mut points = Vec::with_capacity(buckets.len());
+        for &bts in buckets {
+            let val = match plan.spec.metric {
+                InsightsMetric::Wau | InsightsMetric::Mau => {
+                    let window_days = if matches!(plan.spec.metric, InsightsMetric::Wau) {
+                        7i64
+                    } else {
+                        30i64
+                    };
+                    let bucket_end = interval
+                        .bucket_end_inclusive_tz(bts, tz)
+                        .min(range.end_ts_ms);
+                    let end_day = TimeInterval::Day.align_floor_tz(bucket_end, tz);
+                    let mut union_hll = HllSketch::new();
+                    for d in 0..window_days {
+                        if let Some(day_ts) = TimeInterval::prev_days_tz(end_day, d, tz) {
+                            if let Some(sk) = per_bucket.get(&day_ts) {
+                                union_hll.merge_sketch(sk);
+                            }
+                        }
+                    }
+                    Some(union_hll.estimate())
+                }
+                _ => Some(per_bucket.get(&bts).map_or(0.0, HllSketch::estimate)),
+            };
+            points.push(TimePoint {
+                bucket_ts_ms: bts,
+                value: val,
+            });
+        }
+        let overall_value = if plan.is_rolling {
+            points.last().and_then(|p| p.value).or(Some(0.0))
+        } else {
+            Some(per_series_overall[s_idx].estimate())
+        };
+        outputs.push(SeriesOutput {
+            label: plan.spec.label.clone(),
+            breakdown_key: "overall".to_string(),
+            overall_value,
+            points,
+        });
+    }
+
+    Ok(Some((outputs, sampling_plan.to_hll_info())))
+}
+
 #[inline]
 fn scale_metric_value(
     metric: &InsightsMetric,
@@ -1756,4 +1933,188 @@ pub fn eval_math_expr_opt(expr: &str, vars: &HashMap<String, Option<f64>>) -> Re
         )));
     }
     Ok(res.filter(|v| v.is_finite()))
+}
+
+#[cfg(test)]
+mod hll_fast_path_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use pulse_identity::IdentityRouter;
+    use pulse_storage::{StorageConfig, StorageEngine};
+    use pulse_wire::WireEvent;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn footer_hll_fast_path_answers_uniques_and_wau_with_zero_vortex_reads() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 8,
+                l0_flush_row_threshold: 100_000,
+                l0_flush_max_age: Duration::from_secs(3600),
+                compaction_min_segments: 4,
+            },
+            store,
+            id_router.clone(),
+        );
+        let ps = storage.get_or_open_project("proj_hll").await.unwrap();
+        let day0 = 1_790_000_000_000i64 - (1_790_000_000_000i64 % 86_400_000);
+
+        // 2,000 distinct users on day 0, 1,000 overlapping + 500 new on day 1 -> 2,500 total uniques.
+        let mut by_bucket: BTreeMap<u8, Vec<(WireEvent, u32)>> = BTreeMap::new();
+        for u in 1..=2_000u32 {
+            let did = format!("u_{u}");
+            let b = pulse_storage::route_bucket(&did, 8);
+            by_bucket.entry(b).or_default().push((
+                WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid(
+                        &did,
+                        "s",
+                        "open",
+                        day0 + 1_000,
+                        u as u64,
+                    ),
+                    routing_seed: did.clone(),
+                    distinct_id: did,
+                    session_id: "s".into(),
+                    event_name: "open".into(),
+                    client_event_ts_ms: day0 + 1_000,
+                    client_sent_ts_ms: 0,
+                    props: vec![],
+                    replay_offset_kb: 0,
+                },
+                u,
+            ));
+        }
+        for u in 1_001..=2_500u32 {
+            let did = format!("u_{u}");
+            let b = pulse_storage::route_bucket(&did, 8);
+            by_bucket.entry(b).or_default().push((
+                WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid(
+                        &did,
+                        "s2",
+                        "open",
+                        day0 + 86_400_000 + 1_000,
+                        u as u64 + 10_000,
+                    ),
+                    routing_seed: did.clone(),
+                    distinct_id: did,
+                    session_id: "s2".into(),
+                    event_name: "open".into(),
+                    client_event_ts_ms: day0 + 86_400_000 + 1_000,
+                    client_sent_ts_ms: 0,
+                    props: vec![],
+                    replay_offset_kb: 0,
+                },
+                u,
+            ));
+        }
+        for (b, evs) in by_bucket {
+            let g = ps.lock_bucket_append(b).await;
+            ps.append_bucket_events_locked(&g, b, evs).await.unwrap();
+        }
+        ps.flush_all().await.unwrap();
+
+        let snap = ps.snapshot();
+        let range = TimeRange {
+            start_ts_ms: day0,
+            end_ts_ms: day0 + 2 * 86_400_000 - 1,
+        };
+        let tz = chrono_tz::UTC;
+        let buckets = build_time_buckets_tz(range, TimeInterval::Day, tz).unwrap();
+        let dict = ps.dictionary();
+        let catalog = VirtualCatalog::default();
+        let spec_uniques = InsightsSeriesSpec {
+            label: "U".into(),
+            event_name: "open".into(),
+            metric: InsightsMetric::Uniques,
+            filters: vec![],
+        };
+        let spec_wau = InsightsSeriesSpec {
+            label: "W".into(),
+            event_name: "open".into(),
+            metric: InsightsMetric::Wau,
+            filters: vec![],
+        };
+        let plans = vec![
+            SeriesPlan {
+                spec: &spec_uniques,
+                tgt: resolve_event_target("open", dict, &catalog),
+                is_rolling: false,
+                align_unit: TimeInterval::Day,
+                metric_mask: MetricMask::from_metric(&spec_uniques.metric),
+                metric_prop: None,
+                event_preds: vec![],
+                user_mask: None,
+            },
+            SeriesPlan {
+                spec: &spec_wau,
+                tgt: resolve_event_target("open", dict, &catalog),
+                is_rolling: true,
+                align_unit: TimeInterval::Day,
+                metric_mask: MetricMask::from_metric(&spec_wau.metric),
+                metric_prop: None,
+                event_preds: vec![],
+                user_mask: None,
+            },
+        ];
+
+        let all_segments = snap.segments_for_range(
+            ts_to_date_floor(range.start_ts_ms),
+            ts_to_date_floor(range.end_ts_ms),
+            None,
+        );
+        let reads_before = storage
+            .segment_reader()
+            .tier_ab_reads
+            .load(Ordering::Relaxed);
+        let plan = SamplingPlan {
+            total_buckets: 8,
+            sampled_buckets: 2,
+            estimated_total_rows: 3_500,
+        };
+        let (outputs, info) = try_footer_hll_fast_path(
+            &all_segments,
+            &plans,
+            range,
+            range,
+            TimeInterval::Day,
+            &buckets,
+            tz,
+            &ps,
+            &snap,
+            plan,
+        )
+        .unwrap()
+        .expect("HLL fast path should succeed on flushed segments");
+        let reads_after = storage
+            .segment_reader()
+            .tier_ab_reads
+            .load(Ordering::Relaxed);
+
+        assert_eq!(
+            reads_after, reads_before,
+            "HLL fast path must perform 0 Vortex reads"
+        );
+        assert_eq!(info.method.as_deref(), Some("hll_sketch"));
+        assert!(info.is_sampled);
+        assert_eq!(info.sample_rate, 1.0);
+
+        let est_overall = outputs[0].overall_value.unwrap();
+        assert!(
+            (est_overall - 2_500.0).abs() / 2_500.0 < 0.08,
+            "HLL overall uniques {est_overall} should be within 8% of 2500"
+        );
+        let est_wau_day1 = outputs[1].points[1].value.unwrap();
+        assert!(
+            (est_wau_day1 - 2_500.0).abs() / 2_500.0 < 0.08,
+            "HLL WAU day1 {est_wau_day1} should be within 8% of 2500"
+        );
+
+        id_router.close_all().await.unwrap();
+    }
 }

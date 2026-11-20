@@ -68,6 +68,7 @@ export const SamplingMeta: React.FC<{
   us?: number | null;
   loading?: boolean;
 }> = ({ sampling, mode, onChangeMode, us, loading }) => {
+  const isHll = sampling?.method === "hll_sketch";
   const pct = sampling ? +(sampling.sample_rate * 100).toFixed(1) : null;
   const errText =
     sampling?.relative_error_pct != null ? ` (±${sampling.relative_error_pct}%)` : "";
@@ -77,11 +78,15 @@ export const SamplingMeta: React.FC<{
       {sampling?.is_sampled && (
         <span
           className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300 tabular"
-          title={`Entity-consistent deterministic sample of ${sampling.sampled_buckets}/${sampling.total_buckets} user buckets (${pct}% of users, ${sampling.scale_factor}x scale).`}
+          title={
+            isHll
+              ? `Instant HyperLogLog sketch across 100% of segments (${sampling.total_buckets}/${sampling.total_buckets} buckets, zero segment I/O).`
+              : `Entity-consistent deterministic sample of ${sampling.sampled_buckets}/${sampling.total_buckets} user buckets (${pct}% of users, ${sampling.scale_factor}x scale).`
+          }
         >
           <Zap className="h-3 w-3 shrink-0" />
           <span>
-            ~{pct}% sample{errText}
+            {isHll ? `~HLL sketch${errText}` : `~${pct}% sample${errText}`}
           </span>
           <button
             type="button"

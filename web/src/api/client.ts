@@ -75,6 +75,7 @@ export interface SamplingInfo {
   scale_factor: number;
   estimated_total_rows: number;
   relative_error_pct?: number;
+  method?: "bucket_sample" | "hll_sketch" | string;
 }
 
 export interface InsightsResult {

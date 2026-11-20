@@ -3,6 +3,7 @@ pub mod encrypted_store;
 pub mod engine;
 pub mod erased;
 pub mod error;
+pub mod hll;
 pub mod manifest;
 pub mod mem_bucket;
 pub mod profile_store;
@@ -25,6 +26,7 @@ pub use engine::{
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
+pub use hll::{CompactHll, HllSketch};
 pub use manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,

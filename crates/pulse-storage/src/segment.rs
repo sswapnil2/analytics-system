@@ -112,6 +112,11 @@ impl TierBColumnEntry {
 }
 
 /// Segment statistics and Tier B/C column catalog stored in `Manifest` `SegmentMeta`.
+use crate::hll::{CompactHll, HllSketch};
+
+/// Cap footer HLL sketches to the top 32 most frequent events per segment so manifests stay compact.
+const MAX_FOOTER_HLL_EVENTS: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentFooterMeta {
     pub row_count: u32,
@@ -126,9 +131,33 @@ pub struct SegmentFooterMeta {
     /// and false-positive-free event pruning. Empty on legacy segments written before this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_counts: Vec<(u16, u32)>,
+    /// Compact HyperLogLog sketches sorted by `event_id` for top events in this segment,
+    /// enabling zero-I/O approximate `Uniques` / `DAU` / `WAU` / `MAU` over long time ranges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_hlls: Vec<(u16, CompactHll)>,
 }
 
 impl SegmentFooterMeta {
+    /// Returns the compact HLL sketch for `event_id` if available:
+    /// - `Some(Some(hll))` -> sketch present in footer
+    /// - `Some(None)` -> exact 0 occurrences of `event_id` in this segment
+    /// - `None` -> unavailable (legacy segment or long-tail event outside top 32), caller must scan
+    #[inline]
+    pub fn event_hll(&self, event_id: u16) -> Option<Option<&CompactHll>> {
+        if self.event_hlls.is_empty() && self.row_count > 0 {
+            return None;
+        }
+        if self.exact_event_count(event_id) == Some(0) {
+            return Some(None);
+        }
+        match self
+            .event_hlls
+            .binary_search_by_key(&event_id, |&(id, _)| id)
+        {
+            Ok(idx) => Some(Some(&self.event_hlls[idx].1)),
+            Err(_) => None,
+        }
+    }
     /// Returns the exact count of `event_id` in this segment, or `None` for legacy segments
     /// that did not record `event_counts`.
     #[inline]
@@ -774,6 +803,29 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
     let inverted_bytes = inverted_idx.encode()?;
     let session_idx_bytes = encode_session_index(&session_headers, &session_ids)?;
 
+    // Build compact HLL sketches for up to the top `MAX_FOOTER_HLL_EVENTS` events in this segment.
+    let mut top_hll_eids: Vec<(u16, u32)> = event_count_map.iter().map(|(&k, &c)| (k, c)).collect();
+    if top_hll_eids.len() > MAX_FOOTER_HLL_EVENTS {
+        top_hll_eids.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_hll_eids.truncate(MAX_FOOTER_HLL_EVENTS);
+    }
+    let mut hll_map: HashMap<u16, HllSketch> = top_hll_eids
+        .into_iter()
+        .map(|(eid, _)| (eid, HllSketch::new()))
+        .collect();
+    if !hll_map.is_empty() {
+        for e in &entries {
+            if let Some(sk) = hll_map.get_mut(&e.row.event_id) {
+                sk.observe_uid(e.row.uid_internal);
+            }
+        }
+    }
+    let mut event_hlls: Vec<(u16, CompactHll)> = hll_map
+        .into_iter()
+        .map(|(eid, sk)| (eid, sk.to_compact()))
+        .collect();
+    event_hlls.sort_unstable_by_key(|(eid, _)| *eid);
+
     let footer_meta = SegmentFooterMeta {
         row_count: n as u32,
         session_count: session_headers.len() as u32,
@@ -784,6 +836,7 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
         has_tier_c_column,
         tier_b_columns: tier_b_catalog,
         event_counts: event_count_map.into_iter().collect(),
+        event_hlls,
     };
 
     Ok(Some(BuiltSegmentPayload {
