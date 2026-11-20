@@ -20,6 +20,8 @@ import {
   UserRound,
   Users,
   X,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 import {
   ADMIN_TOKEN_STORAGE_KEY,
@@ -139,6 +141,7 @@ function tabFromHash(): WorkspaceId {
 type ThemePref = "system" | "light" | "dark";
 const THEME_KEY = "pulse_theme";
 const PROJECT_KEY = "pulse_project";
+const NAV_KEY = "pulse_nav_collapsed";
 
 const projectFromHash = () => projectInHash(window.location.hash);
 
@@ -192,6 +195,24 @@ export const App: React.FC = () => {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState<number>(0);
   const [theme, setTheme] = useState<ThemePref>(readTheme);
+  // Desktop sidebar can shrink to an icon rail; remembered per browser.
+  const [navCollapsed, setNavCollapsed] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(NAV_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleNav = () =>
+    setNavCollapsed((v) => {
+      try {
+        window.localStorage.setItem(NAV_KEY, v ? "0" : "1");
+      } catch {
+        // storage unavailable: the choice lasts this visit
+      }
+      return !v;
+    });
+  const nc = navCollapsed ? "md:hidden" : ""; // hidden in the icon rail
   const [flushing, setFlushing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [quickstartOpen, setQuickstartOpen] = useState(false);
@@ -626,7 +647,7 @@ export const App: React.FC = () => {
   };
 
   const accountControls = (
-    <div className="flex items-center gap-0.5">
+    <div className={`flex items-center gap-0.5 ${navCollapsed ? "md:flex-col" : ""}`}>
       <button
         type="button"
         onClick={() => {
@@ -682,6 +703,16 @@ export const App: React.FC = () => {
       >
         <LogOut className="h-4 w-4" />
       </button>
+      <button
+        type="button"
+        onClick={toggleNav}
+        className={`${btn.ghost} hidden h-8 w-8 px-0 md:inline-flex`}
+        aria-label={navCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+        aria-expanded={!navCollapsed}
+        title={navCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+      >
+        {navCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+      </button>
     </div>
   );
 
@@ -695,16 +726,16 @@ export const App: React.FC = () => {
       </a>
 
       {/* Sidebar: full height on desktop, a scrolling tab strip on small screens. */}
-      <aside className="shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:w-60 md:flex-col md:gap-5 md:border-b-0 md:border-r md:px-3.5 md:py-5">
+      <aside className={`shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:flex-col md:overflow-hidden md:transition-[width] md:duration-200 md:ease-out ${navCollapsed ? "md:w-[4.25rem]" : "md:w-60"} md:gap-5 md:border-b-0 md:border-r md:px-3.5 md:py-5`}>
         <div className="flex items-center justify-between gap-2.5 px-4 py-3 md:px-1.5 md:py-0">
           <span className="flex items-center gap-2.5">
             <Logo size="sm" />
-            <span className="text-[1.0625rem] font-bold tracking-[-0.01em]">Pulse</span>
+            <span className={`text-[1.0625rem] font-bold tracking-[-0.01em] ${nc}`}>Pulse</span>
           </span>
           <span className="md:hidden">{accountControls}</span>
         </div>
 
-        <label className="mx-4 mb-3 flex flex-col gap-0.5 rounded-lg border border-line bg-canvas px-2.5 py-1.5 md:mx-0 md:mb-0">
+        <label className={`mx-4 mb-3 flex flex-col gap-0.5 rounded-lg border border-line bg-canvas px-2.5 py-1.5 md:mx-0 md:mb-0 ${nc}`}>
           <span className="text-xs text-muted">Project</span>
           <select
             value={activePid}
@@ -727,7 +758,12 @@ export const App: React.FC = () => {
         >
           {NAV_GROUPS.map((group) => (
             <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">
-              {group.label && <div className="hidden px-2.5 pb-1 text-xs text-muted md:block">{group.label}</div>}
+              {group.label &&
+                (navCollapsed ? (
+                  <div className="mx-2.5 mb-2 hidden h-px bg-line md:block" aria-hidden="true" />
+                ) : (
+                  <div className="hidden px-2.5 pb-1 text-xs text-muted md:block">{group.label}</div>
+                ))}
               {group.items.filter((item) => item.id !== "security" || canManageKeys).map((item) => {
                 const Icon = item.icon;
                 const active = activeTab === item.id;
@@ -740,14 +776,15 @@ export const App: React.FC = () => {
                       go(item.id);
                     }}
                     aria-current={active ? "page" : undefined}
-                    className={`flex h-9 shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 text-sm ${
+                    title={navCollapsed ? item.label : undefined}
+                    className={`flex h-9 shrink-0 items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 text-sm transition-colors duration-150 ${
                       active
                         ? "bg-brand-soft font-semibold text-brand"
                         : "text-ink-2 hover:bg-hover hover:text-ink"
                     }`}
                   >
                     <Icon className="h-[17px] w-[17px] shrink-0" />
-                    {item.label}
+                    <span className={navCollapsed ? "md:sr-only" : ""}>{item.label}</span>
                   </a>
                 );
               })}
@@ -755,7 +792,7 @@ export const App: React.FC = () => {
           ))}
         </nav>
 
-        <div className="hidden space-y-1.5 px-1.5 text-xs text-muted md:block">
+        <div className={`hidden space-y-1.5 px-1.5 text-xs text-muted md:block ${nc}`}>
           <div className="tabular">
             <span className="text-ink-2">{formatCount(totalEvents)}</span> events stored
           </div>
@@ -788,7 +825,7 @@ export const App: React.FC = () => {
         </div>
 
         <div className="hidden flex-col gap-2 border-t border-line px-1.5 pt-3 md:flex">
-          <div className="flex items-center gap-2.5">
+          <div className={`flex items-center gap-2.5 ${nc}`}>
           <span
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-[0.8125rem] font-semibold text-ink-2"
             aria-hidden="true"

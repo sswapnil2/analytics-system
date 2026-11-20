@@ -10,7 +10,9 @@ import {
   TimeRange,
 } from "../api/client";
 import { btn, ChartSkeleton, field, fieldLabel } from "../components/ui";
-import { errorMessage, formatCount, humanizeEvent } from "../lib/format";
+import { errorMessage, formatCount, formatDate, formatDateTime, humanizeEvent, segmentName } from "../lib/format";
+import { ChartSeries, TrendChart } from "../components/TrendChart";
+import { CHART_KINDS, cardInterval, chartKindBlocker, isAdditive } from "../lib/chart";
 
 /**
  * A date range choice: "today", "yesterday", a number of days ("7", "14"…),
@@ -146,7 +148,7 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
       </div>
       {open && (
         <form
-          className="absolute left-0 top-full z-40 mt-2 flex w-[min(20rem,calc(100vw-2rem))] flex-col gap-3 rounded-xl border border-line-strong bg-panel p-4 shadow-[0_12px_32px_rgb(0_0_0/0.16)]"
+          className="absolute left-0 top-full z-40 mt-2 flex w-[min(20rem,calc(100vw-2rem))] flex-col gap-3 rounded-xl border border-line-strong bg-panel p-4 shadow-pop motion-safe:animate-pop"
           onSubmit={(e) => {
             e.preventDefault();
             if (!valid) return;
@@ -189,7 +191,7 @@ export const KIND_LABEL: Record<SavedReport["report_kind"], string> = {
 /** "Formula((B / A) * 100)" → "(B / A) * 100" */
 const seriesLabel = (l: string) => l.replace(/^Formula\((.*)\)$/, "$1");
 
-const SERIES_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn))"];
+const SERIES_COLORS = Array.from({ length: 8 }, (_, i) => `rgb(var(--chart-${i + 1}))`);
 
 type CardResult =
   | { kind: "funnel"; data: FunnelResult }
@@ -227,7 +229,7 @@ export const ReportCardBody: React.FC<{
       } else if (report.report_kind === "insights") {
         set(setResult)({
           kind: "insights",
-          data: await api.queryInsights(projectId, { ...body, interval: rangeDays(range) > 30 ? "week" : "day" }, ctrl.signal),
+          data: await api.queryInsights(projectId, { ...body, interval: cardInterval(report.query_json.interval, rangeDays(range)) }, ctrl.signal),
         });
       } else if (report.report_kind === "retention") {
         set(setResult)({ kind: "retention", data: await api.queryRetention(projectId, body, ctrl.signal) });
@@ -273,7 +275,7 @@ export const ReportCardBody: React.FC<{
         <FunnelMini data={result.data} splitBy={(report.query_json as { breakdown_by?: string | null }).breakdown_by ?? null} />
       )}
       {result.kind === "flows" && <FlowsMini data={result.data} />}
-      {result.kind === "insights" && <TrendMini data={result.data} />}
+      {result.kind === "insights" && <TrendMini data={result.data} query={report.query_json} />}
       {result.kind === "retention" && <RetentionMini data={result.data} />}
     </div>
   );
@@ -393,8 +395,16 @@ const FlowsMini: React.FC<{ data: FlowsResult }> = ({ data }) => {
   );
 };
 
-const TrendMini: React.FC<{ data: InsightsResult }> = ({ data }) => {
-  const series = (data.formula_series.length ? data.formula_series : data.series).slice(0, 3);
+/** Inverse of the trend page's metric spec: "prop_sum" → "sum", for deciding what can stack. */
+const metricKindOf = (m: unknown) => {
+  const t = (m as { type?: string } | undefined)?.type ?? "uniques";
+  return t === "prop_sum" ? "sum" : t;
+};
+
+const TrendMini: React.FC<{ data: InsightsResult; query: Record<string, unknown> }> = ({ data, query }) => {
+  const formula = data.formula_series.length > 0;
+  const series = (formula ? data.formula_series : data.series).slice(0, SERIES_COLORS.length);
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const main = series[0];
   if (!main || main.points.length === 0) {
     return <p className="py-6 text-sm text-muted">No events in the selected dates.</p>;
@@ -404,18 +414,32 @@ const TrendMini: React.FC<{ data: InsightsResult }> = ({ data }) => {
   const prevTotal = prev ? prev.overall_value ?? prev.points.reduce((a, p) => a + (p.value ?? 0), 0) : null;
   const change = prevTotal ? ((total - prevTotal) / prevTotal) * 100 : null;
 
-  const W = 420;
-  const H = 110;
-  const max = Math.max(1, ...series.flatMap((s) => s.points.map((p) => p.value ?? 0)));
-  const n = main.points.length;
-  const path = (pts: { value: number | null }[]) =>
-    pts
-      .map((p, i) => {
-        const x = n === 1 ? W / 2 : (i / (n - 1)) * W;
-        const y = H - 6 - ((p.value ?? 0) / max) * (H - 16);
-        return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join(" ");
+  // The card draws the chart kind the report was saved with, if this result can show it.
+  const q = query as { chart_type?: unknown; breakdown_by?: string[]; series?: { metric?: unknown }[] };
+  const saved = q.chart_type === "bar" ? "column" : q.chart_type;
+  const wanted = CHART_KINDS.find((c) => c.kind === saved)?.kind ?? "line";
+  const additive = isAdditive((q.series ?? []).map((s) => metricKindOf(s.metric)), Boolean(q.breakdown_by?.length), formula);
+  const kind = chartKindBlocker(wanted, { seriesCount: series.length, additive }) ? "line" : wanted;
+  const split = Boolean(q.breakdown_by?.length);
+  const buckets = data.buckets_ts_ms;
+  const n = buckets.length;
+  // Bucket size from the spacing: hours, days, weeks or months.
+  const gap = n < 2 ? 86_400_000 : buckets[1] - buckets[0];
+  const step = gap < 86_400_000 ? "hour" : gap < 2 * 86_400_000 ? "day" : gap < 20 * 86_400_000 ? "week" : "month";
+  // "A" → its event name, from the saved query.
+  const nameOf = (label: string) => {
+    const ev = (query as { series?: { label?: string; event_name?: string }[] }).series?.find((x) => x.label === label)?.event_name;
+    return ev ? humanizeEvent(ev) : seriesLabel(label);
+  };
+  const chartSeries: ChartSeries[] = series.map((s, i) => ({
+    key: `${s.label}-${s.breakdown_key}`,
+    name: split ? segmentName(s.breakdown_key) : nameOf(s.label),
+    color: SERIES_COLORS[i],
+    points: s.points.map((p) => p.value),
+    overall: s.overall_value,
+  }));
+  const fmt = (v: number | null | undefined) =>
+    v === null || v === undefined || !Number.isFinite(v) ? "–" : v.toLocaleString(undefined, { maximumFractionDigits: 1 });
 
   return (
     <div className="space-y-2">
@@ -426,35 +450,47 @@ const TrendMini: React.FC<{ data: InsightsResult }> = ({ data }) => {
             {Math.abs(change).toFixed(0)}%
           </span>
         )}
-        <span className="text-sm text-muted">{change !== null ? "vs previous period" : seriesLabel(main.label)}</span>
+        <span className="text-sm text-muted">{change !== null ? "vs previous period" : split ? segmentName(main.breakdown_key) : nameOf(main.label)}</span>
       </Headline>
-      {n > 1 ? (
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label={`${main.label} over time`}>
-          <line x1="0" y1={H - 6} x2={W} y2={H - 6} stroke="rgb(var(--line-strong))" />
-          {prev && prev.points.length === n && (
-            <path d={path(prev.points)} fill="none" stroke="rgb(var(--faint))" strokeWidth={1.5} strokeDasharray="4 4" />
-          )}
-          {series.map((s, i) => (
-            <path
-              key={`${s.label}-${s.breakdown_key}`}
-              d={path(s.points)}
-              fill="none"
-              stroke={SERIES_COLORS[i]}
-              strokeWidth={2.5}
-              strokeLinejoin="round"
-            />
-          ))}
-        </svg>
-      ) : null}
-      {series.length > 1 && (
-        <div className="flex flex-wrap gap-3 text-xs text-ink-2">
-          {series.map((s, i) => (
-            <span key={`${s.label}-${s.breakdown_key}`} className="inline-flex items-center gap-1.5">
-              <span className="h-[3px] w-3.5" style={{ background: SERIES_COLORS[i] }} />
-              {s.breakdown_key ? `${seriesLabel(s.label)}: ${s.breakdown_key}` : seriesLabel(s.label)}
-            </span>
-          ))}
-        </div>
+      {kind !== "number" && (n > 1 || kind === "pie") && (
+        <TrendChart
+          compact
+          kind={kind}
+          series={chartSeries}
+          buckets={buckets}
+          axisLabel={(ts) =>
+            step === "hour"
+              ? formatDateTime(ts, { hour: "numeric" })
+              : step === "month"
+                ? formatDate(ts, { month: "short", year: "2-digit" })
+                : formatDate(ts, { day: "numeric", month: "short" })
+          }
+          bucketTitle={(i) =>
+            step === "hour"
+              ? formatDateTime(buckets[i], { weekday: "short", day: "numeric", month: "short", hour: "numeric" })
+              : step === "day"
+                ? formatDate(buckets[i], { weekday: "short", day: "numeric", month: "short" })
+                : step === "week"
+                  ? `Week of ${formatDate(buckets[i], { day: "numeric", month: "short" })}`
+                  : formatDate(buckets[i], { month: "long", year: "numeric" })
+          }
+          fmt={fmt}
+          partialLast
+          ghost={series.length === 1 && prev ? prev.points.map((p) => p.value) : undefined}
+          hidden={series.length > 1 ? hidden : undefined}
+          onToggle={
+            series.length > 1
+              ? (key) =>
+                  setHidden((h) => {
+                    const next = new Set(h);
+                    if (next.has(key)) next.delete(key);
+                    else if (chartSeries.some((c) => c.key !== key && !next.has(c.key))) next.add(key);
+                    return next;
+                  })
+              : undefined
+          }
+          ariaLabel={`${seriesLabel(main.label)} over time`}
+        />
       )}
     </div>
   );

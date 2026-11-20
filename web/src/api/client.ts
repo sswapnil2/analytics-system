@@ -785,6 +785,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  updateReport: (projectId: string, reportId: string, body: { name: string; query_json: unknown }) =>
+    fetchJson<SavedReport>(
+      `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
   deleteReport: (projectId: string, reportId: string) =>
     fetchJson<unknown>(
       `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
@@ -981,6 +986,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  updateCohort: (projectId: string, cohortId: string, body: { name: string; description: string; definition: unknown }) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  /** Refused with 409 while a cohort, flag, saved report or dashboard still uses it. */
+  deleteCohort: (projectId: string, cohortId: string) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), { method: "DELETE" }),
 
   getSchemaExtensions: (projectId: string, signal?: AbortSignal) =>
     fetchJson<{

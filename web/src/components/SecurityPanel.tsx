@@ -81,6 +81,8 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
 }) => {
   const [encryption, setEncryption] = useState<EncryptionStatusResponse | null>(null);
   const [auditLogs, setAuditLogs] = useState<EnterpriseAuditRecord[]>([]);
+  // Why the audit log couldn't load: it's a licensed feature, or a plain error.
+  const [auditProblem, setAuditProblem] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<ByokCredentialItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -117,11 +119,23 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
       const [enc, creds, logs] = await Promise.all([
         api.getEncryptionStatus().catch(() => null),
         api.listByokCredentials(projectId),
-        api.listAuditLogs(20).catch(() => []),
+        api.listAuditLogs(20).then(
+          (l) => ({ l, problem: null as string | null }),
+          (err) => {
+            const msg = errorMessage(err);
+            return {
+              l: [] as EnterpriseAuditRecord[],
+              problem: msg.includes("commercial_license_required")
+                ? "The audit log needs a commercial licence. Set PULSE_LICENSE_KEY on the node to turn it on."
+                : `Couldn't load the audit log: ${msg}`,
+            };
+          },
+        ),
       ]);
       setEncryption(enc);
       setCredentials(creds);
-      setAuditLogs(logs);
+      setAuditLogs(logs.l);
+      setAuditProblem(logs.problem);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -148,8 +162,8 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
       setNewKeyInput("");
       setNotice(
         disableWrites
-          ? "Disabled encryption for new writes. Historical objects remain decryptable."
-          : `Active encryption key rotated to ${res.status.active_key_id}. Keyring holds ${res.status.keyring_size} keys.`,
+          ? "New data is no longer encrypted. Files encrypted earlier still open."
+          : `Encryption key changed to ${res.status.active_key_id}. ${res.status.keyring_size} keys kept for older files.`,
       );
       await loadState();
     } catch (err) {
@@ -277,7 +291,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
       )}
       {/* 1. Encryption at rest */}
       <Panel
-        title="Cluster Encryption at Rest (AES-256-GCM)"
+        title="Encryption at rest"
         meta={loading ? "Loading…" : undefined}
         actions={
           <span
@@ -288,34 +302,35 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
             }`}
           >
             <Lock className="h-3.5 w-3.5" />
-            {encryption?.status.enabled ? "Active Envelope Encryption" : "Plaintext Storage"}
+            {encryption?.status.enabled ? "On" : "Off"}
           </span>
         }
       >
         <div className="space-y-4">
           <p className="text-xs text-muted">
-            All analytics segments (<code className="font-mono">.pvtx</code>), wireframe replays (<code className="font-mono">.plsr</code>),
-            WAL journals, manifests, and identity stores are encrypted with AES-256-GCM chunked envelope keys.
-            Keyring history is preserved indefinitely across restarts and rotations so historical files always decrypt.
+            {encryption?.status.enabled
+              ? "Everything Pulse writes to disk (events, session replays, logs and user data) is encrypted with AES-256-GCM. "
+              : "New data is written to disk unencrypted. Set a key to encrypt everything Pulse writes from now on (AES-256-GCM). "}
+            Earlier keys are kept, so files written before a key change still open.
           </p>
 
           <div className="grid grid-cols-1 gap-4 rounded-xl border border-line bg-sunken p-4 sm:grid-cols-3">
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Active Key</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Current key</div>
               <div className="font-mono text-xs font-medium text-ink">
-                {encryption?.status.active_key_id ?? "None (writes unencrypted)"}
+                {encryption?.status.active_key_id ?? "None"}
               </div>
             </div>
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Keyring Size</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Keys kept</div>
               <div className="text-xs font-medium text-ink">
-                {encryption?.status.keyring_size ?? 0} keys loaded
+                {encryption?.status.keyring_size ?? 0}
               </div>
             </div>
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Encrypted I/O</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Since start</div>
               <div className="text-xs font-medium text-ink">
-                {formatCount(encryption?.status.ops_encrypted ?? 0)} enc / {formatCount(encryption?.status.ops_decrypted ?? 0)} dec ops
+                {formatCount(encryption?.status.ops_encrypted ?? 0)} encrypted · {formatCount(encryption?.status.ops_decrypted ?? 0)} decrypted
               </div>
             </div>
           </div>
@@ -325,9 +340,9 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
               type="password"
               value={newKeyInput}
               onChange={(e) => setNewKeyInput(e.target.value)}
-              placeholder="Rotate to new 64-hex key or >=16-char passphrase"
-              className={`${field} min-w-[18rem] flex-1 font-mono text-xs`}
-              aria-label="New master key or passphrase"
+              placeholder="64 hex characters, or a passphrase of 16+ characters"
+              className={`${field} min-w-0 flex-1 basis-64 font-mono text-xs`}
+              aria-label="New encryption key or passphrase"
             />
             <button
               type="button"
@@ -335,16 +350,19 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
               onClick={() => void handleRotateKey(false)}
               className={btn.primary}
             >
-              {rotateBusy ? <Spinner label="Rotating" /> : "Rotate Master Key"}
+              {rotateBusy ? <Spinner label="Saving the key" /> : encryption?.status.enabled ? "Change key" : "Turn on encryption"}
             </button>
             {encryption?.status.enabled && (
               <button
                 type="button"
                 disabled={rotateBusy}
-                onClick={() => void handleRotateKey(true)}
+                onClick={() => {
+                  if (window.confirm("Stop encrypting new data? Data written from now on is stored unencrypted. Files already encrypted stay encrypted and readable."))
+                    void handleRotateKey(true);
+                }}
                 className={btn.secondary}
               >
-                Disable New Writes Encryption
+                Stop encrypting new data
               </button>
             )}
           </div>
@@ -425,6 +443,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                             disabled={busy}
                             onChange={(e) => setDraftStorageRegion(e.target.value)}
                             placeholder="Region (ap-south-1)"
+                            aria-label="Storage region"
                             className={`${field} font-mono text-xs`}
                           />
                           <input
@@ -433,6 +452,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                             disabled={busy}
                             onChange={(e) => setDraftStorageAccessKey(e.target.value)}
                             placeholder="Access key ID"
+                            aria-label="Storage access key ID"
                             className={`${field} font-mono text-xs`}
                           />
                         </div>
@@ -442,6 +462,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                           disabled={busy}
                           onChange={(e) => setDraftStorageEndpoint(e.target.value)}
                           placeholder="Custom endpoint (optional, e.g. MinIO/R2)"
+                          aria-label="Custom storage endpoint (optional)"
                           className={`${field} w-full font-mono text-xs`}
                         />
                       </div>
@@ -551,8 +572,14 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
       </Panel>
 
       {/* 3. Audit log */}
-      {auditLogs.length > 0 && (
-        <Panel title="Audit log" meta="Cryptographically tracked security actions">
+      <Panel title="Audit log" meta="Latest 20 security and admin actions">
+          {auditProblem ? (
+            <p className="text-sm text-muted">{auditProblem}</p>
+          ) : auditLogs.length === 0 ? (
+            <p className="text-sm text-muted">
+              Nothing recorded yet. Key changes, provider credentials, invites and role changes appear here.
+            </p>
+          ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
@@ -579,8 +606,8 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
               </tbody>
             </table>
           </div>
-        </Panel>
-      )}
+          )}
+      </Panel>
 
       {/* 4. AI copilot */}
       <Panel
@@ -589,7 +616,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
       >
         <div className="space-y-4">
           <div className="rounded-lg border border-line bg-sunken px-3 py-2 text-xs text-muted">
-            <strong className="text-ink">Data Flow Disclosure:</strong> Questions, aggregate metric summaries, and cited session IDs are sent directly to your configured provider. Pulse never trains on or stores your queries.
+            <strong className="text-ink">What is sent:</strong> Questions, aggregate metric summaries, and cited session IDs are sent directly to your configured provider. Pulse never trains on or stores your queries.
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -602,7 +629,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                   setCopilotPrompt(preset);
                   void handleAskCopilot(undefined, preset);
                 }}
-                className={`${btn.secondary} px-2.5 py-1 text-xs`}
+                className={`${btn.secondary} h-auto max-w-full !whitespace-normal px-2.5 py-1 text-left text-xs`}
               >
                 {preset}
               </button>
@@ -636,7 +663,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
               ) : (
                 <>
                   <Sparkles className="h-3.5 w-3.5" />
-                  Analyze Drop-Offs
+                  Analyze drop-offs
                 </>
               )}
             </button>
