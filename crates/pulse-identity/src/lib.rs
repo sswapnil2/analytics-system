@@ -428,6 +428,18 @@ impl CheckpointSnapshot {
     }
 }
 
+/// Runs CPU-bound work with `block_in_place` on a multi-thread runtime (a no-op wrapper elsewhere,
+/// where `block_in_place` would panic), so it doesn't stall the worker's other tasks.
+fn cpu_bound<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 async fn run_blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
@@ -916,7 +928,7 @@ impl ProjectIdentityGraph {
 
             let mut cp_to_restore: Option<IdentityCheckpoint> = None;
             if let Some(cp_bytes) = reader.get(META_CHECKPOINT_KEY).await? {
-                let cp = decode_checkpoint(&cp_bytes)?;
+                let cp = run_blocking(move || decode_checkpoint(&cp_bytes)).await?;
                 if cp.next_chunk_seq > cur_seq {
                     cur_seq = cp.next_chunk_seq;
                     cp_to_restore = Some(cp);
@@ -934,7 +946,9 @@ impl ProjectIdentityGraph {
                 decoded_chunks.push(decode_mutation_chunk(&bytes)?);
             }
 
-            {
+            // Restores into `self` (not 'static), so block this worker in place rather than
+            // `spawn_blocking`; either way the runtime keeps other tasks and timers moving (#68).
+            cpu_bound(|| -> Result<()> {
                 let mut state = self.state.write();
                 if let Some(cp) = cp_to_restore {
                     let cp_seq = restore_checkpoint(&mut state, &self.fast_lookup, cp)?;
@@ -943,7 +957,8 @@ impl ProjectIdentityGraph {
                 for entries in decoded_chunks {
                     apply_mutation_entries(&mut state, &self.fast_lookup, entries)?;
                 }
-            }
+                Ok(())
+            })?;
             self.next_chunk_seq.store(chunk_count, Ordering::Release);
             self.snapshot_dirty.store(true, Ordering::Release);
             Ok(true)
