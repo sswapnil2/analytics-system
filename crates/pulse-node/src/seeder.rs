@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use chrono::Utc;
 use pulse_control::{
-    AlertRule, CohortRecord, ControlPlaneService, Dashboard, DashboardCard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
+    AlertRule, AnalysisConfig, CohortRecord, ControlPlaneService, Dashboard, DashboardCard,
+    Experiment, ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -207,6 +207,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             metric_type: "conversion".to_string(),
             numeric_prop: None,
             conversion_window_ms: 7 * 86_400_000,
+            direction: "decrease_is_bad".to_string(),
         },
         guardrail_metrics: vec![ExperimentMetricSpec {
             name: "NSDL Gateway 504 Timeout Rate".to_string(),
@@ -214,7 +215,12 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             metric_type: "conversion".to_string(),
             numeric_prop: None,
             conversion_window_ms: 7 * 86_400_000,
+            direction: "increase_is_bad".to_string(),
         }],
+        analysis: AnalysisConfig {
+            sequential: true,
+            ..AnalysisConfig::default()
+        },
         created_at_ms: now_ms,
     };
     ctrl.meta().upsert_experiment(&exp).await?;

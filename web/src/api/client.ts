@@ -297,16 +297,27 @@ export interface Experiment {
   status: string;
   start_ts_ms: number;
   end_ts_ms: number;
-  primary_metric: {
-    name: string;
-    event_name: string;
-    metric_type: string;
-    conversion_window_ms: number;
-  };
-  guardrail_metrics: {
-    name: string;
-    event_name: string;
-  }[];
+  primary_metric: ExperimentMetric;
+  guardrail_metrics: ExperimentMetric[];
+  analysis?: ExperimentAnalysis;
+}
+
+export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
+
+export interface ExperimentMetric {
+  name: string;
+  event_name: string;
+  metric_type?: string;
+  conversion_window_ms: number;
+  /** Which way is bad, for guardrails. */
+  direction?: MetricDirection;
+}
+
+export interface ExperimentAnalysis {
+  /** Always-valid results, safe to check at any time. */
+  sequential: boolean;
+  alpha: number;
+  planned_users_per_variant?: number | null;
 }
 
 export interface VariantLiftRow {
@@ -323,6 +334,10 @@ export interface VariantLiftRow {
   p_value: number;
   bayesian_prob_to_beat_control: number;
   statistically_significant: boolean;
+  abs_diff?: number;
+  abs_ci_low?: number;
+  abs_ci_high?: number;
+  sequential?: boolean;
 }
 
 export interface ExperimentResults {
@@ -333,10 +348,19 @@ export interface ExperimentResults {
   hypothesis: string;
   metric_name: string;
   exec_time_us: number;
+  srm_p_value: number;
+  /** The traffic split doesn't match the flag's weights, so results can't be trusted. */
+  sample_ratio_mismatch: boolean;
+  statistical_methodology_note: string;
+  sequential: boolean;
+  /** Confidence level of every interval, e.g. 0.95. */
+  confidence_level: number;
   variants: VariantLiftRow[];
   guardrails: {
     metric_name: string;
     event_name: string;
+    direction: MetricDirection;
+    regressed_variants: string[];
     variants: VariantLiftRow[];
   }[];
 }
@@ -1076,8 +1100,9 @@ export const api = {
       hypothesis: string;
       start_ts_ms: number;
       end_ts_ms: number;
-      primary_metric: { name: string; event_name: string; conversion_window_ms: number };
-      guardrail_metrics: { name: string; event_name: string; conversion_window_ms: number }[];
+      primary_metric: ExperimentMetric;
+      guardrail_metrics: ExperimentMetric[];
+      analysis: ExperimentAnalysis;
     },
   ) =>
     fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {

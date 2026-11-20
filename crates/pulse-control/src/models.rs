@@ -272,6 +272,42 @@ pub struct ExperimentMetricSpec {
     pub numeric_prop: Option<String>,
     #[serde(default = "default_window_ms")]
     pub conversion_window_ms: i64,
+    /// Which way is bad, for guardrails: `"decrease_is_bad"` (default) or `"increase_is_bad"`.
+    #[serde(default = "default_direction")]
+    pub direction: String,
+}
+
+fn default_direction() -> String {
+    "decrease_is_bad".to_string()
+}
+
+/// How an experiment's results are analysed. Rows stored before this existed read as
+/// fixed-horizon at 5%, which is what they were shown with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    /// Always-valid p-values and confidence sequences, safe to check at any time.
+    #[serde(default)]
+    pub sequential: bool,
+    /// Two-sided significance level, `0 < alpha < 0.5`.
+    #[serde(default = "default_alpha")]
+    pub alpha: f64,
+    /// Tunes the sequential test to be tightest at this sample size. Defaults to 10,000.
+    #[serde(default)]
+    pub planned_users_per_variant: Option<u64>,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            sequential: false,
+            alpha: default_alpha(),
+            planned_users_per_variant: None,
+        }
+    }
+}
+
+fn default_alpha() -> f64 {
+    0.05
 }
 
 fn default_conversion_kind() -> String {
@@ -297,6 +333,8 @@ pub struct Experiment {
     pub primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     pub guardrail_metrics: Vec<ExperimentMetricSpec>,
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
     pub created_at_ms: i64,
 }
 
@@ -315,12 +353,27 @@ pub struct VariantLiftRow {
     pub p_value: f64,
     pub bayesian_prob_to_beat_control: f64,
     pub statistically_significant: bool,
+    /// Treatment minus control, in metric units (conversion rate for conversion metrics).
+    #[serde(default)]
+    pub abs_diff: f64,
+    #[serde(default)]
+    pub abs_ci_low: f64,
+    #[serde(default)]
+    pub abs_ci_high: f64,
+    /// The p-value and CIs are always valid (sequential), not fixed-horizon.
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardrailResult {
     pub metric_name: String,
     pub event_name: String,
+    #[serde(default = "default_direction")]
+    pub direction: String,
+    /// Treatments that moved this guardrail significantly in the bad direction.
+    #[serde(default)]
+    pub regressed_variants: Vec<String>,
     pub variants: Vec<VariantLiftRow>,
 }
 
@@ -339,8 +392,17 @@ pub struct ExperimentResults {
     pub sample_ratio_mismatch: bool,
     #[serde(default = "default_stats_note")]
     pub statistical_methodology_note: String,
+    #[serde(default)]
+    pub sequential: bool,
+    /// Confidence level of every interval in these results (`1 - alpha`).
+    #[serde(default = "default_confidence_level")]
+    pub confidence_level: f64,
     pub variants: Vec<VariantLiftRow>,
     pub guardrails: Vec<GuardrailResult>,
+}
+
+fn default_confidence_level() -> f64 {
+    0.95
 }
 
 fn default_stats_note() -> String {
