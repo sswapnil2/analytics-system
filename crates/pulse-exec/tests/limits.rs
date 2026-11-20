@@ -885,7 +885,7 @@ async fn per_query_deadline_enforces_timeout() {
                 series: vec![InsightsSeriesSpec {
                     label: "A".into(),
                     event_name: "SlowEvt".into(),
-                    metric: InsightsMetric::Totals,
+                    metric: InsightsMetric::Uniques,
                     filters: Vec::new(),
                 }],
                 breakdown_by: Vec::new(),
@@ -1419,6 +1419,208 @@ async fn budget_row_limit_rejects_oversized_scan() {
         ),
         "expected QueryTooLarge, got {res:?}"
     );
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_memory_limit_rejects_high_cardinality_breakdown() {
+    let (storage, ingest, qengine, id_router) = budget_engine().await;
+    let ts = 1_762_000_000_000i64;
+    let events: Vec<_> = (0..500)
+        .map(|i| {
+            ev(
+                i,
+                &format!("u{i}"),
+                "s",
+                "page_view",
+                ts + i as i64 * 1_000,
+                vec![("url", PropValue::Str(format!("/item/{i}")))],
+            )
+        })
+        .collect();
+    ingest
+        .ingest_for_project("proj_mem", WireBatch::new(events), ts + 1_000_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    let query = InsightsQuery {
+        time_range: TimeRange {
+            start_ts_ms: ts - 1_000,
+            end_ts_ms: ts + 1_000_000,
+        },
+        interval: TimeInterval::Hour,
+        series: vec![InsightsSeriesSpec {
+            label: "A".into(),
+            event_name: "page_view".into(),
+            metric: InsightsMetric::Totals,
+            filters: Vec::new(),
+        }],
+        breakdown_by: vec!["url".into()],
+        global_filter: GlobalFilter::default(),
+        formula: None,
+        compare_previous_period: false,
+    };
+
+    // Normal budget succeeds.
+    assert!(qengine.query_insights("proj_mem", &query).await.is_ok());
+
+    // Tight working-memory budget rejects cleanly with QueryMemoryExceeded (HTTP 422).
+    qengine.set_max_memory_bytes(8 * 1024);
+    let res = qengine.query_insights("proj_mem", &query).await;
+    assert!(
+        matches!(res, Err(ExecError::QueryMemoryExceeded { .. })),
+        "expected QueryMemoryExceeded, got {res:?}"
+    );
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn insights_unfiltered_totals_uses_zero_io_footer_fast_path() {
+    let (storage, ingest, qengine, id_router) = budget_engine().await;
+    // Align cleanly inside a single UTC day (2025-11-02T12:00:00Z).
+    let ts = 1_762_084_800_000i64;
+    let events: Vec<_> = (0..300)
+        .map(|i| {
+            let name = if i % 3 == 0 { "checkout" } else { "view" };
+            ev(
+                i,
+                &format!("u{i}"),
+                "s",
+                name,
+                ts + i as i64 * 1_000,
+                Vec::new(),
+            )
+        })
+        .collect();
+    ingest
+        .ingest_for_project("proj_footer", WireBatch::new(events), ts + 500_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    let reads_before = storage
+        .segment_reader()
+        .tier_ab_reads
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let query = InsightsQuery {
+        time_range: TimeRange {
+            start_ts_ms: ts - 3_600_000,
+            end_ts_ms: ts + 3_600_000,
+        },
+        interval: TimeInterval::Day,
+        series: vec![InsightsSeriesSpec {
+            label: "A".into(),
+            event_name: "checkout".into(),
+            metric: InsightsMetric::Totals,
+            filters: Vec::new(),
+        }],
+        breakdown_by: Vec::new(),
+        global_filter: GlobalFilter::default(),
+        formula: None,
+        compare_previous_period: false,
+    };
+
+    let res = qengine.query_insights("proj_footer", &query).await.unwrap();
+    let reads_after = storage
+        .segment_reader()
+        .tier_ab_reads
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(res.series.len(), 1);
+    assert_eq!(res.series[0].overall_value, Some(100.0));
+    assert_eq!(
+        reads_after, reads_before,
+        "unfiltered bucket-aligned Totals should answer from SegmentFooterMeta with 0 Vortex reads"
+    );
+
+    id_router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn insights_user_prop_filter_short_circuits_with_zero_vortex_reads() {
+    let (storage, ingest, qengine, id_router) = budget_engine().await;
+    let ts = 1_762_084_800_000i64;
+    let events: Vec<_> = (0..200)
+        .map(|i| {
+            ev(
+                i,
+                &format!("u{i}"),
+                "s",
+                "purchase",
+                ts + i as i64 * 1_000,
+                Vec::new(),
+            )
+        })
+        .collect();
+    ingest
+        .ingest_for_project("proj_uprop", WireBatch::new(events), ts + 500_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+
+    let id_graph = id_router.get_or_open("proj_uprop").await.unwrap();
+    let cat = qengine.catalogs().for_project("proj_uprop");
+    for i in 0..200 {
+        let uid = id_graph.lookup_canonical(&format!("u{i}")).unwrap();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "plan".to_string(),
+            PropValue::Str(if i < 25 { "Pro" } else { "Free" }.to_string()),
+        );
+        cat.upsert_user_profile(uid, props);
+    }
+
+    // 1. User property filter with 0 matching users short-circuits with 0 Vortex reads.
+    let reads_before = storage
+        .segment_reader()
+        .tier_ab_reads
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let empty_q = InsightsQuery {
+        time_range: TimeRange {
+            start_ts_ms: ts - 3_600_000,
+            end_ts_ms: ts + 3_600_000,
+        },
+        interval: TimeInterval::Day,
+        series: vec![InsightsSeriesSpec {
+            label: "A".into(),
+            event_name: "purchase".into(),
+            metric: InsightsMetric::Totals,
+            filters: Vec::new(),
+        }],
+        breakdown_by: Vec::new(),
+        global_filter: GlobalFilter {
+            predicates: vec![PropPredicate::eq_str("user.plan", "Enterprise")],
+            cohort: None,
+        },
+        formula: None,
+        compare_previous_period: false,
+    };
+    let res_empty = qengine
+        .query_insights("proj_uprop", &empty_q)
+        .await
+        .unwrap();
+    assert_eq!(res_empty.series[0].overall_value, Some(0.0));
+    assert_eq!(
+        storage
+            .segment_reader()
+            .tier_ab_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        reads_before,
+        "empty user.* bitmap must skip all Vortex reads"
+    );
+
+    // 2. Selective user property filter returns exact count (25 Pro users).
+    let pro_q = InsightsQuery {
+        global_filter: GlobalFilter {
+            predicates: vec![PropPredicate::eq_str("user.plan", "Pro")],
+            cohort: None,
+        },
+        ..empty_q
+    };
+    let res_pro = qengine.query_insights("proj_uprop", &pro_q).await.unwrap();
+    assert_eq!(res_pro.series[0].overall_value, Some(25.0));
 
     id_router.close_all().await.unwrap();
 }

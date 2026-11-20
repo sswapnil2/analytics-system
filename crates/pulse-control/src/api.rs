@@ -592,20 +592,64 @@ impl ControlPlaneService {
     }
 
     /// Loads user profiles into the query catalog: every profile on the first call for a
-    /// project, then only the users whose rows changed since the previous call.
-    // ponytail: all profiles live in RAM (one map entry per user, as the live path already
-    // grows to); move to an on-disk KV keyed by canonical uid if projects pass ~10M users.
+    pub(crate) fn from_stored_profile(p: pulse_storage::StoredUserProfile) -> UserProfileRecord {
+        UserProfileRecord {
+            project_id: p.project_id,
+            distinct_id: p.distinct_id,
+            canonical_uid: p.canonical_uid,
+            props: p.props,
+            total_revenue: p.total_revenue,
+            updated_at_ms: p.updated_at_ms,
+        }
+    }
+
+    pub(crate) fn to_stored_profile(p: &UserProfileRecord) -> pulse_storage::StoredUserProfile {
+        pulse_storage::StoredUserProfile {
+            project_id: p.project_id.clone(),
+            distinct_id: p.distinct_id.clone(),
+            canonical_uid: p.canonical_uid,
+            props: p.props.clone(),
+            total_revenue: p.total_revenue,
+            updated_at_ms: p.updated_at_ms,
+        }
+    }
+
+    /// Syncs the project's `ColumnarProfileIndex` from the object-store-backed SlateDB `ProfileStore`.
+    /// On the first call for a project, migrates any legacy SQL `user_profiles` rows automatically.
     async fn refresh_user_profiles(&self, project_id: &str) -> Result<(), String> {
         let cat = self.qengine.catalogs().for_project(project_id);
+        let pstore = self
+            .qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let started_ms = Utc::now().timestamp_millis();
         let since = self.profiles_synced_ms.get(project_id).map(|v| *v);
         match since {
             None => {
-                let rows = self
-                    .meta
-                    .list_user_profiles_updated_since(project_id, 0)
+                let mut rows: Vec<UserProfileRecord> = pstore
+                    .list_updated_since(0)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(Self::from_stored_profile)
+                    .collect();
+                if rows.is_empty() && !self.qengine.storage().profile_router().is_read_only() {
+                    if let Ok(legacy) = self
+                        .meta
+                        .list_user_profiles_updated_since(project_id, 0)
+                        .await
+                    {
+                        if !legacy.is_empty() {
+                            let stored: Vec<_> =
+                                legacy.iter().map(Self::to_stored_profile).collect();
+                            let _ = pstore.upsert_batch(&stored).await;
+                            rows = legacy;
+                        }
+                    }
+                }
                 let merged = merge_profile_rows(rows)
                     .into_iter()
                     .map(|(uid, p)| (uid, profile_to_catalog_props(&p)))
@@ -613,9 +657,8 @@ impl ControlPlaneService {
                 cat.set_user_profiles(merged);
             }
             Some(since) => {
-                let rows = self
-                    .meta
-                    .list_user_profiles_updated_since(project_id, since)
+                let rows = pstore
+                    .list_updated_since(since)
                     .await
                     .map_err(|e| e.to_string())?;
                 let uids: std::collections::BTreeSet<u32> =
@@ -632,17 +675,26 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    /// Recomputes one canonical user's merged properties from all of their profile rows.
+    /// Recomputes one canonical user's merged properties from SlateDB `ProfileStore` into `ColumnarProfileIndex`.
     async fn rebuild_user_profile(
         &self,
         project_id: &str,
         canonical_uid: u32,
     ) -> Result<(), String> {
-        let rows = self
-            .meta
-            .list_user_profiles_for_canonical(project_id, canonical_uid)
+        let pstore = self
+            .qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
             .await
             .map_err(|e| e.to_string())?;
+        let rows: Vec<UserProfileRecord> = pstore
+            .list_for_canonical(canonical_uid)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(Self::from_stored_profile)
+            .collect();
         let cat = self.qengine.catalogs().for_project(project_id);
         match merge_profile_rows(rows).remove(&canonical_uid) {
             Some(p) => cat.upsert_user_profile(canonical_uid, profile_to_catalog_props(&p)),
@@ -731,11 +783,18 @@ impl ControlPlaneService {
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
 
-        let existing_prof = self
-            .meta
-            .get_user_profile(project_id, distinct_id)
+        let pstore = self
+            .qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
             .await
-            .map_err(CtrlError::meta)?;
+            .map_err(|e| CtrlError::internal(e.to_string()))?;
+        let existing_prof = pstore
+            .get_by_distinct_id(distinct_id)
+            .await
+            .map_err(|e| CtrlError::internal(e.to_string()))?
+            .map(Self::from_stored_profile);
 
         let mut uids_bm = RoaringBitmap::new();
         let mut canon_uid = 0u32;
@@ -796,11 +855,15 @@ impl ControlPlaneService {
             }
         }
 
+        let id_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
+        let _ = pstore
+            .delete_for_ids(&id_refs)
+            .await
+            .map_err(|e| CtrlError::internal(e.to_string()))?;
         let _ = self
             .meta
             .delete_user_profiles_for_ids(project_id, &all_ids)
-            .await
-            .map_err(CtrlError::meta)?;
+            .await;
 
         let uid_vec: Vec<u32> = uids_bm.iter().collect();
         let erased_at_ms = Utc::now().timestamp_millis();
@@ -928,12 +991,20 @@ impl GovernanceProvider for ControlPlaneService {
         canonical_uid: u32,
         ops: &Value,
     ) {
-        let existing = self
-            .meta
-            .get_user_profile(project_id, distinct_id)
+        let pstore = match self
+            .qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(project_id, error = %e, "failed to open profile store");
+                return;
+            }
+        };
+        let existing = pstore.get_by_distinct_id(distinct_id).await.ok().flatten();
         let mut props = existing
             .as_ref()
             .map(|p| p.props.clone())
@@ -955,15 +1026,15 @@ impl GovernanceProvider for ControlPlaneService {
             return;
         }
 
-        let rec = UserProfileRecord {
+        let rec = pulse_storage::StoredUserProfile {
             project_id: project_id.to_string(),
             distinct_id: distinct_id.to_string(),
             canonical_uid,
-            props: props.clone(),
+            props,
             total_revenue,
             updated_at_ms: Utc::now().timestamp_millis(),
         };
-        if let Err(e) = self.meta.upsert_user_profile(&rec).await {
+        if let Err(e) = pstore.upsert(&rec).await {
             tracing::error!(project_id, error = %e, "failed to store user profile");
             return;
         }
@@ -979,11 +1050,27 @@ impl GovernanceProvider for ControlPlaneService {
         user_id: &str,
         canonical_uid: u32,
     ) {
+        let pstore = match self
+            .qengine
+            .storage()
+            .profile_router()
+            .get_or_open(project_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(project_id, error = %e, "failed to open profile store on identify");
+                return;
+            }
+        };
         // Rows written before the merge carry the pre-merge uid; point both ids at the
         // canonical user so the anonymous traits show on the identified user.
-        if let Err(e) = self
-            .meta
-            .rekey_user_profiles(project_id, &[anon_id, user_id], canonical_uid)
+        if let Err(e) = pstore
+            .rekey(
+                &[anon_id, user_id],
+                canonical_uid,
+                Utc::now().timestamp_millis(),
+            )
             .await
         {
             tracing::error!(project_id, error = %e, "failed to re-key profiles after identify");
@@ -1473,7 +1560,8 @@ impl CtrlError {
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("query exceeded deadline ({ms} ms)"),
             ),
-            e @ pulse_exec::ExecError::QueryTooLarge { .. } => {
+            e @ pulse_exec::ExecError::QueryTooLarge { .. }
+            | e @ pulse_exec::ExecError::QueryMemoryExceeded { .. } => {
                 Self(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
             }
             e @ pulse_exec::ExecError::Overloaded(_) => {
@@ -3670,11 +3758,17 @@ async fn handle_list_user_profiles(
         .get("offset")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    let profiles = ctrl
-        .meta
-        .list_user_profiles(&id, q.get("search").map(String::as_str), limit, offset)
+    let pstore = ctrl
+        .qengine
+        .storage()
+        .profile_router()
+        .get_or_open(&id)
         .await
-        .map_err(CtrlError::meta)?;
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
+    let profiles = pstore
+        .list_paginated(q.get("search").map(String::as_str), limit, offset)
+        .await
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
 
     let out: Vec<Value> = profiles
         .into_iter()
@@ -3715,11 +3809,18 @@ async fn handle_get_user_detail(
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 
-    let profile = ctrl
-        .meta
-        .get_user_profile(&id, &distinct_id)
+    let pstore = ctrl
+        .qengine
+        .storage()
+        .profile_router()
+        .get_or_open(&id)
         .await
-        .map_err(CtrlError::meta)?;
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
+    let profile = pstore
+        .get_by_distinct_id(&distinct_id)
+        .await
+        .map_err(|e| CtrlError::internal(e.to_string()))?
+        .map(ControlPlaneService::from_stored_profile);
 
     let canon_uid = q
         .uid
@@ -3751,11 +3852,13 @@ async fn handle_get_user_detail(
 
     // Show what every id merged into this user set, not just this id's row.
     let profile = if canon_uid > 0 {
-        let rows = ctrl
-            .meta
-            .list_user_profiles_for_canonical(&id, canon_uid)
+        let rows: Vec<UserProfileRecord> = pstore
+            .list_for_canonical(canon_uid)
             .await
-            .map_err(CtrlError::meta)?;
+            .map_err(|e| CtrlError::internal(e.to_string()))?
+            .into_iter()
+            .map(ControlPlaneService::from_stored_profile)
+            .collect();
         merge_profile_rows(rows).remove(&canon_uid).or(profile)
     } else {
         profile
@@ -4080,12 +4183,26 @@ async fn handle_export_cohort(
         .evaluate_saved_cohort_uids(&id, &cohort_id)
         .await
         .map_err(CtrlError::exec)?;
-    let profiles = ctrl
-        .meta
-        .list_user_profiles_updated_since(&id, 0)
+    let pstore = ctrl
+        .qengine
+        .storage()
+        .profile_router()
+        .get_or_open(&id)
         .await
-        .map_err(CtrlError::meta)?;
-    let by_uid = merge_profile_rows(profiles);
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
+    let mut by_uid: HashMap<u32, UserProfileRecord> = HashMap::with_capacity(members.len());
+    for &(uid, _) in &members {
+        let rows: Vec<UserProfileRecord> = pstore
+            .list_for_canonical(uid)
+            .await
+            .map_err(|e| CtrlError::internal(e.to_string()))?
+            .into_iter()
+            .map(ControlPlaneService::from_stored_profile)
+            .collect();
+        if let Some(merged) = merge_profile_rows(rows).remove(&uid) {
+            by_uid.insert(uid, merged);
+        }
+    }
 
     let format = q
         .get("format")
@@ -4158,11 +4275,17 @@ async fn handle_get_revenue_summary(
         .filter(|s| !s.is_empty())
         .unwrap_or("$revenue")
         .to_string();
-    let (total_profiles, paying_users, total_revenue) = ctrl
-        .meta
-        .user_revenue_summary(&id)
+    let pstore = ctrl
+        .qengine
+        .storage()
+        .profile_router()
+        .get_or_open(&id)
         .await
-        .map_err(CtrlError::meta)?;
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
+    let (total_profiles, paying_users, total_revenue) = pstore
+        .revenue_summary()
+        .await
+        .map_err(|e| CtrlError::internal(e.to_string()))?;
 
     let now_ms = Utc::now().timestamp_millis();
     let iq = InsightsQuery {

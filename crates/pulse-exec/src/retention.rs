@@ -163,7 +163,13 @@ impl RetentionEngine {
                     .reduce(
                         || (HashMap::new(), BTreeMap::new()),
                         |(mut acc_starts, mut acc_returns), (loc_starts, loc_returns)| {
-                            for (uid, ts) in loc_starts {
+                            if !stop.live() {
+                                return (acc_starts, acc_returns);
+                            }
+                            for (idx, (uid, ts)) in loc_starts.into_iter().enumerate() {
+                                if !stop.live_every(idx) {
+                                    break;
+                                }
                                 acc_starts
                                     .entry(uid)
                                     .and_modify(|e| {
@@ -174,16 +180,23 @@ impl RetentionEngine {
                                     .or_insert(ts);
                             }
                             for (b_ts, bm) in loc_returns {
+                                if !stop.live() {
+                                    break;
+                                }
                                 *acc_returns.entry(b_ts).or_default() |= bm;
                             }
                             (acc_starts, acc_returns)
                         },
                     )
             });
+        crate::budget::check_current()?;
 
         // Group users into cohorts by `unit.align_floor_tz(first_start_ts, tz)` (`P2-09d`)
         let mut cohorts_map: BTreeMap<i64, RoaringBitmap> = BTreeMap::new();
-        for (uid, start_ts) in first_start_ts {
+        for (idx, (uid, start_ts)) in first_start_ts.into_iter().enumerate() {
+            if idx & 1023 == 0 {
+                crate::budget::check_current()?;
+            }
             let c_ts = query.unit.align_floor_tz(start_ts, tz);
             if cohorts_map.len() >= MAX_RETENTION_COHORTS && !cohorts_map.contains_key(&c_ts) {
                 return Err(ExecError::InvalidQuery(format!(

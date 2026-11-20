@@ -18,6 +18,9 @@ use crate::scanner::{ExecError, Result};
 /// Rows a single query may scan before it is rejected (`PULSE_QUERY_MAX_ROWS`).
 pub const DEFAULT_MAX_ROWS: u64 = 250_000_000;
 
+/// Working memory a single query may allocate before it is rejected (`PULSE_QUERY_MAX_MEMORY_MB`).
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
 tokio::task_local! {
     static CTX: Arc<QueryCtx>;
 }
@@ -28,21 +31,31 @@ pub struct QueryCtx {
     timeout_ms: u64,
     max_rows: u64,
     rows: AtomicU64,
+    max_memory_bytes: u64,
+    memory_bytes: AtomicU64,
+    memory_exceeded: AtomicBool,
     stopped: AtomicBool,
 }
 
 impl QueryCtx {
     pub fn new(timeout: Duration, max_rows: u64) -> Self {
+        Self::with_memory_limit(timeout, max_rows, DEFAULT_MAX_MEMORY_BYTES)
+    }
+
+    pub fn with_memory_limit(timeout: Duration, max_rows: u64, max_memory_bytes: u64) -> Self {
         Self {
             deadline: Instant::now() + timeout,
             timeout_ms: timeout.as_millis() as u64,
             max_rows,
             rows: AtomicU64::new(0),
+            max_memory_bytes: max_memory_bytes.max(1),
+            memory_bytes: AtomicU64::new(0),
+            memory_exceeded: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         }
     }
 
-    /// True once the deadline has passed; sticky so later checks skip the clock read.
+    /// True once the deadline has passed or the memory budget was exceeded; sticky so later checks skip the clock read.
     pub fn expired(&self) -> bool {
         if self.stopped.load(Ordering::Relaxed) {
             return true;
@@ -55,6 +68,12 @@ impl QueryCtx {
     }
 
     pub fn check(&self) -> Result<()> {
+        if self.memory_exceeded.load(Ordering::Relaxed) {
+            return Err(ExecError::QueryMemoryExceeded {
+                bytes: self.memory_bytes.load(Ordering::Relaxed),
+                limit: self.max_memory_bytes,
+            });
+        }
         if self.expired() {
             Err(ExecError::QueryTimeout(self.timeout_ms))
         } else {
@@ -73,6 +92,30 @@ impl QueryCtx {
         }
         Ok(())
     }
+
+    pub fn max_memory_bytes(&self) -> u64 {
+        self.max_memory_bytes
+    }
+
+    /// Adds `bytes` to the query's working memory total and fails once it passes the budget.
+    pub fn charge_memory(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let total = self
+            .memory_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if total > self.max_memory_bytes {
+            self.memory_exceeded.store(true, Ordering::Relaxed);
+            self.stopped.store(true, Ordering::Relaxed);
+            return Err(ExecError::QueryMemoryExceeded {
+                bytes: total,
+                limit: self.max_memory_bytes,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The running query's context, if any (none in direct engine calls from unit tests).
@@ -83,6 +126,15 @@ pub fn current() -> Option<Arc<QueryCtx>> {
 /// Runs `fut` inside `ctx`.
 pub async fn scope<F: std::future::Future>(ctx: Arc<QueryCtx>, fut: F) -> F::Output {
     CTX.scope(ctx, fut).await
+}
+
+/// Checks the active query's deadline and memory budget (no-op if outside a `QueryCtx`).
+#[inline]
+pub fn check_current() -> Result<()> {
+    if let Some(ctx) = current() {
+        ctx.check()?;
+    }
+    Ok(())
 }
 
 /// Cheap, `Send + Sync` stop check for rayon closures (task-locals are not visible on rayon threads).
@@ -103,6 +155,14 @@ impl Stop {
     #[inline]
     pub fn live_every(&self, i: usize) -> bool {
         i & 1023 != 0 || self.live()
+    }
+
+    /// Charges `bytes` against the active query's memory budget; returns `false` once exceeded.
+    #[inline]
+    pub fn charge_memory(&self, bytes: u64) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|c| c.charge_memory(bytes).is_ok())
     }
 }
 

@@ -671,10 +671,17 @@ async fn invoke_tool(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
-            let profile = meta
-                .get_user_profile(project_id, distinct_id)
+            let pstore = qengine
+                .storage()
+                .profile_router()
+                .get_or_open(project_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            let profile = pstore
+                .get_by_distinct_id(distinct_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(crate::ControlPlaneService::from_stored_profile);
             let id_graph = qengine
                 .storage()
                 .identity_router()
@@ -699,10 +706,13 @@ async fn invoke_tool(
                 .await
                 .map_err(|e| e.to_string())?;
             // Every id merged into this user contributes; the newest value of each key wins.
-            let rows = meta
-                .list_user_profiles_for_canonical(project_id, canon)
+            let rows: Vec<_> = pstore
+                .list_for_canonical(canon)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(crate::ControlPlaneService::from_stored_profile)
+                .collect();
             let merged = crate::api::merge_profile_rows(rows).remove(&canon);
             Ok(json!({
                 "distinct_id": distinct_id,

@@ -5,6 +5,7 @@ pub mod erased;
 pub mod error;
 pub mod manifest;
 pub mod mem_bucket;
+pub mod profile_store;
 pub mod replay_store;
 pub mod segment;
 pub mod store_factory;
@@ -28,6 +29,7 @@ pub use manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
+pub use profile_store::{ProfileRouter, ProjectProfileStore, StoredUserProfile};
 pub use replay_store::{validate_replay_identifier, ReplayAppendResult, ReplayStore};
 pub use segment::{
     decode_session_index, decode_tier_c_row, tier_c_key_bit, write_vortex_segment,

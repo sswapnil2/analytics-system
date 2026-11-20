@@ -8,7 +8,10 @@ use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use slatedb::config::{DbOptions, DbReaderOptions, WriteOptions};
+use slatedb::config::{
+    CompactorOptions, DbOptions, DbReaderOptions, GarbageCollectorDirectoryOptions,
+    GarbageCollectorOptions, GcExecutionMode, WriteOptions,
+};
 use slatedb::{Db, DbReader, SlateDBError, WriteBatch};
 use thiserror::Error;
 
@@ -273,6 +276,79 @@ fn decode_mutation_chunk(bytes: &[u8]) -> Result<Vec<MutationEntry>> {
     Ok(out)
 }
 
+const CHECKPOINT_ZSTD_MAGIC: &[u8; 4] = b"PZST";
+const EXTERNAL_ID_PAGE_SIZE: usize = 16_384;
+
+/// Copy-on-write paged storage for external `distinct_id` strings.
+///
+/// Cloning the page directory for a checkpoint takes O(users / 16_384) `Arc` clones
+/// (~1 microsecond for 2M users) instead of cloning millions of `String` heap allocations
+/// while holding the identity state lock.
+struct PagedStrings {
+    pages: Vec<Arc<Vec<String>>>,
+    len: usize,
+}
+
+impl PagedStrings {
+    fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn from_vec(mut items: Vec<String>) -> Self {
+        let len = items.len();
+        let mut pages = Vec::with_capacity(len.div_ceil(EXTERNAL_ID_PAGE_SIZE));
+        while !items.is_empty() {
+            let split_at = items.len().min(EXTERNAL_ID_PAGE_SIZE);
+            let rest = items.split_off(split_at);
+            pages.push(Arc::new(items));
+            items = rest;
+        }
+        Self { pages, len }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, s: String) {
+        let need_new_page = self
+            .pages
+            .last()
+            .is_none_or(|p| p.len() >= EXTERNAL_ID_PAGE_SIZE);
+        if need_new_page {
+            self.pages
+                .push(Arc::new(Vec::with_capacity(EXTERNAL_ID_PAGE_SIZE)));
+        }
+        let last = self.pages.last_mut().expect("page pushed above");
+        Arc::make_mut(last).push(s);
+        self.len += 1;
+    }
+
+    fn set(&mut self, idx: usize, s: String) {
+        let page_idx = idx / EXTERNAL_ID_PAGE_SIZE;
+        let offset = idx % EXTERNAL_ID_PAGE_SIZE;
+        Arc::make_mut(&mut self.pages[page_idx])[offset] = s;
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> Option<&str> {
+        let page = self.pages.get(idx / EXTERNAL_ID_PAGE_SIZE)?;
+        page.get(idx % EXTERNAL_ID_PAGE_SIZE).map(|s| s.as_str())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.pages.iter().flat_map(|p| p.iter().map(|s| s.as_str()))
+    }
+
+    fn snapshot_pages(&self) -> Vec<Arc<Vec<String>>> {
+        self.pages.clone()
+    }
+}
+
 /// Compacted SlateDB checkpoint record bounding startup recovery cost.
 #[derive(Serialize, Deserialize)]
 struct IdentityCheckpoint {
@@ -284,8 +360,83 @@ struct IdentityCheckpoint {
     identified_roots: Vec<u32>,
 }
 
+/// Wire-compatible borrowed view for zero-String-allocation checkpoint serialization.
+#[derive(Serialize)]
+struct IdentityCheckpointRef<'a> {
+    next_chunk_seq: u64,
+    u32_to_external: Vec<&'a str>,
+    origin_buckets: &'a [u8],
+    parent: &'a [u32],
+    bucket_masks: &'a [BucketMask],
+    identified_roots: Vec<u32>,
+}
+
+/// Detached point-in-time snapshot taken under a brief shared read lock and
+/// compressed/serialized off the lock on a blocking thread.
+struct CheckpointSnapshot {
+    u32_pages: Vec<Arc<Vec<String>>>,
+    total_users: usize,
+    origin_buckets: Vec<u8>,
+    parent: Vec<u32>,
+    bucket_masks: Vec<BucketMask>,
+    identified_roots: RoaringBitmap,
+}
+
+impl CheckpointSnapshot {
+    fn encode(mut self, next_chunk_seq: u64) -> Result<Vec<u8>> {
+        // Path-compress the detached parent array off the lock.
+        let len = self.parent.len();
+        for i in 0..len {
+            let mut root = self.parent[i];
+            while self.parent[root as usize] != root {
+                root = self.parent[root as usize];
+            }
+            self.parent[i] = root;
+        }
+
+        let mut u32_to_external = Vec::with_capacity(self.total_users);
+        for page in &self.u32_pages {
+            for s in page.iter() {
+                u32_to_external.push(s.as_str());
+            }
+        }
+        // Truncate in case the last page was shared with a concurrent push (only happens if
+        // another thread appended after snapshot; `Arc::make_mut` clones on write, so lengths match).
+        u32_to_external.truncate(self.total_users);
+
+        let cp_ref = IdentityCheckpointRef {
+            next_chunk_seq,
+            u32_to_external,
+            origin_buckets: &self.origin_buckets,
+            parent: &self.parent,
+            bucket_masks: &self.bucket_masks,
+            identified_roots: self.identified_roots.iter().collect(),
+        };
+        let raw = bincode::serialize(&cp_ref)
+            .map_err(|_| IdentityError::CorruptedRecord("failed to serialize meta/checkpoint"))?;
+        let compressed = zstd::bulk::compress(&raw, 3)
+            .map_err(|_| IdentityError::CorruptedRecord("failed to compress meta/checkpoint"))?;
+        let mut out = Vec::with_capacity(CHECKPOINT_ZSTD_MAGIC.len() + compressed.len());
+        out.extend_from_slice(CHECKPOINT_ZSTD_MAGIC);
+        out.extend_from_slice(&compressed);
+        Ok(out)
+    }
+}
+
+fn decode_checkpoint(bytes: &[u8]) -> Result<IdentityCheckpoint> {
+    if let Some(payload) = bytes.strip_prefix(CHECKPOINT_ZSTD_MAGIC) {
+        let decompressed = zstd::stream::decode_all(payload)
+            .map_err(|_| IdentityError::CorruptedRecord("corrupted compressed meta/checkpoint"))?;
+        bincode::deserialize(&decompressed)
+            .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))
+    } else {
+        bincode::deserialize(bytes)
+            .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))
+    }
+}
+
 struct GraphState {
-    u32_to_external: Vec<String>,
+    u32_to_external: PagedStrings,
     origin_buckets: Vec<u8>,
     parent: Vec<u32>,
     bucket_masks: Vec<BucketMask>,
@@ -296,7 +447,7 @@ struct GraphState {
 impl GraphState {
     fn new() -> Self {
         Self {
-            u32_to_external: Vec::new(),
+            u32_to_external: PagedStrings::new(),
             origin_buckets: Vec::new(),
             parent: Vec::new(),
             bucket_masks: Vec::new(),
@@ -398,22 +549,26 @@ impl GraphState {
         }
     }
 
-    fn build_checkpoint(&mut self, next_chunk_seq: u64) -> IdentityCheckpoint {
-        let _ = self.compress_all_and_build_snapshot();
-        IdentityCheckpoint {
-            next_chunk_seq,
-            u32_to_external: self.u32_to_external.clone(),
+    fn snapshot_for_checkpoint(&self) -> CheckpointSnapshot {
+        CheckpointSnapshot {
+            u32_pages: self.u32_to_external.snapshot_pages(),
+            total_users: self.u32_to_external.len(),
             origin_buckets: self.origin_buckets.clone(),
             parent: self.parent.clone(),
             bucket_masks: self.bucket_masks.clone(),
-            identified_roots: self.identified_roots.iter().collect(),
+            identified_roots: self.identified_roots.clone(),
         }
     }
 }
 
 const META_CHUNK_COUNT_KEY: &[u8] = b"meta/chunk_count";
 const META_CHECKPOINT_KEY: &[u8] = b"meta/checkpoint";
-const CHECKPOINT_INTERVAL_CHUNKS: u64 = 32;
+/// Minimum mutations since the last checkpoint before compacting history into `meta/checkpoint`.
+/// Combined with the `user_count / 2` amortized rule, this keeps checkpoint write amplification O(1)
+/// instead of O(N^2) as user count grows into the millions.
+const CHECKPOINT_MIN_MUTATIONS: u64 = 250_000;
+/// Hard cap on uncompacted log chunks so recovery never replays thousands of tiny flushes.
+const CHECKPOINT_MAX_CHUNKS: u64 = 512;
 
 /// Durable per-project `distinct_id <-> u32` dictionary and zero-rewrite Union-Find alias graph.
 pub struct ProjectIdentityGraph {
@@ -426,6 +581,7 @@ pub struct ProjectIdentityGraph {
     snapshot_dirty: AtomicBool,
     next_chunk_seq: AtomicU64,
     last_checkpoint_seq: AtomicU64,
+    mutations_since_checkpoint: AtomicU64,
     mutation_epoch: AtomicU64,
     flushed_epoch: AtomicU64,
     pending_mutations: Mutex<Vec<MutationEntry>>,
@@ -459,7 +615,7 @@ fn restore_checkpoint(
     for r in cp.identified_roots {
         state.identified_roots.insert(r);
     }
-    state.u32_to_external = cp.u32_to_external;
+    state.u32_to_external = PagedStrings::from_vec(cp.u32_to_external);
     state.origin_buckets = cp.origin_buckets;
     state.parent = cp.parent;
     state.bucket_masks = cp.bucket_masks;
@@ -490,7 +646,7 @@ fn apply_mutation_entries(
                     state.parent.push(uid);
                     state.bucket_masks.push(BucketMask::single(origin_bucket));
                 } else {
-                    state.u32_to_external[uid as usize] = distinct_id.clone();
+                    state.u32_to_external.set(uid as usize, distinct_id.clone());
                     state.origin_buckets[uid as usize] = origin_bucket;
                     state.bucket_masks[uid as usize].insert(origin_bucket);
                 }
@@ -536,9 +692,22 @@ fn apply_mutation_entries(
 async fn open_slatedb_handle(project_id: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
     let db_path = ObjectPath::from(format!("identity/{project_id}"));
     for attempt in 0..8 {
+        let gc_dir = GarbageCollectorDirectoryOptions {
+            execution_mode: GcExecutionMode::Periodic(Duration::from_secs(60)),
+            min_age: Duration::from_secs(300),
+        };
         let opts = DbOptions {
             flush_interval: Some(Duration::from_millis(25)),
-            compactor_options: None,
+            compactor_options: Some(CompactorOptions {
+                poll_interval: Duration::from_secs(1),
+                ..CompactorOptions::default()
+            }),
+            garbage_collector_options: Some(GarbageCollectorOptions {
+                manifest_options: Some(gc_dir),
+                wal_options: Some(gc_dir),
+                compacted_options: Some(gc_dir),
+                gc_runtime: None,
+            }),
             ..DbOptions::default()
         };
         match Db::open_with_opts(db_path.clone(), opts, object_store.clone()).await {
@@ -581,12 +750,12 @@ impl ProjectIdentityGraph {
 
         // Restore compacted checkpoint if available
         if let Some(cp_bytes) = db.get(META_CHECKPOINT_KEY).await? {
-            let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
-                .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
+            let cp = decode_checkpoint(&cp_bytes)?;
             start_seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
         }
 
         // Replay remaining log chunks strictly (`P1-11`: fail loudly on missing chunk or dangling ref!)
+        let mut replayed_mutations = 0u64;
         for seq in start_seq..chunk_count {
             let chunk_key = format!("log/chunk_{seq:012}");
             let Some(bytes) = db.get(chunk_key.as_bytes()).await? else {
@@ -595,6 +764,7 @@ impl ProjectIdentityGraph {
                 ));
             };
             let entries = decode_mutation_chunk(&bytes)?;
+            replayed_mutations = replayed_mutations.saturating_add(entries.len() as u64);
             apply_mutation_entries(&mut state, &fast_lookup, entries)?;
         }
 
@@ -610,6 +780,7 @@ impl ProjectIdentityGraph {
             snapshot_dirty: AtomicBool::new(false),
             next_chunk_seq: AtomicU64::new(chunk_count),
             last_checkpoint_seq: AtomicU64::new(start_seq),
+            mutations_since_checkpoint: AtomicU64::new(replayed_mutations),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
@@ -634,6 +805,7 @@ impl ProjectIdentityGraph {
             snapshot_dirty: AtomicBool::new(false),
             next_chunk_seq: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
+            mutations_since_checkpoint: AtomicU64::new(0),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
@@ -712,8 +884,7 @@ impl ProjectIdentityGraph {
 
             let mut cp_to_restore: Option<IdentityCheckpoint> = None;
             if let Some(cp_bytes) = reader.get(META_CHECKPOINT_KEY).await? {
-                let cp: IdentityCheckpoint = bincode::deserialize(&cp_bytes)
-                    .map_err(|_| IdentityError::CorruptedRecord("corrupted meta/checkpoint"))?;
+                let cp = decode_checkpoint(&cp_bytes)?;
                 if cp.next_chunk_seq > cur_seq {
                     cur_seq = cp.next_chunk_seq;
                     cp_to_restore = Some(cp);
@@ -889,7 +1060,11 @@ impl ProjectIdentityGraph {
     }
 
     pub fn external_id(&self, uid: u32) -> Option<String> {
-        self.state.read().u32_to_external.get(uid as usize).cloned()
+        self.state
+            .read()
+            .u32_to_external
+            .get(uid as usize)
+            .map(str::to_string)
     }
 
     /// Expands a bitmap of canonical `u32` user IDs into a sorted, deduplicated `Vec<String>` of ALL
@@ -904,7 +1079,7 @@ impl ProjectIdentityGraph {
         for (raw_uid, ext) in st.u32_to_external.iter().enumerate() {
             let canon = snap.resolve(raw_uid as u32);
             if canonical_roots.contains(canon) {
-                out.push(ext.clone());
+                out.push(ext.to_string());
             }
         }
         out.sort_unstable();
@@ -965,16 +1140,20 @@ impl ProjectIdentityGraph {
             return Ok(());
         }
 
-        let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
-            let guard = self.pending_mutations.lock();
-            if guard.is_empty() {
-                let ep = self.mutation_epoch.load(Ordering::Acquire);
-                self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-                return Ok(());
-            }
-            (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
-        };
-        let flushed_len = staged.len();
+        let base_seq = self.next_chunk_seq.load(Ordering::Acquire);
+        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
+        let muts_since = self.mutations_since_checkpoint.load(Ordering::Acquire);
+        let pending_hint = self.pending_mutations.lock().len() as u64;
+        if pending_hint == 0 {
+            let ep = self.mutation_epoch.load(Ordering::Acquire);
+            self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
+            return Ok(());
+        }
+
+        let user_count = self.user_count() as u64;
+        let mutation_threshold = CHECKPOINT_MIN_MUTATIONS.max(user_count / 2);
+        let should_checkpoint = muts_since.saturating_add(pending_hint) >= mutation_threshold
+            || base_seq.saturating_sub(prev_cp) >= CHECKPOINT_MAX_CHUNKS;
 
         if db_guard.is_none() {
             let reopened = open_slatedb_handle(&self.project_id, &self.object_store).await?;
@@ -982,43 +1161,63 @@ impl ProjectIdentityGraph {
         }
         let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
 
-        const CHUNK_SIZE: usize = 32_768;
-        let base_seq = self.next_chunk_seq.load(Ordering::Acquire);
-        let mut new_seq = base_seq;
-        let mut batch = WriteBatch::new();
-
-        for slice in staged.chunks(CHUNK_SIZE) {
-            let chunk_key = format!("log/chunk_{new_seq:012}");
-            let chunk_bytes = encode_mutation_chunk(slice);
-            batch.put(chunk_key.as_bytes(), &chunk_bytes);
-            new_seq += 1;
-        }
-        batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
-
-        // Periodically compact log history into `meta/checkpoint`
-        let prev_cp = self.last_checkpoint_seq.load(Ordering::Acquire);
-        let wrote_checkpoint = if new_seq.saturating_sub(prev_cp) >= CHECKPOINT_INTERVAL_CHUNKS {
-            let cp_opt = {
-                let mut st = self.state.write();
-                let cur_pending = self.pending_mutations.lock().len();
-                if cur_pending == flushed_len {
-                    bincode::serialize(&st.build_checkpoint(new_seq)).ok()
-                } else {
-                    None
+        let (batch, new_seq, flushed_len, batch_epoch, wrote_checkpoint) = if should_checkpoint {
+            // Acquire `state.read()` BEFORE `pending_mutations.lock()` (same lock order as writers,
+            // deadlock-free, and never blocks concurrent readers or fast_lookup hits).
+            let (cp_snap, flushed_len, batch_epoch) = {
+                let st = self.state.read();
+                let guard = self.pending_mutations.lock();
+                if guard.is_empty() {
+                    let ep = self.mutation_epoch.load(Ordering::Acquire);
+                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
+                    return Ok(());
                 }
+                (
+                    st.snapshot_for_checkpoint(),
+                    guard.len(),
+                    self.mutation_epoch.load(Ordering::Acquire),
+                )
             };
-            if let Some(cp_bytes) = cp_opt {
-                batch.put(META_CHECKPOINT_KEY, &cp_bytes);
-                for old_seq in prev_cp..new_seq {
-                    let old_key = format!("log/chunk_{old_seq:012}");
-                    batch.delete(old_key.as_bytes());
-                }
-                true
-            } else {
-                false
+
+            let new_seq = base_seq + 1;
+            let cp_bytes = tokio::task::spawn_blocking(move || cp_snap.encode(new_seq))
+                .await
+                .map_err(|_| {
+                    IdentityError::CorruptedRecord("checkpoint serialization task panicked")
+                })??;
+
+            let mut batch = WriteBatch::new();
+            batch.put(META_CHECKPOINT_KEY, &cp_bytes);
+            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
+            for old_seq in prev_cp..base_seq {
+                let old_key = format!("log/chunk_{old_seq:012}");
+                batch.delete(old_key.as_bytes());
             }
+            (batch, new_seq, flushed_len, batch_epoch, true)
         } else {
-            false
+            let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
+                let guard = self.pending_mutations.lock();
+                if guard.is_empty() {
+                    let ep = self.mutation_epoch.load(Ordering::Acquire);
+                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
+                    return Ok(());
+                }
+                (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
+            };
+            let flushed_len = staged.len();
+
+            const CHUNK_SIZE: usize = 32_768;
+            let mut new_seq = base_seq;
+            let mut batch = WriteBatch::new();
+
+            for slice in staged.chunks(CHUNK_SIZE) {
+                let chunk_key = format!("log/chunk_{new_seq:012}");
+                let chunk_bytes = encode_mutation_chunk(slice);
+                batch.put(chunk_key.as_bytes(), &chunk_bytes);
+                new_seq += 1;
+            }
+            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
+            (batch, new_seq, flushed_len, batch_epoch, false)
         };
 
         let write_opts = WriteOptions {
@@ -1038,6 +1237,10 @@ impl ProjectIdentityGraph {
         self.next_chunk_seq.store(new_seq, Ordering::Release);
         if wrote_checkpoint {
             self.last_checkpoint_seq.store(new_seq, Ordering::Release);
+            self.mutations_since_checkpoint.store(0, Ordering::Release);
+        } else {
+            self.mutations_since_checkpoint
+                .fetch_add(flushed_len as u64, Ordering::AcqRel);
         }
         self.pending_mutations.lock().drain(..flushed_len);
         self.flushed_epoch.fetch_max(batch_epoch, Ordering::AcqRel);

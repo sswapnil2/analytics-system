@@ -122,6 +122,48 @@ pub struct SegmentFooterMeta {
     pub tier_c_bloom_64: u64,
     pub has_tier_c_column: bool,
     pub tier_b_columns: Vec<TierBColumnEntry>,
+    /// Exact sorted `(event_id, row_count)` rollup for zero-I/O unfiltered Totals queries
+    /// and false-positive-free event pruning. Empty on legacy segments written before this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_counts: Vec<(u16, u32)>,
+}
+
+impl SegmentFooterMeta {
+    /// Returns the exact count of `event_id` in this segment, or `None` for legacy segments
+    /// that did not record `event_counts`.
+    #[inline]
+    pub fn exact_event_count(&self, event_id: u16) -> Option<u32> {
+        if self.event_counts.is_empty() && self.row_count > 0 {
+            return None;
+        }
+        match self
+            .event_counts
+            .binary_search_by_key(&event_id, |&(id, _)| id)
+        {
+            Ok(idx) => Some(self.event_counts[idx].1),
+            Err(_) => Some(0),
+        }
+    }
+
+    /// Returns `true` if this segment may contain at least one event in `event_ids`.
+    /// Uses exact `event_counts` when available, falling back to the 64-bit bloom filter.
+    #[inline]
+    pub fn may_contain_any_event_ids(&self, event_ids: &[u16], bloom_mask_64: u64) -> bool {
+        if event_ids.is_empty() {
+            return false;
+        }
+        if bloom_mask_64 != 0 && (self.segment_event_bloom_64 & bloom_mask_64) == 0 {
+            return false;
+        }
+        if !self.event_counts.is_empty() {
+            return event_ids.iter().any(|&id| {
+                self.event_counts
+                    .binary_search_by_key(&id, |&(k, _)| k)
+                    .is_ok()
+            });
+        }
+        true
+    }
 }
 
 /// Pointer & byte-range offsets stored in the MVCC `Manifest` for an immutable L1 Vortex segment.
@@ -420,6 +462,7 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
     let mut min_ts_ms = i64::MAX;
     let mut max_ts_ms = i64::MIN;
     let mut segment_event_bloom_64 = 0u64;
+    let mut event_count_map: BTreeMap<u16, u32> = BTreeMap::new();
 
     // Count property key frequencies to promote Top 512 keys into Tier B columns (`P2-09l` includes Null).
     // Tuple: `(count, has_i64, has_f64, has_bool, has_str, has_null)`
@@ -429,6 +472,7 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
         min_ts_ms = min_ts_ms.min(r.event_ts_ms);
         max_ts_ms = max_ts_ms.max(r.event_ts_ms);
         segment_event_bloom_64 |= SessionHeader::event_bit(r.event_id);
+        *event_count_map.entry(r.event_id).or_insert(0) += 1;
 
         uid_vec.push(r.uid_internal);
         shash_vec.push(r.session_hash);
@@ -739,6 +783,7 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
         tier_c_bloom_64,
         has_tier_c_column,
         tier_b_columns: tier_b_catalog,
+        event_counts: event_count_map.into_iter().collect(),
     };
 
     Ok(Some(BuiltSegmentPayload {
@@ -963,13 +1008,26 @@ impl VortexSegmentReader {
         vortex_bytes: Bytes,
         columns: &[&str],
     ) -> Result<RecordBatch> {
+        self.project_from_vortex_bytes_with_selection_sync(vortex_bytes, columns, None)
+    }
+
+    /// Projects a subset of columns (and optionally only the sorted `row_indices` via Vortex
+    /// `Selection::IncludeByIndex` late materialization) from raw Vortex bytes into an Arrow `RecordBatch`.
+    pub fn project_from_vortex_bytes_with_selection_sync(
+        &self,
+        vortex_bytes: Bytes,
+        columns: &[&str],
+        row_indices: Option<&[u64]>,
+    ) -> Result<RecordBatch> {
         let field_names: Vec<FieldName> = columns.iter().map(|&c| FieldName::from(c)).collect();
         let vfile = VortexOpenOptions::in_memory().open(ByteBuffer::from(vortex_bytes))?;
-        let array = vfile
-            .scan()?
-            .with_projection(select(field_names, root()))
-            .into_array_iter()?
-            .read_all()?;
+        let mut scan = vfile.scan()?.with_projection(select(field_names, root()));
+        if let Some(indices) = row_indices {
+            scan = scan.with_selection(vortex::scan::Selection::IncludeByIndex(
+                vortex_buffer::Buffer::copy_from(indices),
+            ));
+        }
+        let array = scan.into_array_iter()?.read_all()?;
         Ok(RecordBatch::try_from(array.as_ref())?)
     }
 
