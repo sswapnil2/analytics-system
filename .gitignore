@@ -4,6 +4,8 @@
 /web/dist/
 /sdks/ts-web/node_modules/
 /sdks/ts-web/dist/
+/sdks/react-native/node_modules/
+/sdks/react-native/dist/
 *.DS_Store
 .env
 .env.*

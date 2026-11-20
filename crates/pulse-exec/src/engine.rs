@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,50 +37,6 @@ pub struct ExportedEventRow {
 }
 
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 30_000;
-
-struct RankedSession(SessionSummaryItem);
-
-impl PartialEq for RankedSession {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.end_ts_ms == other.0.end_ts_ms && self.0.session_id == other.0.session_id
-    }
-}
-
-impl Eq for RankedSession {}
-
-impl PartialOrd for RankedSession {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RankedSession {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .end_ts_ms
-            .cmp(&other.0.end_ts_ms)
-            .then_with(|| other.0.session_id.cmp(&self.0.session_id))
-    }
-}
-
-fn push_bounded_session(
-    heap: &mut BinaryHeap<Reverse<RankedSession>>,
-    item: SessionSummaryItem,
-    limit: usize,
-) {
-    if limit == 0 {
-        return;
-    }
-    if heap.len() < limit {
-        heap.push(Reverse(RankedSession(item)));
-    } else if let Some(min_top) = heap.peek() {
-        let candidate = RankedSession(item);
-        if candidate > min_top.0 {
-            heap.pop();
-            heap.push(Reverse(candidate));
-        }
-    }
-}
 
 /// Unified analytical query engine backed by `foyer` hybrid block cache, Vortex L1 segments, and L0 `MemBucket`s.
 pub struct QueryEngine {
@@ -647,12 +603,22 @@ impl QueryEngine {
 
             let mut total_sessions_inspected = 0usize;
             let mut sessions_pruned_by_bloom = 0usize;
-            let mut top_heap: BinaryHeap<Reverse<RankedSession>> = BinaryHeap::with_capacity(limit);
             let erased = ps.erased_snapshot();
 
-            // 1. Scan hot L0 `MemBucket` sessions first to establish an immediate recency floor for `limit` pushdown
-            type L0SessionAcc = (u16, Vec<(i64, u16, u32)>);
-            let mut l0_grouped: HashMap<(u32, String), L0SessionAcc> = HashMap::new();
+            // Merge all L0 and L1 pieces by `session_id` so one session is never split into
+            // multiple entries across flushes, segments, or mid-session `identify()` calls.
+            struct MergedSession {
+                canonical_uid: u32,
+                flags: u16,
+                bloom: u64,
+                start_ts_ms: i64,
+                end_ts_ms: i64,
+                l0_events: Vec<(i64, u16, u32)>,
+                l1_slices: Vec<(usize, usize, usize)>,
+            }
+            let mut merged: HashMap<String, MergedSession> = HashMap::new();
+
+            // 1. Collect hot L0 `MemBucket` rows per `session_id`
             for b in 0..ps.config().num_buckets {
                 let rows = ps.snapshot_l0_bucket(&snap, b as u8);
                 for r in rows.iter() {
@@ -663,58 +629,126 @@ impl QueryEngine {
                     {
                         continue;
                     }
-                    let entry = l0_grouped
-                        .entry((canon_uid, r.session_id.clone()))
-                        .or_insert_with(|| (0, Vec::new()));
-                    entry.0 |= r.session_flags;
+                    let entry =
+                        merged
+                            .entry(r.session_id.clone())
+                            .or_insert_with(|| MergedSession {
+                                canonical_uid: canon_uid,
+                                flags: ps.session_flags_for(&r.session_id),
+                                bloom: 0,
+                                start_ts_ms: r.event_ts_ms,
+                                end_ts_ms: r.event_ts_ms,
+                                l0_events: Vec::new(),
+                                l1_slices: Vec::new(),
+                            });
+                    entry.canonical_uid = canon_uid;
+                    entry.flags |= r.session_flags;
+                    entry.bloom |= SessionHeader::event_bit(r.event_id);
+                    entry.start_ts_ms = entry.start_ts_ms.min(r.event_ts_ms);
+                    entry.end_ts_ms = entry.end_ts_ms.max(r.event_ts_ms);
                     entry
-                        .1
+                        .l0_events
                         .push((r.event_ts_ms, r.event_id, r.replay_offset_kb));
                 }
             }
 
-            for ((canon_uid, session_id), (flags, mut evs)) in l0_grouped {
-                total_sessions_inspected += 1;
-                let mut bloom = 0u64;
-                for &(_, eid, _) in &evs {
-                    bloom |= SessionHeader::event_bit(eid);
+            // 2. Collect L1 `SessionIndex` metadata (no Tier A reads yet!) and merge by `session_id`
+            let mut segs = snap.segments_for_range(start_date, end_date, None);
+            segs.sort_by_key(|s| Reverse(s.footer.max_ts_ms));
+
+            for (seg_idx, seg) in segs.iter().enumerate() {
+                let sidx = self.cache.get_session_index(seg).await?;
+                total_sessions_inspected += sidx.headers.len();
+
+                let ranges = sidx.matching_session_ranges(|hdr: &SessionHeader| {
+                    if !erased.is_empty()
+                        && (erased.hides(hdr.raw_uid, hdr.start_ts_ms)
+                            || erased.hides(id_snap.resolve(hdr.raw_uid), hdr.start_ts_ms))
+                    {
+                        return false;
+                    }
+                    true
+                });
+
+                for (r_start, r_end, hdr) in ranges {
+                    let sid = sidx.session_id(&hdr);
+                    if !is_recorded(sid) {
+                        sessions_pruned_by_bloom += 1;
+                        continue;
+                    }
+                    let canon_uid = id_snap.resolve(hdr.raw_uid);
+                    let entry = merged
+                        .entry(sid.to_string())
+                        .or_insert_with(|| MergedSession {
+                            canonical_uid: canon_uid,
+                            flags: ps.session_flags_for(sid),
+                            bloom: 0,
+                            start_ts_ms: hdr.start_ts_ms,
+                            end_ts_ms: hdr.end_ts_ms,
+                            l0_events: Vec::new(),
+                            l1_slices: Vec::new(),
+                        });
+                    entry.flags |= hdr.flags;
+                    entry.bloom |= hdr.event_bloom_64;
+                    entry.start_ts_ms = entry.start_ts_ms.min(hdr.start_ts_ms);
+                    entry.end_ts_ms = entry.end_ts_ms.max(hdr.end_ts_ms);
+                    entry.l1_slices.push((seg_idx, r_start, r_end));
                 }
-                if (flags & required_flags) != required_flags || !is_recorded(&session_id) {
+            }
+            total_sessions_inspected = total_sessions_inspected.max(merged.len());
+
+            // 3. Prune merged sessions using flags, recording presence, time range, and Bloom mask
+            let mut candidates: Vec<(String, MergedSession)> = Vec::with_capacity(merged.len());
+            for (sid, ms) in merged {
+                if (ms.flags & required_flags) != required_flags || !is_recorded(&sid) {
                     sessions_pruned_by_bloom += 1;
                     continue;
                 }
-                if let Some(tgt) = &target {
-                    if tgt.event_ids.is_empty() || (bloom & tgt.bloom_mask_64) == 0 {
-                        sessions_pruned_by_bloom += 1;
-                        continue;
-                    }
-                    if !evs.iter().any(|&(_, eid, _)| tgt.matches_id(eid)) {
-                        continue;
-                    }
-                }
-                evs.sort_by_key(|(ts, _, _)| *ts);
-                let start_ts = evs.first().map(|x| x.0).unwrap_or(0);
-                let end_ts = evs.last().map(|x| x.0).unwrap_or(0);
                 if let Some(tr) = query.time_range {
-                    if end_ts < tr.start_ts_ms || start_ts > tr.end_ts_ms {
+                    if ms.end_ts_ms < tr.start_ts_ms || ms.start_ts_ms > tr.end_ts_ms {
                         sessions_pruned_by_bloom += 1;
                         continue;
                     }
                 }
-                if top_heap.len() >= limit {
-                    if let Some(min_top) = top_heap.peek() {
-                        if end_ts < min_top.0 .0.end_ts_ms {
-                            continue;
-                        }
+                if let Some(tgt) = &target {
+                    if tgt.event_ids.is_empty() || (ms.bloom & tgt.bloom_mask_64) == 0 {
+                        sessions_pruned_by_bloom += 1;
+                        continue;
                     }
                 }
+                candidates.push((sid, ms));
+            }
 
-                let raw_did = id_graph
-                    .external_id(canon_uid)
-                    .unwrap_or_else(|| format!("uid_{canon_uid}"));
-                let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
-                let event_count = evs.len() as u32;
-                let mapped_evs = evs
+            // Order newest-first so we only materialize Tier A for top `limit` sessions.
+            candidates.sort_by(|(sid_a, a), (sid_b, b)| {
+                b.end_ts_ms.cmp(&a.end_ts_ms).then_with(|| sid_a.cmp(sid_b))
+            });
+
+            // 4. Materialize Tier A events only for surviving top-`limit` sessions
+            let mut sessions: Vec<SessionSummaryItem> =
+                Vec::with_capacity(limit.min(candidates.len()));
+            for (session_id, ms) in candidates {
+                if sessions.len() >= limit {
+                    break;
+                }
+                let mut raw_evs = ms.l0_events;
+                for (seg_idx, r_start, r_end) in ms.l1_slices {
+                    let ta = self.cache.get_tier_a(&segs[seg_idx]).await?;
+                    raw_evs.reserve(r_end.saturating_sub(r_start));
+                    for r in r_start..r_end {
+                        raw_evs.push((ta.event_ts_ms[r], ta.event_id[r], ta.replay_offset_kb[r]));
+                    }
+                }
+                if let Some(tgt) = &target {
+                    if !raw_evs.iter().any(|&(_, eid, _)| tgt.matches_id(eid)) {
+                        continue;
+                    }
+                }
+                raw_evs.sort_by_key(|(ts, _, _)| *ts);
+                let start_ts = raw_evs.first().map(|x| x.0).unwrap_or(ms.start_ts_ms);
+                let end_ts = raw_evs.last().map(|x| x.0).unwrap_or(ms.end_ts_ms);
+                let event_count = raw_evs.len() as u32;
+                let mapped_evs: Vec<(i64, String, u32)> = raw_evs
                     .into_iter()
                     .map(|(ts, eid, rkb)| {
                         let ename = id_to_name
@@ -725,149 +759,27 @@ impl QueryEngine {
                     })
                     .collect();
 
-                push_bounded_session(
-                    &mut top_heap,
-                    SessionSummaryItem {
-                        session_id,
-                        canonical_uid: canon_uid,
-                        distinct_id,
-                        start_ts_ms: start_ts,
-                        end_ts_ms: end_ts,
-                        duration_ms: (end_ts - start_ts).max(0),
-                        event_count,
-                        has_rage_tap: (flags & SESSION_FLAG_RAGE_TAP) != 0,
-                        has_dead_tap: (flags & SESSION_FLAG_DEAD_TAP) != 0,
-                        has_error: (flags & SESSION_FLAG_ERROR) != 0,
-                        has_replay: false,
-                        events: mapped_evs,
-                    },
-                    limit,
-                );
-            }
+                let raw_did = id_graph
+                    .external_id(ms.canonical_uid)
+                    .unwrap_or_else(|| format!("uid_{}", ms.canonical_uid));
+                let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
 
-            // 2. Scan L1 Vortex segments newest-first (`footer.max_ts_ms DESC`), pushing `limit` down
-            let mut segs = snap.segments_for_range(start_date, end_date, None);
-            segs.sort_by_key(|s| Reverse(s.footer.max_ts_ms));
-
-            for seg in &segs {
-                if top_heap.len() >= limit {
-                    if let Some(min_top) = top_heap.peek() {
-                        if seg.footer.max_ts_ms < min_top.0 .0.end_ts_ms {
-                            // Segment's newest event is strictly older than our current k-th best session!
-                            continue;
-                        }
-                    }
-                }
-
-                let sidx = self.cache.get_session_index(seg).await?;
-                total_sessions_inspected += sidx.headers.len();
-
-                let min_end_cutoff = if top_heap.len() >= limit {
-                    top_heap.peek().map(|m| m.0 .0.end_ts_ms)
-                } else {
-                    None
-                };
-
-                let mut matched_ranges = sidx.matching_session_ranges(|hdr: &SessionHeader| {
-                    if !erased.is_empty()
-                        && (erased.hides(hdr.raw_uid, hdr.start_ts_ms)
-                            || erased.hides(id_snap.resolve(hdr.raw_uid), hdr.start_ts_ms))
-                    {
-                        return false;
-                    }
-                    if (hdr.flags & required_flags) != required_flags {
-                        return false;
-                    }
-                    if let Some(tr) = query.time_range {
-                        if hdr.end_ts_ms < tr.start_ts_ms || hdr.start_ts_ms > tr.end_ts_ms {
-                            return false;
-                        }
-                    }
-                    if let Some(cutoff) = min_end_cutoff {
-                        if hdr.end_ts_ms < cutoff {
-                            return false;
-                        }
-                    }
-                    if let Some(tgt) = &target {
-                        if tgt.event_ids.is_empty() || !hdr.may_contain_any_event(tgt.bloom_mask_64)
-                        {
-                            return false;
-                        }
-                    }
-                    true
+                sessions.push(SessionSummaryItem {
+                    session_id,
+                    canonical_uid: ms.canonical_uid,
+                    distinct_id,
+                    start_ts_ms: start_ts,
+                    end_ts_ms: end_ts,
+                    duration_ms: (end_ts - start_ts).max(0),
+                    event_count,
+                    has_rage_tap: (ms.flags & SESSION_FLAG_RAGE_TAP) != 0,
+                    has_dead_tap: (ms.flags & SESSION_FLAG_DEAD_TAP) != 0,
+                    has_error: (ms.flags & SESSION_FLAG_ERROR) != 0,
+                    has_replay: false,
+                    events: mapped_evs,
                 });
-
-                sessions_pruned_by_bloom += sidx.headers.len().saturating_sub(matched_ranges.len());
-                if matched_ranges.is_empty() {
-                    continue;
-                }
-
-                // Order matched sessions within segment newest-first so the cutoff tightens immediately
-                matched_ranges.sort_by_key(|(_, _, hdr)| Reverse(hdr.end_ts_ms));
-
-                // Read Tier A ONLY for segments that survived SessionIndex + limit pruning!
-                let ta = self.cache.get_tier_a(seg).await?;
-                for (r_start, r_end, hdr) in matched_ranges {
-                    if top_heap.len() >= limit {
-                        if let Some(min_top) = top_heap.peek() {
-                            if hdr.end_ts_ms < min_top.0 .0.end_ts_ms {
-                                break;
-                            }
-                        }
-                    }
-                    if !is_recorded(sidx.session_id(&hdr)) {
-                        continue;
-                    }
-                    if let Some(tgt) = &target {
-                        let actually_has = (r_start..r_end).any(|r| tgt.matches_id(ta.event_id[r]));
-                        if !actually_has {
-                            continue;
-                        }
-                    }
-
-                    let canon_uid = id_snap.resolve(hdr.raw_uid);
-                    let raw_did = id_graph
-                        .external_id(canon_uid)
-                        .unwrap_or_else(|| format!("uid_{canon_uid}"));
-                    let distinct_id = pulse_wire::mask_user_identifier(&raw_did);
-                    let ev_list: Vec<(i64, String, u32)> = (r_start..r_end)
-                        .map(|r| {
-                            let ename = id_to_name
-                                .get(&ta.event_id[r])
-                                .cloned()
-                                .unwrap_or_else(|| format!("event_{}", ta.event_id[r]));
-                            (ta.event_ts_ms[r], ename, ta.replay_offset_kb[r])
-                        })
-                        .collect();
-
-                    push_bounded_session(
-                        &mut top_heap,
-                        SessionSummaryItem {
-                            session_id: sidx.session_id(&hdr).to_string(),
-                            canonical_uid: canon_uid,
-                            distinct_id,
-                            start_ts_ms: hdr.start_ts_ms,
-                            end_ts_ms: hdr.end_ts_ms,
-                            duration_ms: (hdr.end_ts_ms - hdr.start_ts_ms).max(0),
-                            event_count: hdr.event_count,
-                            has_rage_tap: (hdr.flags & SESSION_FLAG_RAGE_TAP) != 0,
-                            has_dead_tap: (hdr.flags & SESSION_FLAG_DEAD_TAP) != 0,
-                            has_error: (hdr.flags & SESSION_FLAG_ERROR) != 0,
-                            has_replay: false,
-                            events: ev_list,
-                        },
-                        limit,
-                    );
-                }
             }
 
-            let mut sessions: Vec<SessionSummaryItem> =
-                top_heap.into_iter().map(|Reverse(r)| r.0).collect();
-            sessions.sort_by(|a, b| {
-                b.end_ts_ms
-                    .cmp(&a.end_ts_ms)
-                    .then_with(|| a.session_id.cmp(&b.session_id))
-            });
             let rstore = self.storage.replay_store();
             for s in &mut sessions {
                 s.has_replay = rstore.has_session(project_id, &s.session_id).await;

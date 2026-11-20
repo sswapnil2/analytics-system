@@ -365,6 +365,11 @@ impl ProjectStorage {
         }
     }
 
+    pub fn session_flags_for(&self, session_id: &str) -> u16 {
+        let session_hash = xxh3_64(session_id.as_bytes());
+        self.session_flags.get(&session_hash).unwrap_or(0)
+    }
+
     /// Acquires the per-bucket append mutex (`P1-01`, `P1-02`).
     pub async fn lock_bucket_append(&self, bucket_id: u8) -> AsyncMutexGuard<'_, ()> {
         self.bucket_append_locks[bucket_id as usize].lock().await

@@ -185,6 +185,10 @@ pub enum WireframeOp {
         node: WireNode,
     },
     NodeRemove {
+        /// Offset from `chunk_start_ts_ms` at which the node was removed. Absent in older
+        /// chunks (defaults to 0; the player then falls back to the previous timed op).
+        #[serde(default)]
+        ts_offset_ms: u32,
         node_id: u32,
     },
     PointerInteraction {
@@ -213,6 +217,8 @@ impl WireframeOp {
     const OP_FULL_SNAPSHOT_TS: u8 = 6;
     /// `OP_NODE_UPSERT` preceded by a `u32` `ts_offset_ms`; written only when non-zero.
     const OP_NODE_UPSERT_TS: u8 = 7;
+    /// `OP_NODE_REMOVE` preceded by a `u32` `ts_offset_ms`; written only when non-zero.
+    const OP_NODE_REMOVE_TS: u8 = 8;
 
     fn write_to(&self, out: &mut Vec<u8>) {
         match self {
@@ -244,8 +250,16 @@ impl WireframeOp {
                 }
                 node.write_to(out);
             }
-            WireframeOp::NodeRemove { node_id } => {
-                out.push(Self::OP_NODE_REMOVE);
+            WireframeOp::NodeRemove {
+                ts_offset_ms,
+                node_id,
+            } => {
+                if *ts_offset_ms == 0 {
+                    out.push(Self::OP_NODE_REMOVE);
+                } else {
+                    out.push(Self::OP_NODE_REMOVE_TS);
+                    out.extend_from_slice(&ts_offset_ms.to_le_bytes());
+                }
                 out.extend_from_slice(&node_id.to_le_bytes());
             }
             WireframeOp::PointerInteraction {
@@ -323,6 +337,11 @@ impl WireframeOp {
                 node: WireNode::read_from(cursor)?,
             }),
             Self::OP_NODE_REMOVE => Ok(WireframeOp::NodeRemove {
+                ts_offset_ms: 0,
+                node_id: cursor.read_u32("remove.node_id")?,
+            }),
+            Self::OP_NODE_REMOVE_TS => Ok(WireframeOp::NodeRemove {
+                ts_offset_ms: cursor.read_u32("remove.ts")?,
                 node_id: cursor.read_u32("remove.node_id")?,
             }),
             Self::OP_POINTER => {
@@ -640,8 +659,41 @@ mod tests {
         assert_eq!(json["node_id"], 99_000, "node fields stay flat in JSON");
 
         // JSON from older SDKs has no ts_offset_ms and lands at the chunk start.
-        let legacy = br#"{"project_id":"","session_id":"s","chunk_start_ts_ms":1,"ops":[{"op":"full_snapshot","width":390,"height":844,"nodes":[]},{"op":"node_upsert","node_id":99000,"parent_id":1,"kind":"error_banner","x":1,"y":2,"w":3,"h":4,"bg_rgba":0,"masked_label":"boom"}]}"#;
+        let legacy = br#"{"project_id":"","session_id":"s","chunk_start_ts_ms":1,"ops":[{"op":"full_snapshot","width":390,"height":844,"nodes":[]},{"op":"node_upsert","node_id":99000,"parent_id":1,"kind":"error_banner","x":1,"y":2,"w":3,"h":4,"bg_rgba":0,"masked_label":"boom"},{"op":"node_remove","node_id":99000}]}"#;
         let c = ReplayChunk::decode_auto(legacy, Some("application/json")).unwrap();
-        assert_eq!(c.ops, vec![snap(0), banner(0)]);
+        assert_eq!(
+            c.ops,
+            vec![
+                snap(0),
+                banner(0),
+                WireframeOp::NodeRemove {
+                    ts_offset_ms: 0,
+                    node_id: 99_000,
+                }
+            ]
+        );
+
+        // Node removes also preserve non-zero ts_offset_ms while keeping legacy tag for 0.
+        let rem0 = WireframeOp::NodeRemove {
+            ts_offset_ms: 0,
+            node_id: 7,
+        };
+        let rem1 = WireframeOp::NodeRemove {
+            ts_offset_ms: 2_300,
+            node_id: 8,
+        };
+        let mut raw_rem0 = Vec::new();
+        rem0.write_to(&mut raw_rem0);
+        assert_eq!(raw_rem0[0], 3);
+        let rem_chunk = ReplayChunk {
+            ops: vec![rem0, rem1],
+            ..chunk
+        };
+        assert_eq!(
+            ReplayChunk::decode_binary(&rem_chunk.encode_binary(3).unwrap())
+                .unwrap()
+                .ops,
+            rem_chunk.ops
+        );
     }
 }
