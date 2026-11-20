@@ -1303,6 +1303,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_cohort_from_funnel_dropped),
         )
         .route(
+            "/v1/projects/:id/cohorts/:cohort_id",
+            put(handle_update_cohort).delete(handle_delete_cohort),
+        )
+        .route(
             "/v1/projects/:id/cohorts/:cohort_id/export",
             get(handle_export_cohort),
         )
@@ -2467,6 +2471,131 @@ async fn handle_create_cohort(
         .await
         .map_err(CtrlError::internal)?;
     Ok(Json(rec))
+}
+
+#[derive(Deserialize)]
+struct UpdateCohortReq {
+    name: String,
+    #[serde(default)]
+    description: String,
+    definition: BehavioralCohortDef,
+}
+
+async fn find_cohort(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    cohort_id: &str,
+) -> Result<CohortRecord, CtrlError> {
+    ctrl.meta
+        .list_cohorts(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|c| c.id == cohort_id)
+        .ok_or_else(|| CtrlError::not_found(format!("cohort '{cohort_id}' not found")))
+}
+
+async fn handle_update_cohort(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, cohort_id)): AxumPath<(String, String)>,
+    Json(req): Json<UpdateCohortReq>,
+) -> ApiRes<CohortRecord> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let mut rec = find_cohort(&ctrl, &id, &cohort_id).await?;
+    let cat = ctrl.qengine.catalogs().for_project(&id);
+    validate_cohort_acyclic(Some(&cohort_id), &req.definition, &cat)
+        .map_err(|e| CtrlError::bad(e.to_string()))?;
+    rec.name = validate_name(&req.name)?;
+    rec.description = req.description;
+    rec.definition = req.definition;
+    ctrl.meta
+        .upsert_cohort(&rec)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.refresh_project_virtual_catalog(&id)
+        .await
+        .map_err(CtrlError::internal)?;
+    Ok(Json(rec))
+}
+
+fn cohort_def_refs(def: &BehavioralCohortDef, cohort_id: &str) -> bool {
+    match def {
+        BehavioralCohortDef::CohortRef { cohort_id: r } => r == cohort_id,
+        BehavioralCohortDef::And { clauses } | BehavioralCohortDef::Or { clauses } => {
+            clauses.iter().any(|c| cohort_def_refs(c, cohort_id))
+        }
+        _ => false,
+    }
+}
+
+/// Refuses (409) while another cohort, a flag, a saved report or a dashboard still uses it.
+async fn handle_delete_cohort(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, cohort_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let cohorts = ctrl.meta.list_cohorts(&id).await.map_err(CtrlError::meta)?;
+    if !cohorts.iter().any(|c| c.id == cohort_id) {
+        return Err(CtrlError::not_found(format!(
+            "cohort '{cohort_id}' not found"
+        )));
+    }
+    let mut users: Vec<String> = cohorts
+        .iter()
+        .filter(|c| c.id != cohort_id && cohort_def_refs(&c.definition, &cohort_id))
+        .map(|c| format!("cohort '{}'", c.name))
+        .collect();
+    for f in ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        if f.targeting_cohort_id.as_deref() == Some(cohort_id.as_str()) {
+            users.push(format!("flag '{}'", f.key));
+        }
+    }
+    // ponytail: reports/dashboards hold free-form JSON, so match the quoted id anywhere in it.
+    let quoted = format!("\"{cohort_id}\"");
+    for r in ctrl
+        .meta
+        .list_saved_reports(&id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        if r.query_json.to_string().contains(&quoted) {
+            users.push(format!("report '{}'", r.name));
+        }
+    }
+    for d in ctrl
+        .meta
+        .list_dashboards(&id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        if serde_json::to_string(&d.cards)
+            .unwrap_or_default()
+            .contains(&quoted)
+        {
+            users.push(format!("dashboard '{}'", d.name));
+        }
+    }
+    if !users.is_empty() {
+        return Err(CtrlError::conflict(format!(
+            "cohort is still used by {}; remove it there first",
+            users.join(", ")
+        )));
+    }
+    ctrl.meta
+        .delete_cohort(&id, &cohort_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.refresh_project_virtual_catalog(&id)
+        .await
+        .map_err(CtrlError::internal)?;
+    Ok(Json(json!({ "deleted": cohort_id })))
 }
 
 #[derive(Deserialize)]
