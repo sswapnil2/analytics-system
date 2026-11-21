@@ -5,6 +5,7 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 ## [Unreleased]
 
 ### Added
+- The Experiments page has tabs for experiments, feature flags, and holdouts and layers. Each variant's verdict sits beside its name ("Significantly worse" in red), stopped and draft experiments say so instead of showing live-test copy, and funnel drops are labelled "A → B" with a hint when a step gets no one.
 - The start review names A-to-B and time metrics in full, decisions recorded with an old user id read "a teammate", and the experiment list says "Stopped · shipped …" to match the experiment page.
 - Saved metrics: name a guardrail or secondary metric once (say, "KYC failure" as a KYC event where status isn't success) and add it to any experiment from a list.
 - Shipping can roll the winner out in steps: 25%, then 50%, then everyone, every 1 to 7 days. A hand change to the flag stops the schedule.
