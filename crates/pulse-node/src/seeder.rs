@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use chrono::Utc;
 use pulse_control::{
-    AlertRule, CohortRecord, ControlPlaneService, Dashboard, DashboardCard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
+    AlertRule, AnalysisConfig, CohortRecord, ControlPlaneService, Dashboard, DashboardCard,
+    Experiment, ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -206,16 +206,44 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             event_name: "UPI_Autopay_Mandate_Approved".to_string(),
             metric_type: "conversion".to_string(),
             numeric_prop: None,
+            filters: Vec::new(),
+            denominator: None,
             conversion_window_ms: 7 * 86_400_000,
+            direction: "decrease_is_bad".to_string(),
+            auto_stop: false,
         },
-        guardrail_metrics: vec![ExperimentMetricSpec {
-            name: "NSDL Gateway 504 Timeout Rate".to_string(),
-            event_name: "NSDL_Gateway_504_Timeout".to_string(),
-            metric_type: "conversion".to_string(),
-            numeric_prop: None,
-            conversion_window_ms: 7 * 86_400_000,
-        }],
+        guardrail_metrics: vec![
+            ExperimentMetricSpec {
+                name: "NSDL Gateway 504 Timeout Rate".to_string(),
+                event_name: "NSDL_Gateway_504_Timeout".to_string(),
+                metric_type: "conversion".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "increase_is_bad".to_string(),
+                auto_stop: true,
+            },
+            ExperimentMetricSpec {
+                name: "Mandate amount per user".to_string(),
+                event_name: "UPI_Autopay_Mandate_Approved".to_string(),
+                metric_type: "sum".to_string(),
+                numeric_prop: Some("amount".to_string()),
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+            },
+        ],
+        // Demo users are exposed on their first day, so CUPED has no pre-period to use here.
+        analysis: AnalysisConfig {
+            sequential: true,
+            cuped: true,
+            ..AnalysisConfig::default()
+        },
         created_at_ms: now_ms,
+        stop_reason: None,
     };
     ctrl.meta().upsert_experiment(&exp).await?;
 

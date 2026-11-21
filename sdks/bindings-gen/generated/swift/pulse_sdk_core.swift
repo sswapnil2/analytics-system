@@ -963,15 +963,25 @@ public struct SdkConfig {
     public var storageDir: String
     public var flushBatchSize: UInt32
     public var flushIntervalMs: UInt64
+    /**
+     * Re-fetch flags in the background when they are older than this, so rollbacks and
+     * guardrail stops reach running apps. `0` fetches only on first use and `refresh_flags`.
+     */
+    public var flagsTtlMs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(endpointUrl: String, apiKey: String, storageDir: String, flushBatchSize: UInt32, flushIntervalMs: UInt64) {
+    public init(endpointUrl: String, apiKey: String, storageDir: String, flushBatchSize: UInt32, flushIntervalMs: UInt64, 
+        /**
+         * Re-fetch flags in the background when they are older than this, so rollbacks and
+         * guardrail stops reach running apps. `0` fetches only on first use and `refresh_flags`.
+         */flagsTtlMs: UInt64 = UInt64(300000)) {
         self.endpointUrl = endpointUrl
         self.apiKey = apiKey
         self.storageDir = storageDir
         self.flushBatchSize = flushBatchSize
         self.flushIntervalMs = flushIntervalMs
+        self.flagsTtlMs = flagsTtlMs
     }
 }
 
@@ -994,6 +1004,9 @@ extension SdkConfig: Equatable, Hashable {
         if lhs.flushIntervalMs != rhs.flushIntervalMs {
             return false
         }
+        if lhs.flagsTtlMs != rhs.flagsTtlMs {
+            return false
+        }
         return true
     }
 
@@ -1003,6 +1016,7 @@ extension SdkConfig: Equatable, Hashable {
         hasher.combine(storageDir)
         hasher.combine(flushBatchSize)
         hasher.combine(flushIntervalMs)
+        hasher.combine(flagsTtlMs)
     }
 }
 
@@ -1018,7 +1032,8 @@ public struct FfiConverterTypeSdkConfig: FfiConverterRustBuffer {
                 apiKey: FfiConverterString.read(from: &buf), 
                 storageDir: FfiConverterString.read(from: &buf), 
                 flushBatchSize: FfiConverterUInt32.read(from: &buf), 
-                flushIntervalMs: FfiConverterUInt64.read(from: &buf)
+                flushIntervalMs: FfiConverterUInt64.read(from: &buf), 
+                flagsTtlMs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -1028,6 +1043,7 @@ public struct FfiConverterTypeSdkConfig: FfiConverterRustBuffer {
         FfiConverterString.write(value.storageDir, into: &buf)
         FfiConverterUInt32.write(value.flushBatchSize, into: &buf)
         FfiConverterUInt64.write(value.flushIntervalMs, into: &buf)
+        FfiConverterUInt64.write(value.flagsTtlMs, into: &buf)
     }
 }
 
@@ -1405,7 +1421,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_touch() != 7099) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 32896) {
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 49421) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539) {
@@ -1414,7 +1430,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props() != 56505) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371) {
+    if (uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 45811) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054) {

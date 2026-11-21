@@ -399,7 +399,10 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
             let mut ticker = tokio::time::interval(Duration::from_secs(300));
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => alerts_control.evaluate_alerts().await,
+                    _ = ticker.tick() => {
+                        alerts_control.evaluate_alerts().await;
+                        alerts_control.evaluate_experiment_guardrails().await;
+                    }
                     changed = alerts_shutdown.changed() => {
                         if changed.is_err() || *alerts_shutdown.borrow() { break; }
                     }
@@ -699,6 +702,7 @@ mod tests {
                 storage_dir: sdk_dir.to_string_lossy().to_string(),
                 flush_batch_size: 50,
                 flush_interval_ms: 0,
+                flags_ttl_ms: 0,
             })
             .unwrap();
 
@@ -784,6 +788,7 @@ mod tests {
             storage_dir: sdk_dir.to_string_lossy().to_string(),
             flush_batch_size: 50,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         })
         .unwrap();
         let sdk_session_id = live_sdk.session_id();
