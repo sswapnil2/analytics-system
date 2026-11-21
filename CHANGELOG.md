@@ -5,6 +5,15 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 ## [Unreleased]
 
 ### Added
+- Developer documentation site at `/docs` (architecture, internals, ADRs, configuration, troubleshooting, limitations), with `llms.txt` and `llms-full.txt` for AI agents.
+- The Experiments page has tabs for experiments, feature flags, and holdouts and layers. Each variant's verdict sits beside its name ("Significantly worse" in red), stopped and draft experiments say so instead of showing live-test copy, and funnel drops are labelled "A → B" with a hint when a step gets no one.
+- The start review names A-to-B and time metrics in full, decisions recorded with an old user id read "a teammate", and the experiment list says "Stopped · shipped …" to match the experiment page.
+- Saved metrics: name a guardrail or secondary metric once (say, "KYC failure" as a KYC event where status isn't success) and add it to any experiment from a list.
+- Shipping can roll the winner out in steps: 25%, then 50%, then everyone, every 1 to 7 days. A hand change to the flag stops the schedule.
+- Create the experiment's flag from the experiment form (made off, 50/50, turned on when the experiment starts). Flags in use by another experiment are marked and can't be picked, and a taken name is flagged as soon as you leave the field.
+- Pausing an experiment now turns its flag off, so everyone gets the default until you resume; you're asked to confirm and can note why, and users get their same variant back on resume.
+- A flag used by a running or paused experiment shows which experiment, and its on/off switch, audience, holdout and rollout are locked until the experiment is stopped or shipped (pausing turns the flag off).
+- The experiment page shows Pulse's recommendation. Ship is no longer the main button when a guardrail has no data or got worse, the split is off, or the sample is short; concluding then needs each of those acknowledged, including a guardrail that got worse.
 - Sequential testing for experiments: results stay valid however often you check them, so you can stop a test early. It is on by default for new experiments.
 - Experiments can set their significance level and planned sample size, and the sample-size estimate accounts for sequential testing and extra variants.
 - Guardrails show lift and significance, say which way is bad, and flag variants that made them significantly worse.
@@ -26,6 +35,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Flags can be created with your own variants: names, splits, more than two arms, and an optional JSON payload each.
 - Segments hide experiment plumbing, ids and personal-data properties, show no lift for segments with too few users, and name the "no value" segment.
 - Experiments send a webhook (and an audit row) once when a result turns significant, the planned sample is reached, a guardrail gets worse, or a guardrail has no data.
+- Sum and ratio metrics can carry a unit (₹, $, items), shown on every value and difference.
+- Segment pickers say that event properties come from the exposure event, warn when most users have no value, and offer the profile property instead.
+- Full layers can't be picked, and asking for more of a layer than is free is caught before saving.
+- Copied summaries start with a status line (day, planned sample, traffic split, blind guardrails) and a recommendation. Fixed-horizon tests read "too early" until their planned sample, and day counts match everywhere.
 - Experiments can target an audience: keep the flag's, pick a cohort, or build one inline ("hasn't done", "has done", "property is") with a live count of matching users that feeds the duration estimate.
 - Experiment metrics can count only events where a property matches, such as a KYC check with `status = failed`.
 - Every primary metric says whether higher or lower is better (time defaults to lower), and results, verdicts and Ship buttons follow it.
@@ -51,9 +64,22 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Experiments can be paused and resumed from the Studio.
 - Bandits: a new experiment type that moves traffic to the best variant once a day, shows each variant's chance to be best and the cost of shipping it, and charts how traffic moved.
 
+## [0.1.2] - 2026-11-21
+
+### Added
+- Query sampling: exact while a query is under 10 M estimated rows, then deterministic user-bucket sampling, always disclosed in the result (`sampling`) and forceable with `"sampling": "exact"`. Covers Insights, Funnels, Retention and Flows.
+- Zero-I/O HyperLogLog sketches in segment footers for fast long-range Uniques, DAU, WAU and MAU.
+- Edit and delete saved cohorts.
+- Studio: chart export, funnel step picker, per-card intervals, save reports in place, shared trend chart with hover sync, property picker, and UX passes on Journeys, Cohorts, Users, Experiments, Events and Security.
+- React Native wrapper with a native recorder (`sdks/react-native`, experimental, not released).
+
 ### Changed
-- Internal review codes removed from comments and test names; process logs moved to `docs/history/`.
-- Crate manifests now carry descriptions, repository and homepage.
+- Scale work for 10 M–100 M events: streaming query engine, SlateDB profile store, compressed and batched manifests, identity graph GC.
+- Web SDK: fetch timeout (`fetchTimeoutMs`), incremental wireframe diffs, session dedup.
+- Open-source readiness: privacy fixes, CI, docs; internal review codes removed from comments and test names; process logs moved to `docs/history/`; crate manifests carry descriptions, repository and homepage.
+
+### Fixed
+- Mobile core no longer loses queued events when the app is killed.
 
 ## [0.1.1] - 2026-11-19
 
@@ -73,6 +99,7 @@ First public release.
 - Docker image `ghcr.io/sswapnil2/pulse` and Linux x86_64/aarch64 binaries.
 - Everything is Apache-2.0 with no licence key.
 
-[Unreleased]: https://github.com/sswapnil2/analytics-system/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sswapnil2/analytics-system/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/sswapnil2/analytics-system/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sswapnil2/analytics-system/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sswapnil2/analytics-system/releases/tag/v0.1.0

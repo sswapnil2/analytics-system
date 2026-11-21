@@ -1,13 +1,28 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, BanditResults, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
+import { api, BanditResults, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, SavedMetric, TrafficGroup, VariantLiftRow } from "../api/client";
 import { HoldoutsAndLayers } from "../components/HoldoutsAndLayers";
-import { ConcludeDialog, StartReview } from "../components/ExperimentDialogs";
-import { ExperimentIndex } from "../components/ExperimentIndex";
+import { ConcludeDialog, PauseDialog, StartReview } from "../components/ExperimentDialogs";
+import { dayOfTotal, ExperimentIndex } from "../components/ExperimentIndex";
 import { defaultVariants, toAllocations, VariantDraft, VariantsEditor, variantsProblem } from "../components/VariantsEditor";
-import { isTwoStep, MetricRow, metricRowProblem, MetricRows } from "../components/MetricRows";
+import { isTwoStep, MetricRow, metricRowName, metricRowProblem, MetricRows } from "../components/MetricRows";
 import { StepWhere, StepWhereEditor, stepWhereToFilters } from "../components/StepWhere";
 import { AudiencePicker, EVERYONE, KEEP, NEW } from "../components/AudiencePicker";
+
+/** The flag picker's "New flag…" choice. */
+const NEW_FLAG = "__new_flag";
+
+type PageTab = "experiments" | "flags" | "traffic";
+const PAGE_TABS: { value: PageTab; label: string }[] = [
+  { value: "experiments", label: "Experiments" },
+  { value: "flags", label: "Feature flags" },
+  { value: "traffic", label: "Holdouts and layers" },
+];
+const hashParams = () => new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+const tabFromHash = (): PageTab => {
+  const t = hashParams().get("tab");
+  return t === "flags" || t === "traffic" ? t : "experiments";
+};
 import { Cond, cohortDefinition } from "../lib/cohort";
 import { BanditResultsView } from "../components/BanditResults";
 import { LiftChart } from "../components/LiftChart";
@@ -15,7 +30,7 @@ import { clearFilterCaches, useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
 import { PropertyPicker } from "../components/PropertyPicker";
-import { errorMessage, formatCount, formatDuration, formatPValue, formatPercent, formatProbability, humanizeEvent, propertyOptions } from "../lib/format";
+import { errorMessage, formatCount, formatDuration, formatPValue, formatPercent, formatProbability, humanizeEvent, propertyOptions, withUnit } from "../lib/format";
 import { usersPerVariant } from "../lib/power";
 
 interface Props {
@@ -38,11 +53,18 @@ const METRIC_TYPES: { value: MetricType; label: string; eventLabel: string }[] =
 const isRate = (type: MetricType | undefined) => !type || type === "conversion" || type === "step_through";
 
 /** A variant's metric value: a rate for conversions, a plain number otherwise. */
-function formatMetricValue(type: MetricType | undefined, v: VariantLiftRow): string {
+/** The unit of the metric named `name` in this experiment (primary, guardrail or secondary). */
+function unitOf(exp: Experiment | null | undefined, name: string): string | null {
+  if (!exp) return null;
+  const all = [exp.primary_metric, ...exp.guardrail_metrics, ...(exp.secondary_metrics ?? [])];
+  return all.find((m) => m.name === name)?.unit ?? null;
+}
+
+function formatMetricValue(type: MetricType | undefined, v: VariantLiftRow, unit?: string | null): string {
   if (!type || type === "conversion") return formatPercent(v.conversion_rate, 2);
   if (type === "step_through") return formatPercent(v.mean_value, 1);
   if (type === "time_between") return formatDuration(v.mean_value * 1000);
-  return v.mean_value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v.mean_value) < 10 ? 3 : 2 });
+  return withUnit(v.mean_value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v.mean_value) < 10 ? 3 : 2 }), unit);
 }
 
 const DAY_MS = 86_400_000;
@@ -112,12 +134,12 @@ function describeMetric(m: Experiment["primary_metric"]): string {
 }
 
 /** Absolute difference from control: percentage points for rates, metric units otherwise. */
-function formatAbsDiff(type: MetricType | undefined, d: number): string {
+function formatAbsDiff(type: MetricType | undefined, d: number, unit?: string | null): string {
   if (type === "time_between") return `${d > 0 ? "+" : d < 0 ? "−" : ""}${formatDuration(Math.abs(d) * 1000)}`;
   const conv = isRate(type);
   const n = conv ? d * 100 : d;
   const text = n.toLocaleString(undefined, { maximumFractionDigits: Math.abs(n) < 10 ? 2 : 1 });
-  return `${n > 0 ? "+" : ""}${text}${conv ? " pts" : ""}`;
+  return conv ? `${n > 0 ? "+" : ""}${text} pts` : withUnit(`${n > 0 ? "+" : ""}${text}`, unit);
 }
 
 /** No metric events from anyone exposed: usually broken tracking, not "no effect". */
@@ -152,6 +174,9 @@ function verdict(
   } else {
     lines = treatments.map((v) => {
       const better = lowerIsBetter(exp) ? "lower" : "higher";
+      if (!results.sequential && planned && usersNow < planned) {
+        return `Too early for ${v.variant_key}: this is a fixed-horizon test at ${formatCount(usersNow)} of ${formatCount(planned)} planned users per variant, so today's p-value isn't valid yet (likely ${range(v)}).`;
+      }
       if (v.statistically_significant && gain(exp, v.relative_lift_pct) > 0) {
         if (target === null || Math.min(gain(exp, v.ci95_low_pct), gain(exp, v.ci95_high_pct)) >= target) {
           tone = tone === "danger" ? tone : "ok";
@@ -205,6 +230,43 @@ const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuar
 };
 
 /** A plain-text write-up to paste into a doc or chat: setup, result, verdict, guardrails, decision. */
+/** One line on what to do now, from the same reading as the verdict. */
+function recommendation(exp: Experiment, results: ExperimentResults, blindGuardrails: string[]): string {
+  if (results.sample_ratio_mismatch) return "don't decide yet: fix the traffic split first, then restart.";
+  const harmed = results.guardrails.filter((g) => g.regressed_variants.length).map((g) => g.metric_name);
+  if (harmed.length) return `don't ship: ${harmed.join(", ")} got worse.`;
+  const planned = exp.analysis?.planned_users_per_variant;
+  const least = results.variants.length ? Math.min(...results.variants.map((v) => v.sample_size)) : 0;
+  // A fixed-horizon test can't be read before its planned sample without inflating false wins.
+  if (!results.sequential && planned && least < planned) return "wait: a fixed-horizon test is only valid at its planned sample.";
+  const target = exp.analysis?.target_lift_pct ?? null;
+  const winners = results.variants.filter((v) => !v.is_control && v.statistically_significant && gain(exp, v.relative_lift_pct) > 0);
+  const best = winners.sort((a, b) => gain(exp, b.relative_lift_pct) - gain(exp, a.relative_lift_pct))[0];
+  if (best) {
+    const meetsTarget = target === null || Math.min(gain(exp, best.ci95_low_pct), gain(exp, best.ci95_high_pct)) >= target;
+    const caveat = blindGuardrails.length ? ` after checking ${blindGuardrails.join(", ")} another way` : "";
+    return meetsTarget
+      ? `ship ${best.variant_key}${caveat}.`
+      : `${best.variant_key} wins but may be below the ${target}% target: decide if the gain is worth it${caveat}.`;
+  }
+  if (results.variants.some((v) => !v.is_control && v.statistically_significant)) return "keep control: the change made things worse.";
+  if (planned && least < planned) return "wait: too early to call.";
+  return "no clear difference at the planned sample: treat as inconclusive.";
+}
+
+/** Decisions recorded before emails were stored hold a raw user id; don't show that. */
+const decider = (label: string) => (label.startsWith("user:") ? "a teammate" : label || "someone");
+
+/** Where a staged ship's rollout stands. */
+function stagedText(d: NonNullable<Experiment["decision"]>): string {
+  const st = d.staged;
+  if (!st) return `rolling out ${d.variant}`;
+  const now = st.steps_pct[Math.max(0, st.next_step - 1)];
+  if (st.halted) return `rollout stopped at ${now}%: ${st.halted}`;
+  if (st.next_step >= st.steps_pct.length) return `everyone gets ${d.variant} (rolled out in steps)`;
+  return `${d.variant} at ${now}%, ${st.steps_pct[st.next_step]}% on ${new Date(st.next_at_ms).toLocaleDateString()}`;
+}
+
 function experimentSummary(
   exp: Experiment,
   flag: FeatureFlag | undefined,
@@ -217,6 +279,20 @@ function experimentSummary(
     `${exp.name} (${STATUS_LABEL[exp.status] ?? exp.status}, ${day(exp.start_ts_ms)} to ${day(exp.end_ts_ms)})`,
     "",
   ];
+  // Status first, so a pasted summary can't be read as a final result while it isn't one.
+  if (exp.status !== "concluded" && exp.status !== "draft") {
+    const { day: d, total } = dayOfTotal(exp);
+    const planned = exp.analysis?.planned_users_per_variant;
+    const least = results.variants.length ? Math.min(...results.variants.map((v) => v.sample_size)) : 0;
+    out.push(
+      `Status: day ${d} of ${total}${planned ? ` · ${formatCount(least)} of ${formatCount(planned)} planned users per variant` : ""} · traffic split ${
+        results.sample_ratio_mismatch ? "OFF" : "OK"
+      }${blindGuardrails.length ? ` · no data on ${blindGuardrails.join(", ")}` : ""}.`,
+      `Recommendation: ${recommendation(exp, results, blindGuardrails)}`,
+      "",
+    );
+  }
+  if (exp.problem) out.push(`Problem: ${exp.problem}`);
   if (exp.hypothesis) out.push(`Hypothesis: ${exp.hypothesis}`);
   out.push(`Primary metric: ${exp.primary_metric.name} (${describeMetric(exp.primary_metric)})`);
   if (flag) {
@@ -228,7 +304,7 @@ function experimentSummary(
     const lift = v.is_control
       ? ""
       : `, ${pct(v.relative_lift_pct)} vs control (likely ${pct(v.ci95_low_pct)} to ${pct(v.ci95_high_pct)})${v.statistically_significant ? ", significant" : ", not significant"}`;
-    out.push(`- ${v.variant_key}: ${formatMetricValue(results.metric_type, v)} of ${formatCount(v.sample_size)} users${lift}`);
+    out.push(`- ${v.variant_key}: ${formatMetricValue(results.metric_type, v, exp.primary_metric.unit)} of ${formatCount(v.sample_size)} users${lift}`);
   }
   const vd = verdict(exp, results, blindGuardrails);
   if (vd) out.push("", "What it means:", ...vd.lines.map((l) => `- ${l}`));
@@ -246,14 +322,14 @@ function experimentSummary(
   if (results.secondary?.length) {
     out.push("", "Secondary metrics:");
     for (const m of results.secondary) {
-      out.push(`- ${m.metric_name}: ${m.variants.map((v) => `${v.variant_key} ${formatMetricValue(m.metric_type, v)}`).join(", ")}`);
+      out.push(`- ${m.metric_name}: ${m.variants.map((v) => `${v.variant_key} ${formatMetricValue(m.metric_type, v, unitOf(exp, m.metric_name))}`).join(", ")}`);
     }
   }
   if (results.sample_ratio_mismatch) out.push("", "Warning: the traffic split is off, so these results can't be trusted.");
   if (exp.decision) {
     const d = exp.decision;
     const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
-    out.push("", `Decision: ${what}, by ${d.decided_by} on ${day(d.decided_at_ms)}.${d.reason ? ` ${d.reason}` : ""}`);
+    out.push("", `Decision: ${what}, by ${decider(d.decided_by)} on ${day(d.decided_at_ms)}.${d.reason ? ` ${d.reason}` : ""}`);
     for (const a of d.acknowledged ?? []) out.push(`- Accepted: ${a}`);
   }
   out.push("", link);
@@ -282,7 +358,7 @@ const CopyButton: React.FC<{ label: string; text: () => string }> = ({ label, te
 };
 
 /** Secondary metrics: what moved besides the primary metric. Reported only, never decides. */
-const SecondaryResults: React.FC<{ metrics: MetricResult[] }> = ({ metrics }) => (
+const SecondaryResults: React.FC<{ metrics: MetricResult[]; exp: Experiment | null | undefined }> = ({ metrics, exp }) => (
   <div className="border-t border-line pt-4">
     <h3 className="mb-1 text-sm font-medium text-ink">Secondary metrics</h3>
     <p className="mb-2 text-xs text-muted">For context: these don't decide the outcome, and with several of them one may move by chance.</p>
@@ -306,10 +382,10 @@ const SecondaryResults: React.FC<{ metrics: MetricResult[] }> = ({ metrics }) =>
                 <td className="py-2 text-ink-2">{v.variant_key}</td>
                 <td className="tabular py-2 text-right text-ink-2">{formatCount(v.sample_size)}</td>
                 <td className="tabular py-2 text-right text-ink">
-                  {formatMetricValue(m.metric_type, v)}
+                  {formatMetricValue(m.metric_type, v, unitOf(exp, m.metric_name))}
                 </td>
                 <td className="tabular py-2 text-right text-ink-2">
-                  {v.is_control || v.abs_diff === undefined ? "–" : formatAbsDiff(m.metric_type, v.abs_diff)}
+                  {v.is_control || v.abs_diff === undefined ? "–" : formatAbsDiff(m.metric_type, v.abs_diff, unitOf(exp, m.metric_name))}
                 </td>
                 <td className="py-2 text-right text-muted">
                   {v.is_control
@@ -340,8 +416,6 @@ const ExperimentSetup: React.FC<{
   onNotify?: (on: boolean) => void;
 }> = ({ exp, flag, cohortName, usersPerVariantNow, hasWebhook, onNotify }) => {
   const planned = exp.analysis?.planned_users_per_variant ?? null;
-  const elapsed = Math.max(0, Math.min(Date.now(), exp.end_ts_ms) - exp.start_ts_ms);
-  const total = Math.max(1, exp.end_ts_ms - exp.start_ts_ms);
   const bandit = exp.kind === "bandit";
   const rows: [string, React.ReactNode][] = [];
   if (exp.problem) rows.push(["Problem", <span className="whitespace-pre-wrap">{exp.problem}</span>]);
@@ -425,11 +499,18 @@ const ExperimentSetup: React.FC<{
   if (exp.decision) {
     const d = exp.decision;
     const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
-    const flagDid = d.flag_action === "rollout" ? `everyone gets ${d.variant}` : d.flag_action === "rollback" ? "flag turned off" : "flag left as it was";
+    const flagDid =
+      d.flag_action === "rollout"
+        ? `everyone gets ${d.variant}`
+        : d.flag_action === "staged"
+          ? stagedText(d)
+          : d.flag_action === "rollback"
+            ? "flag turned off"
+            : "flag left as it was";
     rows.push([
       "Decision",
       <>
-        <span className="font-medium text-ink">{what}</span> · {flagDid} · {d.decided_by},{" "}
+        <span className="font-medium text-ink">{what}</span> · {flagDid} · {decider(d.decided_by)},{" "}
         {new Date(d.decided_at_ms).toLocaleDateString()}
         {d.reason && <div className="whitespace-pre-wrap">{d.reason}</div>}
         {!!d.acknowledged?.length && (
@@ -442,12 +523,14 @@ const ExperimentSetup: React.FC<{
       </>,
     ]);
   }
+  const { day, total } = dayOfTotal(exp);
   rows.push([
     "Dates",
-    `${new Date(exp.start_ts_ms).toLocaleDateString()} to ${new Date(exp.end_ts_ms).toLocaleDateString()} · day ${Math.min(
-      Math.ceil(elapsed / DAY_MS) || 1,
-      Math.ceil(total / DAY_MS),
-    )} of ${Math.ceil(total / DAY_MS)}`,
+    exp.status === "draft"
+      ? `Not started · planned for ${total} ${total === 1 ? "day" : "days"}`
+      : `${new Date(exp.start_ts_ms).toLocaleDateString()} to ${new Date(exp.end_ts_ms).toLocaleDateString()} · ${
+          exp.status === "concluded" ? `ran ${total} ${total === 1 ? "day" : "days"}` : `day ${day} of ${total}`
+        }`,
   ]);
   return (
     <details className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm" open>
@@ -690,8 +773,44 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [creating, setCreating] = useState<boolean>(false);
 
   const [expFormOpen, setExpFormOpen] = useState(false);
+  const [tab, setTabState] = useState<PageTab>(tabFromHash);
+  /** Shows a tab and keeps it in the URL, so a link opens the same one. */
+  const setTab = (t: PageTab) => {
+    setTabState(t);
+    const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+    const params = new URLSearchParams(search);
+    if (t === "experiments") params.delete("tab");
+    else params.set("tab", t);
+    window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+  };
   const [expName, setExpName] = useState("");
   const [expFlagId, setExpFlagId] = useState("");
+  /** With "New flag…": the key of the flag to create when the experiment is saved. */
+  const [expNewFlagKey, setExpNewFlagKey] = useState("");
+  const [expNameError, setExpNameError] = useState<string | null>(null);
+  const [savedMetrics, setSavedMetrics] = useState<SavedMetric[]>([]);
+  // A flag still to be created stands in as off, for everyone, split 50/50 (what it'll be made as).
+  const formFlag: FeatureFlag | undefined =
+    expFlagId === NEW_FLAG
+      ? {
+          id: NEW_FLAG,
+          project_id: projectId,
+          key: expNewFlagKey.trim(),
+          description: "",
+          enabled: false,
+          rollout_pct: 100,
+          targeting_cohort_id: null,
+          variants: [
+            { key: "control", weight_bps: 5000 },
+            { key: "treatment", weight_bps: 5000 },
+          ],
+          updated_at_ms: 0,
+        }
+      : flags.find((f) => f.id === expFlagId);
+  const loadSavedMetrics = useCallback(() => {
+    api.listSavedMetrics(projectId).then(setSavedMetrics).catch(() => setSavedMetrics([]));
+  }, [projectId]);
+  useEffect(loadSavedMetrics, [loadSavedMetrics]);
   const [expHypothesis, setExpHypothesis] = useState("");
   const [expProblem, setExpProblem] = useState("");
   const [expAudience, setExpAudience] = useState(KEEP);
@@ -718,6 +837,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const eventOptions = availableEvents.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }));
   const [expMetricType, setExpMetricType] = useState<MetricType>("conversion");
   const [expProp, setExpProp] = useState("");
+  const [expUnit, setExpUnit] = useState("");
   const [expDenominator, setExpDenominator] = useState("");
   const [expCuped, setExpCuped] = useState(true);
   const propOptions = propertyOptions(availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$")));
@@ -814,6 +934,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       if (!path.replace(/^\//, "").startsWith("experiments")) return;
       const params = new URLSearchParams(search);
       const exp = params.get("exp");
+      setTabState(exp || params.get("new") === "1" ? "experiments" : tabFromHash());
       if (exp && exp !== selectedExpIdRef.current) {
         if (initial) {
           selectedExpIdRef.current = exp; // loadAll picks it up
@@ -845,17 +966,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     void loadAll();
   }, [loadAll, refreshToken]);
 
+  /** Keeps the URL on this experiment, so it can be shared. */
+  const setExpInUrl = (expId: string) => {
+    const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+    const params = new URLSearchParams(search);
+    if (expId) params.set("exp", expId);
+    else params.delete("exp");
+    window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+  };
+
   const handleSelectExperiment = async (expId: string, seg = segmentRef.current) => {
     selectedExpIdRef.current = expId;
     setSelectedExpId(expId);
-    // Keep the URL on this experiment, so it can be shared.
-    {
-      const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
-      const params = new URLSearchParams(search);
-      if (expId) params.set("exp", expId);
-      else params.delete("exp");
-      window.history.replaceState(null, "", `#${path}?${params.toString()}`);
-    }
+    setExpInUrl(expId);
     const seq = ++resultsSeqRef.current;
     if (!expId) {
       setExpResults(null);
@@ -884,21 +1007,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     });
   }, []);
 
-  /** Flags already confirmed this visit, so dragging a slider asks once, not on every step. */
-  const confirmedFlagsRef = useRef<Set<string>>(new Set());
-  /** Changing a flag under a live experiment changes who sees what mid-test; make that a deliberate step. */
-  const confirmFlagChange = (flag: FeatureFlag, effect: string) => {
-    if (confirmedFlagsRef.current.has(flag.id)) return true;
-    const live = experiments.find(
-      (e) => (e.flag_id === flag.id || e.flag_key === flag.key) && (e.status === "running" || e.status === "paused"),
-    );
-    if (!live) return true;
-    const ok = window.confirm(
-      `"${live.name}" is ${live.status} on ${flag.key}. ${effect} changes who sees each variant and can skew its results. Continue?`,
-    );
-    if (ok) confirmedFlagsRef.current.add(flag.id);
-    return ok;
-  };
+  /** The running or paused experiment holding this flag; its serving is locked while one does. */
+  const liveOn = (flag: FeatureFlag) =>
+    experiments.find((e) => (e.flag_id === flag.id || e.flag_key === flag.key) && (e.status === "running" || e.status === "paused"));
 
   const patchFlag = useCallback(async (flag: FeatureFlag, body: FlagPatch) => {
     setFlagError(null);
@@ -916,7 +1027,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   }, [projectId, clearDraftIfIdle]);
 
   const scheduleRolloutPatch = (flag: FeatureFlag, pctValue: number) => {
-    if (!confirmFlagChange(flag, "Changing the rollout")) return;
     setRolloutDrafts((prev) => ({ ...prev, [flag.id]: pctValue }));
     const prevTimer = rolloutTimersRef.current.get(flag.id);
     if (prevTimer !== undefined) window.clearTimeout(prevTimer);
@@ -931,6 +1041,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpFormOpen(false);
     setExpName("");
     setExpFlagId("");
+    setExpNewFlagKey("");
+    setExpNameError(null);
     setExpHypothesis("");
     setExpProblem("");
     setExpOwner("");
@@ -940,6 +1052,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpWhere(null);
     setExpMetricType("conversion");
     setExpProp("");
+    setExpUnit("");
     setExpDenominator("");
     setExpGuardrails([]);
     setExpSecondaries([]);
@@ -951,8 +1064,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
   /** The form's first problem, or null when it can be saved. */
   const expFormProblem = (): string | null => {
-    const flag = flags.find((f) => f.id === expFlagId);
+    const flag = formFlag;
     if (!expName.trim() || !flag || !expMetric) return "Add a name, pick a flag and pick the metric's event.";
+    const dup = duplicateName(expName);
+    if (dup) return dup;
+    if (expFlagId === NEW_FLAG) {
+      const keyErr = validateFlagKey(expNewFlagKey);
+      if (keyErr) return `New flag: ${keyErr}`;
+      if (flags.some((f) => f.key === expNewFlagKey.trim())) return `A flag called ${expNewFlagKey.trim()} already exists; pick it from the list instead.`;
+    }
     if (expMetricType === "sum" && !expProp) return "Pick the property to add up.";
     if (expMetricType === "ratio" && !expDenominator) return "Pick the denominator event.";
     if (isTwoStep(expMetricType) && !expDenominator) return "Pick the first step (A).";
@@ -963,6 +1083,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       }
     }
     if (expKind === "bandit" && flag.variants.length < 2) return "A bandit needs a flag with at least two variants.";
+    const layer = layers.find((l) => l.id === expLayerId);
+    if (layer && expLayerPct * 100 > (layer.free_bps ?? 10_000))
+      return `${layer.name} has ${formatPercent((layer.free_bps ?? 10_000) / 10_000, 0)} free; ask for that much or less.`;
     if (expAudience === NEW && !cohortDefinition(expAudienceConds, "and"))
       return "Finish the new audience: every line needs an event, or a property and a value.";
     const busy = experiments.find((e) => e.flag_key === flag.key && (e.status === "running" || e.status === "paused"));
@@ -971,9 +1094,28 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     return null;
   };
 
+  /** An experiment name already taken in this project, as a message; null when free. */
+  const duplicateName = (name: string) => {
+    const n = name.trim().toLowerCase();
+    return n && experiments.some((e) => e.name.trim().toLowerCase() === n)
+      ? `An experiment called "${name.trim()}" already exists. Pick another name.`
+      : null;
+  };
+
+  const fromRow = (r: MetricRow, guardrail: boolean): ExperimentMetric => ({
+    name: metricRowName(r),
+    event_name: r.event,
+    filters: stepWhereToFilters(r.where),
+    metric_type: r.type,
+    denominator: isTwoStep(r.type) ? { event_name: r.from } : null,
+    conversion_window_ms: expWindowDays * DAY_MS,
+    direction: r.direction,
+    auto_stop: guardrail && r.autoStop && expSequential,
+  });
+
   const createExperiment = async (status: "draft" | "running") => {
     setReview(null);
-    const flag = flags.find((f) => f.id === expFlagId);
+    let flag = formFlag;
     const problem = expFormProblem();
     if (problem || !flag) {
       setExpError(problem);
@@ -994,26 +1136,28 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       ...(isTwoStep(expMetricType) ? { name: `${humanizeEvent(expDenominator)} → ${humanizeEvent(expMetric)}` } : {}),
       metric_type: expMetricType,
       numeric_prop: expMetricType === "sum" || expMetricType === "ratio" ? expProp || null : null,
+      unit: expMetricType === "sum" || expMetricType === "ratio" ? expUnit.trim() || null : null,
       denominator: expMetricType === "ratio" || isTwoStep(expMetricType) ? { event_name: expDenominator } : null,
       filters: stepWhereToFilters(expWhere),
     };
-    const fromRow = (r: MetricRow, guardrail: boolean): ExperimentMetric => ({
-      name: isTwoStep(r.type)
-        ? `${humanizeEvent(r.from)} → ${humanizeEvent(r.event)}${r.type === "time_between" ? " (time)" : ""}`
-        : humanizeEvent(r.event),
-      event_name: r.event,
-      filters: stepWhereToFilters(r.where),
-      metric_type: r.type,
-      denominator: isTwoStep(r.type) ? { event_name: r.from } : null,
-      conversion_window_ms: expWindowDays * DAY_MS,
-      direction: r.direction,
-      auto_stop: guardrail && r.autoStop && expSequential,
-    });
     // The estimate assumes a conversion rate; other metric types use the server's default horizon.
     const planned = baseline && expMetricType === "conversion"
       ? usersPerVariant(baseline.rate, mde / 100, { variants: Math.max(2, flag.variants.length), sequential: expSequential })
       : Infinity;
     try {
+      if (flag.id === NEW_FLAG) {
+        // Made off; starting the experiment turns it on. A retry finds it in the list.
+        const made = await api.createFlag(projectId, {
+          key: flag.key,
+          description: `For the experiment "${expName.trim()}".`,
+          rollout_pct: 100,
+          enabled: false,
+          variants: flag.variants,
+        });
+        flag = made;
+        setFlags((prev) => [...prev, made]);
+        setExpFlagId(made.id);
+      }
       // The audience lives on the flag, so set it first; the experiment then reports on that audience.
       let cohortId: string | null = null;
       if (expAudience === EVERYONE) cohortId = "";
@@ -1060,6 +1204,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       closeExpForm();
       setSelectedExpId(created.id);
       selectedExpIdRef.current = created.id;
+      setExpInUrl(created.id);
       await loadAll();
     } catch (e) {
       setExpError(`Couldn't create experiment: ${errorMessage(e)}`);
@@ -1068,13 +1213,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     }
   };
 
-  /** Pause keeps the flag as it is and only stops guardrail checks; resume picks them up again. */
-  const setStatus = async (exp: Experiment, status: "running" | "paused") => {
+  /** Pause turns the flag off (everyone gets the default); resume turns it back on with the same split. */
+  const setStatus = async (exp: Experiment, status: "running" | "paused", reason?: string) => {
     setActing(true);
     setActionError(null);
     try {
-      const done = await api.patchExperiment(projectId, exp.id, { status });
-      setExperiments((prev) => prev.map((e) => (e.id === exp.id ? done : e)));
+      await api.patchExperiment(projectId, exp.id, { status, ...(reason ? { reason } : {}) });
+      setPauseOpen(false);
+      await loadAll();
     } catch (err) {
       setActionError(errorMessage(err));
     } finally {
@@ -1128,7 +1274,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       await api.createFlag(projectId, {
         key: newFlagKey.trim(),
         description: newFlagDesc.trim(),
-        rollout_pct: 50,
+        rollout_pct: 100,
         // Off until an experiment starts on it, so creating a flag never changes what users see.
         enabled: false,
         variants: toAllocations(newVariants),
@@ -1144,6 +1290,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     }
   };
 
+  const [pauseOpen, setPauseOpen] = useState(false);
   const selectedExp = experiments.find((e) => e.id === selectedExpId);
   const selectedFlag = selectedExp
     ? flags.find((f) => f.id === selectedExp.flag_id || f.key === selectedExp.flag_key)
@@ -1180,7 +1327,17 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               Update results
             </button>
             {canEdit && (
-              <button type="button" onClick={() => (expFormOpen ? closeExpForm() : setExpFormOpen(true))} className={btn.primary}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (expFormOpen) closeExpForm();
+                  else {
+                    setTab("experiments");
+                    setExpFormOpen(true);
+                  }
+                }}
+                className={btn.primary}
+              >
                 <Plus className="h-3.5 w-3.5" />
                 New experiment
               </button>
@@ -1189,6 +1346,30 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         }
       />
 
+      <div role="tablist" aria-label="Experiments sections" className="flex flex-wrap gap-1 border-b border-line">
+        {PAGE_TABS.map((t) => (
+          <button
+            key={t.value}
+            type="button"
+            role="tab"
+            id={`exp-tab-${t.value}`}
+            aria-selected={tab === t.value}
+            aria-controls={`exp-panel-${t.value}`}
+            onClick={() => setTab(t.value)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              tab === t.value ? "border-brand text-ink" : "border-transparent text-muted hover:text-ink"
+            }`}
+          >
+            {t.label}
+            {t.value === "flags" && flags.length > 0 && <span className="ml-1.5 text-xs text-faint">{flags.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {loadError && <ErrorNotice message={loadError} onRetry={() => void loadAll()} />}
+
+      {tab === "experiments" && (
+      <div role="tabpanel" id="exp-panel-experiments" aria-labelledby="exp-tab-experiments" className="space-y-5">
       {expFormOpen && (
         <Panel title="New experiment" meta="Compares the variants of one feature flag">
           <form
@@ -1202,7 +1383,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             className="space-y-4"
           >
             {flags.length === 0 && (
-              <p className="text-sm text-ink-2">Create a feature flag below first. The experiment splits users by its variants.</p>
+              <p className="text-sm text-ink-2">Pick "New flag…" below: the experiment splits users by its variants.</p>
             )}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="flex flex-col gap-1 sm:col-span-2">
@@ -1214,24 +1395,69 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 {expKind === "bandit" && (
                   <span className="text-xs text-muted">
                     Fewer users get the worse variants while it runs. You get each variant's chance to be best instead of a
-                    p-value, so use an A/B test when you need to know how big the difference is.
+                    p-value, so use an A/B test when you need to know how big the difference is. Bandits have no
+                    guardrails: traffic follows the primary metric alone, so use an A/B test when something must not get
+                    worse.
                   </span>
                 )}
               </label>
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Name</span>
-                <input value={expName} onChange={(e) => setExpName(e.target.value)} placeholder="e.g. Shorter sign-up form" className={field} />
+                <input
+                  value={expName}
+                  onChange={(e) => {
+                    setExpName(e.target.value);
+                    if (expNameError) setExpNameError(duplicateName(e.target.value));
+                  }}
+                  onBlur={() => setExpNameError(duplicateName(expName))}
+                  aria-invalid={!!expNameError}
+                  aria-describedby={expNameError ? "exp-name-error" : undefined}
+                  placeholder="e.g. Shorter sign-up form"
+                  className={field}
+                />
+                {expNameError && (
+                  <span id="exp-name-error" className="text-xs text-danger">
+                    {expNameError}
+                  </span>
+                )}
               </label>
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Feature flag</span>
-                <select value={expFlagId} onChange={(e) => setExpFlagId(e.target.value)} className={field} disabled={flags.length === 0}>
+                <select
+                  value={expFlagId}
+                  onChange={(e) => {
+                    setExpFlagId(e.target.value);
+                    if (e.target.value === NEW_FLAG && !expNewFlagKey)
+                      setExpNewFlagKey(expName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64));
+                  }}
+                  className={field}
+                >
                   <option value="">Pick a flag</option>
-                  {flags.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.key} ({f.variants.map((v) => v.key).join(" / ") || "on"})
-                    </option>
-                  ))}
+                  <option value={NEW_FLAG}>New flag…</option>
+                  {flags.map((f) => {
+                    const live = liveOn(f);
+                    return (
+                      <option key={f.id} value={f.id} disabled={!!live}>
+                        {f.key} ({f.variants.map((v) => v.key).join(" / ") || "on"}){live ? `, in use by ${live.name}` : ""}
+                      </option>
+                    );
+                  })}
                 </select>
+                {expFlagId === NEW_FLAG && (
+                  <>
+                    <input
+                      aria-label="New flag key"
+                      value={expNewFlagKey}
+                      onChange={(e) => setExpNewFlagKey(e.target.value)}
+                      placeholder="e.g. simplified_onboarding"
+                      className={`${field} font-mono`}
+                    />
+                    <span className="text-xs text-muted">
+                      Made off, with control and treatment at 50/50, when you save. Starting the experiment turns it on.
+                      Your app reads it by this key.
+                    </span>
+                  </>
+                )}
               </label>
               <label className="flex flex-col gap-1 sm:col-span-2">
                 <span className={fieldLabel}>Problem</span>
@@ -1322,6 +1548,18 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   options={propOptions}
                 />
               )}
+              {(expMetricType === "sum" || expMetricType === "ratio") && (
+                <label className="flex flex-col gap-1">
+                  <span className={fieldLabel}>Unit (optional)</span>
+                  <input
+                    value={expUnit}
+                    onChange={(e) => setExpUnit(e.target.value)}
+                    maxLength={12}
+                    placeholder="₹, $, items…"
+                    className={field}
+                  />
+                </label>
+              )}
               {(expMetricType === "ratio" || isTwoStep(expMetricType)) && (
                 <PropertyPicker
                   label={expMetricType === "ratio" ? "Denominator event" : "First step (A)"}
@@ -1373,7 +1611,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               )}
               <AudiencePicker
                 projectId={projectId}
-                flag={flags.find((f) => f.id === expFlagId)}
+                flag={formFlag}
                 value={expAudience}
                 conds={expAudienceConds}
                 onChange={(v, c) => {
@@ -1390,11 +1628,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   <div className="flex flex-wrap items-center gap-2">
                     <select aria-label="Layer" value={expLayerId} onChange={(e) => setExpLayerId(e.target.value)} className={field}>
                       <option value="">None: can overlap other experiments</option>
-                      {layers.map((l) => (
-                        <option key={l.id} value={l.id}>
-                          {l.name} ({formatPercent((l.free_bps ?? 0) / 10_000, 0)} free)
-                        </option>
-                      ))}
+                      {layers.map((l) => {
+                        const free = l.free_bps ?? 10_000;
+                        // Slices are at least 1% (100 bps); a layer with less free can't take another experiment.
+                        return (
+                          <option key={l.id} value={l.id} disabled={free < 100}>
+                            {l.name} ({free < 100 ? "full: stop an experiment in it first" : `${formatPercent(free / 10_000, 0)} free`})
+                          </option>
+                        );
+                      })}
                     </select>
                     {expLayerId && (
                       <label className="flex items-center gap-2 text-sm text-ink-2">
@@ -1444,6 +1686,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     recentKey={`pulse.recent-events.${projectId}`}
                     projectId={projectId}
                     props={availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$"))}
+                    saved={savedMetrics}
+                    toSpec={(r) => fromRow(r, true)}
+                    onSaved={loadSavedMetrics}
                   />
                   <MetricRows
                     title="Secondary metrics"
@@ -1456,6 +1701,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     recentKey={`pulse.recent-events.${projectId}`}
                     projectId={projectId}
                     props={availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$"))}
+                    saved={savedMetrics}
+                    toSpec={(r) => fromRow(r, false)}
+                    onSaved={loadSavedMetrics}
                   />
                 </>
               )}
@@ -1491,7 +1739,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             <SampleEstimate
               baseline={baseline}
               mde={mde / 100}
-              flag={flags.find((f) => f.id === expFlagId)}
+              flag={formFlag}
               days={expDays}
               event={expMetric}
               sequential={expSequential}
@@ -1522,8 +1770,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           </form>
         </Panel>
       )}
-
-      {loadError && <ErrorNotice message={loadError} onRetry={() => void loadAll()} />}
 
       {experiments.length > 1 && (
         <Panel title="All experiments" meta={`${experiments.length} in this project`}>
@@ -1611,10 +1857,10 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
             {selectedExp?.status === "paused" && (
               <p role="status" className="rounded-lg border border-line bg-sunken px-3.5 py-2.5 text-sm text-ink-2">
-                <span className="font-medium text-ink">Paused.</span> Users keep getting their variants, results keep
-                counting, and guardrails{selectedExp.guardrail_metrics.some((g) => g.auto_stop) ? " and auto-stop" : ""} keep
-                watching.{selectedExp.kind === "bandit" ? " Daily traffic moves are on hold." : ""} The end date doesn't
-                move. To take the variant away from users, stop the experiment and keep control.
+                <span className="font-medium text-ink">Paused{selectedExp.pause_reason ? `: ${selectedExp.pause_reason}` : ""}.</span>{" "}
+                The flag is off, so everyone gets the app's default and no one new joins. Guardrails keep watching users
+                already in it.{selectedExp.kind === "bandit" ? " Daily traffic moves are on hold." : ""} On resume, users get
+                their same variant back. The end date doesn't move.
               </p>
             )}
 
@@ -1646,6 +1892,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       ? `Stopped ${new Date(selectedExp.end_ts_ms).toLocaleDateString()}`
                       : "Paused"}
                 </span>
+                {(selectedExp.status === "running" || selectedExp.status === "paused") && (
                 <span
                   className="rounded bg-hover px-2 py-0.5 text-xs font-medium text-muted"
                   title={expResults.statistical_methodology_note}
@@ -1656,6 +1903,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       ? "Sequential · safe to check any time"
                       : "Fixed horizon · read at the end"}
                 </span>
+                )}
                 {!noExposures && !banditResults && (
                   <span
                     className={`rounded px-2 py-0.5 text-xs font-medium ${
@@ -1700,33 +1948,43 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     )}
                     {expResults.variants
                       .filter((v) => !v.is_control && v.statistically_significant && gain(selectedExp, v.relative_lift_pct) > 0)
-                      .map((v) => (
-                        <button
-                          key={v.variant_key}
-                          type="button"
-                          disabled={acting}
-                          onClick={() => setConcludeFor({ variant: v.variant_key })}
-                          className={btn.primary}
-                        >
-                          <Rocket className="h-3.5 w-3.5" />
-                          Ship {v.variant_key}
-                        </button>
-                      ))}
+                      .map((v) => {
+                        // Ship is the obvious next step only when nothing undercuts the evidence.
+                        const doubts = [
+                          ...(expResults.sample_ratio_mismatch ? ["the traffic split is off"] : []),
+                          ...(harmedBy[v.variant_key]?.length ? [`${harmedBy[v.variant_key].join(", ")} got worse`] : []),
+                          ...(blindGuardrails.length ? [`no data on ${blindGuardrails.join(", ")}`] : []),
+                          ...(sampleCaveat(selectedExp, expResults, banditResults) ? ["the sample is short of plan"] : []),
+                        ];
+                        return (
+                          <button
+                            key={v.variant_key}
+                            type="button"
+                            disabled={acting}
+                            onClick={() => setConcludeFor({ variant: v.variant_key })}
+                            className={doubts.length ? btn.secondary : btn.primary}
+                            title={doubts.length ? `Needs your sign-off: ${doubts.join("; ")}` : undefined}
+                          >
+                            <Rocket className="h-3.5 w-3.5" />
+                            Ship {v.variant_key}…
+                          </button>
+                        );
+                      })}
                     <button
                       type="button"
                       disabled={acting}
-                      onClick={() => void setStatus(selectedExp, selectedExp.status === "paused" ? "running" : "paused")}
+                      onClick={() =>
+                        selectedExp.status === "paused" ? void setStatus(selectedExp, "running") : setPauseOpen(true)
+                      }
                       title={
                         selectedExp.status === "paused"
-                          ? "Turn guardrail checks back on"
-                          : selectedExp.kind === "bandit"
-                            ? "Stops daily traffic moves; users keep their variants and guardrails keep watching"
-                            : "Marks the test as on hold; users keep their variants and guardrails keep watching"
+                          ? "Turn the flag back on; users get their same variant"
+                          : "Turn the flag off so everyone gets the default until you resume"
                       }
                       className={btn.secondary}
                     >
                       {selectedExp.status === "paused" ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
-                      {selectedExp.status === "paused" ? "Resume" : "Pause"}
+                      {selectedExp.status === "paused" ? "Resume" : "Pause…"}
                     </button>
                     <button type="button" disabled={acting} onClick={() => setConcludeFor({})} className={btn.secondary}>
                       <Square className="h-3.5 w-3.5" />
@@ -1755,6 +2013,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </p>
             )}
 
+            {selectedExp && !noExposures && !banditResults && (selectedExp.status === "running" || selectedExp.status === "paused") && (
+              <p className="rounded-lg border border-line-strong bg-sunken px-3.5 py-2.5 text-sm text-ink">
+                <span className="font-medium">Pulse recommends:</span> {recommendation(selectedExp, expResults, blindGuardrails)}
+              </p>
+            )}
             {selectedExp && !noExposures && !banditResults && (
               <Verdict exp={selectedExp} results={expResults} blindGuardrails={blindGuardrails} />
             )}
@@ -1791,7 +2054,23 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
-            {noExposures && (
+            {noExposures && selectedExp?.status === "concluded" && (
+              <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
+                <p className="font-medium text-ink">Ended with no exposures</p>
+                <p className="mt-1">No one was shown a variant while it ran, so there's nothing to compare.</p>
+              </div>
+            )}
+            {noExposures && selectedExp?.status === "draft" && (
+              <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
+                <p className="font-medium text-ink">Not started</p>
+                <p className="mt-1">
+                  Results appear once it's running and your app asks for a variant. That sends a{" "}
+                  <code className="font-mono">$experiment_started</code> event with the flag key and variant.
+                </p>
+                <ExposureSnippets flagKey={expResults.flag_key} />
+              </div>
+            )}
+            {noExposures && (selectedExp?.status === "running" || selectedExp?.status === "paused") && (
               <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
                 <p className="font-medium text-ink">No one has seen this experiment yet</p>
                 <p className="mt-1">
@@ -1813,7 +2092,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
             {!noExposures && !banditResults && (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-sm">
+              <table className="w-full min-w-[820px] text-sm">
                 <thead>
                   <tr className="border-b border-line text-xs text-muted">
                     <th className="py-2 text-left font-medium">Variant</th>
@@ -1827,7 +2106,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     </th>
                     <th className="py-2 text-right font-medium">p-value</th>
                     <th className="py-2 text-right font-medium">Chance to beat control</th>
-                    <th className="py-2 pl-4 text-left font-medium">Result</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
@@ -1846,11 +2124,31 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                               <span className="rounded bg-hover px-1.5 py-0.5 text-xs text-muted">Control</span>
                             )}
                           </span>
+                          {!v.is_control && (
+                            // The verdict sits with the variant name, so it's never scrolled out of view.
+                            <span
+                              className={`mt-0.5 inline-flex items-center gap-1.5 text-xs font-normal ${
+                                !v.statistically_significant ? "text-muted" : gain(selectedExp, v.relative_lift_pct) > 0 ? "text-ok" : "text-danger"
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 rounded-full ${
+                                  !v.statistically_significant ? "bg-line-strong" : gain(selectedExp, v.relative_lift_pct) > 0 ? "bg-ok" : "bg-danger"
+                                }`}
+                                aria-hidden
+                              />
+                              {!v.statistically_significant
+                                ? "Not yet significant"
+                                : gain(selectedExp, v.relative_lift_pct) > 0
+                                  ? "Significantly better"
+                                  : "Significantly worse"}
+                            </span>
+                          )}
                         </td>
                         <td className="tabular py-3 text-right text-ink-2">{formatCount(v.sample_size)}</td>
                         {isConversion && <td className="tabular py-3 text-right text-ink-2">{formatCount(v.conversions)}</td>}
                         <td className="tabular py-3 text-right font-medium text-ink">
-                          {formatMetricValue(expResults.metric_type, v)}
+                          {formatMetricValue(expResults.metric_type, v, selectedExp?.primary_metric.unit)}
                         </td>
                         <td
                           className={`tabular py-3 text-right font-semibold ${
@@ -1860,7 +2158,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           {v.is_control ? "–" : formatLift(v.relative_lift_pct)}
                         </td>
                         <td className="tabular py-3 text-right text-ink-2">
-                          {v.is_control || v.abs_diff === undefined ? "–" : formatAbsDiff(expResults.metric_type, v.abs_diff)}
+                          {v.is_control || v.abs_diff === undefined ? "–" : formatAbsDiff(expResults.metric_type, v.abs_diff, selectedExp?.primary_metric.unit)}
                         </td>
                         <td className="px-4 py-3">
                           {v.is_control ? (
@@ -1889,21 +2187,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           {v.is_control
                             ? "–"
                             : formatProbability(lowerIsBetter(selectedExp) ? 1 - v.bayesian_prob_to_beat_control : v.bayesian_prob_to_beat_control)}
-                        </td>
-                        <td className="py-3 pl-4">
-                          {v.is_control ? (
-                            <span className="text-faint">–</span>
-                          ) : v.statistically_significant ? (
-                            <span className="inline-flex items-center gap-1.5 text-ok">
-                              <span className="h-2 w-2 rounded-full bg-ok" aria-hidden />
-                              Significant
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1.5 text-muted">
-                              <span className="h-2 w-2 rounded-full bg-line-strong" aria-hidden />
-                              Not yet significant
-                            </span>
-                          )}
                         </td>
                       </tr>
                     );
@@ -1938,10 +2221,45 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       }}
                       noneLabel="No segments"
                       recentKey={`pulse.recent-props.${projectId}`}
-                      options={propertyOptions(availableProps.filter((p) => isSegmentable(p, piiProps)))}
+                      // Segments read event properties off the exposure event, so say so: a property the
+                      // app only sends on other events is empty here.
+                      options={propertyOptions(availableProps.filter((p) => isSegmentable(p, piiProps))).map((o) =>
+                        o.group === "Event properties" ? { ...o, group: "On the exposure event" } : o,
+                      )}
                     />
                   </div>
                 </div>
+                {(() => {
+                  // How many exposed users the chosen property leaves blank, and a better source if there is one.
+                  if (!segment || expResults.segments.every((sg) => sg.segment === "(none)")) return null;
+                  const users = (sg: (typeof expResults.segments)[number]) => sg.variants.reduce((a, v) => a + v.sample_size, 0);
+                  const total = expResults.segments.reduce((a, sg) => a + users(sg), 0);
+                  const none = expResults.segments.filter((sg) => sg.segment === "(none)").reduce((a, sg) => a + users(sg), 0);
+                  if (!total || none / total < 0.5) return null;
+                  const profile = !segment.startsWith("user.") && availableProps.includes(`user.${segment}`) ? `user.${segment}` : null;
+                  return (
+                    <p className="text-xs text-warn">
+                      {formatPercent(none / total, 0)} of users have no {humanizeEvent(segment.replace(/^user\./, ""))}{" "}
+                      {segment.startsWith("user.") ? "on their profile" : "on the exposure event"}, so most land in "No{" "}
+                      {humanizeEvent(segment.replace(/^user\./, "")).toLowerCase()} set".
+                      {profile && (
+                        <>
+                          {" "}
+                          <button
+                            type="button"
+                            className="font-medium underline"
+                            onClick={() => {
+                              setSegment(profile);
+                              void handleSelectExperiment(selectedExpId, profile);
+                            }}
+                          >
+                            Use the profile's {humanizeEvent(segment)} instead
+                          </button>
+                        </>
+                      )}
+                    </p>
+                  );
+                })()}
                 {segment && expResults.segments.every((sg) => sg.segment === "(none)") && (
                   <p className="text-xs text-muted">
                     Exposures don't carry this property. Segments read it from the{" "}
@@ -1976,7 +2294,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                                 <td className="py-2 text-ink">{i === 0 ? label : ""}</td>
                                 <td className="py-2 text-ink-2">{v.variant_key}</td>
                                 <td className="tabular py-2 text-right text-ink-2">{formatCount(v.sample_size)}</td>
-                                <td className="tabular py-2 text-right text-ink">{formatMetricValue(expResults.metric_type, v)}</td>
+                                <td className="tabular py-2 text-right text-ink">{formatMetricValue(expResults.metric_type, v, selectedExp?.primary_metric.unit)}</td>
                                 <td className="tabular py-2 text-right text-ink-2">
                                   {v.is_control ? "–" : tooFew ? "Too few users" : formatLift(v.relative_lift_pct)}
                                 </td>
@@ -2001,7 +2319,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             )}
 
             {!noExposures && !banditResults && (expResults.secondary?.length ?? 0) > 0 && (
-              <SecondaryResults metrics={expResults.secondary ?? []} />
+              <SecondaryResults metrics={expResults.secondary ?? []} exp={selectedExp} />
             )}
 
             {!noExposures && expResults.guardrails.length > 0 && (
@@ -2050,7 +2368,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                               <span className="tabular text-ink">
                                 {!g.metric_type || g.metric_type === "conversion"
                                   ? `${formatPercent(gv.conversion_rate, 2)} (${formatCount(gv.conversions)} of ${formatCount(gv.sample_size)})`
-                                  : `${formatMetricValue(g.metric_type, gv)} per user (${formatCount(gv.sample_size)} users)`}
+                                  : `${formatMetricValue(g.metric_type, gv, unitOf(selectedExp, g.metric_name))} per user (${formatCount(gv.sample_size)} users)`}
                               </span>
                               {!gv.is_control && (
                                 <span className={`tabular ml-2 text-xs ${regressed ? "font-medium text-danger" : "text-muted"}`}>
@@ -2074,6 +2392,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         )}
       </Panel>
 
+      </div>
+      )}
+
+      {tab === "flags" && (
+      <div role="tabpanel" id="exp-panel-flags" aria-labelledby="exp-tab-flags">
       <Panel title="Feature flags">
         <div className="space-y-4">
           {flagError && <ErrorNotice message={flagError} />}
@@ -2091,6 +2414,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               {flags.map((f) => {
                 const pct = Math.round(rolloutDrafts[f.id] ?? f.rollout_pct);
                 const sliderId = `rollout-${f.id}`;
+                const live = liveOn(f);
+                const locked = !canEdit || !!live;
                 return (
                   <li
                     key={f.id}
@@ -2104,11 +2429,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           role="switch"
                           aria-checked={f.enabled}
                           aria-label={`${f.key} enabled`}
-                          disabled={!canEdit}
-                          onClick={() => {
-                            if (confirmFlagChange(f, f.enabled ? "Turning the flag off" : "Turning the flag on"))
-                              void patchFlag(f, { enabled: !f.enabled });
-                          }}
+                          disabled={locked}
+                          onClick={() => void patchFlag(f, { enabled: !f.enabled })}
                           className={`rounded px-2 py-0.5 text-xs font-medium ${
                             f.enabled ? "border border-ok/40 bg-ok/15 text-ok" : "border border-line bg-hover text-muted"
                           }`}
@@ -2124,17 +2446,31 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         </span>
                       </div>
                       {f.description && <div className="text-sm text-muted">{f.description}</div>}
+                      {live && (
+                        <div className="text-xs text-muted">
+                          Used by{" "}
+                          <button
+                            type="button"
+                            className="font-medium text-ink underline"
+                            onClick={() => {
+                              setTab("experiments");
+                              void handleSelectExperiment(live.id);
+                            }}
+                          >
+                            {live.name}
+                          </button>{" "}
+                          ({live.status}). Locked until it’s stopped or shipped, so its split stays fair.
+                        </div>
+                      )}
                     </div>
 
                     <label className="flex min-w-0 max-w-full items-center gap-2">
                       <span className={fieldLabel}>Who</span>
                       <select
                         value={f.targeting_cohort_id ?? ""}
-                        disabled={!canEdit}
-                        onChange={(e) => {
-                          if (confirmFlagChange(f, "Changing who gets the flag"))
-                            void patchFlag(f, { targeting_cohort_id: e.target.value });
-                        }}
+                        aria-label={`Who gets ${f.key}`}
+                        disabled={locked}
+                        onChange={(e) => void patchFlag(f, { targeting_cohort_id: e.target.value })}
                         className={`${field} min-w-0 max-w-full py-1`}
                       >
                         <option value="">Everyone</option>
@@ -2151,11 +2487,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         <span className={fieldLabel}>Holdout</span>
                         <select
                           value={f.holdout?.id ?? ""}
-                          disabled={!canEdit}
-                          onChange={(e) => {
-                            if (confirmFlagChange(f, "Changing the holdout"))
-                              void patchFlag(f, { holdout_id: e.target.value }).then(loadAll);
-                          }}
+                          aria-label={`Holdout for ${f.key}`}
+                          disabled={locked}
+                          onChange={(e) => void patchFlag(f, { holdout_id: e.target.value }).then(loadAll)}
                           className={`${field} min-w-0 max-w-full py-1`}
                         >
                           <option value="">None</option>
@@ -2185,7 +2519,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         max={100}
                         value={pct}
                         aria-valuetext={`${pct}% of users`}
-                        disabled={!canEdit}
+                        aria-label={`Rollout for ${f.key}`}
+                        disabled={locked}
                         onChange={(e) => scheduleRolloutPatch(f, Number(e.target.value))}
                         className="w-full accent-brand sm:w-40"
                       />
@@ -2250,18 +2585,25 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         </div>
       </Panel>
 
-      <HoldoutsAndLayers
-        projectId={projectId}
-        holdouts={holdouts}
-        layers={layers}
-        events={availableEvents}
-        canEdit={canEdit}
-        experiments={experiments}
-        onChanged={loadAll}
-      />
+      </div>
+      )}
+
+      {tab === "traffic" && (
+        <div role="tabpanel" id="exp-panel-traffic" aria-labelledby="exp-tab-traffic">
+          <HoldoutsAndLayers
+            projectId={projectId}
+            holdouts={holdouts}
+            layers={layers}
+            events={availableEvents}
+            canEdit={canEdit}
+            experiments={experiments}
+            onChanged={loadAll}
+          />
+        </div>
+      )}
 
       {review === "form" && (() => {
-        const flag = flags.find((f) => f.id === expFlagId);
+        const flag = formFlag;
         return (
           <StartReview
             name={expName.trim()}
@@ -2281,11 +2623,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       ? `Guardrails: ${expGuardrails
                           .map(
                             (g) =>
-                              `${humanizeEvent(g.event)}${g.where?.prop && g.where.value.trim() ? ` where ${g.where.prop} ${g.where.op === "eq" ? "=" : g.where.op === "neq" ? "is not" : "contains"} ${g.where.value.trim()}` : ""}${g.autoStop && expSequential ? " (auto-stops)" : ""}`,
+                              `${metricRowName(g)}${g.autoStop && expSequential ? " (auto-stops)" : ""}`,
                           )
                           .join(", ")}.`
                       : "No guardrails: nothing will flag harm.",
-                    ...(expSecondaries.length ? [`Secondary: ${expSecondaries.map((g) => humanizeEvent(g.event)).join(", ")}.`] : []),
+                    ...(expSecondaries.length ? [`Secondary: ${expSecondaries.map(metricRowName).join(", ")}.`] : []),
                   ]
                 : []),
               `Variants: ${flag?.variants.map((v) => `${v.key} ${formatPercent(v.weight_bps / 10_000, 0)}`).join(" / ") || "on"}.`,
@@ -2330,6 +2672,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           busy={acting}
           onStart={() => void startDraft(selectedExp)}
           onClose={() => setReview(null)}
+        />
+      )}
+      {pauseOpen && selectedExp && (
+        <PauseDialog
+          experimentName={selectedExp.name}
+          flagKey={selectedExp.flag_key}
+          busy={acting}
+          onPause={(reason) => void setStatus(selectedExp, "paused", reason)}
+          onClose={() => setPauseOpen(false)}
         />
       )}
       {concludeFor && selectedExp && (

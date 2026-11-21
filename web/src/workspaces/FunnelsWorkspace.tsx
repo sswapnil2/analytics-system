@@ -464,7 +464,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                           <div className="my-1.5 flex flex-wrap items-center gap-3 rounded-lg bg-danger-soft px-3.5 py-2.5 text-sm text-danger sm:ml-[13.5rem]">
                             <ArrowDown className="h-4 w-4" aria-hidden="true" />
                             <span className="font-semibold tabular">
-                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)}). Biggest drop
+                              {humanizeEvent(overall[idx - 1].event_name)} → {humanizeEvent(st.event_name)}: {formatCount(lost)} dropped (
+                              {pct(100 - st.conversion_from_prev_pct)}). Biggest drop
                             </span>
                             <button
                               type="button"
@@ -478,7 +479,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                           <div className="flex items-center gap-2.5 py-0.5 text-[0.8125rem] text-muted sm:ml-[13.5rem]">
                             <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
                             <span className="tabular">
-                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)})
+                              {humanizeEvent(overall[idx - 1].event_name)} → {humanizeEvent(st.event_name)}: {formatCount(lost)} dropped (
+                              {pct(100 - st.conversion_from_prev_pct)})
                             </span>
                             <button
                               type="button"
@@ -517,6 +519,13 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                             </span>
                           )}
                         </span>
+                        {idx > 0 && st.entered_users === 0 && overall[idx - 1].entered_users > 0 && (
+                          <span className="col-span-2 text-xs text-warn sm:col-span-3 sm:ml-[13.5rem]">
+                            No one reached {humanizeEvent(st.event_name)} after {humanizeEvent(overall[idx - 1].event_name)}{" "}
+                            in this window. If it usually happens first, swap the two steps; otherwise try a longer window
+                            or check that the event is still tracked.
+                          </span>
+                        )}
                       </div>
                     </li>
                   );
