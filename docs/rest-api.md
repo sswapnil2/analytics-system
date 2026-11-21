@@ -89,7 +89,7 @@ password-reset links are appended to the owner-only `outbox` file in the data di
 
 | Method | Path | Body |
 |---|---|---|
-| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array. Up to 64 MB. |
+| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array, as JSON or the binary `PLSB` frame. Request body up to 8 MiB (`413` above that); a batch decodes to at most 64 MiB and 250,000 events. |
 | POST | `/v1/identify` | `{"anon_id", "user_id", "user_properties"?, "operations"?}`: merges an anonymous id into a user |
 | POST | `/v1/engage` | User-profile operations (`$set` and friends), one object, an array, or `{"profiles": [...]}` / `{"batch": [...]}` |
 | POST | `/v1/groups` | Group-profile operations |
@@ -219,14 +219,16 @@ take simpler arguments.
 | Method | Path | Notes |
 |---|---|---|
 | GET, POST | `/v1/projects/:id/flags` | List / create or update a flag |
-| PATCH | `/v1/projects/:id/flags/:flag_id` | Change a flag (enable, rollout, variants). `holdout_id` attaches a holdout (`""` detaches); `layer_id: ""` leaves the flag's layer (joining one goes through an experiment's `layer`). Turning on a flag whose layer slice another live flag now uses returns 409 |
+| PATCH | `/v1/projects/:id/flags/:flag_id` | Change a flag (enable, rollout, variants). `holdout_id` attaches a holdout (`""` detaches); `layer_id: ""` leaves the flag's layer (joining one goes through an experiment's `layer`). Turning on a flag whose layer slice another live flag now uses returns 409. While a running or paused experiment uses the flag, changes to anything but `description` return 409: pause the experiment to turn the flag off, or stop or ship it |
 | GET, POST | `/v1/projects/:id/holdouts` | List / create holdouts: `{ name, holdout_pct }` (above 0, at most 50). Users in a holdout get no variant from any attached flag. The list includes each holdout's attached `flags` |
 | DELETE | `/v1/projects/:id/holdouts/:holdout_id` | Delete a holdout no flag uses (409 otherwise) |
 | POST | `/v1/projects/:id/holdouts/:holdout_id/results` | `{ metric, start_ts_ms?, end_ts_ms? }` (defaults: since the holdout was created, until now). Users who reached an attached flag (`exposed`) against held-back users (`holdout`, the control), from `$holdout_assigned`; same shape as experiment results, always sequential. The metric's event is saved as the holdout's `metric_event`, which the list returns |
 | GET, POST | `/v1/projects/:id/layers` | List / create layers: `{ name }`. Experiments in one layer never share a user. The list includes each flag's slice (`start_bps`, `end_bps`) and `free_bps` |
 | DELETE | `/v1/projects/:id/layers/:layer_id` | Delete a layer no flag uses (409 otherwise) |
-| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag. `status` is `running` (the default; turns the flag on) or `draft` (saved, not started; holds no flag or layer). Names are unique per project, ignoring case (409). `secondary_metrics` (same shape as guardrails) are reported in the results' `secondary` and never decide or stop anything; guardrails and secondaries together are capped at 20. `created_by` records the creator's email. Optional `analysis: { sequential, alpha, planned_users_per_variant, cuped, cuped_pre_window_ms, target_lift_pct }` (defaults: fixed horizon, `0.05`, 10,000, CUPED off, 14 days). Each metric takes `metric_type` (`conversion`, the default; `count` of events per user; `sum` of `numeric_prop` per user; `ratio` of the metric over `denominator: { event_name, numeric_prop? }`; `step_through`, the share of users who did `denominator.event_name` and then `event_name`; `time_between`, the mean seconds from the first to the second among users who did both), optional `filters` on the metric event, an optional `direction` (`decrease_is_bad`, the default, or `increase_is_bad`), and for guardrails `auto_stop` (needs `analysis.sequential`). The legacy `continuous` type reads as `sum`. `kind: "bandit"` (default `"ab"`) with optional `bandit: { min_weight_bps, burn_in_users }` (defaults 100 and 100) makes a bandit: the flag must exist with at least two variants, and guardrails aren't allowed. `layer: { layer_id, traffic_pct }` gives the flag the first free slice of that share of the layer's users (409 when none is big enough; slices of turned-off flags are free). A flag backs one running or paused experiment at a time: creating a second (or resuming a stopped one) on the same flag returns 409 until the other is stopped |
-| PATCH | `/v1/projects/:id/experiments/:exp_id` | Start, stop, pause or resume (`status`, `end_ts_ms`). Resuming clears `stop_reason`. Moving a `draft` to `running` restarts its clock at now (same length, at least a day) and turns its flag on; a draft can't be paused. Concluding can carry `decision: { outcome: "ship" \| "keep_control" \| "inconclusive", variant, reason, flag_action: "rollout" \| "rollback" \| "keep" }`: `rollout` gives everyone `variant` (100% rollout, out of its layer), `rollback` turns the flag off, `keep` leaves it. The decision is stored on the experiment with `decided_by` and `decided_at_ms` |
+| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag. `status` is `running` (the default; turns the flag on) or `draft` (saved, not started; holds no flag or layer). Names are unique per project, ignoring case (409). `secondary_metrics` (same shape as guardrails) are reported in the results' `secondary` and never decide or stop anything; guardrails and secondaries together are capped at 20. `created_by` records the creator's email. Optional `problem` (≤ 2,000 characters) and `owner` (≤ 200; empty means the creator) describe it, and `notify` (default `true`) controls whether its milestones go to the project webhook; all three can be changed later with PATCH. Optional `analysis: { sequential, alpha, planned_users_per_variant, cuped, cuped_pre_window_ms, target_lift_pct }` (defaults: fixed horizon, `0.05`, 10,000, CUPED off, 14 days). Each metric takes `metric_type` (`conversion`, the default; `count` of events per user; `sum` of `numeric_prop` per user; `ratio` of the metric over `denominator: { event_name, numeric_prop? }`; `step_through`, the share of users who did `denominator.event_name` and then `event_name`; `time_between`, the mean seconds from the first to the second among users who did both), optional `filters` on the metric event, an optional display `unit` (≤ 12 characters, such as `₹` or `items`), an optional `direction` (`decrease_is_bad`, the default, or `increase_is_bad`; on the primary metric it says which way is better), and for guardrails `auto_stop` (needs `analysis.sequential`). The legacy `continuous` type reads as `sum`. `kind: "bandit"` (default `"ab"`) with optional `bandit: { min_weight_bps, burn_in_users }` (defaults 100 and 100) makes a bandit: the flag must exist with at least two variants, and guardrails aren't allowed. `layer: { layer_id, traffic_pct }` gives the flag the first free slice of that share of the layer's users (409 when none is big enough; slices of turned-off flags are free). A flag backs one running or paused experiment at a time: creating a second (or resuming a stopped one) on the same flag returns 409 until the other is stopped |
+| GET, POST | `/v1/projects/:id/saved-metrics` | List / save an experiment metric (same shape as a guardrail) under its `name` (1–80 characters, unique per project ignoring case, 409 otherwise; at most 200). `auto_stop` is never saved. Experiments copy the definition, so they don't change when a saved metric does |
+| DELETE | `/v1/projects/:id/saved-metrics/:metric_id` | Delete a saved metric |
+| PATCH | `/v1/projects/:id/experiments/:exp_id` | Start, stop, pause or resume (`status`, `end_ts_ms`), or change `problem`, `owner` and `notify`. Pausing turns the flag off, so everyone gets the default and no one new is exposed; an optional `reason` (≤ 500 characters) is kept as `pause_reason`. Resuming turns the flag back on (users get the same variant, since bucketing is deterministic; 409 if its layer slice was taken meanwhile) and clears `stop_reason` and `pause_reason`. Moving a `draft` to `running` restarts its clock at now (same length, at least a day) and turns its flag on; a draft can't be paused. Concluding can carry `decision: { outcome: "ship" \| "keep_control" \| "inconclusive", variant, reason, flag_action: "rollout" \| "rollback" \| "keep", acknowledged }`: `rollout` gives everyone `variant` (100% rollout, out of its layer), `rollback` turns the flag off, `keep` leaves it. `staged` gives `variant` to 25% of users, then 50%, then everyone, one step every `every_days` (1 to 14, default 2); the decision's `staged` shows progress, and a hand edit to the flag (rollout, on/off or the winner's weight) halts it. `acknowledged` lists the caveats the decider accepted (at most 10, 500 characters each), such as an unfinished sample or a guardrail with no data. The decision is stored on the experiment with `decided_by` and `decided_at_ms` |
 | GET | `/v1/projects/:id/experiments/:exp_id/results` | Lift with absolute and relative intervals, p-values (Holm-Bonferroni corrected; always valid when `sequential`), Bayesian probability, SRM check, and `regressed_variants` per guardrail. Also `metric_type`, `cuped_applied`, `variance_reduction_pct`, `multi_variant_users` (left out of the results), and `timeseries` (cumulative lift by exposure day). `?segment=<prop>` adds `segments` (up to 50 values plus `$other`; exploratory, not corrected across segments). For bandits, `variants` and `guardrails` are empty and `bandit` has each arm's day-stratified mean and interval, `prob_best`, `expected_loss` and current `weight_bps`, plus `weight_history`, `best_variant`, `burn_in_complete` and `ready_to_ship` |
 
 **Guardrail auto-stop.** Every 5 minutes the node checks running sequential experiments with an `auto_stop` guardrail. When a treatment makes one significantly worse, the flag's weights move to 10000 on control (the flag is turned off if it has no control variant), the experiment is concluded with a `stop_reason`, an `experiment.auto_stopped` row goes to the audit log, and `pulse.experiment.auto_stopped` is POSTed to the project's webhook credential URL, signed like alerts. SDKs pick the change up on their next flag refresh (`flagsTtlMs` / `flags_ttl_ms`, 5 minutes by default). Flag and experiment changes made through the API are audited too (`flag.saved`, `flag.updated`, `experiment.created`, `experiment.updated`).
@@ -240,11 +242,58 @@ take simpler arguments.
 | `guardrail_harmed:<name>` | A treatment made a guardrail significantly worse (auto-stop or not). |
 | `guardrail_no_data:<name>` | 1,000+ users are in the test and a guardrail has no events from any of them. |
 
-Significance and harm are only announced once results are safe to read: the experiment is sequential, or it has reached its planned sample. Paused experiments are not checked.
+Milestones stay in the audit log when an experiment has `notify: false`; only the webhook is skipped. Significance and harm are only announced once results are safe to read: the experiment is sequential, or it has reached its planned sample. Paused experiments are checked too: users already in them can still produce guardrail events, so guardrails, auto-stop and milestones keep running. Only a bandit's daily traffic moves stop while it is paused.
 
 **Bandits.** On the same timer, once a day, in the first hour after midnight in the project's timezone, each running bandit that is past burn-in gets new flag weights from Thompson sampling: every arm keeps `min_weight_bps` and the rest is shared by each arm's chance to be best. The change is recorded in the weight history and audited as `experiment.bandit_reweighted` (actor `system:bandit`). Arm estimates are stratified by exposure day, so traffic moving between arms doesn't bias them, and the SRM check compares users against the weights in effect on each day. `ready_to_ship` is true when the leader's expected loss is under 1% of its value.
 
 The edge flag bundle (`GET /v1/flags/:api_key`) is reused for up to 30 seconds while no flag changes, so polling SDKs don't re-run targeting cohorts on every request.
+
+## AI agent observability
+
+Design and storage: [agent observability architecture](agent-observability-architecture.md).
+
+**Ingest (ingest key).** Send `x-pulse-key: pk_…` (or `Authorization: Bearer pk_…`). CORS is open, the
+body cap is 8 MiB, and other methods return `405`.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/agent/traces` | `{"traces": [...], "spans": [...]}` as `application/json`, or the PLST binary format as `application/x-pulse-trace` (sent by `sdks/ts-agent` and `sdks/py-agent`). Returns accepted and rejected counts. |
+| POST | `/v1/otel/v1/traces` | OTLP traces, JSON or `application/x-protobuf`. GenAI and OpenInference attributes map to models, tokens and tools. |
+
+**Query and configuration (bearer token).** All paths start with `/v1/projects/:id`. Reads need
+`viewer`; writes need `member`, except where the table says `admin`.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/agent/traces` | Runs, newest first. Filters: `agent_name`, `agent_version`, `environment`, `status`, `model`, `session_id`, `user_id`, `has_error`, `has_loop_warning`, `min_eval_score`, `max_eval_score`, `start_ts_ms`, `end_ts_ms`, `search` (trace id, agent, version, model, error type). `sort_by`: `start_ts_ms`, `duration_ms`, `total_cost_usd`, `total_tokens`, `avg_eval_score`; `sort_dir`: `asc`/`desc`; `limit`, `cursor`. |
+| GET | `/agent/traces/:trace_id` | One run with its spans, span events and evaluations |
+| DELETE | `/agent/traces/:trace_id` | Erase one run. Admin. |
+| POST | `/agent/traces/:trace_id/evaluate` | Run the project's enabled evaluators on this run now |
+| POST | `/agent/traces/:trace_id/promote` | Copy the run into a dataset as a test case: `{"dataset_id", "expected_output"?, "name"?}` |
+| GET | `/agent/sessions`, `/agent/sessions/:session_id` | Runs grouped by `session_id`, with cost, errors and eval score |
+| GET | `/agent/analytics` | Runs, success rate, latency percentiles, tokens, cost, failure sources, a daily series, and breakdowns by agent, version, model, tool and environment. Same filters as traces. |
+| GET | `/agent/compare` | Baseline vs candidate (Welch t-test on latency, cost and eval score): `baseline_agent_version` and `candidate_agent_version` (or `_prompt_version`, `_model`, `_environment`) |
+| POST | `/agent/erasure` | `{"level": "trace" \| "session" \| "user", "target_id"}`. Hides the data at once; compaction purges it. Admin. |
+| GET, POST | `/agent/evaluators` | List / create or update (same `id`) an evaluator: `{"name", "kind", "target_type": "trace" \| "span" \| "session", "config", "sample_rate", "enabled", "agent_name"?}` |
+| DELETE | `/agent/evaluators/:eval_id` | Delete an evaluator; its past results stay |
+| POST | `/agent/evaluate` | Queue evaluators for one target: `{"trace_id"?, "session_id"?, "span_id"?}` (a trace or session id is required). `202`, or `503` when the queue is full. |
+| GET, POST | `/agent/evaluations` | List results (`trace_id`, `session_id`, `span_id`, `target_type`, `limit`) / record one, e.g. a human review |
+| GET, POST | `/agent/datasets` | List / create or update a dataset |
+| DELETE | `/agent/datasets/:dataset_id` | Delete a dataset |
+| GET, POST | `/agent/datasets/:dataset_id/items` | List / add test cases |
+| POST | `/agent/datasets/:dataset_id/import` | Import test cases in bulk |
+| DELETE | `/agent/datasets/:dataset_id/items/:item_id` | Delete a test case |
+| GET, POST | `/agent/experiments` | List / create an experiment (an agent version against a dataset) |
+| GET | `/agent/experiments/:exp_id` | One experiment with its results |
+| POST | `/agent/experiments/:exp_id/runs` | Record per-case results |
+| GET | `/agent/experiments/compare` | Compare two experiments, with sample-size guards |
+| GET, POST | `/agent/alerts` | List / create or update alert rules (`failure_rate`, `p95_latency_ms`, `cost_usd`, `eval_score_drop`, `tool_failure_rate`, `loop_rate`, `avg_tokens`) |
+| GET | `/agent/alerts/events` | Firing and recovery history |
+| POST | `/agent/alerts/evaluate`, `/agent/alerts/:rule_id/evaluate` | Evaluate all rules, or one, now |
+| DELETE | `/agent/alerts/:rule_id` | Delete a rule |
+| GET, PUT | `/agent/privacy` | The capture, redaction, sampling and retention policy. `PUT` is admin. |
+| GET, POST | `/agent/pricing` | Model price overrides (`provider`, `model_pattern`, per-1M-token prices). `POST` is admin. |
+| DELETE | `/agent/pricing/:rule_id` | Delete a price override. Admin. |
 
 ## MCP (bearer token)
 

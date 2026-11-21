@@ -36,3 +36,32 @@ Needs the Android SDK + NDK and `cargo install cargo-ndk`.
 examples/android-demo/build-rust.sh
 cd examples/android-demo && gradle :app:installDebug -PpulseKey=pk_live_...
 ```
+
+## AI Agent Observability (`agent-demo/`)
+
+Zero-dependency TypeScript/Node ESM ([`index.mjs`](agent-demo/index.mjs)) and Python ([`main.py`](agent-demo/main.py)) demo agents (see [`package.json`](agent-demo/package.json)) demonstrating multi-turn sessions, parent/child trace lineage (`parent_trace_id`), RAG retrieval with `linked_span_ids`, OpenAI streaming (`first_token` TTFT), explicit `span_phase` (`start` -> `update` -> `final`) updates, tool failure/recovery, guardrails with client-side PII/API-key redaction, and `PLST` v1 binary transport with retry recovery.
+
+Build the local TypeScript Agent SDK ([`sdks/ts-agent`](../sdks/ts-agent/package.json)) once before running the Node demo (the Python demo automatically locates [`sdks/py-agent`](../sdks/py-agent/pyproject.toml) when `pulse_agent` is not installed):
+
+```bash
+npm --prefix sdks/ts-agent ci && npm --prefix sdks/ts-agent run build
+```
+
+Run against a live `pulse-node` (`PULSE_ENDPOINT` / `--endpoint`, `PULSE_API_KEY` / `--api-key`):
+
+```bash
+PULSE_ENDPOINT=http://127.0.0.1:18190 PULSE_API_KEY=pk_live_... npm --prefix examples/agent-demo start
+# or invoke directly:
+node examples/agent-demo/index.mjs --endpoint http://127.0.0.1:18190 --api-key pk_live_...
+python3 examples/agent-demo/main.py --endpoint http://127.0.0.1:18190 --api-key pk_live_...
+```
+
+Run the offline `--self-test` verification (starts an ephemeral loopback server injecting transient HTTP `429`/`503` responses and decodes every `PLST` frame):
+
+```bash
+npm --prefix examples/agent-demo run self-test
+# or individually:
+node examples/agent-demo/index.mjs --self-test
+python3 examples/agent-demo/main.py --self-test
+```
+

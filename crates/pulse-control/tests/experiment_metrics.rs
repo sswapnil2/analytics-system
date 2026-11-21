@@ -343,3 +343,37 @@ async fn incomplete_metric_definitions_are_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 }
+
+#[tokio::test]
+async fn metric_filters_count_only_matching_events() {
+    let (app, token, _) = setup().await;
+    let metric = |filters: Value| {
+        json!({"name": "Big purchase", "event_name": "Purchase", "metric_type": "conversion",
+               "conversion_window_ms": 2 * DAY, "filters": filters})
+    };
+    // Every post-exposure purchase is 15..=113, so `> 1000` matches nothing and `> 0` everything.
+    let none = results(
+        &app,
+        &token,
+        metric(json!([{"prop_name": "amount", "filter": {"op": "gt", "val": 1000}}])),
+        json!({}),
+        "",
+    )
+    .await;
+    let all = results(
+        &app,
+        &token,
+        metric(json!([{"prop_name": "amount", "filter": {"op": "gt", "val": 0}}])),
+        json!({}),
+        "",
+    )
+    .await;
+    for key in ["control", "treatment"] {
+        assert_eq!(variant(&none, key)["conversions"], 0, "{none}");
+        assert_eq!(
+            variant(&all, key)["conversions"],
+            variant(&all, key)["sample_size"],
+            "{all}"
+        );
+    }
+}
