@@ -36,6 +36,19 @@ pub enum MetricValue {
     Sum(String),
 }
 
+/// Funnel-style metrics between two events: the "from" event is the query's `denominator`,
+/// the "to" event its `metric`, both inside the post-exposure window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricSequence {
+    /// `y` = reached "to" after first reaching "from", `d` = reached "from" (both 0/1), so the
+    /// ratio is the step-through rate among users who got to the first step.
+    StepThrough,
+    /// `y` = seconds from the first "from" to the first "to" after it, `d` = 1 if both
+    /// happened, so the ratio is the mean time among users who completed.
+    TimeBetween,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentMetricEvent {
     pub event_name: String,
@@ -65,6 +78,9 @@ pub struct ExperimentMetricQuery {
     /// CUPED covariate: the same metric in `[exposure - pre_window_ms, exposure)`. `0` = none.
     #[serde(default)]
     pub pre_window_ms: i64,
+    /// Ordered two-event metric; needs `denominator` (the first step). No CUPED.
+    #[serde(default)]
+    pub sequence: Option<MetricSequence>,
 }
 
 /// Sufficient statistics over users: `y` post metric, `x` pre-period metric, `d` denominator.
@@ -270,6 +286,27 @@ impl Plan<'_> {
             }
 
             let post_end = anchor.ts.saturating_add(self.window_ms);
+            if let Some(seq) = self.q.sequence {
+                let in_window = |r: &&Row, kind: u8| {
+                    r.kinds & kind != 0 && r.ts >= anchor.ts && r.ts <= post_end
+                };
+                let from = user.iter().find(|r| in_window(r, KIND_DENOM)).map(|r| r.ts);
+                let to = from.and_then(|a| {
+                    user.iter()
+                        .find(|r| in_window(r, KIND_METRIC) && r.ts >= a)
+                        .map(|r| r.ts)
+                });
+                let flag = |b: bool| f64::from(u8::from(b));
+                let (y, d) = match seq {
+                    MetricSequence::StepThrough => (flag(to.is_some()), flag(from.is_some())),
+                    MetricSequence::TimeBetween => (
+                        from.zip(to).map_or(0.0, |(a, b)| (b - a) as f64 / 1000.0),
+                        flag(to.is_some()),
+                    ),
+                };
+                self.record(agg, &anchor, y, 0.0, d);
+                continue;
+            }
             let pre_start = anchor.ts.saturating_sub(self.pre_window_ms);
             let (mut y, mut y_any, mut x, mut x_any, mut d, mut d_any) =
                 (0.0, false, 0.0, false, 0.0, false);
@@ -301,19 +338,23 @@ impl Plan<'_> {
                 .as_ref()
                 .map_or(0.0, |dn| Self::finish(&dn.value, d, d_any));
 
-            agg.variants.entry(anchor.variant).or_default().add(y, x, d);
-            if self.q.segment_by.is_some() {
-                agg.segments
-                    .entry((anchor.variant, anchor.segment))
-                    .or_default()
-                    .add(y, x, d);
-            }
-            let day = TimeInterval::Day.align_floor_tz(anchor.ts, self.tz);
-            agg.daily
-                .entry((day, anchor.variant))
+            self.record(agg, &anchor, y, x, d);
+        }
+    }
+
+    fn record(&self, agg: &mut Agg, anchor: &Row, y: f64, x: f64, d: f64) {
+        agg.variants.entry(anchor.variant).or_default().add(y, x, d);
+        if self.q.segment_by.is_some() {
+            agg.segments
+                .entry((anchor.variant, anchor.segment))
                 .or_default()
                 .add(y, x, d);
         }
+        let day = TimeInterval::Day.align_floor_tz(anchor.ts, self.tz);
+        agg.daily
+            .entry((day, anchor.variant))
+            .or_default()
+            .add(y, x, d);
     }
 }
 
@@ -332,6 +373,11 @@ impl ExperimentEngine {
         if q.time_range.start_ts_ms > q.time_range.end_ts_ms {
             return Err(ExecError::InvalidQuery(
                 "invalid time_range: start after end".into(),
+            ));
+        }
+        if q.sequence.is_some() && q.denominator.is_none() {
+            return Err(ExecError::InvalidQuery(
+                "a sequence metric needs a denominator (its first step)".into(),
             ));
         }
         if q.window_ms <= 0 || q.pre_window_ms < 0 {

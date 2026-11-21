@@ -3692,6 +3692,7 @@ async fn create_traffic_group(
         name: name.to_string(),
         bps,
         created_at_ms: Utc::now().timestamp_millis(),
+        metric_event: None,
     };
     ctrl.meta
         .insert_traffic_group(&g)
@@ -3865,6 +3866,13 @@ async fn handle_holdout_results(
             "holdout '{group_id}' not found"
         )));
     };
+    // Remember the impact metric, so the holdout reopens on it.
+    if h.metric_event.as_deref() != Some(req.metric.event_name.as_str()) {
+        ctrl.meta
+            .set_traffic_group_metric(&id, &h.id, &req.metric.event_name)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
         id: h.id.clone(),
@@ -3878,6 +3886,8 @@ async fn handle_holdout_results(
         end_ts_ms: req.end_ts_ms.unwrap_or(now),
         primary_metric: req.metric,
         guardrail_metrics: Vec::new(),
+        secondary_metrics: Vec::new(),
+        created_by: String::new(),
         // A holdout is read whenever someone looks, so its results must stay valid under peeking.
         analysis: AnalysisConfig {
             sequential: true,
@@ -4012,6 +4022,9 @@ struct CreateExpReq {
     primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     guardrail_metrics: Vec<ExperimentMetricSpec>,
+    /// Reported next to the primary metric; never decide or stop anything.
+    #[serde(default)]
+    secondary_metrics: Vec<ExperimentMetricSpec>,
     #[serde(default)]
     analysis: AnalysisConfig,
     /// `"ab"` (default) or `"bandit"`.
@@ -4056,8 +4069,33 @@ async fn handle_create_experiment(
             "analysis.cuped_pre_window_ms must not be negative",
         ));
     }
-    for m in std::iter::once(&req.primary_metric).chain(&req.guardrail_metrics) {
+    for m in std::iter::once(&req.primary_metric)
+        .chain(&req.guardrail_metrics)
+        .chain(&req.secondary_metrics)
+    {
         crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
+    }
+    if req.guardrail_metrics.len() + req.secondary_metrics.len() > 20 {
+        return Err(CtrlError::bad(
+            "at most 20 guardrail and secondary metrics in total",
+        ));
+    }
+    // Names are how people find and talk about experiments, so two can't share one.
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(CtrlError::bad("name must not be empty"));
+    }
+    if ctrl
+        .meta
+        .list_experiments(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .iter()
+        .any(|e| e.name.trim().eq_ignore_ascii_case(&name))
+    {
+        return Err(CtrlError::conflict(format!(
+            "an experiment named '{name}' already exists; pick another name"
+        )));
     }
     if req.guardrail_metrics.iter().any(|g| g.auto_stop) && !req.analysis.sequential {
         return Err(CtrlError::bad(
@@ -4069,9 +4107,9 @@ async fn handle_create_experiment(
     match kind.as_str() {
         "ab" => {}
         "bandit" => {
-            if !req.guardrail_metrics.is_empty() {
+            if !req.guardrail_metrics.is_empty() || !req.secondary_metrics.is_empty() {
                 return Err(CtrlError::bad(
-                    "bandits don't support guardrails: their traffic moves, so guardrails can't be tested fairly",
+                    "bandits don't support guardrails or secondary metrics: their traffic moves, so guardrails can't be tested fairly",
                 ));
             }
             let flags = ctrl
@@ -4172,7 +4210,7 @@ async fn handle_create_experiment(
     let exp = Experiment {
         id: format!("exp_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id.clone(),
-        name: req.name,
+        name,
         flag_id: req
             .flag_id
             .unwrap_or_else(|| format!("flg_{}_{}", id, req.flag_key)),
@@ -4183,8 +4221,10 @@ async fn handle_create_experiment(
         end_ts_ms: req.end_ts_ms.unwrap_or(now + 14 * 86_400_000),
         primary_metric: req.primary_metric,
         guardrail_metrics: req.guardrail_metrics,
+        secondary_metrics: req.secondary_metrics,
         analysis: req.analysis,
         created_at_ms: now,
+        created_by: ctrl.principal_label(&principal).await?,
         stop_reason: None,
         bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
         kind,

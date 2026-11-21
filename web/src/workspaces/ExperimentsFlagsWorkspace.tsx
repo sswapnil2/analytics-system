@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, DecisionInput, Experiment, ExperimentKind, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
+import { api, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
 import { HoldoutsAndLayers } from "../components/HoldoutsAndLayers";
 import { ConcludeDialog, StartReview } from "../components/ExperimentDialogs";
+import { ExperimentIndex } from "../components/ExperimentIndex";
+import { defaultVariants, toAllocations, VariantDraft, VariantsEditor, variantsProblem } from "../components/VariantsEditor";
+import { isTwoStep, MetricRow, metricRowProblem, MetricRows } from "../components/MetricRows";
 import { BanditResultsView } from "../components/BanditResults";
 import { LiftChart } from "../components/LiftChart";
 import { useCohortNames } from "../components/FilterPanel";
@@ -24,15 +27,44 @@ const METRIC_TYPES: { value: MetricType; label: string; eventLabel: string }[] =
   { value: "count", label: "Count: times per user", eventLabel: "Event to count" },
   { value: "sum", label: "Sum: a property's total per user", eventLabel: "Event with the value" },
   { value: "ratio", label: "Ratio: total of one over another", eventLabel: "Numerator event" },
+  { value: "step_through", label: "Step-through: share who go from A to B", eventLabel: "Then did (B)" },
+  { value: "time_between", label: "Time from A to B", eventLabel: "Then did (B)" },
 ];
+
+/** Seconds as "45s", "6m 29s", "3h 10m" or "2d 4h". */
+function formatDuration(sec: number): string {
+  const s = Math.round(Math.abs(sec));
+  const sign = sec < 0 ? "−" : "";
+  if (s < 60) return `${sign}${s}s`;
+  if (s < 3600) return `${sign}${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 86_400) return `${sign}${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${sign}${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
+}
+
+/** Metrics shown as a rate: conversions and step-throughs. */
+const isRate = (type: MetricType | undefined) => !type || type === "conversion" || type === "step_through";
 
 /** A variant's metric value: a rate for conversions, a plain number otherwise. */
 function formatMetricValue(type: MetricType | undefined, v: VariantLiftRow): string {
   if (!type || type === "conversion") return formatPercent(v.conversion_rate, 2);
+  if (type === "step_through") return formatPercent(v.mean_value, 1);
+  if (type === "time_between") return formatDuration(v.mean_value);
   return v.mean_value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v.mean_value) < 10 ? 3 : 2 });
 }
 
 const DAY_MS = 86_400_000;
+
+/** Segments smaller than this (users per variant) are too noisy to show a lift for. */
+const MIN_SEGMENT_USERS = 100;
+
+/** Properties that make no sense as segments: Pulse's own, experiment plumbing and ids. */
+function isSegmentable(prop: string, pii: Set<string>): boolean {
+  const name = prop.replace(/^user\./, "");
+  if (name.startsWith("$") || pii.has(name)) return false;
+  if (["variant", "flag_key", "holdout_id", "group"].includes(name)) return false;
+  // Ids are one value per user or merchant: every segment would be a single user.
+  return !/(^|_)id$/i.test(name);
+}
 
 const STATUS_LABEL: Record<string, string> = { draft: "draft", running: "running", paused: "paused", concluded: "stopped" };
 
@@ -59,6 +91,8 @@ const METRIC_TYPE_LABEL: Record<MetricType, string> = {
   count: "count per user",
   sum: "sum per user",
   ratio: "ratio",
+  step_through: "step-through rate",
+  time_between: "time between",
 };
 
 function describeMetric(m: Experiment["primary_metric"]): string {
@@ -66,6 +100,11 @@ function describeMetric(m: Experiment["primary_metric"]): string {
   const type: MetricType = raw === "continuous" ? (m.numeric_prop ? "sum" : "count") : raw;
   const of = m.numeric_prop && type !== "count" ? ` of ${m.numeric_prop}` : "";
   const per = type === "ratio" && m.denominator ? ` ÷ ${humanizeEvent(m.denominator.event_name)}` : "";
+  if (isTwoStep(type) && m.denominator) {
+    const pair = `${humanizeEvent(m.denominator.event_name)} → ${humanizeEvent(m.event_name)}`;
+    const lead = m.name.startsWith(pair) ? "" : `${pair} · `;
+    return `${lead}${METRIC_TYPE_LABEL[type]} · within ${Math.round(m.conversion_window_ms / DAY_MS)}d of exposure`;
+  }
   const event = humanizeEvent(m.event_name);
   const head = event === m.name && !of && !per ? "" : `${event}${of}${per} · `;
   return `${head}${METRIC_TYPE_LABEL[type]} · within ${Math.round(m.conversion_window_ms / DAY_MS)}d of exposure`;
@@ -73,7 +112,8 @@ function describeMetric(m: Experiment["primary_metric"]): string {
 
 /** Absolute difference from control: percentage points for rates, metric units otherwise. */
 function formatAbsDiff(type: MetricType | undefined, d: number): string {
-  const conv = !type || type === "conversion";
+  if (type === "time_between") return `${d > 0 ? "+" : d < 0 ? "−" : ""}${formatDuration(Math.abs(d))}`;
+  const conv = isRate(type);
   const n = conv ? d * 100 : d;
   const text = n.toLocaleString(undefined, { maximumFractionDigits: Math.abs(n) < 10 ? 2 : 1 });
   return `${n > 0 ? "+" : ""}${text}${conv ? " pts" : ""}`;
@@ -146,6 +186,54 @@ const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuar
   );
 };
 
+/** Secondary metrics: what moved besides the primary metric. Reported only, never decides. */
+const SecondaryResults: React.FC<{ metrics: MetricResult[] }> = ({ metrics }) => (
+  <div className="border-t border-line pt-4">
+    <h3 className="mb-1 text-sm font-medium text-ink">Secondary metrics</h3>
+    <p className="mb-2 text-xs text-muted">For context: these don't decide the outcome, and with several of them one may move by chance.</p>
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[560px] text-sm">
+        <thead>
+          <tr className="border-b border-line text-xs text-muted">
+            <th className="py-2 text-left font-medium">Metric</th>
+            <th className="py-2 text-left font-medium">Variant</th>
+            <th className="py-2 text-right font-medium">Users</th>
+            <th className="py-2 text-right font-medium">Value</th>
+            <th className="py-2 text-right font-medium">Difference</th>
+            <th className="py-2 text-right font-medium">Read</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-line">
+          {metrics.flatMap((m) =>
+            m.variants.map((v, i) => (
+              <tr key={`${m.metric_name}:${v.variant_key}`}>
+                <td className="py-2 text-ink">{i === 0 ? m.metric_name : ""}</td>
+                <td className="py-2 text-ink-2">{v.variant_key}</td>
+                <td className="tabular py-2 text-right text-ink-2">{formatCount(v.sample_size)}</td>
+                <td className="tabular py-2 text-right text-ink">
+                  {formatMetricValue(m.metric_type, v)}
+                </td>
+                <td className="tabular py-2 text-right text-ink-2">
+                  {v.is_control || v.abs_diff === undefined ? "–" : formatAbsDiff(m.metric_type, v.abs_diff)}
+                </td>
+                <td className="py-2 text-right text-muted">
+                  {v.is_control
+                    ? "–"
+                    : v.statistically_significant
+                      ? v.relative_lift_pct > 0
+                        ? "Higher"
+                        : "Lower"
+                      : "No clear difference"}
+                </td>
+              </tr>
+            )),
+          )}
+        </tbody>
+      </table>
+    </div>
+  </div>
+);
+
 const ExperimentSetup: React.FC<{
   exp: Experiment;
   flag: FeatureFlag | undefined;
@@ -164,7 +252,7 @@ const ExperimentSetup: React.FC<{
       "Guardrails",
       exp.guardrail_metrics.length
         ? exp.guardrail_metrics.map((g) => (
-            <div key={g.event_name}>
+            <div key={`${g.name}:${g.event_name}`}>
               <span className="font-medium text-ink">{g.name}</span> · {describeMetric(g)} · bad when it{" "}
               {g.direction === "increase_is_bad" ? "goes up" : "goes down"}
               {g.auto_stop ? " · auto-stops" : ""}
@@ -172,6 +260,16 @@ const ExperimentSetup: React.FC<{
           ))
         : "None",
     ]);
+    if (exp.secondary_metrics?.length) {
+      rows.push([
+        "Secondary",
+        exp.secondary_metrics.map((m) => (
+          <div key={`${m.name}:${m.event_name}`}>
+            <span className="font-medium text-ink">{m.name}</span> · {describeMetric(m)}
+          </div>
+        )),
+      ]);
+    }
     rows.push([
       "Analysis",
       `${exp.analysis?.sequential ? "Sequential" : "Fixed horizon"} · ${Math.round((1 - (exp.analysis?.alpha ?? 0.05)) * 100)}% confidence · CUPED ${exp.analysis?.cuped ? "on" : "off"}`,
@@ -191,6 +289,7 @@ const ExperimentSetup: React.FC<{
       <code className="font-mono">{exp.flag_key}</code>
     ),
   ]);
+  if (exp.created_by) rows.push(["Owner", exp.created_by]);
   if (exp.decision) {
     const d = exp.decision;
     const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
@@ -362,6 +461,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expResults, setExpResults] = useState<ExperimentResults | null>(null);
   const [newFlagKey, setNewFlagKey] = useState<string>("");
   const [newFlagDesc, setNewFlagDesc] = useState<string>("");
+  const [newVariants, setNewVariants] = useState<VariantDraft[]>(defaultVariants);
   const [keyError, setKeyError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [loaded, setLoaded] = useState<boolean>(false);
@@ -386,15 +486,24 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expCuped, setExpCuped] = useState(true);
   const propOptions = propertyOptions(availableProps.filter((p) => !p.startsWith("user.")));
   const [segment, setSegment] = useState("");
+  /** Properties marked as personal data in the lexicon; never offered as segments. */
+  const [piiProps, setPiiProps] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const ctl = new AbortController();
+    api
+      .getLexicon(projectId, ctl.signal)
+      .then((lx) => setPiiProps(new Set(lx.properties.filter((p) => p.pii_masked).map((p) => p.name))))
+      .catch(() => {});
+    return () => ctl.abort();
+  }, [projectId]);
   const segmentRef = useRef(segment);
   segmentRef.current = segment;
-  const [expGuardrail, setExpGuardrail] = useState("");
-  const [expGuardrailDirection, setExpGuardrailDirection] = useState<MetricDirection>("increase_is_bad");
+  const [expGuardrails, setExpGuardrails] = useState<MetricRow[]>([]);
+  const [expSecondaries, setExpSecondaries] = useState<MetricRow[]>([]);
   const [expSequential, setExpSequential] = useState(true);
   const [expKind, setExpKind] = useState<ExperimentKind>("ab");
   /** Bandits need to know which way is better to pick a winner. */
   const [expLowerIsBetter, setExpLowerIsBetter] = useState(false);
-  const [expAutoStop, setExpAutoStop] = useState(true);
   const [expWindowDays, setExpWindowDays] = useState(7);
   const [expDays, setExpDays] = useState(14);
   const [expLayerId, setExpLayerId] = useState("");
@@ -546,8 +655,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpMetricType("conversion");
     setExpProp("");
     setExpDenominator("");
-    setExpGuardrail("");
-    setExpGuardrailDirection("increase_is_bad");
+    setExpGuardrails([]);
+    setExpSecondaries([]);
     setExpKind("ab");
     setExpLowerIsBetter(false);
     setExpLayerId("");
@@ -560,6 +669,13 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     if (!expName.trim() || !flag || !expMetric) return "Add a name, pick a flag and pick the metric's event.";
     if (expMetricType === "sum" && !expProp) return "Pick the property to add up.";
     if (expMetricType === "ratio" && !expDenominator) return "Pick the denominator event.";
+    if (isTwoStep(expMetricType) && !expDenominator) return "Pick the first step (A).";
+    if (expKind === "ab") {
+      for (const r of [...expGuardrails, ...expSecondaries]) {
+        const p = metricRowProblem(r);
+        if (p) return p;
+      }
+    }
     if (expKind === "bandit" && flag.variants.length < 2) return "A bandit needs a flag with at least two variants.";
     return null;
   };
@@ -584,10 +700,22 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     const bandit = expKind === "bandit";
     const primary = {
       ...metric(expMetric, bandit && expLowerIsBetter ? "increase_is_bad" : "decrease_is_bad"),
+      ...(isTwoStep(expMetricType) ? { name: `${humanizeEvent(expDenominator)} → ${humanizeEvent(expMetric)}` } : {}),
       metric_type: expMetricType,
       numeric_prop: expMetricType === "sum" || expMetricType === "ratio" ? expProp || null : null,
-      denominator: expMetricType === "ratio" ? { event_name: expDenominator } : null,
+      denominator: expMetricType === "ratio" || isTwoStep(expMetricType) ? { event_name: expDenominator } : null,
     };
+    const fromRow = (r: MetricRow, guardrail: boolean): ExperimentMetric => ({
+      name: isTwoStep(r.type)
+        ? `${humanizeEvent(r.from)} → ${humanizeEvent(r.event)}${r.type === "time_between" ? " (time)" : ""}`
+        : humanizeEvent(r.event),
+      event_name: r.event,
+      metric_type: r.type,
+      denominator: isTwoStep(r.type) ? { event_name: r.from } : null,
+      conversion_window_ms: expWindowDays * DAY_MS,
+      direction: r.direction,
+      auto_stop: guardrail && r.autoStop && expSequential,
+    });
     // The estimate assumes a conversion rate; other metric types use the server's default horizon.
     const planned = baseline && expMetricType === "conversion"
       ? usersPerVariant(baseline.rate, mde / 100, { variants: Math.max(2, flag.variants.length), sequential: expSequential })
@@ -604,9 +732,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         kind: expKind,
         status,
         layer: expLayerId ? { layer_id: expLayerId, traffic_pct: expLayerPct } : null,
-        guardrail_metrics: expGuardrail && !bandit
-          ? [{ ...metric(expGuardrail, expGuardrailDirection), auto_stop: expAutoStop && expSequential }]
-          : [],
+        guardrail_metrics: bandit ? [] : expGuardrails.map((r) => fromRow(r, true)),
+        secondary_metrics: bandit ? [] : expSecondaries.map((r) => fromRow(r, false)),
         analysis: {
           sequential: expSequential,
           alpha: 0.05,
@@ -675,6 +802,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     const err = validateFlagKey(newFlagKey);
     setKeyError(err);
     if (err) return;
+    const vErr = variantsProblem(newVariants);
+    if (vErr) {
+      setFlagError(vErr);
+      return;
+    }
     setCreating(true);
     setFlagError(null);
     try {
@@ -684,9 +816,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         rollout_pct: 50,
         // Off until an experiment starts on it, so creating a flag never changes what users see.
         enabled: false,
+        variants: toAllocations(newVariants),
       });
       setNewFlagKey("");
       setNewFlagDesc("");
+      setNewVariants(defaultVariants());
       await loadAll();
     } catch (e) {
       setFlagError(`Couldn't create flag: ${errorMessage(e)}`);
@@ -834,9 +968,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   options={propOptions}
                 />
               )}
-              {expMetricType === "ratio" && (
+              {(expMetricType === "ratio" || isTwoStep(expMetricType)) && (
                 <PropertyPicker
-                  label="Denominator event"
+                  label={expMetricType === "ratio" ? "Denominator event" : "First step (A)"}
                   value={expDenominator}
                   onChange={setExpDenominator}
                   placeholder="Search events"
@@ -854,30 +988,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   >
                     <option value="up">Goes up (purchases, sign-ups)</option>
                     <option value="down">Goes down (errors, cancellations)</option>
-                  </select>
-                </label>
-              )}
-              {expKind === "ab" && (
-              <PropertyPicker
-                label="Guardrail (optional)"
-                value={expGuardrail}
-                onChange={setExpGuardrail}
-                noneLabel="None"
-                placeholder="Search events"
-                recentKey={`pulse.recent-events.${projectId}`}
-                options={eventOptions}
-              />
-              )}
-              {expGuardrail && expKind === "ab" && (
-                <label className="flex flex-col gap-1">
-                  <span className={fieldLabel}>Guardrail is bad when it</span>
-                  <select
-                    value={expGuardrailDirection}
-                    onChange={(e) => setExpGuardrailDirection(e.target.value as MetricDirection)}
-                    className={field}
-                  >
-                    <option value="increase_is_bad">Goes up (errors, cancellations)</option>
-                    <option value="decrease_is_bad">Goes down (purchases, retention)</option>
                   </select>
                 </label>
               )}
@@ -948,6 +1058,30 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   ))}
                 </select>
               </label>
+              {expKind === "ab" && (
+                <>
+                  <MetricRows
+                    title="Guardrails"
+                    hint="Things the change must not make worse, such as errors or KYC failures. Pulse flags a variant that makes one significantly worse, and can stop the experiment."
+                    rows={expGuardrails}
+                    onChange={setExpGuardrails}
+                    guardrail
+                    sequential={expSequential}
+                    events={eventOptions}
+                    recentKey={`pulse.recent-events.${projectId}`}
+                  />
+                  <MetricRows
+                    title="Secondary metrics"
+                    hint="Other things you want to see move, like time to finish a step. Shown with the results; they don't decide the outcome."
+                    rows={expSecondaries}
+                    onChange={setExpSecondaries}
+                    guardrail={false}
+                    sequential={expSequential}
+                    events={eventOptions}
+                    recentKey={`pulse.recent-events.${projectId}`}
+                  />
+                </>
+              )}
             </div>
             {expKind === "ab" && (
             <>
@@ -966,25 +1100,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </span>
               </span>
             </label>
-            {expGuardrail && (
-              <label className="flex items-start gap-2 text-sm text-ink">
-                <input
-                  type="checkbox"
-                  checked={expAutoStop && expSequential}
-                  disabled={!expSequential}
-                  onChange={(e) => setExpAutoStop(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span>
-                  Stop automatically if the guardrail gets worse
-                  <span className="block text-xs text-muted">
-                    {expSequential
-                      ? "Checked every 5 minutes. If a variant makes it significantly worse, everyone goes back to control and the experiment stops."
-                      : "Needs sequential testing, since results are checked every few minutes."}
-                  </span>
-                </span>
-              </label>
-            )}
             <label className="flex items-start gap-2 text-sm text-ink">
               <input type="checkbox" checked={expCuped} onChange={(e) => setExpCuped(e.target.checked)} className="mt-0.5" />
               <span>
@@ -1030,6 +1145,16 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       )}
 
       {loadError && <ErrorNotice message={loadError} onRetry={() => void loadAll()} />}
+
+      {experiments.length > 1 && (
+        <Panel title="All experiments" meta={`${experiments.length} in this project`}>
+          <ExperimentIndex
+            experiments={experiments}
+            selectedId={selectedExpId}
+            onSelect={(id) => void handleSelectExperiment(id)}
+          />
+        </Panel>
+      )}
 
       <Panel
         title="Results"
@@ -1394,7 +1519,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       }}
                       noneLabel="No segments"
                       recentKey={`pulse.recent-props.${projectId}`}
-                      options={propertyOptions(availableProps)}
+                      options={propertyOptions(availableProps.filter((p) => isSegmentable(p, piiProps)))}
                     />
                   </div>
                 </div>
@@ -1419,30 +1544,45 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-line">
-                          {expResults.segments.flatMap((sg) =>
-                            sg.variants.map((v, i) => (
+                          {expResults.segments.flatMap((sg) => {
+                            const tooFew = sg.variants.some((v) => v.sample_size < MIN_SEGMENT_USERS);
+                            const label =
+                              sg.segment === "$other"
+                                ? "Other"
+                                : !sg.segment || sg.segment === "(none)"
+                                  ? `No ${humanizeEvent(segment.replace(/^user\./, "")).toLowerCase()} set`
+                                  : sg.segment;
+                            return sg.variants.map((v, i) => (
                               <tr key={`${sg.segment}:${v.variant_key}`}>
-                                <td className="py-2 text-ink">{i === 0 ? (sg.segment === "$other" ? "Other" : sg.segment || "(none)") : ""}</td>
+                                <td className="py-2 text-ink">{i === 0 ? label : ""}</td>
                                 <td className="py-2 text-ink-2">{v.variant_key}</td>
                                 <td className="tabular py-2 text-right text-ink-2">{formatCount(v.sample_size)}</td>
                                 <td className="tabular py-2 text-right text-ink">{formatMetricValue(expResults.metric_type, v)}</td>
-                                <td className="tabular py-2 text-right text-ink-2">{v.is_control ? "–" : formatLift(v.relative_lift_pct)}</td>
+                                <td className="tabular py-2 text-right text-ink-2">
+                                  {v.is_control ? "–" : tooFew ? "Too few users" : formatLift(v.relative_lift_pct)}
+                                </td>
                                 <td className="tabular py-2 text-right text-muted">
-                                  {v.is_control ? "–" : `${formatLift(v.ci95_low_pct)} to ${formatLift(v.ci95_high_pct)}`}
+                                  {v.is_control || tooFew
+                                    ? "–"
+                                    : `${formatLift(Math.max(-100, v.ci95_low_pct))} to ${formatLift(v.ci95_high_pct)}`}
                                 </td>
                               </tr>
-                            )),
-                          )}
+                            ));
+                          })}
                         </tbody>
                       </table>
                     </div>
                     <p className="text-xs text-faint">
                       Exploratory: with many segments some will look different by chance, so confirm a segment finding with
-                      its own experiment.
+                      its own experiment. Segments with fewer than {MIN_SEGMENT_USERS} users in a variant show no lift.
                     </p>
                   </>
                 )}
               </div>
+            )}
+
+            {!noExposures && !banditResults && (expResults.secondary?.length ?? 0) > 0 && (
+              <SecondaryResults metrics={expResults.secondary ?? []} />
             )}
 
             {!noExposures && expResults.guardrails.length > 0 && (
@@ -1676,6 +1816,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 placeholder="What this flag controls"
                 className={`${field} w-full`}
               />
+            </div>
+            <div className="sm:order-last sm:col-span-3">
+              <VariantsEditor variants={newVariants} onChange={setNewVariants} />
             </div>
             <button type="submit" disabled={creating} className={`${btn.secondary} sm:mt-5`}>
               <Plus className="h-3.5 w-3.5" />

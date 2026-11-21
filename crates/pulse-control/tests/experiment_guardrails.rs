@@ -243,12 +243,15 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    // Names are unique per project, so the rerun gets its own.
+    let mut rerun = experiment(true, true);
+    rerun["name"] = json!("Checkout guardrail rerun");
     let (_, exp) = call(
         &app,
         &token,
         "POST",
         "/v1/projects/proj_g/experiments",
-        experiment(true, true),
+        rerun,
     )
     .await;
     let id = exp["id"].as_str().unwrap();

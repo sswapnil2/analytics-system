@@ -237,6 +237,16 @@ async fn holdout_holds_users_back_and_measures_the_combined_effect() {
         "exposed vs holdout lift {lift}"
     );
     assert_eq!(rows[1]["statistically_significant"], true, "{res}");
+    // The impact metric is remembered on the holdout.
+    let (_, hs) = call(
+        &app,
+        &token,
+        "GET",
+        "/v1/projects/proj_h/holdouts",
+        json!(null),
+    )
+    .await;
+    assert_eq!(hs[0]["metric_event"], "Purchased", "{hs}");
 
     let del = format!("/v1/projects/proj_h/holdouts/{hid}");
     let (status, _) = call(&app, &token, "DELETE", &del, json!(null)).await;
@@ -488,4 +498,113 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
         a["variants"][1],
         json!({"key": "treatment", "weight_bps": 10000, "payload": null})
     );
+}
+
+#[tokio::test]
+async fn secondary_metrics_measure_step_through_and_time_between() {
+    let (app, _ctrl, token, ingest) = setup().await;
+    let exps = "/v1/projects/proj_h/experiments";
+    let body = json!({
+        "name": "Checkout copy", "flag_key": "checkout", "hypothesis": "",
+        "start_ts_ms": BASE, "end_ts_ms": BASE + 14 * DAY,
+        "primary_metric": {"name": "Purchases", "event_name": "Purchased"},
+        "secondary_metrics": [
+            {"name": "Visit to purchase", "event_name": "Purchased", "metric_type": "step_through",
+             "denominator": {"event_name": "Visited"}},
+            {"name": "Time to purchase", "event_name": "Purchased", "metric_type": "time_between",
+             "denominator": {"event_name": "Visited"}, "direction": "increase_is_bad"},
+        ],
+    });
+    let (status, exp) = call(&app, &token, "POST", exps, body.clone()).await;
+    assert!(status.is_success(), "{exp}");
+    assert_eq!(exp["created_by"], "admin token");
+    // Names are unique per project, ignoring case.
+    let mut dup = body.clone();
+    dup["name"] = json!("checkout COPY");
+    dup["flag_key"] = json!("a");
+    let (status, _) = call(&app, &token, "POST", exps, dup).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // A two-step metric needs its first step.
+    let mut bad = body.clone();
+    bad["name"] = json!("Other");
+    bad["flag_key"] = json!("b");
+    bad["secondary_metrics"] =
+        json!([{"name": "x", "event_name": "Purchased", "metric_type": "time_between"}]);
+    let (status, _) = call(&app, &token, "POST", exps, bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Everyone visits an hour after exposure. Treatment: 60 of 100 buy 2h after visiting.
+    // Control: 30 of 100 buy 4h after visiting; 10 more bought before visiting, which doesn't
+    // count as stepping through.
+    let mut events = Vec::new();
+    let mut seq = 0;
+    let mut push = |who: &str, name: &str, ts: i64, props: Vec<(&str, PropValue)>| {
+        seq += 1;
+        events.push(ev(seq, who, name, ts, props));
+    };
+    for u in 0..200 {
+        let who = format!("u_{u}");
+        let treat = u >= 100;
+        let i = u % 100;
+        let t0 = BASE + HOUR;
+        push(
+            &who,
+            "$experiment_started",
+            t0,
+            vec![
+                ("flag_key", PropValue::Str("checkout".into())),
+                (
+                    "variant",
+                    PropValue::Str(if treat { "treatment" } else { "control" }.into()),
+                ),
+            ],
+        );
+        push(&who, "Visited", t0 + HOUR, vec![]);
+        if treat && i < 60 {
+            push(&who, "Purchased", t0 + 3 * HOUR, vec![]);
+        } else if !treat && i < 30 {
+            push(&who, "Purchased", t0 + 5 * HOUR, vec![]);
+        } else if !treat && i < 40 {
+            push(&who, "Purchased", t0 + HOUR / 2, vec![]);
+        }
+    }
+    ingest
+        .ingest_for_project("proj_h", WireBatch::new(events), BASE + 10 * DAY)
+        .await
+        .unwrap();
+    let uri = format!("{exps}/{}/results", exp["id"].as_str().unwrap());
+    let (status, res) = call(&app, &token, "GET", &uri, json!(null)).await;
+    assert!(status.is_success(), "{res}");
+    let sec = res["secondary"].as_array().unwrap();
+    assert_eq!(sec.len(), 2, "{res}");
+    let mean = |m: &Value, v: &str| {
+        m["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["variant_key"] == v)
+            .unwrap()["mean_value"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(sec[0]["metric_type"], "step_through");
+    assert!((mean(&sec[0], "control") - 0.3).abs() < 1e-9, "{}", sec[0]);
+    assert!(
+        (mean(&sec[0], "treatment") - 0.6).abs() < 1e-9,
+        "{}",
+        sec[0]
+    );
+    assert_eq!(sec[1]["metric_type"], "time_between");
+    assert!(
+        (mean(&sec[1], "control") - 4.0 * 3600.0).abs() < 1e-6,
+        "{}",
+        sec[1]
+    );
+    assert!(
+        (mean(&sec[1], "treatment") - 2.0 * 3600.0).abs() < 1e-6,
+        "{}",
+        sec[1]
+    );
+    // Secondaries never flag regressions.
+    assert_eq!(sec[1]["regressed_variants"], json!([]));
 }

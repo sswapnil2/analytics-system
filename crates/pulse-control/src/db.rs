@@ -869,6 +869,7 @@ impl MetaStore {
     pub async fn upsert_experiment(&self, exp: &Experiment) -> Result<(), MetaError> {
         let pjson = serde_json::to_string(&exp.primary_metric).unwrap_or_else(|_| "{}".into());
         let gjson = serde_json::to_string(&exp.guardrail_metrics).unwrap_or_else(|_| "[]".into());
+        let sjson = serde_json::to_string(&exp.secondary_metrics).unwrap_or_else(|_| "[]".into());
         let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
         let bjson = exp
             .bandit
@@ -880,8 +881,8 @@ impl MetaStore {
             .and_then(|d| serde_json::to_string(d).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -896,7 +897,8 @@ impl MetaStore {
                 stop_reason = excluded.stop_reason,
                 kind = excluded.kind,
                 bandit_json = excluded.bandit_json,
-                decision_json = excluded.decision_json
+                decision_json = excluded.decision_json,
+                secondary_metrics_json = excluded.secondary_metrics_json
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -915,6 +917,8 @@ impl MetaStore {
             &exp.kind,
             &bjson,
             &djson,
+            &sjson,
+            &exp.created_by,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -928,7 +932,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -945,6 +949,13 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())
@@ -975,7 +986,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -992,6 +1003,13 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())
@@ -1188,7 +1206,7 @@ impl MetaStore {
     ) -> Result<Vec<TrafficGroup>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, kind, name, bps, created_at_ms FROM traffic_groups
+            "SELECT id, project_id, kind, name, bps, created_at_ms, metric_event FROM traffic_groups
              WHERE project_id = ? AND kind = ? ORDER BY created_at_ms ASC",
             |r| {
                 TrafficGroup {
@@ -1198,12 +1216,29 @@ impl MetaStore {
                     name: r.get("name"),
                     bps: r.get::<i64, _>("bps") as u32,
                     created_at_ms: r.get("created_at_ms"),
+                    metric_event: r.get("metric_event"),
                 }
             },
             project_id,
             kind,
         );
         Ok(rows)
+    }
+
+    pub async fn set_traffic_group_metric(
+        &self,
+        project_id: &str,
+        id: &str,
+        metric_event: &str,
+    ) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "UPDATE traffic_groups SET metric_event = ? WHERE project_id = ? AND id = ?",
+            metric_event,
+            project_id,
+            id,
+        );
+        Ok(())
     }
 
     pub async fn delete_traffic_group(

@@ -291,6 +291,9 @@ pub struct TrafficGroup {
     pub name: String,
     pub bps: u32,
     pub created_at_ms: i64,
+    /// Holdouts: the event last used to measure their impact, so the Studio reopens on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_event: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,9 +407,15 @@ pub struct Experiment {
     pub primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     pub guardrail_metrics: Vec<ExperimentMetricSpec>,
+    /// Reported alongside the primary metric; they never decide the outcome or stop anything.
+    #[serde(default)]
+    pub secondary_metrics: Vec<ExperimentMetricSpec>,
     #[serde(default)]
     pub analysis: AnalysisConfig,
     pub created_at_ms: i64,
+    /// Who created it: an email for Studio users, otherwise `"admin token"`.
+    #[serde(default)]
+    pub created_by: String,
     /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -542,7 +551,7 @@ pub struct GuardrailResult {
     /// Treatments that moved this guardrail significantly in the bad direction.
     #[serde(default)]
     pub regressed_variants: Vec<String>,
-    /// conversion | count | sum | ratio.
+    /// conversion | count | sum | ratio | step_through | time_between.
     #[serde(default = "default_metric_type")]
     pub metric_type: String,
     pub variants: Vec<VariantLiftRow>,
@@ -570,6 +579,9 @@ pub struct ExperimentResults {
     pub confidence_level: f64,
     pub variants: Vec<VariantLiftRow>,
     pub guardrails: Vec<GuardrailResult>,
+    /// Secondary metrics, same shape as guardrails (`regressed_variants` stays empty).
+    #[serde(default)]
+    pub secondary: Vec<GuardrailResult>,
     /// The primary metric's normalized type (`conversion`, `count`, `sum`, `ratio`).
     #[serde(default = "default_conversion_kind")]
     pub metric_type: String,

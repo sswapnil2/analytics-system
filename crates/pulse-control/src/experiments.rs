@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use pulse_exec::{
-    ExecError, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricValue,
-    PropPredicate, QueryEngine, TimeRange,
+    ExecError, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricSequence,
+    MetricValue, PropPredicate, QueryEngine, TimeRange,
 };
 use pulse_wire::{cohort_member_hash, CohortGate, PropValue};
 use xxhash_rust::xxh3::xxh3_64;
@@ -223,6 +223,26 @@ pub async fn evaluate_experiment_results(
         });
     }
 
+    let mut secondary = Vec::with_capacity(exp.secondary_metrics.len());
+    for sm in &exp.secondary_metrics {
+        let mut rows = evaluate_metric(exp, sm, &variant_keys, opts, None, qengine)
+            .await?
+            .rows;
+        if sample_ratio_mismatch {
+            for r in &mut rows {
+                r.statistically_significant = false;
+            }
+        }
+        secondary.push(GuardrailResult {
+            metric_name: sm.name.clone(),
+            event_name: sm.event_name.clone(),
+            direction: sm.direction.clone(),
+            regressed_variants: Vec::new(),
+            metric_type: normalized_metric_type(sm).to_string(),
+            variants: rows,
+        });
+    }
+
     let cuped_applied = primary.variance_reduction_pct.is_some();
     Ok(ExperimentResults {
         experiment_id: exp.id.clone(),
@@ -239,6 +259,7 @@ pub async fn evaluate_experiment_results(
         confidence_level: 1.0 - opts.alpha,
         variants: primary.rows,
         guardrails,
+        secondary,
         metric_type: normalized_metric_type(&exp.primary_metric).to_string(),
         cuped_applied,
         variance_reduction_pct: primary.variance_reduction_pct.unwrap_or(0.0),
@@ -370,6 +391,7 @@ pub async fn evaluate_bandit_results(
         confidence_level: 1.0 - alpha,
         variants: Vec::new(),
         guardrails: Vec::new(),
+        secondary: Vec::new(),
         metric_type: normalized_metric_type(metric).to_string(),
         cuped_applied: false,
         variance_reduction_pct: 0.0,
@@ -429,6 +451,8 @@ pub fn normalized_metric_type(m: &ExperimentMetricSpec) -> &'static str {
         "count" => "count",
         "sum" => "sum",
         "ratio" => "ratio",
+        "step_through" => "step_through",
+        "time_between" => "time_between",
         "continuous" if m.numeric_prop.is_some() => "sum",
         "continuous" => "count",
         _ => "conversion",
@@ -439,9 +463,12 @@ pub fn normalized_metric_type(m: &ExperimentMetricSpec) -> &'static str {
 pub fn validate_metric_spec(m: &ExperimentMetricSpec) -> Result<(), String> {
     if !matches!(
         m.metric_type.as_str(),
-        "conversion" | "count" | "sum" | "ratio" | "continuous"
+        "conversion" | "count" | "sum" | "ratio" | "step_through" | "time_between" | "continuous"
     ) {
-        return Err("metric_type must be conversion, count, sum or ratio".into());
+        return Err(
+            "metric_type must be conversion, count, sum, ratio, step_through or time_between"
+                .into(),
+        );
     }
     if !matches!(m.direction.as_str(), "decrease_is_bad" | "increase_is_bad") {
         return Err("metric direction must be decrease_is_bad or increase_is_bad".into());
@@ -456,14 +483,15 @@ pub fn validate_metric_spec(m: &ExperimentMetricSpec) -> Result<(), String> {
             m.name
         ));
     }
-    if m.metric_type == "ratio"
+    let two_step = matches!(m.metric_type.as_str(), "step_through" | "time_between");
+    if (m.metric_type == "ratio" || two_step)
         && m.denominator
             .as_ref()
             .is_none_or(|d| d.event_name.trim().is_empty())
     {
         return Err(format!(
-            "metric '{}' is a ratio and needs a denominator",
-            m.name
+            "metric '{}' needs a denominator (for {}, the first step's event)",
+            m.name, m.metric_type
         ));
     }
     Ok(())
@@ -495,7 +523,12 @@ fn metric_query(
     cuped: bool,
 ) -> ExperimentMetricQuery {
     let kind = normalized_metric_type(metric);
-    let ratio = kind == "ratio";
+    let sequence = match kind {
+        "step_through" => Some(MetricSequence::StepThrough),
+        "time_between" => Some(MetricSequence::TimeBetween),
+        _ => None,
+    };
+    let ratio = kind == "ratio" || sequence.is_some();
     // Respect the exact configured window, including sub-24h windows.
     let window_ms = if metric.conversion_window_ms > 0 {
         metric.conversion_window_ms
@@ -525,19 +558,23 @@ fn metric_query(
             &metric.event_name,
             &metric.filters,
             metric.numeric_prop.as_deref(),
-            kind == "conversion",
+            kind == "conversion" || sequence.is_some(),
         ),
-        denominator: metric
-            .denominator
-            .as_ref()
-            .filter(|_| ratio)
-            .map(|d| metric_event(&d.event_name, &[], d.numeric_prop.as_deref(), false)),
+        denominator: metric.denominator.as_ref().filter(|_| ratio).map(|d| {
+            metric_event(
+                &d.event_name,
+                &[],
+                d.numeric_prop.as_deref(),
+                sequence.is_some(),
+            )
+        }),
         window_ms,
-        pre_window_ms: if cuped {
+        pre_window_ms: if cuped && sequence.is_none() {
             exp.analysis.cuped_pre_window_ms.max(0)
         } else {
             0
         },
+        sequence,
     }
 }
 
@@ -559,7 +596,8 @@ async fn evaluate_metric(
     qengine: &QueryEngine,
 ) -> Result<MetricEval, ExecError> {
     let kind = normalized_metric_type(metric);
-    let ratio = kind == "ratio";
+    // Two-step metrics are ratios across users: step-throughs over starters, seconds over completers.
+    let ratio = matches!(kind, "ratio" | "step_through" | "time_between");
     let estimate_kind = if ratio {
         EstimateKind::Ratio
     } else {

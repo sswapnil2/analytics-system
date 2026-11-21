@@ -290,6 +290,8 @@ export interface TrafficGroup {
   name: string;
   bps: number;
   created_at_ms: number;
+  /** Holdouts: the event last used to measure their impact. */
+  metric_event?: string | null;
   flags: { flag_key: string; enabled: boolean; start_bps?: number; end_bps?: number }[];
   /** Layers: share no live flag uses yet. */
   free_bps?: number;
@@ -319,6 +321,10 @@ export interface Experiment {
   end_ts_ms: number;
   primary_metric: ExperimentMetric;
   guardrail_metrics: ExperimentMetric[];
+  /** Reported next to the primary metric; never decide or stop anything. */
+  secondary_metrics?: ExperimentMetric[];
+  /** Email of whoever created it (or "admin token"). */
+  created_by?: string;
   analysis?: ExperimentAnalysis;
   /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
   stop_reason?: string | null;
@@ -374,7 +380,9 @@ export interface BanditResults {
 
 export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
 
-export type MetricType = "conversion" | "count" | "sum" | "ratio";
+/** `step_through`: share of users who did `denominator.event_name` (A) and then `event_name` (B).
+ *  `time_between`: seconds from A to B among users who did both. */
+export type MetricType = "conversion" | "count" | "sum" | "ratio" | "step_through" | "time_between";
 
 export interface ExperimentMetric {
   name: string;
@@ -423,6 +431,16 @@ export interface VariantLiftRow {
   sequential?: boolean;
 }
 
+/** A guardrail's or secondary metric's results. */
+export interface MetricResult {
+  metric_name: string;
+  event_name: string;
+  direction: MetricDirection;
+  regressed_variants: string[];
+  metric_type?: MetricType;
+  variants: VariantLiftRow[];
+}
+
 export interface ExperimentResults {
   experiment_id: string;
   experiment_name: string;
@@ -439,14 +457,9 @@ export interface ExperimentResults {
   /** Confidence level of every interval, e.g. 0.95. */
   confidence_level: number;
   variants: VariantLiftRow[];
-  guardrails: {
-    metric_name: string;
-    event_name: string;
-    direction: MetricDirection;
-    regressed_variants: string[];
-    metric_type?: MetricType;
-    variants: VariantLiftRow[];
-  }[];
+  guardrails: MetricResult[];
+  /** Secondary metrics: reported only, `regressed_variants` always empty. */
+  secondary?: MetricResult[];
   metric_type: MetricType;
   cuped_applied: boolean;
   variance_reduction_pct: number;
@@ -1214,6 +1227,7 @@ export const api = {
       end_ts_ms: number;
       primary_metric: ExperimentMetric;
       guardrail_metrics: ExperimentMetric[];
+      secondary_metrics?: ExperimentMetric[];
       analysis: ExperimentAnalysis;
       kind?: ExperimentKind;
       status?: "draft" | "running";
@@ -1228,7 +1242,13 @@ export const api = {
 
   createFlag: (
     projectId: string,
-    body: { key: string; description: string; rollout_pct: number; enabled?: boolean },
+    body: {
+      key: string;
+      description: string;
+      rollout_pct: number;
+      enabled?: boolean;
+      variants?: { key: string; weight_bps: number; payload?: unknown }[];
+    },
   ) =>
     fetchJson<FeatureFlag>(`/v1/projects/${encodeURIComponent(projectId)}/flags`, {
       method: "POST",

@@ -20,6 +20,12 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Concluding an experiment records the decision (ship, keep control or inconclusive), the reason and who made it, and applies it to the flag in the same step.
 - Results open with a plain verdict that checks the lift against the one you planned for, says when it's too early, and calls out guardrails with no data. Shipping with such a guardrail needs an explicit acknowledgement, and guardrails with auto-stop say it can't fire without data.
 - The sample-size estimate counts only users the experiment can reach: rollout, layer slice and holdout.
+- Experiments can have several guardrails and any number of secondary metrics. Secondary metrics show next to the results but never decide the outcome.
+- Two new metric types: step-through (the share of users who go from one event to the next) and time between two events.
+- An experiments list with search, a status filter, progress, decisions and owners. Experiment names are now unique within a project.
+- Flags can be created with your own variants: names, splits, more than two arms, and an optional JSON payload each.
+- Segments hide experiment plumbing, ids and personal-data properties, show no lift for segments with too few users, and name the "no value" segment.
+- Holdouts remember the metric they were last measured on, say plainly when there are no conversions yet, and explain that their counts are users assigned, not experiment exposures.
 
 ### Changed
 - A flag can back only one running or paused experiment at a time; a second one is refused with 409 until the first is stopped.

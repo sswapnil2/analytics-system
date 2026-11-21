@@ -4,7 +4,8 @@ use std::time::Instant;
 use chrono::Utc;
 use pulse_control::{
     AlertRule, AnalysisConfig, CohortRecord, ControlPlaneService, Dashboard, DashboardCard,
-    Experiment, ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
+    Experiment, ExperimentMetricSpec, FeatureFlag, LexiconProperty, MetricDenominator, SavedReport,
+    VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -238,6 +239,33 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 auto_stop: false,
             },
         ],
+        secondary_metrics: vec![
+            ExperimentMetricSpec {
+                name: "First disbursal".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric_type: "conversion".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+            },
+            ExperimentMetricSpec {
+                name: "Mandate to disbursal".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric_type: "step_through".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: Some(MetricDenominator {
+                    event_name: "UPI_Autopay_Mandate_Approved".to_string(),
+                    numeric_prop: None,
+                }),
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+            },
+        ],
         // Demo users are exposed on their first day, so CUPED has no pre-period to use here.
         analysis: AnalysisConfig {
             sequential: true,
@@ -245,6 +273,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             ..AnalysisConfig::default()
         },
         created_at_ms: now_ms,
+        created_by: "Pulse demo".to_string(),
         stop_reason: None,
         kind: "ab".to_string(),
         bandit: None,

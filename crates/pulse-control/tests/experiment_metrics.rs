@@ -193,9 +193,12 @@ async fn setup() -> (Router, String, Truth) {
 }
 
 fn experiment(metric: Value, analysis: Value) -> Value {
+    // Names are unique per project, so each analysis gets its own.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     json!({
         // Concluded, so several analyses of the same flag can coexist (one live experiment per flag).
-        "name": "Bigger cart", "flag_key": "bigger_cart", "hypothesis": "", "status": "concluded",
+        "name": format!("Bigger cart {n}"), "flag_key": "bigger_cart", "hypothesis": "", "status": "concluded",
         "start_ts_ms": BASE, "end_ts_ms": BASE + 5 * DAY,
         "primary_metric": metric, "guardrail_metrics": [], "analysis": analysis,
     })

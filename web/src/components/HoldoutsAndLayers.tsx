@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { api, ExperimentResults, TrafficGroup } from "../api/client";
 import { ErrorNotice, Panel, btn, field, fieldLabel } from "./ui";
@@ -34,7 +34,15 @@ const HoldoutImpact: React.FC<{ projectId: string; holdout: TrafficGroup; events
       setBusy(false);
     }
   };
+  // Reopen on the metric last used for this holdout (the server remembers it).
+  const saved = holdout.metric_event ?? "";
+  useEffect(() => {
+    if (saved && events.includes(saved)) void measure(saved);
+  }, [holdout.id, saved]);
   const users = res?.variants.reduce((a, v) => a + v.sample_size, 0) ?? 0;
+  const noConversions = !!res && res.variants.every((v) => v.conversions === 0);
+  // Below this many users in a group, a lift interval is too wide to mean anything.
+  const tooFew = !!res && res.variants.some((v) => v.sample_size < 100);
   return (
     <div className="space-y-2">
       <label className="flex flex-wrap items-center gap-2 text-sm text-ink-2">
@@ -56,7 +64,13 @@ const HoldoutImpact: React.FC<{ projectId: string; holdout: TrafficGroup; events
           tracking on; SDKs then send a <code className="font-mono">$holdout_assigned</code> event.
         </p>
       )}
-      {res && users > 0 && (
+      {res && users > 0 && noConversions && (
+        <p className="text-xs text-muted">
+          {formatCount(users)} users assigned, but no one in either group has done {humanizeEvent(event)} yet, so
+          there's nothing to compare.
+        </p>
+      )}
+      {res && users > 0 && !noConversions && (
         <>
           {res.sample_ratio_mismatch && (
             <p role="alert" className="text-xs text-danger">
@@ -68,7 +82,7 @@ const HoldoutImpact: React.FC<{ projectId: string; holdout: TrafficGroup; events
             <thead>
               <tr className="border-b border-line text-xs text-muted">
                 <th className="py-1.5 text-left font-medium">Group</th>
-                <th className="py-1.5 text-right font-medium">Users</th>
+                <th className="py-1.5 text-right font-medium">Users assigned</th>
                 <th className="py-1.5 text-right font-medium">Converted</th>
                 <th className="py-1.5 text-right font-medium">Lift</th>
                 <th className="py-1.5 text-right font-medium">Range</th>
@@ -77,7 +91,7 @@ const HoldoutImpact: React.FC<{ projectId: string; holdout: TrafficGroup; events
             <tbody className="divide-y divide-line">
               {res.variants.map((v) => (
                 <tr key={v.variant_key}>
-                  <td className="py-1.5 text-ink">{v.is_control ? "Held back" : "Got the flags"}</td>
+                  <td className="py-1.5 text-ink">{v.is_control ? "Held back" : "Eligible for the flags"}</td>
                   <td className="tabular py-1.5 text-right text-ink-2">{formatCount(v.sample_size)}</td>
                   <td className="tabular py-1.5 text-right text-ink">{formatPercent(v.conversion_rate, 2)}</td>
                   <td
@@ -85,18 +99,24 @@ const HoldoutImpact: React.FC<{ projectId: string; holdout: TrafficGroup; events
                       v.is_control ? "text-faint" : v.statistically_significant ? (v.relative_lift_pct > 0 ? "text-ok" : "text-danger") : "text-ink-2"
                     }`}
                   >
-                    {v.is_control ? "–" : lift(v.relative_lift_pct)}
+                    {v.is_control ? "–" : tooFew ? "Too few users" : lift(v.relative_lift_pct)}
                   </td>
                   <td className="tabular py-1.5 text-right text-muted">
-                    {v.is_control ? "–" : `${lift(v.ci95_low_pct)} to ${lift(v.ci95_high_pct)}`}
+                    {v.is_control || tooFew ? "–" : `${lift(Math.max(-100, v.ci95_low_pct))} to ${lift(v.ci95_high_pct)}`}
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {tooFew && (
+            <p className="text-xs text-muted">
+              No lift until each group has 100 users: with fewer, the range is too wide to mean anything.
+            </p>
+          )}
           <p className="text-xs text-faint">
             The combined effect of every flag in this holdout since it was created. Sequential, so safe to check any
-            time.
+            time. Users are assigned when their app first asks for any flag in the holdout, so these counts are higher
+            than an experiment's exposures, which only count users who reached that experiment's variant.
           </p>
         </>
       )}
