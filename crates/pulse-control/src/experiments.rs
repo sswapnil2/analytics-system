@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use pulse_exec::{
-    ExecError, FunnelOrderMode, FunnelQuery, FunnelStepSpec, PropPredicate, QueryEngine, TimeRange,
+    ExecError, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricValue,
+    PropPredicate, QueryEngine, TimeRange,
 };
 use pulse_wire::{cohort_member_hash, evaluate_flag_rule, CohortGate, PropValue};
 use xxhash_rust::xxh3::xxh3_64;
@@ -10,14 +11,14 @@ use xxhash_rust::xxh3::xxh3_64;
 pub mod stats;
 
 pub use stats::{
-    compare_means, compute_lift_table, compute_sample_ratio_mismatch,
-    compute_statistical_lift_table, normal_quantile, sequential_rho, Comparison, LiftOptions,
-    Moments,
+    compare_estimates, compare_means, compute_estimate_table, compute_lift_table,
+    compute_sample_ratio_mismatch, compute_statistical_lift_table, estimates_from_moments,
+    normal_quantile, sequential_rho, Comparison, Estimate, EstimateKind, LiftOptions, Moments,
 };
 
 use crate::models::{
     EdgeFlagBundle, EdgeFlagRule, Experiment, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
-    GuardrailResult, VariantLiftRow,
+    GuardrailResult, SegmentResult, TimeseriesPoint, TimeseriesVariant, VariantLiftRow,
 };
 
 /// Evaluates an `EdgeFlagRule` deterministically via the shared `pulse_wire::evaluate_flag_rule`
@@ -132,56 +133,61 @@ fn finalize_bundle(project_id: &str, rules: Vec<EdgeFlagRule>, now_ms: i64) -> E
     }
 }
 
-/// Evaluates an A/B experiment's exposure & conversion lift across variants using `QueryEngine`
-/// plus Chi-square SRM check and the lift table configured by `exp.analysis`
-/// (fixed-horizon or sequential, Holm-Bonferroni across treatments, Bayesian P(beat control)).
+/// Evaluates an experiment's primary metric and guardrails across variants: per-user metric
+/// values after each user's first exposure (`QueryEngine::query_experiment_metric`), a Chi-square
+/// SRM check, and the lift table configured by `exp.analysis` (fixed-horizon or sequential,
+/// optional CUPED, Holm-Bonferroni across treatments). `segment_by` adds exploratory
+/// per-segment results for the primary metric.
 pub async fn evaluate_experiment_results(
     exp: &Experiment,
     flag: Option<&FeatureFlag>,
     qengine: &QueryEngine,
+    segment_by: Option<&str>,
 ) -> Result<ExperimentResults, ExecError> {
     let t0 = Instant::now();
 
-    let (variant_keys, expected_weights): (Vec<String>, BTreeMap<String, u32>) =
-        if let Some(f) = flag {
-            if f.variants.is_empty() {
-                let mut m = BTreeMap::new();
-                m.insert("control".to_string(), 5000);
-                m.insert("treatment".to_string(), 5000);
-                (vec!["control".to_string(), "treatment".to_string()], m)
-            } else {
-                let keys = f.variants.iter().map(|v| v.key.clone()).collect();
-                let weights = f
-                    .variants
-                    .iter()
-                    .map(|v| (v.key.clone(), v.weight_bps))
-                    .collect();
-                (keys, weights)
-            }
-        } else {
-            let mut m = BTreeMap::new();
-            m.insert("control".to_string(), 5000);
-            m.insert("treatment".to_string(), 5000);
-            (vec!["control".to_string(), "treatment".to_string()], m)
-        };
+    let expected_weights: BTreeMap<String, u32> = match flag {
+        Some(f) if !f.variants.is_empty() => f
+            .variants
+            .iter()
+            .map(|v| (v.key.clone(), v.weight_bps))
+            .collect(),
+        _ => BTreeMap::from([
+            ("control".to_string(), 5000),
+            ("treatment".to_string(), 5000),
+        ]),
+    };
+    let variant_keys: Vec<String> = expected_weights.keys().cloned().collect();
 
     let opts = lift_options(exp, variant_keys.len());
-    let (mut primary_rows, observed_counts) =
-        evaluate_metric_for_experiment(exp, &exp.primary_metric, &variant_keys, opts, qengine)
-            .await?;
+    let mut primary = evaluate_metric(
+        exp,
+        &exp.primary_metric,
+        &variant_keys,
+        opts,
+        segment_by,
+        qengine,
+    )
+    .await?;
 
+    let observed: BTreeMap<String, (u64, u64)> = primary
+        .moments
+        .iter()
+        .map(|(k, m)| (k.clone(), (m.n, 0)))
+        .collect();
     let (srm_p_value, sample_ratio_mismatch) =
-        compute_sample_ratio_mismatch(&observed_counts, &expected_weights);
+        compute_sample_ratio_mismatch(&observed, &expected_weights);
     if sample_ratio_mismatch {
-        for r in &mut primary_rows {
+        for r in &mut primary.rows {
             r.statistically_significant = false;
         }
     }
 
     let mut guardrails = Vec::with_capacity(exp.guardrail_metrics.len());
     for gm in &exp.guardrail_metrics {
-        let (mut gm_rows, _) =
-            evaluate_metric_for_experiment(exp, gm, &variant_keys, opts, qengine).await?;
+        let mut gm_rows = evaluate_metric(exp, gm, &variant_keys, opts, None, qengine)
+            .await?
+            .rows;
         if sample_ratio_mismatch {
             for r in &mut gm_rows {
                 r.statistically_significant = false;
@@ -203,10 +209,12 @@ pub async fn evaluate_experiment_results(
             event_name: gm.event_name.clone(),
             direction: gm.direction.clone(),
             regressed_variants,
+            metric_type: normalized_metric_type(gm).to_string(),
             variants: gm_rows,
         });
     }
 
+    let cuped_applied = primary.variance_reduction_pct.is_some();
     Ok(ExperimentResults {
         experiment_id: exp.id.clone(),
         experiment_name: exp.name.clone(),
@@ -217,11 +225,18 @@ pub async fn evaluate_experiment_results(
         exec_time_us: t0.elapsed().as_micros() as u64,
         srm_p_value,
         sample_ratio_mismatch,
-        statistical_methodology_note: methodology_note(opts),
+        statistical_methodology_note: methodology_note(opts, cuped_applied),
         sequential: opts.sequential_rho.is_some(),
         confidence_level: 1.0 - opts.alpha,
-        variants: primary_rows,
+        variants: primary.rows,
         guardrails,
+        metric_type: normalized_metric_type(&exp.primary_metric).to_string(),
+        cuped_applied,
+        variance_reduction_pct: primary.variance_reduction_pct.unwrap_or(0.0),
+        multi_variant_users: primary.multi_variant_users,
+        segment_by: segment_by.map(str::to_string),
+        segments: primary.segments,
+        timeseries: primary.timeseries,
     })
 }
 
@@ -243,80 +258,210 @@ fn lift_options(exp: &Experiment, variants: usize) -> LiftOptions {
     }
 }
 
-fn methodology_note(opts: LiftOptions) -> String {
+fn methodology_note(opts: LiftOptions, cuped: bool) -> String {
     let level = format!("{:.0}%", (1.0 - opts.alpha) * 100.0);
+    let cuped = if cuped {
+        "; CUPED variance reduction using each user's pre-exposure value of the metric"
+    } else {
+        ""
+    };
     match opts.sequential_rho {
         Some(_) => format!(
-            "Sequential: always-valid p-values and {level} confidence sequences (Waudby-Smith et al. asymptotic CS), safe to check at any time; Holm-Bonferroni adjusted across treatment variants; Chi-square SRM check at alpha=0.001"
+            "Sequential: always-valid p-values and {level} confidence sequences (Waudby-Smith et al. asymptotic CS), safe to check at any time; Holm-Bonferroni adjusted across treatment variants{cuped}; Chi-square SRM check at alpha=0.001"
         ),
         None => format!(
-            "Fixed-horizon two-sided Z-test (not peeking-corrected: read results once, at the planned end); Holm-Bonferroni adjusted across treatment variants; Fieller relative lift {level} CI; Chi-square SRM check at alpha=0.001"
+            "Fixed-horizon two-sided test (not peeking-corrected: read results once, at the planned end); Holm-Bonferroni adjusted across treatment variants; {level} intervals{cuped}; Chi-square SRM check at alpha=0.001"
         ),
     }
 }
 
-async fn evaluate_metric_for_experiment(
+/// `conversion`, `count`, `sum` or `ratio`; older `continuous` rows map to `sum` or `count`.
+pub fn normalized_metric_type(m: &ExperimentMetricSpec) -> &'static str {
+    match m.metric_type.as_str() {
+        "count" => "count",
+        "sum" => "sum",
+        "ratio" => "ratio",
+        "continuous" if m.numeric_prop.is_some() => "sum",
+        "continuous" => "count",
+        _ => "conversion",
+    }
+}
+
+/// Checks a metric definition is complete for its type.
+pub fn validate_metric_spec(m: &ExperimentMetricSpec) -> Result<(), String> {
+    if !matches!(
+        m.metric_type.as_str(),
+        "conversion" | "count" | "sum" | "ratio" | "continuous"
+    ) {
+        return Err("metric_type must be conversion, count, sum or ratio".into());
+    }
+    if !matches!(m.direction.as_str(), "decrease_is_bad" | "increase_is_bad") {
+        return Err("metric direction must be decrease_is_bad or increase_is_bad".into());
+    }
+    let has_prop = m
+        .numeric_prop
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    if m.metric_type == "sum" && !has_prop {
+        return Err(format!(
+            "metric '{}' is a sum and needs numeric_prop",
+            m.name
+        ));
+    }
+    if m.metric_type == "ratio"
+        && m.denominator
+            .as_ref()
+            .is_none_or(|d| d.event_name.trim().is_empty())
+    {
+        return Err(format!(
+            "metric '{}' is a ratio and needs a denominator",
+            m.name
+        ));
+    }
+    Ok(())
+}
+
+fn metric_event(
+    event_name: &str,
+    filters: &[PropPredicate],
+    prop: Option<&str>,
+    binary: bool,
+) -> ExperimentMetricEvent {
+    ExperimentMetricEvent {
+        event_name: event_name.to_string(),
+        filters: filters.to_vec(),
+        value: match prop.filter(|p| !p.trim().is_empty()) {
+            _ if binary => MetricValue::Binary,
+            Some(p) => MetricValue::Sum(p.to_string()),
+            None => MetricValue::Count,
+        },
+    }
+}
+
+struct MetricEval {
+    rows: Vec<VariantLiftRow>,
+    moments: BTreeMap<String, MetricMoments>,
+    variance_reduction_pct: Option<f64>,
+    multi_variant_users: u64,
+    segments: Vec<SegmentResult>,
+    timeseries: Vec<TimeseriesPoint>,
+}
+
+async fn evaluate_metric(
     exp: &Experiment,
     metric: &ExperimentMetricSpec,
     expected_variants: &[String],
     opts: LiftOptions,
+    segment_by: Option<&str>,
     qengine: &QueryEngine,
-) -> Result<(Vec<VariantLiftRow>, BTreeMap<String, (u64, u64)>), ExecError> {
-    let range = TimeRange {
-        start_ts_ms: exp.start_ts_ms,
-        end_ts_ms: exp.end_ts_ms,
+) -> Result<MetricEval, ExecError> {
+    let kind = normalized_metric_type(metric);
+    let ratio = kind == "ratio";
+    let estimate_kind = if ratio {
+        EstimateKind::Ratio
+    } else {
+        EstimateKind::Mean
     };
-    // Respect exact configured conversion window, including sub-24h windows (`P2-09f`)!
+    let cuped = exp.analysis.cuped && !ratio;
+    // Respect the exact configured window, including sub-24h windows.
     let window_ms = if metric.conversion_window_ms > 0 {
         metric.conversion_window_ms
     } else {
         7 * 86_400_000
     };
 
-    let funnel_from_exposure = FunnelQuery {
-        time_range: range,
-        steps: vec![
-            FunnelStepSpec {
-                event_name: "$experiment_started".to_string(),
-                filters: vec![PropPredicate {
-                    prop_name: "flag_key".to_string(),
-                    filter: pulse_exec::PropFilterOp::Eq(PropValue::Str(exp.flag_key.clone())),
-                }],
-                first_time_ever: false,
-            },
-            FunnelStepSpec {
-                event_name: metric.event_name.clone(),
-                filters: Vec::new(),
-                first_time_ever: false,
-            },
-        ],
-        order_mode: FunnelOrderMode::LooseOrder,
-        conversion_window_ms: window_ms,
-        exclusions: Vec::new(),
-        hold_constant_props: Vec::new(),
-        breakdown_by: Some("variant".to_string()),
-        global_filter: pulse_exec::GlobalFilter::default(),
-        sampling: pulse_exec::SamplingMode::Exact,
+    let q = ExperimentMetricQuery {
+        time_range: TimeRange {
+            start_ts_ms: exp.start_ts_ms,
+            end_ts_ms: exp.end_ts_ms,
+        },
+        exposure_event: "$experiment_started".to_string(),
+        exposure_filters: vec![PropPredicate {
+            prop_name: "flag_key".to_string(),
+            filter: pulse_exec::PropFilterOp::Eq(PropValue::Str(exp.flag_key.clone())),
+        }],
+        variant_prop: "variant".to_string(),
+        segment_by: segment_by.map(str::to_string),
+        metric: metric_event(
+            &metric.event_name,
+            &metric.filters,
+            metric.numeric_prop.as_deref(),
+            kind == "conversion",
+        ),
+        denominator: metric
+            .denominator
+            .as_ref()
+            .filter(|_| ratio)
+            .map(|d| metric_event(&d.event_name, &[], d.numeric_prop.as_deref(), false)),
+        window_ms,
+        pre_window_ms: if cuped {
+            exp.analysis.cuped_pre_window_ms.max(0)
+        } else {
+            0
+        },
+    };
+    let res = qengine.query_experiment_metric(&exp.project_id, &q).await?;
+
+    // Every configured variant shows, even before anyone sees it.
+    let mut moments: BTreeMap<String, MetricMoments> = expected_variants
+        .iter()
+        .map(|k| (k.clone(), MetricMoments::default()))
+        .collect();
+    moments.extend(res.variants);
+
+    let (estimates, reduction) = estimates_from_moments(&moments, estimate_kind, cuped);
+    // Plain conversion metrics keep the exact Fieller / Beta-Binomial table.
+    let rows = if kind == "conversion" && reduction.is_none() {
+        let counts = moments
+            .iter()
+            .map(|(k, m)| (k.clone(), (m.n, m.sum_y.round() as u64)))
+            .collect();
+        compute_lift_table(&counts, opts)
+    } else {
+        compute_estimate_table(&moments, &estimates, opts)
     };
 
-    let mut counts_by_variant: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    for vk in expected_variants {
-        counts_by_variant.insert(vk.clone(), (0, 0));
-    }
+    let segments = res
+        .segments
+        .into_iter()
+        .map(|g| {
+            let (est, _) = estimates_from_moments(&g.variants, estimate_kind, cuped);
+            SegmentResult {
+                segment: g.segment,
+                variants: compute_estimate_table(&g.variants, &est, opts),
+            }
+        })
+        .collect();
 
-    let res1 = qengine
-        .query_funnel(&exp.project_id, &funnel_from_exposure)
-        .await?;
-    for bg in &res1.breakdowns {
-        if bg.breakdown_value != "(none)" && !bg.steps.is_empty() {
-            let n = bg.steps[0].entered_users;
-            let conv = bg.steps.get(1).map(|s| s.entered_users).unwrap_or(0);
-            counts_by_variant.insert(bg.breakdown_value.clone(), (n, conv));
-        }
-    }
+    let timeseries = res
+        .daily
+        .into_iter()
+        .map(|p| {
+            let (est, _) = estimates_from_moments(&p.cumulative, estimate_kind, cuped);
+            TimeseriesPoint {
+                day_start_ms: p.day_start_ms,
+                variants: compute_estimate_table(&p.cumulative, &est, opts)
+                    .into_iter()
+                    .map(|r| TimeseriesVariant {
+                        variant_key: r.variant_key,
+                        is_control: r.is_control,
+                        users: r.sample_size,
+                        mean_value: r.mean_value,
+                        relative_lift_pct: r.relative_lift_pct,
+                        ci_low_pct: r.ci95_low_pct,
+                        ci_high_pct: r.ci95_high_pct,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
 
-    // Exposures come only from `$experiment_started`; with none, every variant reports 0 users
-    // and the Studio says how to send them.
-    let rows = compute_lift_table(&counts_by_variant, opts);
-    Ok((rows, counts_by_variant))
+    Ok(MetricEval {
+        rows,
+        moments,
+        variance_reduction_pct: reduction,
+        multi_variant_users: res.multi_variant_users,
+        segments,
+        timeseries,
+    })
 }

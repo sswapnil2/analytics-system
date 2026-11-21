@@ -1,17 +1,32 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection } from "../api/client";
+import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricType, VariantLiftRow } from "../api/client";
+import { LiftChart } from "../components/LiftChart";
 import { useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
 import { PropertyPicker } from "../components/PropertyPicker";
-import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent } from "../lib/format";
+import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent, propertyOptions } from "../lib/format";
 import { usersPerVariant } from "../lib/power";
 
 interface Props {
   projectId: string;
   availableEvents: string[];
+  availableProps: string[];
   refreshToken: number;
+}
+
+const METRIC_TYPES: { value: MetricType; label: string; eventLabel: string }[] = [
+  { value: "conversion", label: "Conversion: did the user do it", eventLabel: "Counts as a conversion" },
+  { value: "count", label: "Count: times per user", eventLabel: "Event to count" },
+  { value: "sum", label: "Sum: a property's total per user", eventLabel: "Event with the value" },
+  { value: "ratio", label: "Ratio: total of one over another", eventLabel: "Numerator event" },
+];
+
+/** A variant's metric value: a rate for conversions, a plain number otherwise. */
+function formatMetricValue(type: MetricType | undefined, v: VariantLiftRow): string {
+  if (!type || type === "conversion") return formatPercent(v.conversion_rate, 2);
+  return v.mean_value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v.mean_value) < 10 ? 3 : 2 });
 }
 
 const DAY_MS = 86_400_000;
@@ -122,7 +137,7 @@ const ExposureSnippets: React.FC<{ flagKey: string }> = ({ flagKey }) => {
   );
 };
 
-export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availableEvents, refreshToken }) => {
+export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availableEvents, availableProps, refreshToken }) => {
   const { canEdit } = useAccess();
   const cohorts = useCohortNames(projectId);
   const [mde, setMde] = useState(10);
@@ -152,6 +167,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   // No default: the busiest event is usually one everyone does, which a test can't move.
   const [expMetric, setExpMetric] = useState("");
   const eventOptions = availableEvents.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }));
+  const [expMetricType, setExpMetricType] = useState<MetricType>("conversion");
+  const [expProp, setExpProp] = useState("");
+  const [expDenominator, setExpDenominator] = useState("");
+  const [expCuped, setExpCuped] = useState(true);
+  const propOptions = propertyOptions(availableProps.filter((p) => !p.startsWith("user.")));
+  const [segment, setSegment] = useState("");
+  const segmentRef = useRef(segment);
+  segmentRef.current = segment;
   const [expGuardrail, setExpGuardrail] = useState("");
   const [expGuardrailDirection, setExpGuardrailDirection] = useState<MetricDirection>("increase_is_bad");
   const [expSequential, setExpSequential] = useState(true);
@@ -193,7 +216,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         setSelectedExpId(targetExp);
       }
       if (targetExp) {
-        const res = await api.getExperimentResults(projectId, targetExp);
+        const res = await api.getExperimentResults(projectId, targetExp, segmentRef.current || undefined);
         if (resultsSeqRef.current === seq && selectedExpIdRef.current === targetExp) setExpResults(res);
       } else if (resultsSeqRef.current === seq) {
         setExpResults(null);
@@ -212,7 +235,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     void loadAll();
   }, [loadAll, refreshToken]);
 
-  const handleSelectExperiment = async (expId: string) => {
+  const handleSelectExperiment = async (expId: string, seg = segmentRef.current) => {
     selectedExpIdRef.current = expId;
     setSelectedExpId(expId);
     const seq = ++resultsSeqRef.current;
@@ -223,7 +246,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setLoading(true);
     setLoadError(null);
     try {
-      const res = await api.getExperimentResults(projectId, expId);
+      const res = await api.getExperimentResults(projectId, expId, seg || undefined);
       if (resultsSeqRef.current === seq && selectedExpIdRef.current === expId) setExpResults(res);
     } catch (err) {
       if (resultsSeqRef.current === seq && selectedExpIdRef.current === expId) setLoadError(errorMessage(err));
@@ -271,7 +294,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const createExperiment = async () => {
     const flag = flags.find((f) => f.id === expFlagId);
     if (!expName.trim() || !flag || !expMetric) {
-      setExpError("Add a name, pick a flag and pick the event that counts as a conversion.");
+      setExpError("Add a name, pick a flag and pick the metric's event.");
+      return;
+    }
+    if (expMetricType === "sum" && !expProp) {
+      setExpError("Pick the property to add up.");
+      return;
+    }
+    if (expMetricType === "ratio" && !expDenominator) {
+      setExpError("Pick the denominator event.");
       return;
     }
     setExpCreating(true);
@@ -283,7 +314,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       conversion_window_ms: expWindowDays * DAY_MS,
       direction,
     });
-    const planned = baseline
+    const primary = {
+      ...metric(expMetric, "decrease_is_bad"),
+      metric_type: expMetricType,
+      numeric_prop: expMetricType === "sum" || expMetricType === "ratio" ? expProp || null : null,
+      denominator: expMetricType === "ratio" ? { event_name: expDenominator } : null,
+    };
+    // The estimate assumes a conversion rate; other metric types use the server's default horizon.
+    const planned = baseline && expMetricType === "conversion"
       ? usersPerVariant(baseline.rate, mde / 100, { variants: Math.max(2, flag.variants.length), sequential: expSequential })
       : Infinity;
     try {
@@ -294,12 +332,13 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         hypothesis: expHypothesis.trim(),
         start_ts_ms: now,
         end_ts_ms: now + expDays * DAY_MS,
-        primary_metric: metric(expMetric, "decrease_is_bad"),
+        primary_metric: primary,
         guardrail_metrics: expGuardrail ? [metric(expGuardrail, expGuardrailDirection)] : [],
         analysis: {
           sequential: expSequential,
           alpha: 0.05,
           planned_users_per_variant: Number.isFinite(planned) ? planned : null,
+          cuped: expCuped,
         },
       });
       setExpFormOpen(false);
@@ -379,6 +418,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     selectedFlag.rollout_pct >= 100 &&
     selectedFlag.variants.length < 2;
   const noExposures = expResults !== null && expResults.variants.every((v) => v.sample_size === 0);
+  const isConversion = !expResults?.metric_type || expResults.metric_type === "conversion";
+  const valueLabel = isConversion ? "Conversion rate" : expResults?.metric_type === "ratio" ? "Ratio" : "Per user";
 
   return (
     <div className="space-y-5">
@@ -440,18 +481,52 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   className={field}
                 />
               </label>
+              <label className="flex flex-col gap-1">
+                <span className={fieldLabel}>Metric</span>
+                <select
+                  value={expMetricType}
+                  onChange={(e) => setExpMetricType(e.target.value as MetricType)}
+                  className={field}
+                >
+                  {METRIC_TYPES.map((t) => (
+                    <option key={t.value} value={t.value}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               {availableEvents.length === 0 ? (
                 <label className="flex flex-col gap-1">
-                  <span className={fieldLabel}>Counts as a conversion</span>
+                  <span className={fieldLabel}>{METRIC_TYPES.find((t) => t.value === expMetricType)?.eventLabel}</span>
                   <select disabled className={field}>
                     <option>No events yet</option>
                   </select>
                 </label>
               ) : (
                 <PropertyPicker
-                  label="Counts as a conversion"
+                  label={METRIC_TYPES.find((t) => t.value === expMetricType)?.eventLabel ?? "Event"}
                   value={expMetric}
                   onChange={setExpMetric}
+                  placeholder="Search events"
+                  recentKey={`pulse.recent-events.${projectId}`}
+                  options={eventOptions}
+                />
+              )}
+              {(expMetricType === "sum" || expMetricType === "ratio") && (
+                <PropertyPicker
+                  label={expMetricType === "sum" ? "Property to add up" : "Numerator property (optional)"}
+                  value={expProp}
+                  onChange={setExpProp}
+                  noneLabel={expMetricType === "ratio" ? "Count the events" : undefined}
+                  recentKey={`pulse.recent-props.${projectId}`}
+                  options={propOptions}
+                />
+              )}
+              {expMetricType === "ratio" && (
+                <PropertyPicker
+                  label="Denominator event"
+                  value={expDenominator}
+                  onChange={setExpDenominator}
                   placeholder="Search events"
                   recentKey={`pulse.recent-events.${projectId}`}
                   options={eventOptions}
@@ -489,6 +564,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   ))}
                 </select>
               </label>
+              {expMetricType === "conversion" && (
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Smallest lift worth detecting</span>
                 <select value={mde} onChange={(e) => setMde(Number(e.target.value))} className={field}>
@@ -499,6 +575,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   ))}
                 </select>
               </label>
+              )}
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Run for</span>
                 <select value={expDays} onChange={(e) => setExpDays(Number(e.target.value))} className={field}>
@@ -525,6 +602,17 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </span>
               </span>
             </label>
+            <label className="flex items-start gap-2 text-sm text-ink">
+              <input type="checkbox" checked={expCuped} onChange={(e) => setExpCuped(e.target.checked)} className="mt-0.5" />
+              <span>
+                Reduce noise with pre-experiment data (CUPED)
+                <span className="block text-xs text-muted">
+                  Adjusts for what each user did in the 14 days before they saw the flag, so results get significant
+                  sooner. Has no effect on brand-new users or ratio metrics.
+                </span>
+              </span>
+            </label>
+            {expMetricType === "conversion" && (
             <SampleEstimate
               baseline={baseline}
               mde={mde / 100}
@@ -533,6 +621,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               event={expMetric}
               sequential={expSequential}
             />
+            )}
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setExpFormOpen(false)} className={btn.ghost}>
                 Cancel
@@ -641,6 +730,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 >
                   {expResults.sequential ? "Sequential · safe to check any time" : "Fixed horizon · read at the end"}
                 </span>
+                {expResults.cuped_applied && (
+                  <span
+                    className="rounded bg-hover px-2 py-0.5 text-xs font-medium text-muted"
+                    title="CUPED: adjusted for each user's pre-exposure value of the metric"
+                  >
+                    CUPED · {formatPercent(expResults.variance_reduction_pct / 100, 0)} less noise
+                  </span>
+                )}
                 {canEdit && selectedExp.status !== "concluded" && (
                   <>
                     {expResults.variants
@@ -690,8 +787,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   <tr className="border-b border-line text-xs text-muted">
                     <th className="py-2 text-left font-medium">Variant</th>
                     <th className="py-2 text-right font-medium">Users</th>
-                    <th className="py-2 text-right font-medium">Conversions</th>
-                    <th className="py-2 text-right font-medium">Conversion rate</th>
+                    {isConversion && <th className="py-2 text-right font-medium">Conversions</th>}
+                    <th className="py-2 text-right font-medium">{valueLabel}</th>
                     <th className="py-2 text-right font-medium">Lift</th>
                     <th className="px-4 py-2 text-center font-medium">
                       {Math.round((expResults.confidence_level ?? 0.95) * 100)}% range of lift
@@ -719,9 +816,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           </span>
                         </td>
                         <td className="tabular py-3 text-right text-ink-2">{formatCount(v.sample_size)}</td>
-                        <td className="tabular py-3 text-right text-ink-2">{formatCount(v.conversions)}</td>
+                        {isConversion && <td className="tabular py-3 text-right text-ink-2">{formatCount(v.conversions)}</td>}
                         <td className="tabular py-3 text-right font-medium text-ink">
-                          {formatPercent(v.conversion_rate, 2)}
+                          {formatMetricValue(expResults.metric_type, v)}
                         </td>
                         <td
                           className={`tabular py-3 text-right font-semibold ${
@@ -779,6 +876,82 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             </div>
             )}
 
+            {!noExposures && expResults.multi_variant_users > 0 && (
+              <p className="text-xs text-muted">
+                {formatCount(expResults.multi_variant_users)} users saw more than one variant and are left out.
+              </p>
+            )}
+
+            {!noExposures && (
+              <LiftChart series={expResults.timeseries} confidence={expResults.confidence_level ?? 0.95} />
+            )}
+
+            {!noExposures && (
+              <div className="space-y-2 border-t border-line pt-4">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <h3 className="text-sm font-medium text-ink">By segment</h3>
+                  <div className="w-56">
+                    <PropertyPicker
+                      label="Segment by"
+                      dense
+                      value={segment}
+                      onChange={(v) => {
+                        setSegment(v);
+                        void handleSelectExperiment(selectedExpId, v);
+                      }}
+                      noneLabel="No segments"
+                      recentKey={`pulse.recent-props.${projectId}`}
+                      options={propertyOptions(availableProps)}
+                    />
+                  </div>
+                </div>
+                {segment && expResults.segments.every((sg) => sg.segment === "(none)") && (
+                  <p className="text-xs text-muted">
+                    Exposures don't carry this property. Segments read it from the{" "}
+                    <code className="font-mono">$experiment_started</code> event, or pick a user profile property.
+                  </p>
+                )}
+                {expResults.segments.length > 0 && (
+                  <>
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[560px] text-sm">
+                        <thead>
+                          <tr className="border-b border-line text-xs text-muted">
+                            <th className="py-2 text-left font-medium">{humanizeEvent(segment.replace(/^user\./, ""))}</th>
+                            <th className="py-2 text-left font-medium">Variant</th>
+                            <th className="py-2 text-right font-medium">Users</th>
+                            <th className="py-2 text-right font-medium">{valueLabel}</th>
+                            <th className="py-2 text-right font-medium">Lift</th>
+                            <th className="py-2 text-right font-medium">Range of lift</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-line">
+                          {expResults.segments.flatMap((sg) =>
+                            sg.variants.map((v, i) => (
+                              <tr key={`${sg.segment}:${v.variant_key}`}>
+                                <td className="py-2 text-ink">{i === 0 ? (sg.segment === "$other" ? "Other" : sg.segment || "(none)") : ""}</td>
+                                <td className="py-2 text-ink-2">{v.variant_key}</td>
+                                <td className="tabular py-2 text-right text-ink-2">{formatCount(v.sample_size)}</td>
+                                <td className="tabular py-2 text-right text-ink">{formatMetricValue(expResults.metric_type, v)}</td>
+                                <td className="tabular py-2 text-right text-ink-2">{v.is_control ? "–" : formatLift(v.relative_lift_pct)}</td>
+                                <td className="tabular py-2 text-right text-muted">
+                                  {v.is_control ? "–" : `${formatLift(v.ci95_low_pct)} to ${formatLift(v.ci95_high_pct)}`}
+                                </td>
+                              </tr>
+                            )),
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-xs text-faint">
+                      Exploratory: with many segments some will look different by chance, so confirm a segment finding with
+                      its own experiment.
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
             {!noExposures && expResults.guardrails.length > 0 && (
               <div className="border-t border-line pt-4">
                 <h3 className="mb-2 text-sm font-medium text-ink">Guardrails</h3>
@@ -800,8 +973,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                             >
                               <span className="text-ink-2">{gv.variant_key}: </span>
                               <span className="tabular text-ink">
-                                {formatPercent(gv.conversion_rate, 2)} ({formatCount(gv.conversions)} of{" "}
-                                {formatCount(gv.sample_size)})
+                                {!g.metric_type || g.metric_type === "conversion"
+                                  ? `${formatPercent(gv.conversion_rate, 2)} (${formatCount(gv.conversions)} of ${formatCount(gv.sample_size)})`
+                                  : `${formatMetricValue(g.metric_type, gv)} per user (${formatCount(gv.sample_size)} users)`}
                               </span>
                               {!gv.is_control && (
                                 <span className={`tabular ml-2 text-xs ${regressed ? "font-medium text-danger" : "text-muted"}`}>

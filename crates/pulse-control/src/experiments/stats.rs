@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use pulse_exec::MetricMoments;
+
 use crate::models::VariantLiftRow;
 
 /// Pearson's Chi-square Sample Ratio Mismatch test against configured variant `weight_bps`.
@@ -138,28 +140,53 @@ fn cs_p_value(diff: f64, s2: f64, n: f64, rho: f64) -> f64 {
     ln_p.exp().clamp(0.0, 1.0)
 }
 
+/// One arm's estimate: a mean (or ratio) and the variance of that estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Estimate {
+    pub n: u64,
+    pub mean: f64,
+    pub var_of_mean: f64,
+}
+
+impl Moments {
+    pub fn estimate(&self) -> Estimate {
+        Estimate {
+            n: self.n,
+            mean: self.mean(),
+            var_of_mean: if self.n == 0 {
+                0.0
+            } else {
+                self.variance() / self.n as f64
+            },
+        }
+    }
+}
+
 /// Welch (unpooled, normal-approximation) comparison of two per-user means, with a delta-method
 /// relative-lift CI. With `opts.sequential_rho` the p-value and both CIs are always valid, so the
 /// result can be checked any number of times. `None` below two users per arm.
 pub fn compare_means(c: &Moments, t: &Moments, opts: LiftOptions) -> Option<Comparison> {
+    compare_estimates(&c.estimate(), &t.estimate(), opts)
+}
+
+/// [`compare_means`] over any two arm estimates (plain, CUPED-adjusted or ratio).
+pub fn compare_estimates(c: &Estimate, t: &Estimate, opts: LiftOptions) -> Option<Comparison> {
     if c.n < 2 || t.n < 2 {
         return None;
     }
-    let (n_c, n_t) = (c.n as f64, t.n as f64);
-    let (m_c, m_t) = (c.mean(), t.mean());
-    let (s2_c, s2_t) = (c.variance(), t.variance());
+    let (m_c, m_t) = (c.mean, t.mean);
     let diff = m_t - m_c;
-    let var_diff = s2_c / n_c + s2_t / n_t;
+    let var_diff = c.var_of_mean + t.var_of_mean;
 
     // Delta method for `m_t / m_c - 1`.
     let rel = (m_c.abs() > 1e-12).then(|| {
-        let var_rel = s2_t / (n_t * m_c * m_c) + (m_t * m_t * s2_c) / (n_c * m_c.powi(4));
+        let var_rel = t.var_of_mean / (m_c * m_c) + (m_t * m_t * c.var_of_mean) / m_c.powi(4);
         (m_t / m_c - 1.0, var_rel)
     });
 
     let (abs_half, rel_half, p_value) = match opts.sequential_rho {
         Some(rho) => {
-            let n = n_c + n_t;
+            let n = (c.n + t.n) as f64;
             (
                 cs_half_width(var_diff * n, n, rho, opts.alpha),
                 rel.map(|(_, v)| cs_half_width(v * n, n, rho, opts.alpha)),
@@ -191,6 +218,203 @@ pub fn compare_means(c: &Moments, t: &Moments, opts: LiftOptions) -> Option<Comp
         rel_ci_pct,
         p_value,
     })
+}
+
+/// How a metric's per-user moments turn into one estimate per arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateKind {
+    /// Mean of `y` per user.
+    Mean,
+    /// `Σy / Σd` (delta method).
+    Ratio,
+}
+
+fn sample_var(n: f64, sum: f64, sum_sq: f64) -> f64 {
+    if n < 2.0 {
+        0.0
+    } else {
+        ((sum_sq - sum * sum / n) / (n - 1.0)).max(0.0)
+    }
+}
+
+fn sample_cov(n: f64, sum_a: f64, sum_b: f64, sum_ab: f64) -> f64 {
+    if n < 2.0 {
+        0.0
+    } else {
+        (sum_ab - sum_a * sum_b / n) / (n - 1.0)
+    }
+}
+
+/// Per-arm estimates from engine moments, with optional CUPED on mean metrics.
+///
+/// CUPED: `theta = Cov(x, y) / Var(x)` pooled over all arms; each arm's mean becomes
+/// `ȳ - theta (x̄ - x̄_all)` with per-user variance `Var(y) + theta² Var(x) - 2 theta Cov(x, y)`.
+/// Returns the estimates and the pooled variance reduction (`None` when CUPED didn't apply:
+/// asked off, a ratio metric, or no pre-period variation).
+pub fn estimates_from_moments(
+    groups: &BTreeMap<String, MetricMoments>,
+    kind: EstimateKind,
+    cuped: bool,
+) -> (BTreeMap<String, Estimate>, Option<f64>) {
+    let all = groups
+        .values()
+        .fold(MetricMoments::default(), |mut acc, m| {
+            acc.merge(m);
+            acc
+        });
+    let n_all = all.n as f64;
+    let theta = (cuped && kind == EstimateKind::Mean && all.n >= 2)
+        .then(|| {
+            let var_x = sample_var(n_all, all.sum_x, all.sum_x2);
+            (var_x > 1e-12).then(|| sample_cov(n_all, all.sum_x, all.sum_y, all.sum_xy) / var_x)
+        })
+        .flatten();
+    let x_bar_all = if all.n > 0 { all.sum_x / n_all } else { 0.0 };
+
+    let est = groups
+        .iter()
+        .map(|(k, m)| {
+            let n = m.n as f64;
+            let e = if m.n == 0 {
+                Estimate {
+                    n: 0,
+                    mean: 0.0,
+                    var_of_mean: 0.0,
+                }
+            } else {
+                match (kind, theta) {
+                    (EstimateKind::Ratio, _) => {
+                        let d_bar = m.sum_d / n;
+                        let r = if m.sum_d.abs() > 1e-12 {
+                            m.sum_y / m.sum_d
+                        } else {
+                            0.0
+                        };
+                        let var = if d_bar.abs() > 1e-12 {
+                            let s_yy = sample_var(n, m.sum_y, m.sum_y2);
+                            let s_dd = sample_var(n, m.sum_d, m.sum_d2);
+                            let s_yd = sample_cov(n, m.sum_y, m.sum_d, m.sum_yd);
+                            ((s_yy - 2.0 * r * s_yd + r * r * s_dd) / (n * d_bar * d_bar)).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        Estimate {
+                            n: m.n,
+                            mean: r,
+                            var_of_mean: var,
+                        }
+                    }
+                    (EstimateKind::Mean, Some(th)) => {
+                        let s_yy = sample_var(n, m.sum_y, m.sum_y2);
+                        let s_xx = sample_var(n, m.sum_x, m.sum_x2);
+                        let s_xy = sample_cov(n, m.sum_x, m.sum_y, m.sum_xy);
+                        Estimate {
+                            n: m.n,
+                            mean: m.sum_y / n - th * (m.sum_x / n - x_bar_all),
+                            var_of_mean: ((s_yy + th * th * s_xx - 2.0 * th * s_xy) / n).max(0.0),
+                        }
+                    }
+                    (EstimateKind::Mean, None) => Estimate {
+                        n: m.n,
+                        mean: m.sum_y / n,
+                        var_of_mean: sample_var(n, m.sum_y, m.sum_y2) / n,
+                    },
+                }
+            };
+            (k.clone(), e)
+        })
+        .collect();
+
+    let reduction = theta.map(|th| {
+        let var_y = sample_var(n_all, all.sum_y, all.sum_y2);
+        let var_x = sample_var(n_all, all.sum_x, all.sum_x2);
+        let cov = sample_cov(n_all, all.sum_x, all.sum_y, all.sum_xy);
+        if var_y > 1e-12 {
+            ((th * th * var_x - 2.0 * th * cov) / -var_y).clamp(0.0, 1.0) * 100.0
+        } else {
+            0.0
+        }
+    });
+    (est, reduction)
+}
+
+/// Lift table over per-arm estimates (any metric type). `P(beat control)` uses the normal
+/// approximation; p-values are Holm-Bonferroni adjusted across treatments.
+pub fn compute_estimate_table(
+    groups: &BTreeMap<String, MetricMoments>,
+    estimates: &BTreeMap<String, Estimate>,
+    opts: LiftOptions,
+) -> Vec<VariantLiftRow> {
+    let control_key = if estimates.contains_key("control") {
+        "control".to_string()
+    } else {
+        estimates.keys().next().cloned().unwrap_or_default()
+    };
+    let control = estimates.get(&control_key).copied();
+    let mut keys: Vec<&String> = estimates.keys().filter(|k| **k != control_key).collect();
+    if control.is_some() {
+        keys.insert(0, &control_key);
+    }
+
+    let mut rows = Vec::with_capacity(keys.len());
+    let mut treatments = Vec::new();
+    for k in keys {
+        let e = estimates[k];
+        let m = groups.get(k).copied().unwrap_or_default();
+        let is_control = *k == control_key;
+        let mut row = VariantLiftRow {
+            variant_key: k.clone(),
+            is_control,
+            sample_size: e.n,
+            conversions: 0,
+            conversion_rate: e.mean,
+            mean_value: e.mean,
+            variance: e.var_of_mean * e.n as f64,
+            relative_lift_pct: 0.0,
+            ci95_low_pct: 0.0,
+            ci95_high_pct: 0.0,
+            p_value: 1.0,
+            bayesian_prob_to_beat_control: if is_control { 0.5 } else { 0.0 },
+            statistically_significant: false,
+            abs_diff: 0.0,
+            abs_ci_low: 0.0,
+            abs_ci_high: 0.0,
+            sequential: opts.sequential_rho.is_some(),
+        };
+        row.conversions = m.sum_y.round().max(0.0) as u64;
+        if !is_control {
+            treatments.push(rows.len());
+            if let Some(cmp) = control.and_then(|c| compare_estimates(&c, &e, opts)) {
+                let c = control.unwrap_or(e);
+                let sd = (c.var_of_mean + e.var_of_mean).sqrt();
+                row.relative_lift_pct = cmp.rel_lift_pct;
+                row.ci95_low_pct = cmp.rel_ci_pct.0;
+                row.ci95_high_pct = cmp.rel_ci_pct.1;
+                row.p_value = cmp.p_value;
+                row.abs_diff = cmp.abs_diff;
+                row.abs_ci_low = cmp.abs_ci.0;
+                row.abs_ci_high = cmp.abs_ci.1;
+                row.bayesian_prob_to_beat_control = if sd > 1e-15 {
+                    standard_normal_cdf(cmp.abs_diff / sd)
+                } else {
+                    0.5
+                };
+            }
+        }
+        rows.push(row);
+    }
+    holm_adjust(&mut rows, &treatments, opts.alpha);
+    rows
+}
+
+/// `Φ(z)`, from the two-sided p-value helper.
+fn standard_normal_cdf(z: f64) -> f64 {
+    let tail = 0.5 * two_sided_normal_p_value(z.abs());
+    if z >= 0.0 {
+        1.0 - tail
+    } else {
+        tail
+    }
 }
 
 /// Fixed-horizon conversion lift table at the default 5% level. See [`compute_lift_table`].

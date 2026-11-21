@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef};
+use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef, PropPredicate};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -265,16 +265,36 @@ pub struct FeatureFlag {
 pub struct ExperimentMetricSpec {
     pub name: String,
     pub event_name: String,
-    /// `"conversion"` (binary user conversion) or `"continuous"` (numeric property average/sum per user).
+    /// Per exposed user, after their first exposure:
+    /// - `"conversion"`: did `event_name` at least once (0/1);
+    /// - `"count"`: how many times;
+    /// - `"sum"`: total of `numeric_prop`;
+    /// - `"ratio"`: `numeric_prop` total (or count) over `denominator`, across users.
+    ///
+    /// `"continuous"` (older rows) reads as `"sum"` with a `numeric_prop`, else `"count"`.
     #[serde(default = "default_conversion_kind")]
     pub metric_type: String,
     #[serde(default)]
     pub numeric_prop: Option<String>,
+    /// Only `event_name` events matching every filter count.
+    #[serde(default)]
+    pub filters: Vec<PropPredicate>,
+    /// Required for `"ratio"`.
+    #[serde(default)]
+    pub denominator: Option<MetricDenominator>,
     #[serde(default = "default_window_ms")]
     pub conversion_window_ms: i64,
     /// Which way is bad, for guardrails: `"decrease_is_bad"` (default) or `"increase_is_bad"`.
     #[serde(default = "default_direction")]
     pub direction: String,
+}
+
+/// A ratio metric's denominator: a count of `event_name`, or the total of `numeric_prop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDenominator {
+    pub event_name: String,
+    #[serde(default)]
+    pub numeric_prop: Option<String>,
 }
 
 fn default_direction() -> String {
@@ -294,6 +314,15 @@ pub struct AnalysisConfig {
     /// Tunes the sequential test to be tightest at this sample size. Defaults to 10,000.
     #[serde(default)]
     pub planned_users_per_variant: Option<u64>,
+    /// CUPED: adjust for each user's same metric before exposure to cut variance.
+    #[serde(default)]
+    pub cuped: bool,
+    #[serde(default = "default_cuped_pre_window_ms")]
+    pub cuped_pre_window_ms: i64,
+}
+
+fn default_cuped_pre_window_ms() -> i64 {
+    14 * 86_400_000
 }
 
 impl Default for AnalysisConfig {
@@ -302,6 +331,8 @@ impl Default for AnalysisConfig {
             sequential: false,
             alpha: default_alpha(),
             planned_users_per_variant: None,
+            cuped: false,
+            cuped_pre_window_ms: default_cuped_pre_window_ms(),
         }
     }
 }
@@ -374,6 +405,9 @@ pub struct GuardrailResult {
     /// Treatments that moved this guardrail significantly in the bad direction.
     #[serde(default)]
     pub regressed_variants: Vec<String>,
+    /// conversion | count | sum | ratio.
+    #[serde(default = "default_metric_type")]
+    pub metric_type: String,
     pub variants: Vec<VariantLiftRow>,
 }
 
@@ -399,6 +433,49 @@ pub struct ExperimentResults {
     pub confidence_level: f64,
     pub variants: Vec<VariantLiftRow>,
     pub guardrails: Vec<GuardrailResult>,
+    /// The primary metric's normalized type (`conversion`, `count`, `sum`, `ratio`).
+    #[serde(default = "default_conversion_kind")]
+    pub metric_type: String,
+    /// CUPED adjusted the primary metric (it needs pre-exposure variation to apply).
+    #[serde(default)]
+    pub cuped_applied: bool,
+    #[serde(default)]
+    pub variance_reduction_pct: f64,
+    /// Users who saw more than one variant; left out of every result.
+    #[serde(default)]
+    pub multi_variant_users: u64,
+    #[serde(default)]
+    pub segment_by: Option<String>,
+    /// Exploratory per-segment results (`?segment=`), not corrected across segments.
+    #[serde(default)]
+    pub segments: Vec<SegmentResult>,
+    /// Cumulative lift by exposure day.
+    #[serde(default)]
+    pub timeseries: Vec<TimeseriesPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentResult {
+    pub segment: String,
+    pub variants: Vec<VariantLiftRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeseriesPoint {
+    pub day_start_ms: i64,
+    pub variants: Vec<TimeseriesVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeseriesVariant {
+    pub variant_key: String,
+    pub is_control: bool,
+    /// Users first exposed by the end of this day.
+    pub users: u64,
+    pub mean_value: f64,
+    pub relative_lift_pct: f64,
+    pub ci_low_pct: f64,
+    pub ci_high_pct: f64,
 }
 
 fn default_confidence_level() -> f64 {
@@ -1069,4 +1146,8 @@ mod byok_config_seal_tests {
             .get("access_key_sealed")
             .is_none());
     }
+}
+
+fn default_metric_type() -> String {
+    "conversion".to_string()
 }

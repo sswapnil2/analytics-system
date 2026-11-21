@@ -3601,13 +3601,13 @@ async fn handle_create_experiment(
             "analysis.planned_users_per_variant must be at least 1",
         ));
     }
-    if std::iter::once(&req.primary_metric)
-        .chain(&req.guardrail_metrics)
-        .any(|m| !matches!(m.direction.as_str(), "decrease_is_bad" | "increase_is_bad"))
-    {
+    if req.analysis.cuped_pre_window_ms < 0 {
         return Err(CtrlError::bad(
-            "metric direction must be decrease_is_bad or increase_is_bad",
+            "analysis.cuped_pre_window_ms must not be negative",
         ));
+    }
+    for m in std::iter::once(&req.primary_metric).chain(&req.guardrail_metrics) {
+        crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
     }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
@@ -3678,6 +3678,7 @@ async fn handle_experiment_results_scoped(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((project_id, exp_id)): AxumPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<crate::models::ExperimentResults> {
     ctrl.authorize_and_check(&principal, &project_id).await?;
     let Some(exp) = ctrl
@@ -3696,7 +3697,11 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
-    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
+    let segment = params
+        .get("segment")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment)
         .await
         .map_err(CtrlError::internal)?;
     Ok(Json(results))

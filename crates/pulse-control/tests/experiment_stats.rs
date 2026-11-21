@@ -159,3 +159,98 @@ fn experiments_stored_before_analysis_config_still_parse() {
     assert!((exp.analysis.alpha - 0.05).abs() < 1e-12);
     assert_eq!(exp.guardrail_metrics[0].direction, "decrease_is_bad");
 }
+
+fn add_user(m: &mut pulse_exec::MetricMoments, y: f64, x: f64, d: f64) {
+    m.n += 1;
+    m.sum_y += y;
+    m.sum_y2 += y * y;
+    m.sum_x += x;
+    m.sum_x2 += x * x;
+    m.sum_xy += x * y;
+    m.sum_d += d;
+    m.sum_d2 += d * d;
+    m.sum_yd += y * d;
+}
+
+fn normal(rng: &mut StdRng) -> f64 {
+    let u1: f64 = rng.gen::<f64>().max(1e-12);
+    let u2: f64 = rng.gen();
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// 1,000 simulated tests with a true +2 effect and a pre-period covariate (correlation ~0.9):
+/// CUPED stays unbiased and its estimates vary far less than the plain difference in means.
+#[test]
+fn cuped_is_unbiased_and_cuts_variance_in_simulation() {
+    use pulse_control::experiments::{estimates_from_moments, EstimateKind};
+    let mut rng = StdRng::seed_from_u64(7);
+    let (mut plain, mut adj) = (Vec::new(), Vec::new());
+    for _ in 0..1_000 {
+        let mut groups: BTreeMap<String, pulse_exec::MetricMoments> = BTreeMap::new();
+        for (arm, effect) in [("control", 0.0), ("treatment", 2.0)] {
+            let m = groups.entry(arm.to_string()).or_default();
+            for _ in 0..400 {
+                let level = 50.0 + 10.0 * normal(&mut rng);
+                let x = level + 4.0 * normal(&mut rng);
+                let y = level + effect + 4.0 * normal(&mut rng);
+                add_user(m, y, x, 0.0);
+            }
+        }
+        let (p, _) = estimates_from_moments(&groups, EstimateKind::Mean, false);
+        let (c, red) = estimates_from_moments(&groups, EstimateKind::Mean, true);
+        assert!(red.unwrap() > 50.0);
+        plain.push(p["treatment"].mean - p["control"].mean);
+        adj.push(c["treatment"].mean - c["control"].mean);
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let var = |v: &[f64]| {
+        let m = mean(v);
+        v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64
+    };
+    assert!(
+        (mean(&adj) - 2.0).abs() < 0.05,
+        "CUPED bias: mean {}",
+        mean(&adj)
+    );
+    assert!(
+        (mean(&plain) - 2.0).abs() < 0.15,
+        "plain mean {}",
+        mean(&plain)
+    );
+    assert!(
+        var(&adj) < 0.4 * var(&plain),
+        "CUPED var {} vs plain {}",
+        var(&adj),
+        var(&plain)
+    );
+}
+
+/// Ratio metrics (spend per visit) under A/A: the delta-method test keeps its 5% level.
+#[test]
+fn ratio_metric_aa_false_positive_rate() {
+    use pulse_control::experiments::{
+        compute_estimate_table, estimates_from_moments, EstimateKind,
+    };
+    let mut rng = StdRng::seed_from_u64(3);
+    let sims = 1_000;
+    let mut hits = 0;
+    for _ in 0..sims {
+        let mut groups: BTreeMap<String, pulse_exec::MetricMoments> = BTreeMap::new();
+        for arm in ["control", "treatment"] {
+            let m = groups.entry(arm.to_string()).or_default();
+            for _ in 0..300 {
+                let visits = f64::from(rng.gen_range(1..=6u8));
+                let spend = visits * (10.0 + 3.0 * normal(&mut rng)).max(0.0);
+                add_user(m, spend, 0.0, visits);
+            }
+        }
+        let (est, _) = estimates_from_moments(&groups, EstimateKind::Ratio, false);
+        let rows = compute_estimate_table(&groups, &est, LiftOptions::default());
+        hits += usize::from(rows.iter().any(|r| r.statistically_significant));
+    }
+    let rate = hits as f64 / sims as f64;
+    assert!(
+        (0.025..=0.075).contains(&rate),
+        "ratio A/A false-positive rate {rate}"
+    );
+}
