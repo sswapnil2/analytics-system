@@ -17,6 +17,7 @@ Two tools help with almost everything below:
 | `409` | `identify` tried to merge two ids that are both already identified users | Expected protection. Don't call `identify(B)` while still identified as `A`; call `reset()` on logout |
 | `413` | Request body over 8 MiB | Send smaller batches |
 | `422` | Schema cap hit: more than 128 new event names or 256 new property keys in one batch, or the project is at 8,192 event names or 16,384 property keys | You are probably putting ids or timestamps into event or property *names*. Put them in property *values* |
+| `503` with `code: "not_writer"` | Another node holds this project's writer lease, this node restarted after a crash and its old lease has not expired yet, or it cannot reach the metadata database | Retry after `Retry-After` (the SDKs do). Clears within `PULSE_WRITER_LEASE_TTL_SECS` (15 s) of the other writer stopping. Route ingest to one node per project |
 | `429` | Rate limit (default 20,000 events/s per project per node) or ingest is ahead of flushing | Retry after `Retry-After`. The SDKs do this. Raise `PULSE_INGEST_EVENTS_PER_SEC` if the load is legitimate |
 | `5xx` | Storage write failed | Check the node log and `/readyz`. Events in that request were **not** acknowledged; retry them |
 

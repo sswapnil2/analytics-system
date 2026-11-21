@@ -750,6 +750,11 @@ impl ProfileRouter {
         Ok(s)
     }
 
+    /// Forgets a project's store so the next `get_or_open` reopens it from storage.
+    pub fn evict(&self, project_id: &str) {
+        self.stores.remove(project_id);
+    }
+
     pub async fn close_all(&self) -> Result<()> {
         let stores: Vec<Arc<ProjectProfileStore>> =
             self.stores.iter().map(|e| e.value().clone()).collect();

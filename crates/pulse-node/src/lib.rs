@@ -180,6 +180,7 @@ pub struct RunningNode {
     pub storage: Arc<StorageEngine>,
     pub qengine: Arc<QueryEngine>,
     pub bootstrap_credentials: BootstrapCredentials,
+    writer_leases: Option<Arc<pulse_control::DbWriterLeases>>,
     shutdown_bg_tx: watch::Sender<bool>,
     shutdown_http_tx: Option<oneshot::Sender<()>>,
     http_task: tokio::task::JoinHandle<()>,
@@ -227,6 +228,12 @@ impl RunningNode {
             }
             if let Err(e) = self.storage.profile_router().close_all().await {
                 tracing::error!(error = %e, "closing profile stores on shutdown failed");
+            }
+            // Last: everything acknowledged is flushed, so a standby can take over at once.
+            if let Some(leases) = &self.writer_leases {
+                if let Err(e) = leases.release_all().await {
+                    tracing::warn!(error = %e, "releasing writer leases on shutdown failed");
+                }
             }
         }
     }
@@ -387,6 +394,32 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     .await?;
 
     let meta = MetaStore::connect_auto(&config.data_dir).await?;
+    // Set before anything can open a project: only the lease holder may write one.
+    let writer_leases = config
+        .role
+        .serves_ingest()
+        .then(|| Arc::new(pulse_control::DbWriterLeases::from_env(meta.clone())));
+    let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
+    if let Some(leases) = &writer_leases {
+        use pulse_storage::WriterLeases;
+        storage.set_writer_leases(leases.clone());
+        // Renewal starts now: seeding below holds a lease for longer than one TTL.
+        let lease_storage = storage.clone();
+        let mut lease_shutdown = shutdown_bg_rx.clone();
+        let every = leases.ttl() / 3;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => lease_storage.renew_writer_leases().await,
+                    changed = lease_shutdown.changed() => {
+                        if changed.is_err() || *lease_shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
     let control = ControlPlaneService::new_with_admin(
         meta,
         qengine.clone(),
@@ -429,7 +462,6 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         }
     }
 
-    let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
     if config.role.serves_query_and_admin() {
         let alerts_control = control.clone();
         let mut alerts_shutdown = shutdown_bg_rx.clone();
@@ -720,6 +752,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         storage,
         qengine,
         bootstrap_credentials,
+        writer_leases,
         shutdown_bg_tx,
         shutdown_http_tx: Some(shutdown_http_tx),
         http_task,
@@ -1416,6 +1449,71 @@ mod tests {
 
         compactor.shutdown().await;
         ingest_node.shutdown().await;
+    }
+
+    /// Two ingest-capable nodes on one data dir used to both acknowledge writes for the same
+    /// project and overwrite each other's WAL objects. Only the lease holder may write.
+    #[tokio::test]
+    async fn second_ingest_node_refuses_writes_until_the_writer_releases_its_lease() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let shared = tmp_dir.path().join("shared");
+        let cfg = || NodeConfig {
+            role: NodeRole::Ingest,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: shared.clone(),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_lease".to_string(),
+            default_api_key: String::new(),
+            admin_token: Some("sk_root_writer_lease_test_token".to_string()),
+            allowed_origins: vec![],
+            auto_seed: false,
+            num_buckets: 1,
+        };
+        let node_a = start_pulse_node(cfg()).await.unwrap();
+        let key = node_a
+            .bootstrap_credentials
+            .generated_ingest_key
+            .clone()
+            .unwrap();
+        let node_b = start_pulse_node(cfg()).await.unwrap();
+        let http = reqwest::Client::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let post = |addr: SocketAddr, user: &'static str| {
+            http.post(format!("http://{addr}/v1/ingest"))
+                .header("x-pulse-key", &key)
+                .json(&json!({ "events": [{
+                    "distinct_id": user,
+                    "event_name": "App_Open",
+                    "client_event_ts_ms": now_ms,
+                }]}))
+                .send()
+        };
+        for user in ["a1", "a2", "a3"] {
+            let resp = post(node_a.http_addr, user).await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }
+
+        let refused = post(node_b.http_addr, "b1").await.unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = refused.json().await.unwrap();
+        assert_eq!(body["code"], "not_writer");
+        // The writer is unaffected by the refused attempt.
+        let resp = post(node_a.http_addr, "a4").await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // A clean shutdown flushes and releases the lease, so the standby takes over at once.
+        node_a.shutdown().await;
+        let resp = post(node_b.http_addr, "b1").await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let ps = node_b
+            .storage
+            .get_or_open_project("proj_lease")
+            .await
+            .unwrap();
+        let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
+        assert_eq!(rows, 5, "takeover lost or duplicated acknowledged events");
+        node_b.shutdown().await;
     }
 
     #[tokio::test]

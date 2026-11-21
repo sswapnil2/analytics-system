@@ -716,7 +716,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 
 ### P0: before production, or before a second node
 
-**P0-1. Writer lease per project.**
+**P0-1. Writer lease per project.** — In review: PR_LINK (lease with a generation number; the manifest is the fence. One `writer_leases` table on both SQLite and Postgres instead of a lock file.)
 - Problem: R-01. Evidence: A1–A3.
 - Solution: a `writer_leases(project_id, node_id, expires_at)` row in the metadata DB, taken when a project is opened for writing and renewed on a heartbeat; stop accepting writes when renewal fails; write WAL objects with `PutMode::Create` and treat "already exists" as loss of ownership. On SQLite, the lease is a lock file in the data directory.
 - Why it matters: it turns silent data loss into a refused start.
