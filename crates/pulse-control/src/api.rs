@@ -520,9 +520,12 @@ impl ControlPlaneService {
             .list_api_keys(None)
             .await
             .map_err(|e| e.to_string())?;
-        self.api_key_cache.clear();
+        // Upsert, then drop what is gone. Clearing first would 401 every ingest and flag
+        // request that looks a key up mid-reload: the cache has no DB fallback.
+        let mut live: HashSet<String> = HashSet::with_capacity(keys.len());
         for k in keys {
             if !k.revoked {
+                live.insert(k.key_hash.clone());
                 self.api_key_cache.insert(
                     k.key_hash,
                     CachedApiKey {
@@ -532,16 +535,27 @@ impl ControlPlaneService {
                 );
             }
         }
+        self.api_key_cache.retain(|hash, _| live.contains(hash));
 
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
-        self.known_projects.clear();
-        for proj in projects {
+        let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        self.known_projects
+            .retain(|id, _| live_projects.contains(id.as_str()));
+        // One project's broken catalog must not stop the others from reloading.
+        let mut first_err = None;
+        for proj in &projects {
             self.known_projects
                 .insert(proj.id.clone(), proj.org_id.clone());
-            self.refresh_project_lexicon_cache(&proj.id).await?;
-            self.refresh_project_virtual_catalog(&proj.id).await?;
+            let res = async {
+                self.refresh_project_lexicon_cache(&proj.id).await?;
+                self.refresh_project_virtual_catalog(&proj.id).await
+            }
+            .await;
+            if let Err(e) = res {
+                first_err.get_or_insert(format!("project {}: {e}", proj.id));
+            }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     /// The project's org id; 404 when the project doesn't exist.

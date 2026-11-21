@@ -286,6 +286,39 @@ async fn security_headers_middleware(
     res
 }
 
+/// Refuses ingest requests beyond the in-flight cap with `503` + `Retry-After`, which every
+/// SDK retries with backoff. Without it, requests queue on the bucket append locks with their
+/// decoded batches in memory, and latency and memory grow without bound under overload.
+async fn shed_ingest_when_saturated(
+    axum::extract::State(slots): axum::extract::State<Arc<tokio::sync::Semaphore>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(_slot) = slots.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "code": "ingest_saturated",
+                "message": "too many ingest requests in flight; retry shortly",
+            })),
+        )
+            .into_response();
+    };
+    next.run(req).await
+}
+
+/// `PULSE_INGEST_MAX_INFLIGHT`: concurrent ingest requests per node (default 256, `0` = no cap).
+/// Each can hold an 8 MiB body plus its decoded batch, so this is also the memory bound.
+fn ingest_inflight_cap() -> Option<usize> {
+    let cap = std::env::var("PULSE_INGEST_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(256);
+    (cap > 0).then_some(cap)
+}
+
 fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
     let parsed: Vec<HeaderValue> = origins
         .iter()
@@ -421,31 +454,52 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     }
     if config.role.serves_ingest() {
         // The agent trace store only flushes and compacts when asked; writers own both.
-        let agent_control = control.clone();
-        let mut agent_shutdown = shutdown_bg_rx.clone();
+        // Flush runs on its own task: acknowledged spans pile up in memory until it does, so
+        // a long compaction pass must never hold it back.
+        let flush_control = control.clone();
+        let mut flush_shutdown = shutdown_bg_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = flush_control.agent_store().flush_l0().await {
+                            tracing::warn!(error = %e, "agent L0 flush failed");
+                        }
+                    }
+                    changed = flush_shutdown.changed() => {
+                        if changed.is_err() || *flush_shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+        let agent_control = control.clone();
+        let mut agent_shutdown = shutdown_bg_rx.clone();
+        // On `all` the alerts loop above already prunes; a query node's store is read-only,
+        // so with split roles the ingest node is the only one that can delete expired segments.
+        let prunes_here = config.role == NodeRole::Ingest;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut ticks: u64 = 0;
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let store = agent_control.agent_store();
-                        if let Err(e) = store.flush_l0().await {
-                            tracing::warn!(error = %e, "agent L0 flush failed");
-                        }
-                        ticks += 1;
                         // ponytail: compaction every minute on each writer; the manifest CAS
                         // settles races between ingest nodes. Elect one compactor if that churns.
-                        if ticks % 12 == 0 {
-                            let now_ms = chrono::Utc::now().timestamp_millis();
-                            match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
-                                Ok(tombstones) => {
-                                    if let Err(e) = store.compact_and_gc(None, &tombstones).await {
-                                        tracing::warn!(error = %e, "agent compaction failed");
-                                    }
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
+                            Ok(tombstones) => {
+                                if let Err(e) = agent_control.agent_store().compact_and_gc(None, &tombstones).await {
+                                    tracing::warn!(error = %e, "agent compaction failed");
                                 }
-                                Err(e) => tracing::warn!(error = %e, "loading agent erasure tombstones failed"),
                             }
+                            Err(e) => tracing::warn!(error = %e, "loading agent erasure tombstones failed"),
+                        }
+                        ticks += 1;
+                        if prunes_here && ticks % 5 == 0 {
+                            agent_control.prune_expired_agent_data().await;
                         }
                     }
                     changed = agent_shutdown.changed() => {
@@ -484,6 +538,20 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                                 // Erasure tombstones decide which rows compaction drops.
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
                                     tracing::warn!(error = %e, "compactor failed to reload control state");
+                                }
+                                // Compaction walks open projects, and nothing else on this
+                                // role opens one.
+                                // ponytail: every project stays open on the compactor. Shard
+                                // projects across compactors when that no longer fits in RAM.
+                                match bg_control.meta().list_projects().await {
+                                    Ok(projects) => {
+                                        for p in projects {
+                                            if let Err(e) = bg_storage.get_or_open_project(&p.id).await {
+                                                tracing::warn!(project_id = %p.id, error = %e, "compactor failed to open project");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "compactor failed to list projects"),
                                 }
                                 errs.check(MaintenanceKind::Compaction, bg_storage.compact_all_projects().await);
                             }
@@ -543,9 +611,16 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                 .filter(|t| !t.trim().is_empty()),
         }));
     if config.role.serves_ingest() {
-        let ingest_public = Router::new()
+        let mut ingest_routes = Router::new()
             .merge(build_ingest_router(ingest.clone()))
-            .merge(build_agent_ingest_router(control.clone()))
+            .merge(build_agent_ingest_router(control.clone()));
+        if let Some(cap) = ingest_inflight_cap() {
+            ingest_routes = ingest_routes.layer(axum::middleware::from_fn_with_state(
+                Arc::new(tokio::sync::Semaphore::new(cap)),
+                shed_ingest_when_saturated,
+            ));
+        }
+        let ingest_public = ingest_routes
             .merge(build_public_flag_router(control.clone()))
             .layer(CorsLayer::permissive());
         api_router = api_router.merge(ingest_public);
@@ -1274,6 +1349,114 @@ mod tests {
 
         query_node.shutdown().await;
         ingest_node.shutdown().await;
+    }
+
+    /// A `compactor` node shares storage with an ingest node and must merge the segments the
+    /// ingest node flushes. It only ever looked at projects it had open, and opened none.
+    #[tokio::test]
+    async fn compactor_role_compacts_projects_written_by_an_ingest_node() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let shared = tmp_dir.path().join("shared");
+        let cfg = |role| NodeConfig {
+            role,
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_addr: None,
+            data_dir: shared.clone(),
+            web_dist_dir: tmp_dir.path().join("no_web"),
+            default_project_id: "proj_compact".to_string(),
+            default_api_key: String::new(),
+            admin_token: Some("sk_root_compactor_test_token".to_string()),
+            allowed_origins: vec![],
+            auto_seed: false,
+            num_buckets: 1,
+        };
+        let ingest_node = start_pulse_node(cfg(NodeRole::Ingest)).await.unwrap();
+        let key = ingest_node
+            .bootstrap_credentials
+            .generated_ingest_key
+            .clone()
+            .unwrap();
+        let http = reqwest::Client::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Four flushes into the same (day, bucket): enough to be due for compaction.
+        for i in 0..4 {
+            let resp = http
+                .post(format!("http://{}/v1/ingest", ingest_node.http_addr))
+                .header("x-pulse-key", &key)
+                .json(&json!({ "events": [{
+                    "distinct_id": format!("user_{i}"),
+                    "event_name": "App_Open",
+                    "client_event_ts_ms": now_ms - i,
+                }]}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            ingest_node.storage.flush_all_projects().await.unwrap();
+        }
+        let ps = ingest_node
+            .storage
+            .get_or_open_project("proj_compact")
+            .await
+            .unwrap();
+        assert_eq!(ps.snapshot().manifest.total_segments(), 4);
+
+        let compactor = start_pulse_node(cfg(NodeRole::Compactor)).await.unwrap();
+        let mut segments = 4;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ps.refresh_manifest().await.unwrap();
+            segments = ps.snapshot().manifest.total_segments();
+            if segments == 1 {
+                break;
+            }
+        }
+        assert_eq!(segments, 1, "compactor node never merged the 4 segments");
+        assert_eq!(ps.snapshot().manifest.total_l1_rows(), 4);
+
+        compactor.shutdown().await;
+        ingest_node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ingest_sheds_with_503_once_inflight_cap_is_reached() {
+        use tower::ServiceExt;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let app = Router::new()
+            .route(
+                "/v1/ingest",
+                axum::routing::post(move || {
+                    let (entered_tx, gate) = (entered_tx.clone(), gate.clone());
+                    async move {
+                        let _ = entered_tx.send(()).await;
+                        gate.notified().await;
+                        "ok"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                shed_ingest_when_saturated,
+            ));
+        let post = || {
+            axum::http::Request::post("/v1/ingest")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(post()));
+        entered_rx.recv().await.expect("first request is in flight");
+        let shed = app.clone().oneshot(post()).await.unwrap();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(shed.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+        release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        // The slot is free again.
+        release.notify_one();
+        assert_eq!(app.oneshot(post()).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -329,10 +329,15 @@ impl AgentTraceStore {
         }
         let states: Vec<Arc<ProjectAgentState>> =
             self.projects.iter().map(|e| e.value().clone()).collect();
+        // Every project gets its turn: one failing project must not leave the others'
+        // acknowledged spans in memory. The first error is still reported.
+        let mut first_err = None;
         for state in states {
-            self.flush_project_l0(&state, force_all).await?;
+            if let Err(e) = self.flush_project_l0(&state, force_all).await {
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     async fn flush_project_l0(

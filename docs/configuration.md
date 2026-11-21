@@ -49,6 +49,7 @@
 | Env var | Default | Meaning |
 |---|---|---|
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
+| `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |
 
 ## Queries
