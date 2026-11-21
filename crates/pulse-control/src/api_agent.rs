@@ -3084,12 +3084,16 @@ impl ControlPlaneService {
                 _ => None,
             };
 
-            rule.last_evaluated_ms = Some(now_ms);
-            let Some(observed) = observed_opt.filter(|v| v.is_finite()) else {
-                let _ = self.meta().upsert_agent_alert_rule(&rule).await;
+            // Evaluation bookkeeping never writes `state`: the transitions below are conditional
+            // updates, so with several nodes only the one that wins the claim delivers.
+            let observed_opt = observed_opt.filter(|v| v.is_finite());
+            self.meta()
+                .record_agent_alert_evaluation(&rule.id, now_ms, observed_opt)
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(observed) = observed_opt else {
                 continue;
             };
-            rule.last_value = Some(observed);
 
             let condition_met = alert_condition_met(&rule.operator, observed, rule.threshold);
             let in_cooldown = rule.last_triggered_ms.is_some_and(|t| {
@@ -3097,7 +3101,14 @@ impl ControlPlaneService {
             });
 
             if condition_met {
-                if rule.state != "firing" && !in_cooldown {
+                if rule.state != "firing"
+                    && !in_cooldown
+                    && self
+                        .meta()
+                        .claim_agent_alert_transition(&rule.id, &rule.state, "firing", now_ms)
+                        .await
+                        .map_err(CtrlError::meta)?
+                {
                     rule.state = "firing".to_string();
                     rule.last_triggered_ms = Some(now_ms);
                     let (delivered, delivery_error) = self
@@ -3122,7 +3133,13 @@ impl ControlPlaneService {
                         .map_err(CtrlError::meta)?;
                     emitted_events.push(ev);
                 }
-            } else if rule.state == "firing" {
+            } else if rule.state == "firing"
+                && self
+                    .meta()
+                    .claim_agent_alert_transition(&rule.id, "firing", "ok", now_ms)
+                    .await
+                    .map_err(CtrlError::meta)?
+            {
                 rule.state = "ok".to_string();
                 rule.last_resolved_ms = Some(now_ms);
                 let (delivered, delivery_error) = self
@@ -3147,11 +3164,6 @@ impl ControlPlaneService {
                     .map_err(CtrlError::meta)?;
                 emitted_events.push(ev);
             }
-
-            self.meta()
-                .upsert_agent_alert_rule(&rule)
-                .await
-                .map_err(CtrlError::meta)?;
         }
 
         Ok((evaluated, emitted_events))
@@ -3303,7 +3315,13 @@ mod tests {
 
     async fn make_test_ctrl() -> (TempDir, Arc<ControlPlaneService>) {
         let dir = TempDir::new().unwrap();
-        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        let ctrl = make_test_ctrl_at(dir.path(), "agent_cache").await;
+        (dir, ctrl)
+    }
+
+    /// A node with its own object store whose metadata DB lives in `dir`.
+    async fn make_test_ctrl_at(dir: &std::path::Path, cache: &str) -> Arc<ControlPlaneService> {
+        let meta = MetaStore::connect_auto(dir).await.unwrap();
         let raw_store = build_from_url("memory://").unwrap();
         let enc_store = Arc::new(EncryptedObjectStore::new(raw_store));
         let id_router = Arc::new(IdentityRouter::new(enc_store.as_object_store()));
@@ -3320,20 +3338,89 @@ mod tests {
         let qengine = QueryEngine::new(storage, 4 * 1024 * 1024, None, 0, CatalogRegistry::new())
             .await
             .unwrap();
-        let ctrl = ControlPlaneService::new_with_admin_with_agent_config(
+        ControlPlaneService::new_with_admin_with_agent_config(
             meta,
             qengine,
             "proj_default",
             TEST_INGEST_KEY,
             Some(TEST_ADMIN_TOKEN.to_string()),
             AgentTraceStoreConfig {
-                cache_dir: Some(dir.path().join("agent_cache")),
+                cache_dir: Some(dir.join(cache)),
                 ..Default::default()
             },
         )
         .await
-        .unwrap();
-        (dir, ctrl)
+        .unwrap()
+    }
+
+    /// Scalability review R-05: two nodes share the metadata DB and both see a failing trace.
+    /// The state transition is the claim, so only one records and delivers the trigger.
+    #[tokio::test]
+    async fn two_nodes_emit_one_agent_alert_event_per_transition() {
+        let dir = TempDir::new().unwrap();
+        let a = make_test_ctrl_at(dir.path(), "cache_a").await;
+        let b = make_test_ctrl_at(dir.path(), "cache_b").await;
+        let now_ms = Utc::now().timestamp_millis();
+        a.meta()
+            .upsert_agent_alert_rule(&AgentAlertRule {
+                id: "rule_claim".to_string(),
+                project_id: "proj_default".to_string(),
+                name: "High Failure Rate".to_string(),
+                agent_name: None,
+                environment: None,
+                metric: "failure_rate".to_string(),
+                operator: "gt".to_string(),
+                threshold: 0.2,
+                window_minutes: 60,
+                cooldown_minutes: 10,
+                enabled: true,
+                state: "ok".to_string(),
+                webhook_url: None,
+                last_evaluated_ms: None,
+                last_triggered_ms: None,
+                last_resolved_ms: None,
+                last_value: None,
+                created_at_ms: now_ms,
+            })
+            .await
+            .unwrap();
+        for ctrl in [&a, &b] {
+            let trace: AgentTrace = serde_json::from_value(json!({
+                "trace_id": "tr_fail_1", "project_id": "proj_default", "agent_name": "bot",
+                "agent_version": "1.0.0", "environment": "production", "status": "error",
+                "start_ts_ms": now_ms - 500, "end_ts_ms": now_ms - 400, "duration_ms": 100,
+            }))
+            .unwrap();
+            ctrl.agent_store()
+                .ingest_batch(
+                    "proj_default",
+                    TraceIngestBatch {
+                        traces: vec![trace],
+                        spans: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let (ra, rb) = tokio::join!(
+            a.evaluate_agent_alerts_for_project("proj_default", None),
+            b.evaluate_agent_alerts_for_project("proj_default", None),
+        );
+        assert_eq!(ra.unwrap().1.len() + rb.unwrap().1.len(), 1);
+        let events = a
+            .meta()
+            .list_agent_alert_events("proj_default", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "one triggered event row, not one per node");
+        let rule = a
+            .meta()
+            .get_agent_alert_rule("proj_default", "rule_claim")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule.state, "firing");
     }
 
     #[tokio::test]
