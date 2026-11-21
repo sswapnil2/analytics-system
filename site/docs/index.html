@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse Docs</title>
+<meta name="description" content="Pulse documentation: getting started, architecture, how Pulse works internally, API reference, SDKs, security and limitations.">
+<meta name="theme-color" content="#09090B">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#09090B;--bg2:#141418;--card:#0E0E11;--ink:#EDEDEF;--ink2:#B4B4BB;--ink3:#8A8A93;--line:#1F1F25;--line2:#34343C;--ac:#C8F04A;--acs:#262E12;--am:#F2B544}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-padding-top:80px;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.65 'Instrument Sans',system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+code,pre,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+a{color:var(--ac);text-underline-offset:3px}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px;border-radius:4px}
+.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;height:60px;padding:0 20px;background:rgba(9,9,11,.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:17px;color:var(--ink);text-decoration:none;white-space:nowrap}
+.logo small{font:500 11px ui-monospace,monospace;color:var(--ink3);letter-spacing:.08em;text-transform:uppercase}
+.search{position:relative;flex:1;max-width:420px;margin-left:auto}
+.search input{width:100%;height:38px;padding:0 12px;border-radius:9px;border:1px solid var(--line2);background:var(--card);color:var(--ink);font:inherit;font-size:14px}
+.results{position:absolute;top:44px;left:0;right:0;max-height:60vh;overflow:auto;background:var(--card);border:1px solid var(--line2);border-radius:10px;padding:6px;display:none}
+.results.on{display:block}
+.results a{display:block;padding:8px 10px;border-radius:7px;color:var(--ink);text-decoration:none;font-size:14px}
+.results a:hover,.results a:focus{background:var(--bg2)}
+.results small{display:block;color:var(--ink3);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gh{color:var(--ink2);font-size:14px;text-decoration:none;white-space:nowrap}
+.menu{display:none;background:var(--card);border:1px solid var(--line2);color:var(--ink);border-radius:8px;height:38px;padding:0 12px;font:inherit;font-size:14px}
+.layout{display:grid;grid-template-columns:260px minmax(0,1fr);max-width:1320px;margin:0 auto}
+nav.side{position:sticky;top:60px;align-self:start;height:calc(100vh - 60px);overflow:auto;padding:20px 12px 40px 20px;border-right:1px solid var(--line)}
+.side h4{margin:18px 0 6px;padding:0 10px;font:500 11px ui-monospace,monospace;letter-spacing:.09em;text-transform:uppercase;color:var(--ink3)}
+.side h4:first-child{margin-top:0}
+.side a{display:block;padding:5px 10px;border-radius:7px;color:var(--ink2);text-decoration:none;font-size:14px}
+.side a:hover{background:var(--bg2);color:var(--ink)}
+.side a.on{background:var(--acs);color:var(--ac)}
+main{padding:32px clamp(16px,4vw,56px) 80px;min-width:0}
+article{max-width:860px}
+article h1{font-size:clamp(30px,4vw,40px);line-height:1.1;letter-spacing:-.035em;margin:0 0 18px}
+article h2{font-size:24px;letter-spacing:-.02em;margin:44px 0 12px;padding-top:12px;border-top:1px solid var(--line)}
+article h3{font-size:18px;margin:30px 0 8px}
+article h4{font-size:16px;margin:24px 0 6px}
+article p,article li{color:var(--ink2)}
+article strong{color:var(--ink)}
+article :not(pre)>code{background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:.88em;color:var(--ink);overflow-wrap:anywhere}
+article pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;font-size:13.5px;line-height:1.55;position:relative}
+article pre code{color:var(--ink)}
+.copy{position:absolute;top:8px;right:8px;background:var(--bg2);border:1px solid var(--line2);color:var(--ink2);border-radius:6px;font:inherit;font-size:12px;padding:3px 8px;cursor:pointer;opacity:.8}
+.copy:hover{opacity:1}
+.tw{overflow-x:auto;margin:16px 0;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink);background:var(--bg2);font-weight:600}
+td{color:var(--ink2)}
+tr:last-child td{border-bottom:0}
+blockquote{margin:16px 0;padding:10px 16px;border-left:3px solid var(--am);background:var(--bg2);border-radius:0 8px 8px 0}
+blockquote p{margin:6px 0}
+pre.mermaid{background:#0C0C0F;text-align:center;padding:20px}
+hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+.pager{display:flex;justify-content:space-between;gap:12px;margin-top:56px;padding-top:20px;border-top:1px solid var(--line);font-size:14px}
+.pager a{text-decoration:none}
+.edit{margin-top:28px;font-size:13px;color:var(--ink3)}
+.edit a{color:var(--ink3)}
+@media (max-width:900px){
+ .layout{grid-template-columns:1fr}
+ nav.side{display:none;position:fixed;top:60px;left:0;right:0;bottom:0;height:auto;background:var(--bg);z-index:15;border-right:0}
+ body.nav-open nav.side{display:block}
+ .menu{display:block}
+ .gh{display:none}
+ .logo small{display:none}
+}
+</style>
+</head>
+<body>
+<header class="top">
+ <button class="menu" id="menu" aria-expanded="false" aria-controls="side">Menu</button>
+ <a class="logo" href="../"><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect x=".5" y=".5" width="31" height="31" rx="7.5" fill="#141418" stroke="#2A2A31"/><polyline points="4,17 10,17 13,8 18,25 21,14 28,14" fill="none" stroke="#C8F04A" stroke-width="3"/></svg>Pulse <small>Docs</small></a>
+ <div class="search"><input id="q" type="search" placeholder="Search docs" aria-label="Search docs" autocomplete="off"><div class="results" id="results" role="listbox"></div></div>
+ <a class="gh" href="https://github.com/sswapnil2/analytics-system">GitHub</a>
+</header>
+<div class="layout">
+ <nav class="side" id="side" aria-label="Documentation"></nav>
+ <main><article id="doc"><p>Loading…</p></article><div class="pager" id="pager"></div><p class="edit" id="edit"></p></main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+// Navigation. Pages are the Markdown files in the repo's docs/ folder, copied to ./md/ at deploy time.
+const NAV = [
+ ["Start here", [["README","Introduction"],["concepts","Concepts"],["quickstart","Quickstart"],["agent-setup","Set up with an AI agent"],["troubleshooting","Troubleshooting"]]],
+ ["Integrate", [["integrations","Integrations overview"],["web-sdk","Web SDK"],["mobile-core","Mobile core (beta)"],["mcp","MCP for agents"]]],
+ ["Reference", [["rest-api","REST API"],["configuration","Configuration"]]],
+ ["Architecture", [["architecture","System architecture"],["how-it-works","How Pulse works"],["data-model","Data model"],["security-privacy","Security & privacy"],["adr/README","Design decisions (ADRs)"]]],
+ ["Operate", [["self-hosting-cloud","Self-hosting in the cloud"],["limitations","Limitations"]]],
+ ["Contribute", [["contributing","Contributing"],["docs-status","Docs status & roadmap"]]],
+];
+const FLAT = NAV.flatMap(([, items]) => items);
+const REPO = "https://github.com/sswapnil2/analytics-system/blob/main/";
+const page = (new URLSearchParams(location.search).get("p") || "README").replace(/[^\w\-\/]/g, "");
+const dir = page.includes("/") ? page.slice(0, page.lastIndexOf("/") + 1) : "";
+
+// Side nav
+document.getElementById("side").innerHTML = NAV.map(([h, items]) =>
+ `<h4>${h}</h4>` + items.map(([p, t]) => `<a href="?p=${p}"${p === page ? ' class="on" aria-current="page"' : ""}>${t}</a>`).join("")).join("");
+const menu = document.getElementById("menu");
+menu.onclick = () => menu.setAttribute("aria-expanded", document.body.classList.toggle("nav-open"));
+
+// GitHub-compatible heading slugs, so #anchors in the Markdown work here and on GitHub.
+const slug = s => s.toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\w\- ]+/g, "").replace(/ /g, "-");
+// Resolve a relative path against the current page's folder (docs/ is the root).
+function resolve(href) {
+ const parts = (dir + href).split("/"), out = [];
+ for (const p of parts) p === ".." ? (out.length && !out[out.length - 1].startsWith("..") ? out.pop() : out.push("..")) : p !== "." && out.push(p);
+ return out.join("/");
+}
+const renderer = {
+ heading(text, level) { return `<h${level} id="${slug(text)}">${text}</h${level}>`; },
+ code(code, lang) {
+  if (lang === "mermaid") return `<pre class="mermaid">${code.replace(/</g, "&lt;")}</pre>`;
+  return `<pre><code>${code.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</code></pre>`;
+ },
+ table(header, body) { return `<div class="tw"><table><thead>${header}</thead><tbody>${body}</tbody></table></div>`; },
+ link(href, title, text) {
+  if (href && !/^([a-z]+:|#|\/)/i.test(href)) {
+   const [path, hash] = href.split("#");
+   const r = resolve(path);
+   if (r.startsWith("..")) href = REPO + r.replace(/^(\.\.\/)+/, "") + (hash ? "#" + hash : "");
+   else if (r.endsWith(".md")) href = "?p=" + r.slice(0, -3) + (hash ? "#" + hash : "");
+   else href = REPO + "docs/" + r;
+  }
+  return `<a href="${href}"${title ? ` title="${title}"` : ""}>${text}</a>`;
+ },
+};
+marked.use({ renderer, gfm: true });
+mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict",
+ themeVariables: { background: "#0C0C0F", primaryColor: "#1A1C24", primaryBorderColor: "#C8F04A", primaryTextColor: "#EDEDEF", lineColor: "#8A8A93", fontFamily: "Instrument Sans, system-ui, sans-serif" } });
+
+async function load() {
+ const doc = document.getElementById("doc");
+ const res = await fetch(`md/${page}.md`);
+ if (!res.ok) { doc.innerHTML = `<h1>Page not found</h1><p>No page named <code>${page}</code>. <a href="?p=README">Go to the introduction</a>.</p>`; return; }
+ doc.innerHTML = marked.parse(await res.text());
+ document.title = (doc.querySelector("h1")?.textContent || "Pulse") + " · Pulse Docs";
+ doc.querySelectorAll("pre:not(.mermaid)").forEach(pre => {
+  const b = document.createElement("button"); b.className = "copy"; b.textContent = "Copy";
+  b.onclick = () => navigator.clipboard.writeText(pre.innerText.replace(/Copy$/, "")).then(() => (b.textContent = "Copied"));
+  pre.appendChild(b);
+ });
+ await mermaid.run({ querySelector: "pre.mermaid" });
+ if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
+ const i = FLAT.findIndex(([p]) => p === page);
+ const prev = FLAT[i - 1], next = FLAT[i + 1];
+ document.getElementById("pager").innerHTML = (i < 0 ? "" : (prev ? `<a href="?p=${prev[0]}">← ${prev[1]}</a>` : "<span></span>") + (next ? `<a href="?p=${next[0]}">${next[1]} →</a>` : ""));
+ document.getElementById("edit").innerHTML = `<a href="${REPO}docs/${page}.md">Edit this page on GitHub</a>`;
+}
+load();
+
+// Search: fetch every page once, on first focus, and match lines. ponytail: linear scan; ~20 pages is nothing.
+let index = null;
+const q = document.getElementById("q"), results = document.getElementById("results");
+q.addEventListener("focus", async () => {
+ index ??= await Promise.all(FLAT.map(async ([p, t]) => ({ p, t, text: await fetch(`md/${p}.md`).then(r => r.ok ? r.text() : "").catch(() => "") })));
+});
+q.addEventListener("input", () => {
+ const term = q.value.trim().toLowerCase();
+ if (!index || term.length < 2) { results.classList.remove("on"); return; }
+ const hits = [];
+ for (const { p, t, text } of index) {
+  const lines = text.split("\n");
+  let heading = "";
+  for (const line of lines) {
+   if (/^#{1,4} /.test(line)) heading = line.replace(/^#+ /, "");
+   if (line.toLowerCase().includes(term)) {
+    hits.push({ p, t, heading, line: line.replace(/[#*`|]/g, " ").trim() });
+    if (hits.filter(h => h.p === p).length >= 3) break;
+   }
+  }
+ }
+ results.innerHTML = hits.slice(0, 30).map(h => `<a href="?p=${h.p}${h.heading ? "#" + slug(h.heading) : ""}">${h.t}${h.heading ? " › " + h.heading.replace(/</g, "&lt;") : ""}<small>${h.line.replace(/</g, "&lt;").slice(0, 140)}</small></a>`).join("") || `<a>No results</a>`;
+ results.classList.add("on");
+});
+q.addEventListener("keydown", e => { if (e.key === "Escape") { q.value = ""; results.classList.remove("on"); } });
+document.addEventListener("click", e => { if (!e.target.closest(".search")) results.classList.remove("on"); });
+document.addEventListener("keydown", e => { if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); } });
+</script>
+</body>
+</html>

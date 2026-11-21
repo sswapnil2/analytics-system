@@ -11,6 +11,10 @@ Single-binary product analytics, session wireframe replay, feature flags, and ex
 
 ## Documentation
 
+Browse it at **[sswapnil2.github.io/analytics-system/docs](https://sswapnil2.github.io/analytics-system/docs/)**, or read the Markdown in [`docs/`](docs/README.md):
+
+- [Concepts](docs/concepts.md), [architecture](docs/architecture.md), [how Pulse works](docs/how-it-works.md), [data model](docs/data-model.md) and [design decisions](docs/adr/README.md)
+- [Security & privacy](docs/security-privacy.md), [configuration](docs/configuration.md), [troubleshooting](docs/troubleshooting.md) and [limitations](docs/limitations.md)
 - [Quickstart](docs/quickstart.md): build, run, admin token and ingest keys
 - [Web SDK](docs/web-sdk.md) and [mobile core (beta)](docs/mobile-core.md)
 - [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude, Cursor, OpenAI Codex and Responses API, Gemini CLI, Antigravity)

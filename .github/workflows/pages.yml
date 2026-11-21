@@ -3,7 +3,7 @@ name: Deploy site to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/pages.yml"]
+    paths: ["site/**", "docs/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # The docs viewer (site/docs/index.html) renders the Markdown in docs/ as-is.
+      - run: mkdir -p site/docs/md && cp -r docs/*.md docs/adr site/docs/md/
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
