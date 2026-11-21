@@ -9,7 +9,8 @@ pub use batch::{
     DEFAULT_DICT_ID, FLAG_DICT_ZSTD, FLAG_RAW_ZSTD, MAX_DECOMPRESSED_BYTES, WIRE_VERSION,
 };
 pub use bucketing::{
-    cohort_member_hash, evaluate_flag_rule, flag_rollout_slot, flag_variant_slot, CohortGate,
+    cohort_member_hash, evaluate_flag_rule, evaluate_placed_flag_rule, flag_rollout_slot,
+    flag_variant_slot, holdout_slot, layer_slot, CohortGate, HoldoutGate, LayerGate, Placement,
 };
 pub use error::{sanitize_json_error_message, Result, WireError};
 pub use event::{PropValue, WireEvent};

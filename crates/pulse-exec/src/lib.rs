@@ -3,6 +3,7 @@ pub mod budget;
 pub mod cache;
 pub mod catalog;
 pub mod engine;
+pub mod experiment;
 pub mod flows;
 pub mod funnel;
 pub mod insights;
@@ -16,6 +17,10 @@ pub use catalog::{
     CustomEventDef, CustomPropertyDef, LookupTableDef, VirtualCatalog,
 };
 pub use engine::{ExportedEventRow, QueryEngine};
+pub use experiment::{
+    ExperimentDailyPoint, ExperimentEngine, ExperimentMetricEvent, ExperimentMetricQuery,
+    ExperimentMetricResult, ExperimentSegmentGroup, MetricMoments, MetricSequence, MetricValue,
+};
 pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;
 pub use insights::{eval_math_expr, InsightsEngine};

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -47,17 +47,20 @@ use crate::agent_eval_worker::{
 
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
 use crate::db::{MetaError, MetaStore};
-use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
+use crate::experiments::{
+    build_edge_flag_bundle_with_cohorts, evaluate_bandit_results, evaluate_experiment_results,
+};
 use crate::mcp::JsonRpcRequest;
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
-    unseal_byok_config_json, unseal_secret, AlertRule, Annotation, ApiKeyRecord,
-    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
+    BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
-    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
+    FlagHoldout, FlagLayer, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization,
+    Project, Role, SavedMetric, SavedReport, StagedRollout, SystemKeyringRecord, TrafficGroup,
+    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
     KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
@@ -180,6 +183,17 @@ pub struct ControlPlaneService {
     auth_state: auth::AuthState,
     /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// Per project: the edge flag bundle, keyed by the flags' latest `updated_at_ms` and count.
+    /// SDKs poll it, and building it evaluates targeting cohorts.
+    flag_bundle_cache: DashMap<
+        String,
+        (
+            i64,
+            usize,
+            std::time::Instant,
+            Arc<crate::models::EdgeFlagBundle>,
+        ),
+    >,
     agent_rate_limit: RateLimiter,
 }
 
@@ -311,6 +325,7 @@ impl ControlPlaneService {
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
             outbox_path: parking_lot::RwLock::new(None),
+            flag_bundle_cache: DashMap::new(),
             agent_rate_limit: RateLimiter::from_env(),
         });
 
@@ -1634,6 +1649,34 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/experiments/:exp_id/results",
             get(handle_experiment_results_scoped),
+        )
+        .route(
+            "/v1/projects/:id/holdouts",
+            get(handle_list_holdouts).post(handle_create_holdout),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id/results",
+            post(handle_holdout_results),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics",
+            get(handle_list_saved_metrics).post(handle_create_saved_metric),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics/:metric_id",
+            axum::routing::delete(handle_delete_saved_metric),
+        )
+        .route(
+            "/v1/projects/:id/layers",
+            get(handle_list_layers).post(handle_create_layer),
+        )
+        .route(
+            "/v1/projects/:id/layers/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
         )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
@@ -3595,8 +3638,23 @@ async fn handle_upsert_flag(
         }
     }
 
+    let actor = principal.actor_label();
+    let flag_id = format!("flg_{}_{}", id, req.key);
+    // Re-saving a flag keeps its holdout and layer slice; those change through their own routes.
+    let existing = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == flag_id);
+    if existing.is_some() {
+        ensure_flag_unlocked(&ctrl, &id, &req.key).await?;
+    }
     let flag = FeatureFlag {
-        id: format!("flg_{}_{}", id, req.key),
+        holdout: existing.as_ref().and_then(|f| f.holdout.clone()),
+        layer: existing.and_then(|f| f.layer),
+        id: flag_id,
         project_id: id,
         key: req.key,
         description: req.description,
@@ -3610,6 +3668,13 @@ async fn handle_upsert_flag(
         .upsert_feature_flag(&flag)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &actor,
+        "flag.saved",
+        &format!("project:{}", flag.project_id),
+        json!({ "flag_key": flag.key, "enabled": flag.enabled, "rollout_pct": flag.rollout_pct, "variants": flag.variants }),
+    )
+    .await;
     Ok(Json(flag))
 }
 
@@ -3622,6 +3687,11 @@ struct PatchFlagReq {
     targeting_cohort_id: Option<String>,
     /// Replaces the variant split (e.g. shipping the winner at 10000 bps).
     variants: Option<Vec<VariantAllocation>>,
+    /// A holdout id to attach, or `""` to detach.
+    holdout_id: Option<String>,
+    /// Only `""`: leave the layer (e.g. when shipping to everyone). Joining one goes through an
+    /// experiment's `layer`, which picks a free slice.
+    layer_id: Option<String>,
 }
 
 async fn handle_patch_flag(
@@ -3642,6 +3712,15 @@ async fn handle_patch_flag(
     else {
         return Err(CtrlError::not_found("flag not found"));
     };
+    let changes_serving = req.enabled.is_some()
+        || req.rollout_pct.is_some()
+        || req.targeting_cohort_id.is_some()
+        || req.variants.is_some()
+        || req.holdout_id.is_some()
+        || req.layer_id.is_some();
+    if changes_serving {
+        ensure_flag_unlocked(&ctrl, &id, &found.key).await?;
+    }
     if let Some(en) = req.enabled {
         found.enabled = en;
     }
@@ -3673,13 +3752,479 @@ async fn handle_patch_flag(
         }
         found.variants = variants;
     }
+    if let Some(hid) = req.holdout_id {
+        found.holdout = if hid.is_empty() {
+            None
+        } else {
+            let groups = ctrl
+                .meta
+                .list_traffic_groups(&id, "holdout")
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(h) = groups.into_iter().find(|g| g.id == hid) else {
+                return Err(CtrlError::bad(format!("holdout '{hid}' does not exist")));
+            };
+            Some(FlagHoldout {
+                id: h.id,
+                bps: h.bps,
+            })
+        };
+    }
+    match req.layer_id.as_deref() {
+        None => {}
+        Some("") => found.layer = None,
+        Some(_) => {
+            return Err(CtrlError::bad(
+                "join a layer by starting an experiment with `layer`, which picks a free slice",
+            ))
+        }
+    }
+    if found.enabled {
+        if let Some(l) = &found.layer {
+            let taken = layer_slices(&ctrl, &id, &l.id, &found.id).await?;
+            if taken
+                .iter()
+                .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+            {
+                return Err(CtrlError::conflict(format!(
+                    "another live flag now uses this flag's slice of layer '{}'; start a new experiment on it to get a free slice",
+                    l.id
+                )));
+            }
+        }
+    }
     found.updated_at_ms = Utc::now().timestamp_millis();
     ctrl.meta
         .upsert_feature_flag(&found)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "flag.updated",
+        &format!("project:{id}"),
+        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants, "holdout": found.holdout, "layer": found.layer }),
+    )
+    .await;
     Ok(Json(found))
 }
+
+/// `(start_bps, end_bps, flag_key)` held by the enabled flags in `layer_id` other than
+/// `except_flag_id`, sorted. A disabled flag serves no one, so its slice is free to reuse.
+async fn layer_slices(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    layer_id: &str,
+    except_flag_id: &str,
+) -> Result<Vec<(u32, u32, String)>, CtrlError> {
+    let mut taken: Vec<(u32, u32, String)> = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .filter(|f| f.enabled && f.id != except_flag_id)
+        .filter_map(|f| {
+            f.layer
+                .filter(|l| l.id == layer_id)
+                .map(|l| (l.start_bps, l.end_bps, f.key))
+        })
+        .collect();
+    taken.sort();
+    Ok(taken)
+}
+
+/// The first gap of at least `need` bps between sorted `taken` slices.
+fn first_free_slice(taken: &[(u32, u32, String)], need: u32) -> Option<(u32, u32)> {
+    let mut cursor = 0u32;
+    for (s, e, _) in taken {
+        if s.saturating_sub(cursor) >= need {
+            break;
+        }
+        cursor = cursor.max(*e);
+    }
+    (10_000u32.saturating_sub(cursor) >= need).then(|| (cursor, cursor + need))
+}
+
+async fn handle_list_saved_metrics(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<SavedMetric>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(
+        ctrl.meta
+            .list_saved_metrics(&id)
+            .await
+            .map_err(CtrlError::meta)?,
+    ))
+}
+
+const MAX_SAVED_METRICS: usize = 200;
+
+/// Saves `spec` under `name` (unique per project, ignoring case) for reuse in experiments.
+async fn handle_create_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut spec): Json<ExperimentMetricSpec>,
+) -> ApiRes<SavedMetric> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let name = spec.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    spec.name = name.clone();
+    // Auto-stop belongs to an experiment's guardrail, not to the definition.
+    spec.auto_stop = false;
+    crate::experiments::validate_metric_spec(&spec).map_err(CtrlError::bad)?;
+    let existing = ctrl
+        .meta
+        .list_saved_metrics(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    if existing.len() >= MAX_SAVED_METRICS {
+        return Err(CtrlError::bad(format!(
+            "a project can save at most {MAX_SAVED_METRICS} metrics; delete one first"
+        )));
+    }
+    if existing
+        .iter()
+        .any(|m| m.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(CtrlError::conflict(format!(
+            "a metric named '{name}' already exists"
+        )));
+    }
+    let m = SavedMetric {
+        id: format!("met_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id.clone(),
+        name,
+        spec,
+        created_by: ctrl.principal_label(&principal).await?,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .insert_saved_metric(&m)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.created",
+        &format!("project:{id}"),
+        json!({ "id": m.id, "name": m.name }),
+    )
+    .await;
+    Ok(Json(m))
+}
+
+/// Experiments keep their own copy of a metric, so deleting a saved one changes none of them.
+async fn handle_delete_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, metric_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_saved_metric(&id, &metric_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{metric_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.deleted",
+        &format!("project:{id}"),
+        json!({ "id": metric_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": metric_id })))
+}
+
+#[derive(Deserialize)]
+struct CreateTrafficGroupReq {
+    name: String,
+    /// Holdouts: the share of users held back, `0 < pct <= 50`.
+    #[serde(default)]
+    holdout_pct: f64,
+}
+
+async fn create_traffic_group(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+    req: CreateTrafficGroupReq,
+) -> ApiRes<TrafficGroup> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    let bps = if kind == "holdout" {
+        if !(req.holdout_pct > 0.0 && req.holdout_pct <= 50.0) {
+            return Err(CtrlError::bad("holdout_pct must be above 0 and at most 50"));
+        }
+        (req.holdout_pct * 100.0).round() as u32
+    } else {
+        0
+    };
+    let g = TrafficGroup {
+        id: format!(
+            "{}_{}",
+            &kind[..3],
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        project_id: project_id.to_string(),
+        kind: kind.to_string(),
+        name: name.to_string(),
+        bps,
+        created_at_ms: Utc::now().timestamp_millis(),
+        metric_event: None,
+    };
+    ctrl.meta
+        .insert_traffic_group(&g)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        &format!("{kind}.created"),
+        &format!("project:{project_id}"),
+        json!({ "id": g.id, "name": g.name, "bps": g.bps }),
+    )
+    .await;
+    Ok(Json(g))
+}
+
+/// A group plus the flags in it (holdouts: attached flags; layers: each flag's slice).
+async fn list_traffic_groups_with_flags(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+) -> ApiRes<Vec<Value>> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let groups = ctrl
+        .meta
+        .list_traffic_groups(project_id, kind)
+        .await
+        .map_err(CtrlError::meta)?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let out = groups
+        .into_iter()
+        .map(|g| {
+            let members: Vec<Value> = flags
+                .iter()
+                .filter_map(|f| match kind {
+                    "holdout" => f.holdout.as_ref().filter(|h| h.id == g.id).map(|_| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled })
+                    }),
+                    _ => f.layer.as_ref().filter(|l| l.id == g.id).map(|l| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled, "start_bps": l.start_bps, "end_bps": l.end_bps })
+                    }),
+                })
+                .collect();
+            let used: u32 = flags
+                .iter()
+                .filter(|f| f.enabled)
+                .filter_map(|f| f.layer.as_ref().filter(|l| l.id == g.id))
+                .map(|l| l.end_bps - l.start_bps)
+                .sum();
+            let mut v = serde_json::to_value(&g).unwrap_or_default();
+            v["flags"] = json!(members);
+            if kind == "layer" {
+                v["free_bps"] = json!(10_000u32.saturating_sub(used));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn handle_list_holdouts(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "holdout").await
+}
+
+async fn handle_list_layers(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "layer").await
+}
+
+async fn handle_create_holdout(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "holdout", req).await
+}
+
+async fn handle_create_layer(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "layer", req).await
+}
+
+/// Deletes a holdout or layer no flag uses (409 otherwise).
+async fn handle_delete_traffic_group(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let users: Vec<&str> = flags
+        .iter()
+        .filter(|f| {
+            f.holdout.as_ref().is_some_and(|h| h.id == group_id)
+                || f.layer.as_ref().is_some_and(|l| l.id == group_id)
+        })
+        .map(|f| f.key.as_str())
+        .collect();
+    if !users.is_empty() {
+        return Err(CtrlError::conflict(format!(
+            "still used by {}; detach those flags first",
+            users.join(", ")
+        )));
+    }
+    if !ctrl
+        .meta
+        .delete_traffic_group(&id, &group_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{group_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "traffic_group.deleted",
+        &format!("project:{id}"),
+        json!({ "id": group_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": group_id })))
+}
+
+#[derive(Deserialize)]
+struct HoldoutResultsReq {
+    metric: ExperimentMetricSpec,
+    /// Defaults to when the holdout was created.
+    start_ts_ms: Option<i64>,
+    /// Defaults to now.
+    end_ts_ms: Option<i64>,
+}
+
+/// Users who reached any flag in the holdout ("exposed") against those held back ("holdout"),
+/// from `$holdout_assigned`: the combined effect of every attached flag.
+async fn handle_holdout_results(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+    Json(req): Json<HoldoutResultsReq>,
+) -> ApiRes<ExperimentResults> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    crate::experiments::validate_metric_spec(&req.metric).map_err(CtrlError::bad)?;
+    let Some(h) = ctrl
+        .meta
+        .list_traffic_groups(&id, "holdout")
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|g| g.id == group_id)
+    else {
+        return Err(CtrlError::not_found(format!(
+            "holdout '{group_id}' not found"
+        )));
+    };
+    // Remember the impact metric, so the holdout reopens on it.
+    if h.metric_event.as_deref() != Some(req.metric.event_name.as_str()) {
+        ctrl.meta
+            .set_traffic_group_metric(&id, &h.id, &req.metric.event_name)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    let now = Utc::now().timestamp_millis();
+    let exp = Experiment {
+        id: h.id.clone(),
+        project_id: id.clone(),
+        name: h.name.clone(),
+        flag_id: h.id.clone(),
+        flag_key: h.id.clone(),
+        hypothesis: String::new(),
+        status: "running".to_string(),
+        start_ts_ms: req.start_ts_ms.unwrap_or(h.created_at_ms),
+        end_ts_ms: req.end_ts_ms.unwrap_or(now),
+        primary_metric: req.metric,
+        guardrail_metrics: Vec::new(),
+        secondary_metrics: Vec::new(),
+        created_by: String::new(),
+        problem: String::new(),
+        owner: String::new(),
+        notify: false,
+        // A holdout is read whenever someone looks, so its results must stay valid under peeking.
+        analysis: AnalysisConfig {
+            sequential: true,
+            ..AnalysisConfig::default()
+        },
+        created_at_ms: h.created_at_ms,
+        stop_reason: None,
+        pause_reason: None,
+        kind: "holdout".to_string(),
+        bandit: None,
+        decision: None,
+    };
+    let groups = FeatureFlag {
+        id: h.id.clone(),
+        project_id: id,
+        key: h.id,
+        description: String::new(),
+        enabled: true,
+        rollout_pct: 100.0,
+        targeting_cohort_id: None,
+        variants: vec![
+            VariantAllocation {
+                key: "holdout".to_string(),
+                weight_bps: h.bps,
+                payload: Value::Null,
+            },
+            VariantAllocation {
+                key: "exposed".to_string(),
+                weight_bps: 10_000 - h.bps,
+                payload: Value::Null,
+            },
+        ],
+        updated_at_ms: now,
+        holdout: None,
+        layer: None,
+    };
+    let results =
+        crate::experiments::evaluate_experiment_results(&exp, Some(&groups), &ctrl.qengine, None)
+            .await
+            .map_err(CtrlError::internal)?;
+    Ok(Json(results))
+}
+
+/// How long a built flag bundle is reused when no flag changed; cohort membership can still move.
+const FLAG_BUNDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn handle_edge_flag_bundle(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3694,30 +4239,51 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    let bundle = build_edge_flag_bundle_with_cohorts(
-        &project_id,
-        &flags,
-        &ctrl.qengine,
-        Utc::now().timestamp_millis(),
-    )
-    .await
-    .map_err(CtrlError::internal)?;
+    let version = flags.iter().map(|f| f.updated_at_ms).max().unwrap_or(0);
+    let cached = ctrl
+        .flag_bundle_cache
+        .get(&project_id)
+        .filter(|c| c.0 == version && c.1 == flags.len() && c.2.elapsed() < FLAG_BUNDLE_TTL)
+        .map(|c| c.3.clone());
+    let bundle = match cached {
+        Some(b) => b,
+        None => {
+            let b = Arc::new(
+                build_edge_flag_bundle_with_cohorts(
+                    &project_id,
+                    &flags,
+                    &ctrl.qengine,
+                    Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(CtrlError::internal)?,
+            );
+            ctrl.flag_bundle_cache.insert(
+                project_id.clone(),
+                (version, flags.len(), std::time::Instant::now(), b.clone()),
+            );
+            b
+        }
+    };
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
         if inm.trim() == bundle.etag {
-            return Ok(
-                (StatusCode::NOT_MODIFIED, [(header::ETAG, bundle.etag)], "").into_response(),
-            );
+            return Ok((
+                StatusCode::NOT_MODIFIED,
+                [(header::ETAG, bundle.etag.clone())],
+                "",
+            )
+                .into_response());
         }
     }
 
     Ok((
         StatusCode::OK,
         [(header::ETAG, bundle.etag.clone())],
-        Json(bundle),
+        Json(bundle.as_ref().clone()),
     )
         .into_response())
 }
@@ -3749,6 +4315,46 @@ struct CreateExpReq {
     primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     guardrail_metrics: Vec<ExperimentMetricSpec>,
+    /// Reported next to the primary metric; never decide or stop anything.
+    #[serde(default)]
+    secondary_metrics: Vec<ExperimentMetricSpec>,
+    #[serde(default)]
+    analysis: AnalysisConfig,
+    /// `"ab"` (default) or `"bandit"`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    bandit: Option<BanditConfig>,
+    /// Run in a slice of this layer, so no user is also in another of its experiments.
+    #[serde(default)]
+    layer: Option<ExperimentLayerReq>,
+    /// The problem being addressed, in plain words.
+    #[serde(default)]
+    problem: String,
+    /// Who answers for the experiment; empty means whoever created it.
+    #[serde(default)]
+    owner: String,
+    /// Send milestones to the project webhook (default on).
+    #[serde(default)]
+    notify: Option<bool>,
+}
+
+/// Problem and owner are free text shown to people; keep them to a sensible size.
+fn check_context(problem: Option<&str>, owner: Option<&str>) -> Result<(), CtrlError> {
+    if problem.is_some_and(|p| p.chars().count() > 2_000) {
+        return Err(CtrlError::bad("problem must be at most 2000 characters"));
+    }
+    if owner.is_some_and(|o| o.chars().count() > 200) {
+        return Err(CtrlError::bad("owner must be at most 200 characters"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ExperimentLayerReq {
+    layer_id: String,
+    /// Share of the layer's users this experiment takes, `0 < pct <= 100`.
+    traffic_pct: f64,
 }
 
 async fn handle_create_experiment(
@@ -3758,39 +4364,412 @@ async fn handle_create_experiment(
     Json(req): Json<CreateExpReq>,
 ) -> ApiRes<Experiment> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    check_context(Some(&req.problem), Some(&req.owner))?;
     if req.id.is_some() {
         return Err(CtrlError::bad(
             "experiment id is generated by the server and must not be client-supplied",
         ));
     }
+    if !(req.analysis.alpha > 0.0 && req.analysis.alpha < 0.5) {
+        return Err(CtrlError::bad("analysis.alpha must be between 0 and 0.5"));
+    }
+    if req.analysis.planned_users_per_variant == Some(0) {
+        return Err(CtrlError::bad(
+            "analysis.planned_users_per_variant must be at least 1",
+        ));
+    }
+    if req.analysis.cuped_pre_window_ms < 0 {
+        return Err(CtrlError::bad(
+            "analysis.cuped_pre_window_ms must not be negative",
+        ));
+    }
+    for m in std::iter::once(&req.primary_metric)
+        .chain(&req.guardrail_metrics)
+        .chain(&req.secondary_metrics)
+    {
+        crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
+    }
+    if req.guardrail_metrics.len() + req.secondary_metrics.len() > 20 {
+        return Err(CtrlError::bad(
+            "at most 20 guardrail and secondary metrics in total",
+        ));
+    }
+    // Names are how people find and talk about experiments, so two can't share one.
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(CtrlError::bad("name must not be empty"));
+    }
+    if ctrl
+        .meta
+        .list_experiments(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .iter()
+        .any(|e| e.name.trim().eq_ignore_ascii_case(&name))
+    {
+        return Err(CtrlError::conflict(format!(
+            "an experiment named '{name}' already exists; pick another name"
+        )));
+    }
+    if req.guardrail_metrics.iter().any(|g| g.auto_stop) && !req.analysis.sequential {
+        return Err(CtrlError::bad(
+            "auto_stop guardrails need analysis.sequential: results are checked every few minutes",
+        ));
+    }
+    let kind = req.kind.unwrap_or_else(|| "ab".to_string());
+    let mut bandit_start: Option<BTreeMap<String, u32>> = None;
+    match kind.as_str() {
+        "ab" => {}
+        "bandit" => {
+            if !req.guardrail_metrics.is_empty() || !req.secondary_metrics.is_empty() {
+                return Err(CtrlError::bad(
+                    "bandits don't support guardrails or secondary metrics: their traffic moves, so guardrails can't be tested fairly",
+                ));
+            }
+            let flags = ctrl
+                .meta
+                .list_feature_flags(&id)
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(flag) = flags.iter().find(|f| f.key == req.flag_key) else {
+                return Err(CtrlError::bad(
+                    "create the flag with its variants before starting a bandit on it",
+                ));
+            };
+            let cfg = req.bandit.clone().unwrap_or_default();
+            let arms = flag.variants.len() as u32;
+            if arms < 2 {
+                return Err(CtrlError::bad(
+                    "a bandit needs a flag with at least two variants",
+                ));
+            }
+            if cfg.min_weight_bps.saturating_mul(arms) > 10_000 {
+                return Err(CtrlError::bad(format!(
+                    "bandit.min_weight_bps {} is too high for {arms} variants",
+                    cfg.min_weight_bps
+                )));
+            }
+            bandit_start = Some(
+                flag.variants
+                    .iter()
+                    .map(|v| (v.key.clone(), v.weight_bps))
+                    .collect(),
+            );
+        }
+        _ => return Err(CtrlError::bad("kind must be ab or bandit")),
+    }
+    // Two live experiments on one flag share users and assignment, so their results conflict
+    // (and a bandit rewrites the weights under the other one).
+    let status = req.status.clone().unwrap_or_else(|| "running".to_string());
+    if !matches!(
+        status.as_str(),
+        "draft" | "running" | "paused" | "concluded"
+    ) {
+        return Err(CtrlError::bad(
+            "status must be one of draft, running, paused, concluded",
+        ));
+    }
+    if is_live(&status) {
+        ensure_flag_free(&ctrl, &id, &req.flag_key, None).await?;
+    }
+    if let Some(lr) = &req.layer {
+        if !(lr.traffic_pct > 0.0 && lr.traffic_pct <= 100.0) {
+            return Err(CtrlError::bad(
+                "layer.traffic_pct must be above 0 and at most 100",
+            ));
+        }
+        let layers = ctrl
+            .meta
+            .list_traffic_groups(&id, "layer")
+            .await
+            .map_err(CtrlError::meta)?;
+        if !layers.iter().any(|l| l.id == lr.layer_id) {
+            return Err(CtrlError::bad(format!(
+                "layer '{}' does not exist",
+                lr.layer_id
+            )));
+        }
+        let flags = ctrl
+            .meta
+            .list_feature_flags(&id)
+            .await
+            .map_err(CtrlError::meta)?;
+        let Some(mut flag) = flags.into_iter().find(|f| f.key == req.flag_key) else {
+            return Err(CtrlError::bad(
+                "create the flag before starting an experiment in a layer",
+            ));
+        };
+        let need = ((lr.traffic_pct * 100.0).round() as u32).max(1);
+        let taken = layer_slices(&ctrl, &id, &lr.layer_id, &flag.id).await?;
+        let Some((start_bps, end_bps)) = first_free_slice(&taken, need) else {
+            let free = 10_000 - taken.iter().map(|(s, e, _)| e - s).sum::<u32>();
+            return Err(CtrlError::conflict(format!(
+                "layer has no free slice of {}% (free: {}%, possibly split); stop an experiment in it or ask for less",
+                lr.traffic_pct,
+                f64::from(free) / 100.0
+            )));
+        };
+        flag.layer = Some(FlagLayer {
+            id: lr.layer_id.clone(),
+            start_bps,
+            end_bps,
+        });
+        flag.updated_at_ms = Utc::now().timestamp_millis();
+        ctrl.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
         id: format!("exp_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id.clone(),
-        name: req.name,
+        name,
         flag_id: req
             .flag_id
             .unwrap_or_else(|| format!("flg_{}_{}", id, req.flag_key)),
         flag_key: req.flag_key,
         hypothesis: req.hypothesis,
-        status: req.status.unwrap_or_else(|| "running".to_string()),
+        status,
         start_ts_ms: req.start_ts_ms.unwrap_or(now - 14 * 86_400_000),
         end_ts_ms: req.end_ts_ms.unwrap_or(now + 14 * 86_400_000),
         primary_metric: req.primary_metric,
         guardrail_metrics: req.guardrail_metrics,
+        secondary_metrics: req.secondary_metrics,
+        analysis: req.analysis,
         created_at_ms: now,
+        created_by: ctrl.principal_label(&principal).await?,
+        problem: req.problem.trim().to_string(),
+        owner: req.owner.trim().to_string(),
+        notify: req.notify.unwrap_or(true),
+        stop_reason: None,
+        pause_reason: None,
+        bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
+        kind,
+        decision: None,
     };
     ctrl.meta
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    if let Some(weights) = bandit_start {
+        let snap = WeightSnapshot {
+            effective_from_ms: exp.start_ts_ms,
+            weights,
+        };
+        ctrl.meta
+            .insert_weight_snapshot(&id, &exp.id, &snap)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    if exp.status == "running" {
+        turn_flag_on_for(&ctrl, &exp).await?;
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.created",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "name": exp.name, "flag_key": exp.flag_key }),
+    )
+    .await;
     Ok(Json(exp))
+}
+
+/// 409 when a running or paused experiment uses `flag_key`: changing who gets which variant
+/// mid-test skews its results. Pause, stop or ship the experiment instead.
+async fn ensure_flag_unlocked(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+) -> Result<(), CtrlError> {
+    let live = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| e.flag_key == flag_key && is_live(&e.status));
+    match live {
+        Some(e) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is locked while the experiment '{}' is {}. Stop or ship it to change who sees what, or pause it to turn the flag off",
+            e.name, e.status
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// 409 when another running or paused experiment (other than `except_id`) uses `flag_key`.
+async fn ensure_flag_free(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+    except_id: Option<&str>,
+) -> Result<(), CtrlError> {
+    let other = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| e.flag_key == flag_key && is_live(&e.status) && Some(e.id.as_str()) != except_id);
+    match other {
+        Some(o) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is already used by the experiment '{}'. Stop it first, or use another flag",
+            o.name
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[derive(Deserialize)]
 struct PatchExpReq {
     status: Option<String>,
     end_ts_ms: Option<i64>,
+    /// With `status: "concluded"`: what was decided, and what to do with the flag.
+    decision: Option<DecisionReq>,
+    problem: Option<String>,
+    owner: Option<String>,
+    notify: Option<bool>,
+    /// With `status: "paused"`: why, kept on the experiment and in the audit log.
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DecisionReq {
+    outcome: String,
+    variant: Option<String>,
+    #[serde(default)]
+    reason: String,
+    flag_action: String,
+    #[serde(default)]
+    acknowledged: Vec<String>,
+    /// With `flag_action: "staged"`: days between steps (1 to 14, default 2).
+    every_days: Option<u32>,
+}
+
+/// The rollout steps a staged ship goes through.
+const STAGED_STEPS_PCT: [f64; 3] = [25.0, 50.0, 100.0];
+
+/// Running and paused experiments hold their flag; drafts and concluded ones don't.
+fn is_live(status: &str) -> bool {
+    matches!(status, "running" | "paused")
+}
+
+async fn set_flag_enabled(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    enabled: bool,
+) -> Result<(), CtrlError> {
+    let Some(mut flag) = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    flag.enabled = enabled;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
+}
+
+/// Turns the experiment's flag on, first moving it to a free slice if its layer slice was
+/// taken while it was off.
+async fn turn_flag_on_for(ctrl: &ControlPlaneService, exp: &Experiment) -> Result<(), CtrlError> {
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Ok(());
+    };
+    if flag.enabled {
+        return Ok(());
+    }
+    if let Some(l) = flag.layer.clone() {
+        let taken = layer_slices(ctrl, &exp.project_id, &l.id, &flag.id).await?;
+        if taken
+            .iter()
+            .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+        {
+            let Some((start_bps, end_bps)) = first_free_slice(&taken, l.end_bps - l.start_bps)
+            else {
+                return Err(CtrlError::conflict(format!(
+                    "layer '{}' no longer has a free slice of {}%; stop an experiment in it first",
+                    l.id,
+                    f64::from(l.end_bps - l.start_bps) / 100.0
+                )));
+            };
+            flag.layer = Some(FlagLayer {
+                id: l.id,
+                start_bps,
+                end_bps,
+            });
+        }
+    }
+    flag.enabled = true;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
+}
+
+/// Applies a decision's flag action: everyone gets the winner, the flag goes off, or nothing.
+async fn apply_decision_to_flag(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    d: &DecisionReq,
+) -> Result<(), CtrlError> {
+    if d.flag_action == "keep" {
+        return Ok(());
+    }
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    if d.flag_action == "rollout" || d.flag_action == "staged" {
+        let winner = d.variant.as_deref().unwrap_or_default();
+        if !flag.variants.iter().any(|v| v.key == winner) {
+            return Err(CtrlError::bad(format!(
+                "rollout needs one of the flag's variants, got '{winner}'"
+            )));
+        }
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == winner { 10_000 } else { 0 };
+        }
+        flag.enabled = true;
+        flag.rollout_pct = if d.flag_action == "staged" {
+            STAGED_STEPS_PCT[0]
+        } else {
+            100.0
+        };
+        // Leave the layer so the winner reaches everyone, not just this experiment's slice.
+        flag.layer = None;
+    } else {
+        flag.enabled = false;
+    }
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
 }
 
 /// Stop, pause or resume an experiment. Shipping a winner is a flag patch plus `status: "concluded"`.
@@ -3809,13 +4788,117 @@ async fn handle_patch_experiment(
     else {
         return Err(CtrlError::not_found("experiment not found"));
     };
+    check_context(req.problem.as_deref(), req.owner.as_deref())?;
+    if let Some(p) = req.problem {
+        exp.problem = p.trim().to_string();
+    }
+    if let Some(o) = req.owner {
+        exp.owner = o.trim().to_string();
+    }
+    if let Some(n) = req.notify {
+        exp.notify = n;
+    }
+    if req.decision.is_some() && req.status.as_deref() != Some("concluded") {
+        return Err(CtrlError::bad(
+            "a decision is recorded when concluding: send status \"concluded\"",
+        ));
+    }
     if let Some(status) = req.status {
         if !matches!(status.as_str(), "running" | "paused" | "concluded") {
             return Err(CtrlError::bad(
                 "status must be one of running, paused, concluded",
             ));
         }
+        if exp.status == "draft" && status == "paused" {
+            return Err(CtrlError::bad(
+                "a draft can't be paused; start it or conclude it",
+            ));
+        }
+        if is_live(&status) && !is_live(&exp.status) {
+            ensure_flag_free(&ctrl, &id, &exp.flag_key, Some(&exp.id)).await?;
+        }
+        if exp.status == "draft" && status == "running" {
+            // Starting a draft: the clock starts now and keeps the planned length.
+            let now = Utc::now().timestamp_millis();
+            let length = (exp.end_ts_ms - exp.start_ts_ms).max(86_400_000);
+            exp.start_ts_ms = now;
+            exp.end_ts_ms = now + length;
+            turn_flag_on_for(&ctrl, &exp).await?;
+        }
+        if exp.status == "running" && status == "paused" {
+            // Pausing serves everyone the app's default until resumed. Bucketing is deterministic,
+            // so users get their same variant back on resume.
+            set_flag_enabled(&ctrl, &exp, false).await?;
+            let reason = req.reason.as_deref().unwrap_or("").trim();
+            if reason.chars().count() > 500 {
+                return Err(CtrlError::bad("reason must be at most 500 characters"));
+            }
+            exp.pause_reason = (!reason.is_empty()).then(|| reason.to_string());
+        }
+        if exp.status == "paused" && status == "running" {
+            turn_flag_on_for(&ctrl, &exp).await?;
+            exp.pause_reason = None;
+        }
+        if status == "running" {
+            exp.stop_reason = None;
+        }
         exp.status = status;
+    }
+    if let Some(d) = req.decision {
+        if !matches!(d.outcome.as_str(), "ship" | "keep_control" | "inconclusive") {
+            return Err(CtrlError::bad(
+                "decision.outcome must be ship, keep_control or inconclusive",
+            ));
+        }
+        if !matches!(
+            d.flag_action.as_str(),
+            "rollout" | "staged" | "rollback" | "keep"
+        ) {
+            return Err(CtrlError::bad(
+                "decision.flag_action must be rollout, staged, rollback or keep",
+            ));
+        }
+        if d.flag_action == "staged" && d.outcome != "ship" {
+            return Err(CtrlError::bad("a staged rollout needs outcome ship"));
+        }
+        let every_days = d.every_days.unwrap_or(2);
+        if !(1..=14).contains(&every_days) {
+            return Err(CtrlError::bad("decision.every_days must be 1 to 14"));
+        }
+        if d.acknowledged.len() > 10 || d.acknowledged.iter().any(|a| a.chars().count() > 500) {
+            return Err(CtrlError::bad(
+                "decision.acknowledged takes at most 10 items of 500 characters",
+            ));
+        }
+        if d.reason.chars().count() > 2_000 {
+            return Err(CtrlError::bad(
+                "decision.reason must be at most 2000 characters",
+            ));
+        }
+        apply_decision_to_flag(&ctrl, &exp, &d).await?;
+        let staged = d.flag_action == "staged";
+        let now = Utc::now().timestamp_millis();
+        exp.end_ts_ms = exp.end_ts_ms.min(now);
+        let decided_by = ctrl.principal_label(&principal).await?;
+        exp.decision = Some(ExperimentDecision {
+            outcome: d.outcome,
+            variant: d.variant,
+            reason: d.reason.trim().to_string(),
+            flag_action: d.flag_action,
+            staged: staged.then(|| {
+                let every_ms = i64::from(every_days) * 86_400_000;
+                StagedRollout {
+                    steps_pct: STAGED_STEPS_PCT.to_vec(),
+                    every_ms,
+                    next_step: 1,
+                    next_at_ms: now + every_ms,
+                    halted: None,
+                }
+            }),
+            acknowledged: d.acknowledged,
+            decided_by,
+            decided_at_ms: now,
+        });
     }
     if let Some(end) = req.end_ts_ms {
         exp.end_ts_ms = end;
@@ -3824,6 +4907,13 @@ async fn handle_patch_experiment(
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.updated",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms, "decision": exp.decision }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -3831,6 +4921,7 @@ async fn handle_experiment_results_scoped(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((project_id, exp_id)): AxumPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<crate::models::ExperimentResults> {
     ctrl.authorize_and_check(&principal, &project_id).await?;
     let Some(exp) = ctrl
@@ -3849,9 +4940,21 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
-    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
-        .await
-        .map_err(CtrlError::internal)?;
+    let segment = params
+        .get("segment")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let results = if exp.kind == "bandit" {
+        let history = ctrl
+            .meta
+            .list_weight_history(&project_id, &exp.id)
+            .await
+            .map_err(CtrlError::meta)?;
+        evaluate_bandit_results(&exp, flag, &history, &ctrl.qengine).await
+    } else {
+        evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment).await
+    }
+    .map_err(CtrlError::internal)?;
     Ok(Json(results))
 }
 
@@ -4611,20 +5714,6 @@ impl ControlPlaneService {
         value: f64,
         now_ms: i64,
     ) -> Result<Option<reqwest::StatusCode>, String> {
-        let Some(rec) = self
-            .meta
-            .get_byok_credential(&a.project_id, "webhook")
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
-        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
-        let signing_secret = webhook_signing_secret(&cfg)
-            .ok_or("webhook credential has no signing_secret")?
-            .to_string();
-        let url = a.webhook_url.clone().unwrap_or(cred_url);
         let body = json!({
             "event": "pulse.alert.triggered",
             "project_id": a.project_id,
@@ -4639,9 +5728,475 @@ impl ControlPlaneService {
             "window_ms": ALERT_WINDOW_MS,
             "timestamp_ms": now_ms,
         });
-        post_signed_webhook(&url, &signing_secret, &body)
+        self.post_project_webhook(&a.project_id, a.webhook_url.clone(), &body)
+            .await
+    }
+
+    /// Posts `body` to `url` (or the project's webhook credential URL), signed with that
+    /// credential's secret. `Ok(None)` when the project has no webhook credential.
+    async fn post_project_webhook(
+        &self,
+        project_id: &str,
+        url: Option<String>,
+        body: &Value,
+    ) -> Result<Option<reqwest::StatusCode>, String> {
+        let Some(rec) = self
+            .meta
+            .get_byok_credential(project_id, "webhook")
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
+        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
+        let signing_secret = webhook_signing_secret(&cfg)
+            .ok_or("webhook credential has no signing_secret")?
+            .to_string();
+        post_signed_webhook(&url.unwrap_or(cred_url), &signing_secret, body)
             .await
             .map(Some)
+    }
+
+    /// Stops running sequential experiments whose `auto_stop` guardrail a treatment made
+    /// significantly worse: everyone gets control, the experiment is concluded with a
+    /// `stop_reason`, and it is audited and sent to the project webhook. Also announces A/B
+    /// milestones (see [`Self::announce_milestones`]). `pulse-node` calls this on a timer.
+    // ponytail: same multi-node ceiling as `evaluate_alerts`; also re-runs every guardrail query
+    // each tick, fine at the 5-minute cadence.
+    pub async fn evaluate_experiment_guardrails(&self) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                // Paused experiments' flags are off, but users already in them can still trip a guardrail.
+                if exp.status != "running" && exp.status != "paused" {
+                    continue;
+                }
+                if let Err(e) = self.check_running_experiment(exp).await {
+                    tracing::warn!(project_id = %proj.id, "guardrail check failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Raises each staged ship's rollout to its next step once due. If the flag was changed by
+    /// hand since the last step (rollout, on/off or the winner's weight), it halts instead and
+    /// leaves the flag alone. `pulse-node` calls this on the guardrail timer.
+    pub async fn advance_staged_rollouts(&self) {
+        self.advance_staged_rollouts_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::advance_staged_rollouts`] as if the time were `now_ms`.
+    pub async fn advance_staged_rollouts_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                let due = exp
+                    .decision
+                    .as_ref()
+                    .and_then(|d| d.staged.as_ref())
+                    .is_some_and(|st| {
+                        st.halted.is_none()
+                            && st.next_step < st.steps_pct.len()
+                            && now_ms >= st.next_at_ms
+                    });
+                if due {
+                    if let Err(e) = self.advance_staged_rollout(exp, now_ms).await {
+                        tracing::warn!(project_id = %proj.id, "staged rollout failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn advance_staged_rollout(&self, mut exp: Experiment, now: i64) -> Result<(), String> {
+        let Some(d) = exp.decision.as_mut() else {
+            return Ok(());
+        };
+        let winner = d.variant.clone().unwrap_or_default();
+        let Some(st) = d.staged.as_mut() else {
+            return Ok(());
+        };
+        let flag = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
+        let expected = st.steps_pct[st.next_step - 1];
+        let action = match flag {
+            Some(mut f)
+                if f.enabled
+                    && (f.rollout_pct - expected).abs() < 0.01
+                    && f.variants
+                        .iter()
+                        .any(|v| v.key == winner && v.weight_bps == 10_000) =>
+            {
+                f.rollout_pct = st.steps_pct[st.next_step];
+                f.updated_at_ms = now;
+                self.meta
+                    .upsert_feature_flag(&f)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                st.next_step += 1;
+                st.next_at_ms += st.every_ms;
+                json!({ "experiment_id": exp.id, "flag_key": f.key, "rollout_pct": f.rollout_pct })
+            }
+            _ => {
+                st.halted = Some(
+                    "the flag was changed by hand, so Pulse stopped raising the rollout".into(),
+                );
+                json!({ "experiment_id": exp.id, "halted": st.halted })
+            }
+        };
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "pulse",
+            "experiment.rollout_advanced",
+            &format!("project:{}", exp.project_id),
+            action,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Moves each running bandit's flag weights toward its best arm, once a day, in the first
+    /// hour after midnight in the project's timezone, once every arm is past burn-in. Weights only
+    /// change at day boundaries so each exposure day (the unit results are stratified and
+    /// SRM-checked by) has one set of weights. `pulse-node` calls this on the guardrail timer.
+    // ponytail: users exposed between midnight and the next tick (up to 5 minutes) get yesterday's
+    // weights but count in today's stratum; a node that's down for that hour skips a day.
+    pub async fn evaluate_bandits(&self) {
+        self.evaluate_bandits_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::evaluate_bandits`] as if the time were `now_ms`.
+    pub async fn evaluate_bandits_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running" || exp.kind != "bandit" {
+                    continue;
+                }
+                if let Err(e) = self.reweight_bandit(exp, now_ms).await {
+                    tracing::warn!(project_id = %proj.id, "bandit update failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn reweight_bandit(&self, exp: Experiment, now: i64) -> Result<(), String> {
+        let tz = self
+            .qengine
+            .catalogs()
+            .for_project(&exp.project_id)
+            .timezone();
+        let today = pulse_exec::TimeInterval::Day.align_floor_tz(now, tz);
+        if now - today >= 3_600_000 {
+            return Ok(());
+        }
+        let history = self
+            .meta
+            .list_weight_history(&exp.project_id, &exp.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if history.last().is_some_and(|s| s.effective_from_ms >= today) {
+            return Ok(());
+        }
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_bandit_results(&exp, Some(&flag), &history, &self.qengine)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(b) = res.bandit.filter(|b| b.burn_in_complete) else {
+            return Ok(());
+        };
+        let prob: BTreeMap<String, f64> = b
+            .arms
+            .iter()
+            .map(|a| (a.variant_key.clone(), a.prob_best))
+            .collect();
+        let cfg = exp.bandit.clone().unwrap_or_default();
+        let weights = crate::experiments::bandit::weights_from_prob_best(&prob, cfg.min_weight_bps);
+        let previous = flag.variants.clone();
+        for v in &mut flag.variants {
+            if let Some(&w) = weights.get(&v.key) {
+                v.weight_bps = w;
+            }
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.meta
+            .insert_weight_snapshot(
+                &exp.project_id,
+                &exp.id,
+                &WeightSnapshot {
+                    effective_from_ms: today,
+                    weights: weights.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:bandit",
+            "experiment.bandit_reweighted",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key,
+                "prob_best": prob, "previous_variants": previous, "weights": weights,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// One results query per running experiment per tick: announce new milestones, then
+    /// auto-stop it if an `auto_stop` guardrail regressed.
+    async fn check_running_experiment(&self, exp: Experiment) -> Result<(), String> {
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_experiment_results(&exp, Some(&flag), &self.qengine, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Bandits report P(best), not p-values, so they have no significance milestones.
+        if exp.kind != "bandit" {
+            self.announce_milestones(&exp, &res).await;
+        }
+        if exp.analysis.sequential && exp.guardrail_metrics.iter().any(|g| g.auto_stop) {
+            self.auto_stop_if_regressed(exp, flag, &res).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends each milestone once, as audit row `experiment.milestone` and webhook event
+    /// `pulse.experiment.milestone`. Significance and guardrail harm only count when it's safe to
+    /// look: a sequential test, or a fixed one that reached its planned sample.
+    async fn announce_milestones(&self, exp: &Experiment, res: &ExperimentResults) {
+        let users: u64 = res.variants.iter().map(|v| v.sample_size).sum();
+        let min_users = res
+            .variants
+            .iter()
+            .map(|v| v.sample_size)
+            .min()
+            .unwrap_or(0);
+        let planned_reached = exp
+            .analysis
+            .planned_users_per_variant
+            .is_some_and(|p| p > 0 && min_users >= p);
+        let safe_to_read = res.sequential || planned_reached;
+        let mut found: Vec<(String, String)> = Vec::new();
+        if planned_reached {
+            found.push((
+                "planned_sample_reached".into(),
+                format!("Every variant has reached its planned {min_users}+ users."),
+            ));
+        }
+        if safe_to_read && !res.sample_ratio_mismatch {
+            for v in res
+                .variants
+                .iter()
+                .filter(|v| !v.is_control && v.statistically_significant)
+            {
+                found.push((
+                    format!("significant:{}", v.variant_key),
+                    format!(
+                        "{} changed {} by {:+.1}% (p = {:.4}).",
+                        v.variant_key, res.metric_name, v.relative_lift_pct, v.p_value
+                    ),
+                ));
+            }
+        }
+        for g in &res.guardrails {
+            if safe_to_read && !g.regressed_variants.is_empty() {
+                found.push((
+                    format!("guardrail_harmed:{}", g.metric_name),
+                    format!(
+                        "{} got worse in {}.",
+                        g.metric_name,
+                        g.regressed_variants.join(", ")
+                    ),
+                ));
+            }
+            // ponytail: 1,000 users is a fixed "should have seen one by now" bar; make it a
+            // setting if rare guardrail events trip it.
+            if users >= 1_000
+                && g.variants
+                    .iter()
+                    .all(|v| v.conversions == 0 && v.mean_value == 0.0)
+            {
+                found.push((
+                    format!("guardrail_no_data:{}", g.metric_name),
+                    format!(
+                        "{} has no events from {users} users in this test, so it can't catch harm. Check the event name or that your app sends it.",
+                        g.metric_name
+                    ),
+                ));
+            }
+        }
+        let now = Utc::now().timestamp_millis();
+        for (milestone, message) in found {
+            match self
+                .meta
+                .claim_experiment_milestone(&exp.project_id, &exp.id, &milestone, now)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(experiment_id = %exp.id, "milestone store failed: {e}");
+                    continue;
+                }
+            }
+            self.record_enterprise_audit(
+                "system:experiments",
+                "experiment.milestone",
+                &format!("project:{}", exp.project_id),
+                json!({"experiment_id": exp.id, "milestone": milestone, "message": message}),
+            )
+            .await;
+            let body = json!({
+                "event": "pulse.experiment.milestone",
+                "project_id": exp.project_id,
+                "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+                "milestone": milestone,
+                "message": message,
+                "timestamp_ms": now,
+            });
+            if !exp.notify {
+                continue;
+            }
+            if let Err(e) = self
+                .post_project_webhook(&exp.project_id, None, &body)
+                .await
+            {
+                tracing::warn!(experiment_id = %exp.id, "milestone webhook failed: {e}");
+            }
+        }
+    }
+
+    async fn auto_stop_if_regressed(
+        &self,
+        mut exp: Experiment,
+        mut flag: FeatureFlag,
+        res: &ExperimentResults,
+    ) -> Result<(), String> {
+        let auto: std::collections::HashSet<&str> = exp
+            .guardrail_metrics
+            .iter()
+            .filter(|g| g.auto_stop)
+            .map(|g| g.name.as_str())
+            .collect();
+        let hits: Vec<(String, String, f64)> = res
+            .guardrails
+            .iter()
+            .filter(|g| auto.contains(g.metric_name.as_str()))
+            .flat_map(|g| {
+                g.variants
+                    .iter()
+                    .filter(|v| g.regressed_variants.contains(&v.variant_key))
+                    .map(|v| (g.metric_name.clone(), v.variant_key.clone(), v.p_value))
+            })
+            .collect();
+        let Some((metric, variant, p)) = hits.first().cloned() else {
+            return Ok(());
+        };
+        let control = res
+            .variants
+            .iter()
+            .find(|v| v.is_control)
+            .map(|v| v.variant_key.clone())
+            .unwrap_or_else(|| "control".to_string());
+        let now = Utc::now().timestamp_millis();
+        let old_variants = flag.variants.clone();
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == control { 10_000 } else { 0 };
+        }
+        // A flag without a control variant can't be rolled back by weight; turn it off instead.
+        if !flag.variants.iter().any(|v| v.key == control) {
+            flag.enabled = false;
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        let reason =
+            format!("{metric} got worse in {variant} (p = {p:.4}); everyone now gets {control}");
+        exp.status = "concluded".to_string();
+        exp.end_ts_ms = now;
+        exp.stop_reason = Some(reason.clone());
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:guardrail",
+            "experiment.auto_stopped",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key, "reason": reason,
+                "regressions": hits.iter().map(|(m, v, p)| json!({"metric": m, "variant": v, "p_value": p})).collect::<Vec<_>>(),
+                "previous_variants": old_variants, "variants": flag.variants,
+            }),
+        )
+        .await;
+        tracing::warn!(experiment_id = %exp.id, %reason, "experiment stopped by guardrail");
+        let body = json!({
+            "event": "pulse.experiment.auto_stopped",
+            "project_id": exp.project_id,
+            "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+            "reason": reason,
+            "timestamp_ms": now,
+        });
+        if let Err(e) = self
+            .post_project_webhook(&exp.project_id, None, &body)
+            .await
+        {
+            tracing::warn!(experiment_id = %exp.id, "auto-stop webhook failed: {e}");
+        }
+        Ok(())
     }
 }
 
