@@ -73,6 +73,21 @@ python3 -m http.server 8000 --directory site    # open http://localhost:8000/doc
 
 The generated files are git-ignored. Run `python3 scripts/check_docs_links.py` before you push: CI runs it too, and fails on any broken relative link, heading anchor or nav entry. To add a page, write `docs/<name>.md` and add it to the `NAV` list at the top of the script in `site/docs/index.html`. Link between pages with relative `.md` links, as on GitHub. The viewer rewrites them, and sends links outside `docs/` to GitHub.
 
+## Cutting a release
+
+1. **Bump the version.** Set `[workspace.package] version` in `Cargo.toml` to the new version. All crates inherit it, and so do `pulse-node --version` and the MCP `serverInfo`. Run `cargo update --workspace --offline` to update `Cargo.lock`.
+2. **Update the changelog.** Move the *Unreleased* entries in `CHANGELOG.md` under a new `[x.y.z] - YYYY-MM-DD` heading, and add the compare link at the bottom.
+3. **Merge both** to `main` and wait for CI to pass.
+4. **Tag `main`:** `git tag -a vX.Y.Z -m "Pulse vX.Y.Z" && git push origin vX.Y.Z`.
+
+`.github/workflows/release.yml` then:
+- builds and smoke-tests the Linux tarballs;
+- pushes `ghcr.io/sswapnil2/pulse:X.Y.Z` and `:latest`;
+- packs the Web SDK at version `X.Y.Z`;
+- publishes the GitHub release with `SHA256SUMS`.
+
+A tag containing `-` (for example `v0.2.0-rc1`) is published as a prerelease.
+
 ## Where to start
 
 - **Pick from the list of gaps.** [Docs status & roadmap](docs-status.md) and [Limitations](limitations.md) list known gaps. Many are good first issues, such as a server SDK, retention TTLs, or React Native docs and CI.
