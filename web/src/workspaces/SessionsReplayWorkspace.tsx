@@ -45,6 +45,9 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
   const [onlyRecorded, setOnlyRecorded] = useState<boolean>(true);
   const [searchRes, setSearchRes] = useState<SessionSearchResult | null>(null);
   const [selected, setSelected] = useState<SessionSummaryItem | null>(null);
+  // `#/replays?session=<id>` (e.g. from an AI agent session) opens that recording even when
+  // it isn't in the first page of search results.
+  const [linkedId] = useState(() => new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("session"));
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -78,13 +81,19 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
       );
       if (ctrl.signal.aborted) return;
       setSearchRes(res);
-      setSelected(res.sessions[0] ?? null);
+      setSelected((prev) =>
+        prev
+          ? (res.sessions.find((s) => s.session_id === prev.session_id) ?? res.sessions[0] ?? null)
+          : linkedId
+            ? (res.sessions.find((s) => s.session_id === linkedId) ?? null)
+            : (res.sessions[0] ?? null),
+      );
     } catch (err) {
       if (!isAbortError(err) && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
       if (!ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, eventFilter, onlyRage, onlyErrors, onlyRecorded]);
+  }, [projectId, eventFilter, onlyRage, onlyErrors, onlyRecorded, linkedId]);
 
   useEffect(() => {
     void runSearch();
@@ -197,6 +206,8 @@ export const SessionsReplayWorkspace: React.FC<Props> = ({ projectId, availableE
           <Panel title="Recording">
             {selected ? (
               <SessionReplay key={selected.session_id} projectId={projectId} sessionId={selected.session_id} />
+            ) : linkedId ? (
+              <SessionReplay key={linkedId} projectId={projectId} sessionId={linkedId} />
             ) : (
               <EmptyState title="Pick a session" body="Its screen recording plays here." />
             )}

@@ -125,9 +125,10 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
     if (chunks.length === 0) {
       return { timeline: items, durationMs: 1000, viewport: vp, moments: found };
     }
-    const baseStart = chunks[0].chunk_start_ts_ms;
+    const orderedChunks = [...chunks].sort((a, b) => a.chunk_start_ts_ms - b.chunk_start_ts_ms);
+    const baseStart = orderedChunks[0].chunk_start_ts_ms;
 
-    for (const chunk of chunks) {
+    for (const chunk of orderedChunks) {
       const chunkDelta = Math.max(0, chunk.chunk_start_ts_ms - baseStart);
       let runningOffset = chunkDelta;
       for (const op of chunk.ops) {
@@ -138,6 +139,10 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
           vp = { w: op.width || 390, h: op.height || 844 };
           items.push({ absOffsetMs: t, op });
         } else if (op.op === "node_upsert" && op.ts_offset_ms) {
+          const t = chunkDelta + op.ts_offset_ms;
+          runningOffset = Math.max(runningOffset, t);
+          items.push({ absOffsetMs: t, op });
+        } else if (op.op === "node_remove" && op.ts_offset_ms) {
           const t = chunkDelta + op.ts_offset_ms;
           runningOffset = Math.max(runningOffset, t);
           items.push({ absOffsetMs: t, op });
@@ -257,6 +262,7 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
           <div className="relative h-full w-full">
             {activeNodes.map((n) => {
               const isScreen = n.kind === "screen";
+              const isContainer = n.kind === "container";
               const isBtn = n.kind === "button";
               const isMasked = n.kind === "masked_input";
               const isErr = n.kind === "error_banner";
@@ -275,13 +281,15 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
                   className={
                     isScreen
                       ? "z-0 bg-panel"
-                      : isErr
-                        ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
-                        : isBtn
-                          ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold"
-                          : isMasked
-                            ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
-                            : "z-10 flex items-center px-1 text-[11px] text-ink-2"
+                      : isContainer
+                        ? "z-[5] overflow-hidden rounded-md"
+                        : isErr
+                          ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
+                          : isBtn
+                            ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold"
+                            : isMasked
+                              ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
+                              : "z-10 flex items-center px-1 text-[11px] text-ink-2"
                   }
                 >
                   {isScreen ? (
