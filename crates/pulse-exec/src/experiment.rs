@@ -119,6 +119,9 @@ pub struct ExperimentDailyPoint {
     pub day_start_ms: i64,
     /// Users first exposed on or before this day.
     pub cumulative: BTreeMap<String, MetricMoments>,
+    /// Users first exposed on this day only.
+    #[serde(default)]
+    pub day: BTreeMap<String, MetricMoments>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -569,12 +572,13 @@ fn cumulate(daily: BTreeMap<i64, BTreeMap<String, MetricMoments>>) -> Vec<Experi
     daily
         .into_iter()
         .map(|(day_start_ms, day)| {
-            for (v, m) in day {
-                running.entry(v).or_default().merge(&m);
+            for (v, m) in &day {
+                running.entry(v.clone()).or_default().merge(m);
             }
             ExperimentDailyPoint {
                 day_start_ms,
                 cumulative: running.clone(),
+                day,
             }
         })
         .collect()

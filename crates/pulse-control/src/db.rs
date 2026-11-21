@@ -14,7 +14,7 @@ use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
     LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
-    SystemKeyringRecord, User, UserProfileRecord,
+    SystemKeyringRecord, User, UserProfileRecord, WeightSnapshot,
 };
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
@@ -860,10 +860,14 @@ impl MetaStore {
         let pjson = serde_json::to_string(&exp.primary_metric).unwrap_or_else(|_| "{}".into());
         let gjson = serde_json::to_string(&exp.guardrail_metrics).unwrap_or_else(|_| "[]".into());
         let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
+        let bjson = exp
+            .bandit
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -875,7 +879,9 @@ impl MetaStore {
                 primary_metric_json = excluded.primary_metric_json,
                 guardrail_metrics_json = excluded.guardrail_metrics_json,
                 analysis_json = excluded.analysis_json,
-                stop_reason = excluded.stop_reason
+                stop_reason = excluded.stop_reason,
+                kind = excluded.kind,
+                bandit_json = excluded.bandit_json
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -891,6 +897,8 @@ impl MetaStore {
             &ajson,
             exp.created_at_ms,
             &exp.stop_reason,
+            &exp.kind,
+            &bjson,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -904,7 +912,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -927,6 +935,12 @@ impl MetaStore {
                         .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
                     stop_reason: r.get("stop_reason"),
+                    kind: r
+                        .get::<Option<String>, _>("kind")
+                        .unwrap_or_else(|| "ab".to_string()),
+                    bandit: r
+                        .get::<Option<String>, _>("bandit_json")
+                        .and_then(|b| serde_json::from_str(&b).ok()),
                 })
             },
             project_id,
@@ -942,7 +956,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -965,6 +979,12 @@ impl MetaStore {
                         .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
                     stop_reason: r.get("stop_reason"),
+                    kind: r
+                        .get::<Option<String>, _>("kind")
+                        .unwrap_or_else(|| "ab".to_string()),
+                    bandit: r
+                        .get::<Option<String>, _>("bandit_json")
+                        .and_then(|b| serde_json::from_str(&b).ok()),
                 })
             },
             exp_id,
@@ -1034,6 +1054,49 @@ impl MetaStore {
             id,
         );
         Ok(row)
+    }
+
+    pub async fn insert_weight_snapshot(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+        snap: &WeightSnapshot,
+    ) -> Result<(), MetaError> {
+        let wjson = serde_json::to_string(&snap.weights).unwrap_or_else(|_| "{}".into());
+        db_exec!(
+            self,
+            "INSERT INTO experiment_weight_history (experiment_id, project_id, effective_from_ms, weights_json)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(experiment_id, effective_from_ms) DO UPDATE SET weights_json = excluded.weights_json",
+            experiment_id,
+            project_id,
+            snap.effective_from_ms,
+            &wjson,
+        );
+        Ok(())
+    }
+
+    /// Oldest first.
+    pub async fn list_weight_history(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+    ) -> Result<Vec<WeightSnapshot>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT effective_from_ms, weights_json FROM experiment_weight_history
+             WHERE experiment_id = ? AND project_id = ? ORDER BY effective_from_ms ASC",
+            |r| {
+                let w: String = r.get("weights_json");
+                WeightSnapshot {
+                    effective_from_ms: r.get("effective_from_ms"),
+                    weights: serde_json::from_str(&w).unwrap_or_default(),
+                }
+            },
+            experiment_id,
+            project_id,
+        );
+        Ok(rows)
     }
 
     /// Returns `false` when no report with this id exists in the project.

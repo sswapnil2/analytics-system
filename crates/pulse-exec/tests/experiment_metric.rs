@@ -371,6 +371,14 @@ async fn check(world: World) {
         if let Some(last) = got.daily.last() {
             for (v, m) in &got.variants {
                 assert!(close(&last.cumulative[v], m));
+                // Per-day groups add up to the totals too.
+                let mut summed = MetricMoments::default();
+                for p in &got.daily {
+                    if let Some(d) = p.day.get(v) {
+                        summed.merge(d);
+                    }
+                }
+                assert!(close(&summed, m));
             }
         }
     }

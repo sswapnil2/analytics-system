@@ -244,6 +244,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         },
         created_at_ms: now_ms,
         stop_reason: None,
+        kind: "ab".to_string(),
+        bandit: None,
     };
     ctrl.meta().upsert_experiment(&exp).await?;
 

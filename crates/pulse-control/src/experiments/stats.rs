@@ -779,7 +779,7 @@ fn sample_gamma<R: Rng>(rng: &mut R, shape: f64) -> f64 {
 }
 
 #[inline]
-fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
+pub(super) fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
     let u1 = rng.gen::<f64>().clamp(1e-15, 1.0);
     let u2 = rng.gen::<f64>();
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()

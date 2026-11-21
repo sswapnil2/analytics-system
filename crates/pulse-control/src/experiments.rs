@@ -8,6 +8,7 @@ use pulse_exec::{
 use pulse_wire::{cohort_member_hash, evaluate_flag_rule, CohortGate, PropValue};
 use xxhash_rust::xxh3::xxh3_64;
 
+pub mod bandit;
 pub mod stats;
 
 pub use stats::{
@@ -17,8 +18,9 @@ pub use stats::{
 };
 
 use crate::models::{
-    EdgeFlagBundle, EdgeFlagRule, Experiment, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
-    GuardrailResult, SegmentResult, TimeseriesPoint, TimeseriesVariant, VariantLiftRow,
+    BanditArm, BanditResults, EdgeFlagBundle, EdgeFlagRule, Experiment, ExperimentMetricSpec,
+    ExperimentResults, FeatureFlag, GuardrailResult, SegmentResult, TimeseriesPoint,
+    TimeseriesVariant, VariantLiftRow, WeightSnapshot,
 };
 
 /// Evaluates an `EdgeFlagRule` deterministically via the shared `pulse_wire::evaluate_flag_rule`
@@ -237,6 +239,145 @@ pub async fn evaluate_experiment_results(
         segment_by: segment_by.map(str::to_string),
         segments: primary.segments,
         timeseries: primary.timeseries,
+        kind: exp.kind.clone(),
+        bandit: None,
+    })
+}
+
+/// Bandit results: per-arm means stratified by exposure day, `P(best)` and expected loss from
+/// Thompson sampling, the weight history, and an SRM check against the weights each day's users
+/// were assigned under. No p-values: the weights moved toward the leader, so a fixed-split test
+/// doesn't apply.
+pub async fn evaluate_bandit_results(
+    exp: &Experiment,
+    flag: Option<&FeatureFlag>,
+    history: &[WeightSnapshot],
+    qengine: &QueryEngine,
+) -> Result<ExperimentResults, ExecError> {
+    let t0 = Instant::now();
+    let current: BTreeMap<String, u32> = flag
+        .map(|f| {
+            f.variants
+                .iter()
+                .map(|v| (v.key.clone(), v.weight_bps))
+                .collect()
+        })
+        .unwrap_or_default();
+    let keys: Vec<String> = current.keys().cloned().collect();
+    let metric = &exp.primary_metric;
+    let kind = if normalized_metric_type(metric) == "ratio" {
+        EstimateKind::Ratio
+    } else {
+        EstimateKind::Mean
+    };
+    let res = qengine
+        .query_experiment_metric(&exp.project_id, &metric_query(exp, metric, None, false))
+        .await?;
+
+    let days: Vec<BTreeMap<String, MetricMoments>> =
+        res.daily.iter().map(|p| p.day.clone()).collect();
+    let est = bandit::stratified_estimates(&days, &keys, kind);
+    let odds = bandit::prob_best_and_loss(&est, metric.direction != "increase_is_bad");
+    let cfg = exp.bandit.clone().unwrap_or_default();
+    let burn_in_complete = !keys.is_empty() && est.values().all(|e| e.n >= cfg.burn_in_users);
+
+    // Expected users per arm = Σ over days of that day's users × the weights in effect then.
+    let mut expected: BTreeMap<String, f64> = keys.iter().map(|k| (k.clone(), 0.0)).collect();
+    for p in &res.daily {
+        let n: u64 = p.day.values().map(|m| m.n).sum();
+        let w = bandit::weights_at(history, p.day_start_ms).unwrap_or(&current);
+        let w_total: u32 = w.values().sum();
+        for (k, e) in expected.iter_mut() {
+            *e += n as f64 * *w.get(k).unwrap_or(&0) as f64 / w_total.max(1) as f64;
+        }
+    }
+    let exp_total: f64 = expected.values().sum();
+    let expected_bps: BTreeMap<String, u32> = expected
+        .iter()
+        .map(|(k, e)| {
+            let bps = if exp_total > 0.0 {
+                (e / exp_total * 10_000.0).round()
+            } else {
+                0.0
+            };
+            (k.clone(), bps as u32)
+        })
+        .collect();
+    let observed: BTreeMap<String, (u64, u64)> =
+        est.iter().map(|(k, e)| (k.clone(), (e.n, 0))).collect();
+    let (srm_p_value, sample_ratio_mismatch) = if exp_total > 0.0 {
+        compute_sample_ratio_mismatch(&observed, &expected_bps)
+    } else {
+        (1.0, false)
+    };
+
+    let alpha = if exp.analysis.alpha > 0.0 && exp.analysis.alpha < 0.5 {
+        exp.analysis.alpha
+    } else {
+        0.05
+    };
+    let z = normal_quantile(1.0 - alpha / 2.0);
+    let arms: Vec<BanditArm> = keys
+        .iter()
+        .map(|k| {
+            let e = est[k];
+            let (prob_best, expected_loss) = odds[k];
+            let half = z * e.var_of_mean.sqrt();
+            BanditArm {
+                variant_key: k.clone(),
+                users: e.n,
+                mean_value: e.mean,
+                ci_low: e.mean - half,
+                ci_high: e.mean + half,
+                prob_best,
+                expected_loss,
+                weight_bps: current[k],
+            }
+        })
+        .collect();
+    let best = arms
+        .iter()
+        .max_by(|a, b| a.prob_best.total_cmp(&b.prob_best));
+    let ready_to_ship = burn_in_complete
+        && !sample_ratio_mismatch
+        && best.is_some_and(|b| {
+            b.mean_value.abs() > 1e-12 && b.expected_loss < 0.01 * b.mean_value.abs()
+        });
+
+    Ok(ExperimentResults {
+        experiment_id: exp.id.clone(),
+        experiment_name: exp.name.clone(),
+        flag_key: exp.flag_key.clone(),
+        status: exp.status.clone(),
+        hypothesis: exp.hypothesis.clone(),
+        metric_name: metric.name.clone(),
+        exec_time_us: t0.elapsed().as_micros() as u64,
+        srm_p_value,
+        sample_ratio_mismatch,
+        statistical_methodology_note: format!(
+            "Bandit: Thompson sampling on normal posteriors; arm means stratified by exposure day and weighted by each day's share of users, so changing weights don't bias them; weights update daily with a {:.0}% floor per arm; {:.0}% intervals; no p-values; SRM checked against each day's weights",
+            cfg.min_weight_bps as f64 / 100.0,
+            (1.0 - alpha) * 100.0
+        ),
+        sequential: false,
+        confidence_level: 1.0 - alpha,
+        variants: Vec::new(),
+        guardrails: Vec::new(),
+        metric_type: normalized_metric_type(metric).to_string(),
+        cuped_applied: false,
+        variance_reduction_pct: 0.0,
+        multi_variant_users: res.multi_variant_users,
+        segment_by: None,
+        segments: Vec::new(),
+        timeseries: Vec::new(),
+        kind: exp.kind.clone(),
+        bandit: Some(BanditResults {
+            best_variant: best.map(|b| b.variant_key.clone()),
+            arms,
+            weight_history: history.to_vec(),
+            burn_in_complete,
+            ready_to_ship,
+        }),
     })
 }
 
@@ -338,31 +479,16 @@ fn metric_event(
     }
 }
 
-struct MetricEval {
-    rows: Vec<VariantLiftRow>,
-    moments: BTreeMap<String, MetricMoments>,
-    variance_reduction_pct: Option<f64>,
-    multi_variant_users: u64,
-    segments: Vec<SegmentResult>,
-    timeseries: Vec<TimeseriesPoint>,
-}
-
-async fn evaluate_metric(
+/// The engine query for one metric of `exp`: first exposure to its flag, then `metric` within
+/// the window (and the CUPED pre-window when `cuped`).
+fn metric_query(
     exp: &Experiment,
     metric: &ExperimentMetricSpec,
-    expected_variants: &[String],
-    opts: LiftOptions,
     segment_by: Option<&str>,
-    qengine: &QueryEngine,
-) -> Result<MetricEval, ExecError> {
+    cuped: bool,
+) -> ExperimentMetricQuery {
     let kind = normalized_metric_type(metric);
     let ratio = kind == "ratio";
-    let estimate_kind = if ratio {
-        EstimateKind::Ratio
-    } else {
-        EstimateKind::Mean
-    };
-    let cuped = exp.analysis.cuped && !ratio;
     // Respect the exact configured window, including sub-24h windows.
     let window_ms = if metric.conversion_window_ms > 0 {
         metric.conversion_window_ms
@@ -370,7 +496,7 @@ async fn evaluate_metric(
         7 * 86_400_000
     };
 
-    let q = ExperimentMetricQuery {
+    ExperimentMetricQuery {
         time_range: TimeRange {
             start_ts_ms: exp.start_ts_ms,
             end_ts_ms: exp.end_ts_ms,
@@ -399,7 +525,35 @@ async fn evaluate_metric(
         } else {
             0
         },
+    }
+}
+
+struct MetricEval {
+    rows: Vec<VariantLiftRow>,
+    moments: BTreeMap<String, MetricMoments>,
+    variance_reduction_pct: Option<f64>,
+    multi_variant_users: u64,
+    segments: Vec<SegmentResult>,
+    timeseries: Vec<TimeseriesPoint>,
+}
+
+async fn evaluate_metric(
+    exp: &Experiment,
+    metric: &ExperimentMetricSpec,
+    expected_variants: &[String],
+    opts: LiftOptions,
+    segment_by: Option<&str>,
+    qengine: &QueryEngine,
+) -> Result<MetricEval, ExecError> {
+    let kind = normalized_metric_type(metric);
+    let ratio = kind == "ratio";
+    let estimate_kind = if ratio {
+        EstimateKind::Ratio
+    } else {
+        EstimateKind::Mean
     };
+    let cuped = exp.analysis.cuped && !ratio;
+    let q = metric_query(exp, metric, segment_by, cuped);
     let res = qengine.query_experiment_metric(&exp.project_id, &q).await?;
 
     // Every configured variant shows, even before anyone sees it.

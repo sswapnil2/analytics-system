@@ -17,6 +17,7 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - The web and mobile SDKs re-check feature flags every 5 minutes (configurable), so rollbacks reach apps that are already open.
 - Flag and experiment changes are recorded in the audit log.
 - Experiments can be paused and resumed from the Studio.
+- Bandits: a new experiment type that moves traffic to the best variant once a day, shows each variant's chance to be best and the cost of shipping it, and charts how traffic moved.
 
 ### Changed
 - Internal review codes removed from comments and test names; process logs moved to `docs/history/`.

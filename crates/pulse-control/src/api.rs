@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,17 +39,19 @@ pub use auth::AuthConfig;
 
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
 use crate::db::{MetaError, MetaStore};
-use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
+use crate::experiments::{
+    build_edge_flag_bundle_with_cohorts, evaluate_bandit_results, evaluate_experiment_results,
+};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
     unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
-    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
     Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
     LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
-    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
     KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
@@ -3630,6 +3632,11 @@ struct CreateExpReq {
     guardrail_metrics: Vec<ExperimentMetricSpec>,
     #[serde(default)]
     analysis: AnalysisConfig,
+    /// `"ab"` (default) or `"bandit"`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    bandit: Option<BanditConfig>,
 }
 
 async fn handle_create_experiment(
@@ -3665,6 +3672,63 @@ async fn handle_create_experiment(
             "auto_stop guardrails need analysis.sequential: results are checked every few minutes",
         ));
     }
+    let kind = req.kind.unwrap_or_else(|| "ab".to_string());
+    let mut bandit_start: Option<BTreeMap<String, u32>> = None;
+    match kind.as_str() {
+        "ab" => {}
+        "bandit" => {
+            if !req.guardrail_metrics.is_empty() {
+                return Err(CtrlError::bad(
+                    "bandits don't support guardrails: their traffic moves, so guardrails can't be tested fairly",
+                ));
+            }
+            let flags = ctrl
+                .meta
+                .list_feature_flags(&id)
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(flag) = flags.iter().find(|f| f.key == req.flag_key) else {
+                return Err(CtrlError::bad(
+                    "create the flag with its variants before starting a bandit on it",
+                ));
+            };
+            let cfg = req.bandit.clone().unwrap_or_default();
+            let arms = flag.variants.len() as u32;
+            if arms < 2 {
+                return Err(CtrlError::bad(
+                    "a bandit needs a flag with at least two variants",
+                ));
+            }
+            if cfg.min_weight_bps.saturating_mul(arms) > 10_000 {
+                return Err(CtrlError::bad(format!(
+                    "bandit.min_weight_bps {} is too high for {arms} variants",
+                    cfg.min_weight_bps
+                )));
+            }
+            bandit_start = Some(
+                flag.variants
+                    .iter()
+                    .map(|v| (v.key.clone(), v.weight_bps))
+                    .collect(),
+            );
+        }
+        _ => return Err(CtrlError::bad("kind must be ab or bandit")),
+    }
+    // A bandit rewrites its flag's weights, which would break any other test on that flag.
+    let active = ctrl
+        .meta
+        .list_experiments(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .filter(|e| e.flag_key == req.flag_key && e.status != "concluded")
+        .find(|e| kind == "bandit" || e.kind == "bandit");
+    if let Some(other) = active {
+        return Err(CtrlError::conflict(format!(
+            "flag '{}' is already used by the active experiment '{}'; a bandit needs its flag to itself",
+            req.flag_key, other.name
+        )));
+    }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
         id: format!("exp_{}", &Uuid::new_v4().simple().to_string()[..12]),
@@ -3683,11 +3747,23 @@ async fn handle_create_experiment(
         analysis: req.analysis,
         created_at_ms: now,
         stop_reason: None,
+        bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
+        kind,
     };
     ctrl.meta
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    if let Some(weights) = bandit_start {
+        let snap = WeightSnapshot {
+            effective_from_ms: exp.start_ts_ms,
+            weights,
+        };
+        ctrl.meta
+            .insert_weight_snapshot(&id, &exp.id, &snap)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
     ctrl.record_enterprise_audit(
         &principal.actor_label(),
         "experiment.created",
@@ -3775,9 +3851,17 @@ async fn handle_experiment_results_scoped(
         .get("segment")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
-    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment)
-        .await
-        .map_err(CtrlError::internal)?;
+    let results = if exp.kind == "bandit" {
+        let history = ctrl
+            .meta
+            .list_weight_history(&project_id, &exp.id)
+            .await
+            .map_err(CtrlError::meta)?;
+        evaluate_bandit_results(&exp, flag, &history, &ctrl.qengine).await
+    } else {
+        evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment).await
+    }
+    .map_err(CtrlError::internal)?;
     Ok(Json(results))
 }
 
@@ -4600,6 +4684,114 @@ impl ControlPlaneService {
                 }
             }
         }
+    }
+
+    /// Moves each running bandit's flag weights toward its best arm, once a day, in the first
+    /// hour after midnight in the project's timezone, once every arm is past burn-in. Weights only
+    /// change at day boundaries so each exposure day (the unit results are stratified and
+    /// SRM-checked by) has one set of weights. `pulse-node` calls this on the guardrail timer.
+    // ponytail: users exposed between midnight and the next tick (up to 5 minutes) get yesterday's
+    // weights but count in today's stratum; a node that's down for that hour skips a day.
+    pub async fn evaluate_bandits(&self) {
+        self.evaluate_bandits_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::evaluate_bandits`] as if the time were `now_ms`.
+    pub async fn evaluate_bandits_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running" || exp.kind != "bandit" {
+                    continue;
+                }
+                if let Err(e) = self.reweight_bandit(exp, now_ms).await {
+                    tracing::warn!(project_id = %proj.id, "bandit update failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn reweight_bandit(&self, exp: Experiment, now: i64) -> Result<(), String> {
+        let tz = self
+            .qengine
+            .catalogs()
+            .for_project(&exp.project_id)
+            .timezone();
+        let today = pulse_exec::TimeInterval::Day.align_floor_tz(now, tz);
+        if now - today >= 3_600_000 {
+            return Ok(());
+        }
+        let history = self
+            .meta
+            .list_weight_history(&exp.project_id, &exp.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if history.last().is_some_and(|s| s.effective_from_ms >= today) {
+            return Ok(());
+        }
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_bandit_results(&exp, Some(&flag), &history, &self.qengine)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(b) = res.bandit.filter(|b| b.burn_in_complete) else {
+            return Ok(());
+        };
+        let prob: BTreeMap<String, f64> = b
+            .arms
+            .iter()
+            .map(|a| (a.variant_key.clone(), a.prob_best))
+            .collect();
+        let cfg = exp.bandit.clone().unwrap_or_default();
+        let weights = crate::experiments::bandit::weights_from_prob_best(&prob, cfg.min_weight_bps);
+        let previous = flag.variants.clone();
+        for v in &mut flag.variants {
+            if let Some(&w) = weights.get(&v.key) {
+                v.weight_bps = w;
+            }
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.meta
+            .insert_weight_snapshot(
+                &exp.project_id,
+                &exp.id,
+                &WeightSnapshot {
+                    effective_from_ms: today,
+                    weights: weights.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:bandit",
+            "experiment.bandit_reweighted",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key,
+                "prob_best": prob, "previous_variants": previous, "weights": weights,
+            }),
+        )
+        .await;
+        Ok(())
     }
 
     async fn auto_stop_if_regressed(&self, mut exp: Experiment) -> Result<(), String> {

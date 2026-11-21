@@ -1,5 +1,6 @@
 //! Guardrail auto-stop: a treatment that makes an `auto_stop` guardrail significantly worse gets
 //! rolled back to control, the experiment is concluded with a reason, and it is audited.
+//! Bandits: the daily update moves flag weights to the best arm and records the change.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -312,4 +313,108 @@ async fn cached_flag_bundle_follows_flag_changes() {
     let (_, after) = bundle(app.clone()).await;
     assert_eq!(after["flags"][0]["rollout_bps"], 2000);
     assert_ne!(first["etag"], after["etag"]);
+}
+
+/// A bandit on the same data: errors are bad, control errs half as often, so the daily update
+/// moves traffic to control and records it; a second run the same day changes nothing.
+#[tokio::test]
+async fn bandit_moves_traffic_to_the_best_arm_once_a_day() {
+    let (app, ctrl, token) = setup().await;
+    let mut body = json!({
+        "name": "Risky bandit", "flag_key": "risky", "hypothesis": "", "kind": "bandit",
+        "start_ts_ms": BASE, "end_ts_ms": BASE + 5 * DAY,
+        "primary_metric": {"name": "Errors", "event_name": "Error_Shown", "direction": "increase_is_bad"},
+        "guardrail_metrics": [{"name": "Errors", "event_name": "Error_Shown"}],
+    });
+    let (status, _) = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/projects/proj_g/experiments",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no guardrails on bandits");
+    body["guardrail_metrics"] = json!([]);
+    body["flag_key"] = json!("missing");
+    let (status, _) = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/projects/proj_g/experiments",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "flag must exist");
+    body["flag_key"] = json!("risky");
+    let (status, exp) = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/projects/proj_g/experiments",
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{exp}");
+    assert_eq!(exp["kind"], "bandit");
+    assert_eq!(exp["bandit"]["min_weight_bps"], 100);
+    let (status, _) = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/projects/proj_g/experiments",
+        experiment(false, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "a bandit owns its flag");
+    let results_uri = format!(
+        "/v1/projects/proj_g/experiments/{}/results",
+        exp["id"].as_str().unwrap()
+    );
+
+    let (_, res) = call(&app, &token, "GET", &results_uri, json!(null)).await;
+    let b = &res["bandit"];
+    assert_eq!(res["kind"], "bandit");
+    assert_eq!(res["variants"], json!([]));
+    assert_eq!(b["best_variant"], "control");
+    assert_eq!(b["burn_in_complete"], true);
+    assert_eq!(b["arms"][0]["users"], 500);
+    assert!(b["arms"][0]["prob_best"].as_f64().unwrap() > 0.99, "{b}");
+    assert!((b["arms"][0]["mean_value"].as_f64().unwrap() - 1.0 / 3.0).abs() < 0.01);
+    assert_eq!(b["weight_history"].as_array().unwrap().len(), 1);
+    assert_eq!(res["sample_ratio_mismatch"], false);
+
+    // Weights only move in the first hour of a day (UTC here).
+    let midnight = chrono::Utc::now().timestamp_millis() / DAY * DAY;
+    ctrl.evaluate_bandits_at(midnight + 2 * HOUR).await;
+    assert_eq!(
+        flag_weights(&app, &token).await[1].1,
+        5000,
+        "mid-day: no change"
+    );
+    ctrl.evaluate_bandits_at(midnight + 5 * 60_000).await;
+    assert_eq!(
+        flag_weights(&app, &token).await,
+        vec![
+            ("control".to_string(), 9_900),
+            ("treatment".to_string(), 100)
+        ]
+    );
+    ctrl.evaluate_bandits_at(midnight + 30 * 60_000).await;
+    let (_, res) = call(&app, &token, "GET", &results_uri, json!(null)).await;
+    let history = res["bandit"]["weight_history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "one update per day");
+    assert_eq!(history[1]["weights"]["control"], 9_900);
+    assert_eq!(res["bandit"]["arms"][0]["weight_bps"], 9_900);
+    // Users so far were assigned 50/50; checking them against today's weights would be an SRM.
+    assert_eq!(res["sample_ratio_mismatch"], false);
+
+    let audit = ctrl.meta().list_enterprise_audit(50).await.unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|a| a.action == "experiment.bandit_reweighted")
+            .count(),
+        1
+    );
 }

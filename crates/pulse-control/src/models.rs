@@ -374,6 +374,79 @@ pub struct Experiment {
     /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
     #[serde(default)]
     pub stop_reason: Option<String>,
+    /// `"ab"` (fixed split, p-values) or `"bandit"` (weights move daily toward the best arm).
+    #[serde(default = "default_experiment_kind")]
+    pub kind: String,
+    /// Set for bandits; `None` reads as the defaults.
+    #[serde(default)]
+    pub bandit: Option<BanditConfig>,
+}
+
+fn default_experiment_kind() -> String {
+    "ab".to_string()
+}
+
+/// How a bandit moves traffic. Weights update once a day, in the first hour after midnight in the project's
+/// timezone, so each exposure day has a single set of weights.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditConfig {
+    /// No arm drops below this share, so the weaker arms keep being measured.
+    #[serde(default = "default_min_weight_bps")]
+    pub min_weight_bps: u32,
+    /// Weights stay as set until every arm has this many users.
+    #[serde(default = "default_burn_in_users")]
+    pub burn_in_users: u64,
+}
+
+impl Default for BanditConfig {
+    fn default() -> Self {
+        Self {
+            min_weight_bps: default_min_weight_bps(),
+            burn_in_users: default_burn_in_users(),
+        }
+    }
+}
+
+fn default_min_weight_bps() -> u32 {
+    100
+}
+
+fn default_burn_in_users() -> u64 {
+    100
+}
+
+/// Variant weights (basis points) in effect from `effective_from_ms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeightSnapshot {
+    pub effective_from_ms: i64,
+    pub weights: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditArm {
+    pub variant_key: String,
+    pub users: u64,
+    /// Stratified by exposure day, so changing weights don't bias it.
+    pub mean_value: f64,
+    pub ci_low: f64,
+    pub ci_high: f64,
+    /// Chance this arm is the best one.
+    pub prob_best: f64,
+    /// Expected shortfall versus the best arm if this one is shipped, in metric units.
+    pub expected_loss: f64,
+    /// Current flag weight.
+    pub weight_bps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditResults {
+    pub arms: Vec<BanditArm>,
+    pub weight_history: Vec<WeightSnapshot>,
+    pub best_variant: Option<String>,
+    /// Every arm has `burn_in_users`, so weights are moving.
+    pub burn_in_complete: bool,
+    /// Past burn-in, no SRM, and the best arm's expected loss is under 1% of its mean.
+    pub ready_to_ship: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,6 +532,11 @@ pub struct ExperimentResults {
     /// Cumulative lift by exposure day.
     #[serde(default)]
     pub timeseries: Vec<TimeseriesPoint>,
+    #[serde(default = "default_experiment_kind")]
+    pub kind: String,
+    /// Bandits only; their `variants` and `guardrails` are empty (no p-values).
+    #[serde(default)]
+    pub bandit: Option<BanditResults>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

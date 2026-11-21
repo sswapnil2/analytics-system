@@ -302,6 +302,36 @@ export interface Experiment {
   analysis?: ExperimentAnalysis;
   /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
   stop_reason?: string | null;
+  /** "ab" (fixed split, p-values) or "bandit" (traffic moves daily to the best variant). */
+  kind?: ExperimentKind;
+  bandit?: BanditConfig | null;
+}
+
+export type ExperimentKind = "ab" | "bandit";
+
+export interface BanditConfig {
+  /** No variant drops below this share (basis points). */
+  min_weight_bps: number;
+  /** Weights stay put until every variant has this many users. */
+  burn_in_users: number;
+}
+
+export interface BanditResults {
+  arms: {
+    variant_key: string;
+    users: number;
+    mean_value: number;
+    ci_low: number;
+    ci_high: number;
+    prob_best: number;
+    /** Expected shortfall versus the best variant, in metric units. */
+    expected_loss: number;
+    weight_bps: number;
+  }[];
+  weight_history: { effective_from_ms: number; weights: Record<string, number> }[];
+  best_variant: string | null;
+  burn_in_complete: boolean;
+  ready_to_ship: boolean;
 }
 
 export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
@@ -398,6 +428,9 @@ export interface ExperimentResults {
       ci_high_pct: number;
     }[];
   }[];
+  kind?: ExperimentKind;
+  /** Bandits only; their `variants` and `guardrails` are empty. */
+  bandit?: BanditResults | null;
 }
 
 export const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
@@ -1138,6 +1171,8 @@ export const api = {
       primary_metric: ExperimentMetric;
       guardrail_metrics: ExperimentMetric[];
       analysis: ExperimentAnalysis;
+      kind?: ExperimentKind;
+      bandit?: BanditConfig;
     },
   ) =>
     fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {
