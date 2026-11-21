@@ -734,7 +734,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before production traffic from browsers or many small clients.
 - Validation: `loadgen events --concurrency 64 --batch 100` should exceed 1,000 requests/s on the laptop used here with p99 under 100 ms; kill-9 tests show zero acknowledged loss.
 
-**P0-3. Bound the agent memtable.**
+**P0-3. Bound the agent memtable.** — Done: [#92](https://github.com/sswapnil2/analytics-system/pull/92)
 - Problem: R-03. Evidence: C1.
 - Solution: track bytes per project and per node; trigger flush from the append path when a shard passes its threshold instead of waiting for the tick; return `429` above a high-water mark (`PULSE_AGENT_L0_MAX_MB`).
 - Why it matters: the current behaviour is an out-of-memory kill under burst.

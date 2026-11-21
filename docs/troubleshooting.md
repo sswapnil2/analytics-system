@@ -17,7 +17,7 @@ Two tools help with almost everything below:
 | `409` | `identify` tried to merge two ids that are both already identified users | Expected protection. Don't call `identify(B)` while still identified as `A`; call `reset()` on logout |
 | `413` | Request body over 8 MiB | Send smaller batches |
 | `422` | Schema cap hit: more than 128 new event names or 256 new property keys in one batch, or the project is at 8,192 event names or 16,384 property keys | You are probably putting ids or timestamps into event or property *names*. Put them in property *values* |
-| `429` | Rate limit (default 20,000 events/s per project per node) or ingest is ahead of flushing | Retry after `Retry-After`. The SDKs do this. Raise `PULSE_INGEST_EVENTS_PER_SEC` if the load is legitimate |
+| `429` | Rate limit (default 20,000 events/s per project per node) or ingest is ahead of flushing | Retry after `Retry-After`. The SDKs do this. Raise `PULSE_INGEST_EVENTS_PER_SEC` if the load is legitimate . On agent trace ingest, `l0_backpressure` means unflushed traces reached `PULSE_AGENT_L0_MAX_MB` or `PULSE_AGENT_L0_PROJECT_MAX_MB`; it clears when the flush catches up |
 | `5xx` | Storage write failed | Check the node log and `/readyz`. Events in that request were **not** acknowledged; retry them |
 
 ## Events don't show up
