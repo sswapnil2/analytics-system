@@ -26,7 +26,7 @@ The data stays on your infrastructure. Concretely:
 - **Privacy on the device.** Replay text is masked before it leaves the browser. Lexicon rules can drop or mask properties before storage ([details](security-privacy.md)).
 - **Agent-ready.** Claude, Cursor, Codex or Gemini can answer analytics questions over [MCP](mcp.md).
 
-**What it is not:** Pulse does not ingest OpenTelemetry, traces or spans, and does not trace LLM or agent runs. See [Limitations](limitations.md).
+**What it is not:** Pulse is not an APM: it does not take OpenTelemetry metrics, logs or general service traces. It does trace LLM and agent runs, including OTLP GenAI spans ([AI agent observability](agent-observability-architecture.md)). See [Limitations](limitations.md).
 
 ## Start here
 
@@ -40,6 +40,7 @@ The data stays on your infrastructure. Concretely:
 | Send events from a backend | [Integrations → server-side](integrations.md#server-side-events-over-http) |
 | See every supported integration | [Integrations](integrations.md) |
 | Look up an endpoint | [REST API](rest-api.md) |
+| Trace LLM and AI agent runs | [AI agent observability](agent-observability-architecture.md) |
 | Look up a setting | [Configuration](configuration.md) |
 | Understand how it works inside | [System architecture](architecture.md) → [How Pulse works](how-it-works.md) → [Data model](data-model.md) |
 | Evaluate security and data handling | [Security & privacy](security-privacy.md) |

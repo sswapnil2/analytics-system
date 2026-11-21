@@ -4,9 +4,8 @@ These are the things Pulse does not do, or does with known limits. This list com
 
 ## Not supported
 
-- **OpenTelemetry.** No OTLP receiver for traces, metrics or logs.
-- **LLM and agent observability.** Pulse does not trace agent runs, LLM calls, tool calls or spans. It has no trace, span or evaluation data model, and no token or cost tracking. AI agents can *query* Pulse over [MCP](mcp.md), but they are not observed by it.
-- **Server SDKs.** None for Python, Java, Go, Ruby or Node. Use plain [HTTP](integrations.md#server-side-events-over-http).
+- **OpenTelemetry beyond agents.** The only OTLP receiver is `POST /v1/otel/v1/traces`, for LLM and agent spans ([AI agent observability](agent-observability-architecture.md)). No OTLP metrics or logs, and general service traces are not analysed.
+- **Server SDKs.** None for Python, Java, Go, Ruby or Node for product events. Use plain [HTTP](integrations.md#server-side-events-over-http). (Agent tracing has its own SDKs in `sdks/ts-agent` and `sdks/py-agent`.)
 - **Packaged mobile SDKs.** The iOS and Android core is beta and has to be built yourself ([mobile core](mobile-core.md)). React Native exists in `sdks/react-native` but is undocumented, untested in CI and not released.
 - **Sign-in and identity.** No SSO/SAML, SCIM or MFA. No OAuth on the MCP endpoint, so OAuth-only MCP clients such as ChatGPT connectors cannot connect.
 - **Email.** Pulse has no mailer. Verification and reset links are written to a local `outbox` file; invite links are returned to the admin who created them.

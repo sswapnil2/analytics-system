@@ -17,6 +17,8 @@
 /examples/ios-demo/PulseSDK/
 /examples/android-demo/app/src/main/jniLibs/
 /examples/android-demo/app/src/main/java/uniffi/
+__pycache__/
+*.pyc
 site/docs/md/
 site/llms.txt
 site/llms-full.txt

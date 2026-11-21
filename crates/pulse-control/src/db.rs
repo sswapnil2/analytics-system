@@ -70,7 +70,7 @@ pub enum MetaStore {
 }
 
 /// Converts `?` placeholders (outside single-quoted SQL string literals) into PostgreSQL `$1, $2, ...`.
-fn pg_rewrite(sql: &str) -> String {
+pub(crate) fn pg_rewrite(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 16);
     let mut idx = 0usize;
     let mut in_quotes = false;
@@ -137,7 +137,7 @@ macro_rules! profile_from_row {
 }
 
 /// Escapes `LIKE` wildcards so user search text matches literally (paired with `ESCAPE '\\'`).
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '%' | '_' | '\\') {

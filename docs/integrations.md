@@ -14,7 +14,7 @@ This is every way to get data into Pulse or out of it, and how well each one is 
 | React Native | **Experimental, undocumented.** `sdks/react-native` wraps the Web SDK with native recorder modules. It is not in CI or releases | `sdks/react-native/README.md` |
 | OpenTelemetry (OTLP traces, metrics, logs) | **Not supported** | — |
 | Python, Java, Go, Ruby SDKs | **Not available.** Use HTTP | — |
-| LLM / agent tracing (LangChain, LangGraph, OpenAI or Anthropic SDK instrumentation) | **Not supported.** Pulse does not ingest traces or spans | [Limitations](limitations.md#not-supported) |
+| LLM / agent tracing | **Supported.** `POST /v1/agent/traces`, OTLP GenAI spans at `/v1/otel/v1/traces`, or the `sdks/ts-agent` and `sdks/py-agent` SDKs | [AI agent observability](agent-observability-architecture.md) |
 
 ## Reading data
 
