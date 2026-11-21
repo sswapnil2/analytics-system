@@ -1,5 +1,6 @@
 import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Bot,
   Check,
   Copy,
   FlaskConical,
@@ -64,6 +65,9 @@ const FunnelsWorkspace = lazy(() => import("./workspaces/FunnelsWorkspace").then
 const FlowsWorkspace = lazy(() => import("./workspaces/FlowsWorkspace").then((m) => ({ default: m.FlowsWorkspace })));
 const RetentionWorkspace = lazy(() => import("./workspaces/RetentionWorkspace").then((m) => ({ default: m.RetentionWorkspace })));
 const SessionsReplayWorkspace = lazy(() => import("./workspaces/SessionsReplayWorkspace").then((m) => ({ default: m.SessionsReplayWorkspace })));
+const AgentObservabilityWorkspace = lazy(() =>
+  import("./workspaces/AgentObservabilityWorkspace").then((m) => ({ default: m.AgentObservabilityWorkspace })),
+);
 const UsersWorkspace = lazy(() => import("./workspaces/UsersWorkspace").then((m) => ({ default: m.UsersWorkspace })));
 const CohortsLookupsWorkspace = lazy(() => import("./workspaces/CohortsLookupsWorkspace").then((m) => ({ default: m.CohortsLookupsWorkspace })));
 const ExperimentsFlagsWorkspace = lazy(() => import("./workspaces/ExperimentsFlagsWorkspace").then((m) => ({ default: m.ExperimentsFlagsWorkspace })));
@@ -82,6 +86,7 @@ type WorkspaceId =
   | "journeys"
   | "retention"
   | "replays"
+  | "agents"
   | "users"
   | "cohorts"
   | "experiments"
@@ -112,7 +117,10 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   },
   {
     label: "Investigate",
-    items: [{ id: "replays", label: "Session replays", icon: PlayCircle }],
+    items: [
+      { id: "replays", label: "Session replays", icon: PlayCircle },
+      { id: "agents", label: "AI agents", icon: Bot },
+    ],
   },
   {
     label: "Audience and shipping",
@@ -1015,6 +1023,9 @@ export const App: React.FC = () => {
                         availableEvents={availableEvents}
                         refreshToken={refreshToken}
                       />
+                    )}
+                    {activeTab === "agents" && (
+                      <AgentObservabilityWorkspace projectId={activePid} refreshToken={refreshToken} />
                     )}
                     {activeTab === "users" && <UsersWorkspace projectId={activePid} />}
                     {activeTab === "cohorts" && (

@@ -100,6 +100,39 @@ fn lift_table_sequential_path_uses_compare_means_and_alpha() {
     assert!(s.ci95_high_pct - s.ci95_low_pct > l.ci95_high_pct - l.ci95_low_pct);
 }
 
+/// Seen on a real node: p = 0.016 and an absolute CI clear of 0, yet a symmetric delta-method
+/// relative CI of -21.9% to +218%. The relative CI must exclude 0 whenever the absolute one does.
+#[test]
+fn sequential_relative_ci_agrees_with_absolute_ci() {
+    let mut counts = BTreeMap::new();
+    counts.insert("control".to_string(), (615u64, 70u64));
+    counts.insert("treatment".to_string(), (585u64, 132u64));
+    let seq = LiftOptions {
+        alpha: 0.05,
+        sequential_rho: Some(sequential_rho(0.05, 20_000)),
+    };
+    for opts in [seq, LiftOptions::default()] {
+        let rows = compute_lift_table(&counts, opts);
+        let t = rows.iter().find(|r| !r.is_control).unwrap();
+        assert!(t.abs_ci_low > 0.0, "{t:?}");
+        assert!(t.statistically_significant, "{t:?}");
+        assert!(t.ci95_low_pct > 0.0, "relative CI must exclude 0: {t:?}");
+        assert!(t.ci95_low_pct < t.relative_lift_pct && t.relative_lift_pct < t.ci95_high_pct);
+    }
+
+    // Agreement holds across a sweep of effect sizes, both directions, fixed and sequential.
+    let c = Moments::from_conversions(615, 70);
+    for x_t in 20..200 {
+        let t = Moments::from_conversions(585, x_t);
+        for opts in [seq, LiftOptions::default()] {
+            let cmp = compare_means(&c, &t, opts).unwrap();
+            let abs_sig = cmp.abs_ci.0 > 0.0 || cmp.abs_ci.1 < 0.0;
+            let rel_sig = cmp.rel_ci_pct.0 > 0.0 || cmp.rel_ci_pct.1 < 0.0;
+            assert_eq!(abs_sig, rel_sig, "x_t={x_t} {cmp:?}");
+        }
+    }
+}
+
 /// 2,000 A/A tests at a 10% base rate, each checked 20 times as users arrive. Checking a
 /// fixed-horizon test that often inflates false positives well past 5%; the sequential test must
 /// stay at or under its 5% level.

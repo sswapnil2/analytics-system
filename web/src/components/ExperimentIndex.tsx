@@ -22,7 +22,7 @@ function statusText(e: Experiment): string {
   if (e.status === "concluded") {
     const d = e.decision;
     if (!d) return "Stopped";
-    return d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
+    return `Stopped · ${d.outcome === "ship" ? `shipped ${d.variant}` : d.outcome === "keep_control" ? "kept control" : "inconclusive"}`;
   }
   const { day, total } = dayOfTotal(e);
   return `${e.status === "paused" ? "Paused" : "Running"} · day ${day} of ${total}`;
