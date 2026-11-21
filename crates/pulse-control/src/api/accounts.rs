@@ -46,6 +46,7 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         // Every user who dropped off at a funnel step, as ids.
         "/v1/projects/:id/query/funnel/dropped",
         "/v1/projects/:id/deletions",
+        "/v1/projects/:id/agent/erasure",
         "/v1/org/invites",
         "/v1/org/invites/:invite_id",
         "/v1/org/members/:user_id",
@@ -76,6 +77,10 @@ pub(super) fn required_role(method: &Method, path: &str) -> Role {
         || (path == "/v1/projects" && m == Method::POST)
         || (path == "/v1/projects/:id" && m == Method::PATCH)
         || (path == "/v1/projects/:id/users/:distinct_id" && m == Method::DELETE)
+        || (path == "/v1/projects/:id/agent/traces/:trace_id" && m == Method::DELETE)
+        || (path == "/v1/projects/:id/agent/privacy" && m == Method::PUT)
+        || (path == "/v1/projects/:id/agent/pricing" && m == Method::POST)
+        || (path == "/v1/projects/:id/agent/pricing/:rule_id" && m == Method::DELETE)
     {
         Role::Admin
     } else if m == Method::GET || m == Method::HEAD || READ_POSTS.contains(&path) {
@@ -1001,6 +1006,118 @@ mod tests {
         assert_eq!(r(Method::PATCH, "/v1/org/members/:user_id"), Role::Admin);
         assert_eq!(r(Method::PATCH, "/v1/org"), Role::Owner);
         assert_eq!(r(Method::POST, "/v1/auth/password"), Role::Viewer);
+        assert_eq!(r(Method::POST, "/v1/mcp"), Role::Viewer);
+
+        // Agent observability 4-tier RBAC
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/sessions"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/sessions/:session_id"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/traces"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/traces/:trace_id"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/analytics"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/compare"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/privacy"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::GET, "/v1/projects/:id/agent/pricing"),
+            Role::Viewer
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/evaluators"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/agent/evaluators/:eval_id"),
+            Role::Member
+        );
+        assert_eq!(
+            r(
+                Method::POST,
+                "/v1/projects/:id/agent/traces/:trace_id/evaluate"
+            ),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/evaluate"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/evaluations"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/datasets"),
+            Role::Member
+        );
+        assert_eq!(
+            r(
+                Method::POST,
+                "/v1/projects/:id/agent/traces/:trace_id/promote"
+            ),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/experiments"),
+            Role::Member
+        );
+        assert_eq!(
+            r(
+                Method::POST,
+                "/v1/projects/:id/agent/experiments/:exp_id/runs"
+            ),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/alerts"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/alerts/evaluate"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/agent/alerts/:rule_id"),
+            Role::Member
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/agent/traces/:trace_id"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/erasure"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::PUT, "/v1/projects/:id/agent/privacy"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::POST, "/v1/projects/:id/agent/pricing"),
+            Role::Admin
+        );
+        assert_eq!(
+            r(Method::DELETE, "/v1/projects/:id/agent/pricing/:rule_id"),
+            Role::Admin
+        );
     }
 
     #[test]

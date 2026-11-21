@@ -12,6 +12,7 @@ for AI agents.
 | [Web SDK](web-sdk.md) | `sdks/ts-web`: tracking, identify, user properties, flags, replay |
 | [Mobile core (beta)](mobile-core.md) | `crates/pulse-sdk-core`: the Rust core with UniFFI Swift/Kotlin bindings |
 | [REST API](rest-api.md) | The open-source `/v1/...` routes, grouped by auth type |
+| [AI agent observability](agent-observability-architecture.md) | Tracing LLM agents: ingest routes, the PLST format, storage, evaluations, privacy and limits |
 | [MCP for agents](mcp.md) | `POST /v1/mcp`: tools, protocol support, and config for Claude Code, Claude Desktop, Cursor, OpenAI Codex / Responses API, Gemini CLI and Antigravity |
 | [Claude Code plugin](../integrations/claude-code-plugin/README.md) | Installable plugin that wires up the MCP server and adds analysis skills |
 

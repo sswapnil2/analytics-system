@@ -6,6 +6,7 @@ members = [
     "crates/pulse-storage",
     "crates/pulse-ingest",
     "crates/pulse-exec",
+    "crates/pulse-agent",
     "crates/pulse-control",
     "crates/pulse-sdk-core",
     "crates/pulse-node",
@@ -28,6 +29,7 @@ pulse-identity = { path = "crates/pulse-identity" }
 pulse-storage = { path = "crates/pulse-storage" }
 pulse-ingest = { path = "crates/pulse-ingest" }
 pulse-exec = { path = "crates/pulse-exec" }
+pulse-agent = { path = "crates/pulse-agent" }
 pulse-control = { path = "crates/pulse-control" }
 pulse-sdk-core = { path = "crates/pulse-sdk-core" }
 

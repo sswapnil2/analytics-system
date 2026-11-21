@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use chrono::Utc;
+use dashmap::DashMap;
 use pulse_exec::{
     FlowDirection, FlowsQuery, FunnelOrderMode, FunnelQuery, FunnelResult, FunnelStepSpec,
     GlobalFilter, InsightsMetric, InsightsQuery, InsightsSeriesSpec, QueryEngine, RetentionMode,
@@ -14,27 +15,59 @@ use serde_json::{json, Value};
 use crate::db::MetaStore;
 use crate::models::ByokCredentialRecord;
 
-/// Validates a customer-supplied outbound URL and returns a client that can only reach the
-/// addresses that passed the SSRF check: redirects are off, and DNS for the host is pinned to the
-/// checked IPs so a rebinding name can't swap in an internal address after validation.
+/// Connect-time DNS resolver that rejects private/loopback/metadata IPs so a cached `reqwest::Client`
+/// cannot be tricked by DNS rebinding between URL validation and TCP connect.
+struct SsrfCheckingDnsResolver;
+
+impl reqwest::dns::Resolve for SsrfCheckingDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let addrs = check_resolved_addrs(&host, addrs)?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn cached_outbound_client(
+    allow_priv: bool,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    static CLIENTS: OnceLock<DashMap<(bool, std::time::Duration), reqwest::Client>> =
+        OnceLock::new();
+    let cache = CLIENTS.get_or_init(DashMap::new);
+    let key = (allow_priv, timeout);
+    if let Some(existing) = cache.get(&key) {
+        return Ok(existing.clone());
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    if !allow_priv {
+        builder = builder
+            .https_only(true)
+            .dns_resolver(Arc::new(SsrfCheckingDnsResolver));
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    let entry = cache.entry(key).or_insert(client);
+    Ok(entry.value().clone())
+}
+
+/// Validates a customer-supplied outbound URL and returns a cached SSRF-guarded client:
+/// redirects and proxies are off, HTTPS is enforced when private endpoints are disallowed,
+/// and DNS is re-checked against forbidden IP ranges at connect time via `SsrfCheckingDnsResolver`.
 pub(crate) async fn pinned_outbound_client(
     raw_url: &str,
     timeout: std::time::Duration,
 ) -> Result<(reqwest::Url, reqwest::Client), String> {
     let url = validate_outbound_url_ssrf(raw_url).map_err(|e| e.to_string())?;
-    let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    if let (Some(host), false) = (url.domain(), allow_private_endpoints()) {
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| format!("outbound host '{host}' could not be resolved: {e}"))?;
-        let addrs = check_resolved_addrs(host, addrs).map_err(|e| e.to_string())?;
-        builder = builder.resolve_to_addrs(host, &addrs);
-    }
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let client = cached_outbound_client(allow_private_endpoints(), timeout)?;
     Ok((url, client))
 }
 
@@ -463,6 +496,30 @@ pub(crate) async fn call_external_llm(
     metrics: &Value,
     cited_sessions: &[String],
 ) -> Result<String, CopilotError> {
+    let system_prompt = "You are Pulse Analytics BYOK Copilot. Note: session IDs and aggregate query JSON are sent here under customer BYOK consent. Answer the user's question directly in concise Markdown, referencing exact metrics and session IDs from the provided tool outputs.";
+    let user_msg =
+        format!("Question: {prompt}\nMetrics: {metrics}\nCited Sessions: {cited_sessions:?}");
+    call_external_llm_with_system(
+        provider,
+        model,
+        api_key,
+        custom_endpoint,
+        system_prompt,
+        &user_msg,
+        500,
+    )
+    .await
+}
+
+pub(crate) async fn call_external_llm_with_system(
+    provider: &str,
+    model: &str,
+    api_key: &str,
+    custom_endpoint: Option<&str>,
+    system_prompt: &str,
+    user_msg: &str,
+    max_tokens: u32,
+) -> Result<String, CopilotError> {
     let default_url = match provider {
         "anthropic" => "https://api.anthropic.com/v1/messages".to_string(),
         "gemini" => format!(
@@ -477,10 +534,6 @@ pub(crate) async fn call_external_llm(
             CopilotError::BadRequest(format!("LLM endpoint blocked by SSRF policy: {e}"))
         })?;
 
-    let system_prompt = "You are Pulse Analytics BYOK Copilot. Note: session IDs and aggregate query JSON are sent here under customer BYOK consent. Answer the user's question directly in concise Markdown, referencing exact metrics and session IDs from the provided tool outputs.";
-    let user_msg =
-        format!("Question: {prompt}\nMetrics: {metrics}\nCited Sessions: {cited_sessions:?}");
-
     match provider {
         "anthropic" => {
             let res = client
@@ -489,7 +542,7 @@ pub(crate) async fn call_external_llm(
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
                     "model": model,
-                    "max_tokens": 500,
+                    "max_tokens": max_tokens,
                     "system": system_prompt,
                     "messages": [{ "role": "user", "content": user_msg }],
                 }))
@@ -546,7 +599,7 @@ pub(crate) async fn call_external_llm(
                         { "role": "system", "content": system_prompt },
                         { "role": "user", "content": user_msg }
                     ],
-                    "max_tokens": 500
+                    "max_tokens": max_tokens
                 }))
                 .send()
                 .await
