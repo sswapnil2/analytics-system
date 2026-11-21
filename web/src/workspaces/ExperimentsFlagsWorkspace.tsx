@@ -11,6 +11,18 @@ import { AudiencePicker, EVERYONE, KEEP, NEW } from "../components/AudiencePicke
 
 /** The flag picker's "New flag…" choice. */
 const NEW_FLAG = "__new_flag";
+
+type PageTab = "experiments" | "flags" | "traffic";
+const PAGE_TABS: { value: PageTab; label: string }[] = [
+  { value: "experiments", label: "Experiments" },
+  { value: "flags", label: "Feature flags" },
+  { value: "traffic", label: "Holdouts and layers" },
+];
+const hashParams = () => new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+const tabFromHash = (): PageTab => {
+  const t = hashParams().get("tab");
+  return t === "flags" || t === "traffic" ? t : "experiments";
+};
 import { Cond, cohortDefinition } from "../lib/cohort";
 import { BanditResultsView } from "../components/BanditResults";
 import { LiftChart } from "../components/LiftChart";
@@ -511,9 +523,14 @@ const ExperimentSetup: React.FC<{
       </>,
     ]);
   }
+  const { day, total } = dayOfTotal(exp);
   rows.push([
     "Dates",
-    `${new Date(exp.start_ts_ms).toLocaleDateString()} to ${new Date(exp.end_ts_ms).toLocaleDateString()} · day ${dayOfTotal(exp).day} of ${dayOfTotal(exp).total}`,
+    exp.status === "draft"
+      ? `Not started · planned for ${total} ${total === 1 ? "day" : "days"}`
+      : `${new Date(exp.start_ts_ms).toLocaleDateString()} to ${new Date(exp.end_ts_ms).toLocaleDateString()} · ${
+          exp.status === "concluded" ? `ran ${total} ${total === 1 ? "day" : "days"}` : `day ${day} of ${total}`
+        }`,
   ]);
   return (
     <details className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm" open>
@@ -756,6 +773,16 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [creating, setCreating] = useState<boolean>(false);
 
   const [expFormOpen, setExpFormOpen] = useState(false);
+  const [tab, setTabState] = useState<PageTab>(tabFromHash);
+  /** Shows a tab and keeps it in the URL, so a link opens the same one. */
+  const setTab = (t: PageTab) => {
+    setTabState(t);
+    const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+    const params = new URLSearchParams(search);
+    if (t === "experiments") params.delete("tab");
+    else params.set("tab", t);
+    window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+  };
   const [expName, setExpName] = useState("");
   const [expFlagId, setExpFlagId] = useState("");
   /** With "New flag…": the key of the flag to create when the experiment is saved. */
@@ -907,6 +934,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       if (!path.replace(/^\//, "").startsWith("experiments")) return;
       const params = new URLSearchParams(search);
       const exp = params.get("exp");
+      setTabState(exp || params.get("new") === "1" ? "experiments" : tabFromHash());
       if (exp && exp !== selectedExpIdRef.current) {
         if (initial) {
           selectedExpIdRef.current = exp; // loadAll picks it up
@@ -938,17 +966,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     void loadAll();
   }, [loadAll, refreshToken]);
 
+  /** Keeps the URL on this experiment, so it can be shared. */
+  const setExpInUrl = (expId: string) => {
+    const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+    const params = new URLSearchParams(search);
+    if (expId) params.set("exp", expId);
+    else params.delete("exp");
+    window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+  };
+
   const handleSelectExperiment = async (expId: string, seg = segmentRef.current) => {
     selectedExpIdRef.current = expId;
     setSelectedExpId(expId);
-    // Keep the URL on this experiment, so it can be shared.
-    {
-      const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
-      const params = new URLSearchParams(search);
-      if (expId) params.set("exp", expId);
-      else params.delete("exp");
-      window.history.replaceState(null, "", `#${path}?${params.toString()}`);
-    }
+    setExpInUrl(expId);
     const seq = ++resultsSeqRef.current;
     if (!expId) {
       setExpResults(null);
@@ -1174,6 +1204,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       closeExpForm();
       setSelectedExpId(created.id);
       selectedExpIdRef.current = created.id;
+      setExpInUrl(created.id);
       await loadAll();
     } catch (e) {
       setExpError(`Couldn't create experiment: ${errorMessage(e)}`);
@@ -1296,7 +1327,17 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               Update results
             </button>
             {canEdit && (
-              <button type="button" onClick={() => (expFormOpen ? closeExpForm() : setExpFormOpen(true))} className={btn.primary}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (expFormOpen) closeExpForm();
+                  else {
+                    setTab("experiments");
+                    setExpFormOpen(true);
+                  }
+                }}
+                className={btn.primary}
+              >
                 <Plus className="h-3.5 w-3.5" />
                 New experiment
               </button>
@@ -1305,6 +1346,30 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         }
       />
 
+      <div role="tablist" aria-label="Experiments sections" className="flex flex-wrap gap-1 border-b border-line">
+        {PAGE_TABS.map((t) => (
+          <button
+            key={t.value}
+            type="button"
+            role="tab"
+            id={`exp-tab-${t.value}`}
+            aria-selected={tab === t.value}
+            aria-controls={`exp-panel-${t.value}`}
+            onClick={() => setTab(t.value)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              tab === t.value ? "border-brand text-ink" : "border-transparent text-muted hover:text-ink"
+            }`}
+          >
+            {t.label}
+            {t.value === "flags" && flags.length > 0 && <span className="ml-1.5 text-xs text-faint">{flags.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {loadError && <ErrorNotice message={loadError} onRetry={() => void loadAll()} />}
+
+      {tab === "experiments" && (
+      <div role="tabpanel" id="exp-panel-experiments" aria-labelledby="exp-tab-experiments" className="space-y-5">
       {expFormOpen && (
         <Panel title="New experiment" meta="Compares the variants of one feature flag">
           <form
@@ -1330,7 +1395,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 {expKind === "bandit" && (
                   <span className="text-xs text-muted">
                     Fewer users get the worse variants while it runs. You get each variant's chance to be best instead of a
-                    p-value, so use an A/B test when you need to know how big the difference is.
+                    p-value, so use an A/B test when you need to know how big the difference is. Bandits have no
+                    guardrails: traffic follows the primary metric alone, so use an A/B test when something must not get
+                    worse.
                   </span>
                 )}
               </label>
@@ -1704,8 +1771,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         </Panel>
       )}
 
-      {loadError && <ErrorNotice message={loadError} onRetry={() => void loadAll()} />}
-
       {experiments.length > 1 && (
         <Panel title="All experiments" meta={`${experiments.length} in this project`}>
           <ExperimentIndex
@@ -1827,6 +1892,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       ? `Stopped ${new Date(selectedExp.end_ts_ms).toLocaleDateString()}`
                       : "Paused"}
                 </span>
+                {(selectedExp.status === "running" || selectedExp.status === "paused") && (
                 <span
                   className="rounded bg-hover px-2 py-0.5 text-xs font-medium text-muted"
                   title={expResults.statistical_methodology_note}
@@ -1837,6 +1903,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       ? "Sequential · safe to check any time"
                       : "Fixed horizon · read at the end"}
                 </span>
+                )}
                 {!noExposures && !banditResults && (
                   <span
                     className={`rounded px-2 py-0.5 text-xs font-medium ${
@@ -1987,7 +2054,23 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
-            {noExposures && (
+            {noExposures && selectedExp?.status === "concluded" && (
+              <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
+                <p className="font-medium text-ink">Ended with no exposures</p>
+                <p className="mt-1">No one was shown a variant while it ran, so there's nothing to compare.</p>
+              </div>
+            )}
+            {noExposures && selectedExp?.status === "draft" && (
+              <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
+                <p className="font-medium text-ink">Not started</p>
+                <p className="mt-1">
+                  Results appear once it's running and your app asks for a variant. That sends a{" "}
+                  <code className="font-mono">$experiment_started</code> event with the flag key and variant.
+                </p>
+                <ExposureSnippets flagKey={expResults.flag_key} />
+              </div>
+            )}
+            {noExposures && (selectedExp?.status === "running" || selectedExp?.status === "paused") && (
               <div className="rounded-lg border border-line bg-sunken px-3.5 py-3 text-sm text-ink-2">
                 <p className="font-medium text-ink">No one has seen this experiment yet</p>
                 <p className="mt-1">
@@ -2009,7 +2092,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
             {!noExposures && !banditResults && (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-sm">
+              <table className="w-full min-w-[820px] text-sm">
                 <thead>
                   <tr className="border-b border-line text-xs text-muted">
                     <th className="py-2 text-left font-medium">Variant</th>
@@ -2023,7 +2106,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     </th>
                     <th className="py-2 text-right font-medium">p-value</th>
                     <th className="py-2 text-right font-medium">Chance to beat control</th>
-                    <th className="py-2 pl-4 text-left font-medium">Result</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
@@ -2042,6 +2124,26 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                               <span className="rounded bg-hover px-1.5 py-0.5 text-xs text-muted">Control</span>
                             )}
                           </span>
+                          {!v.is_control && (
+                            // The verdict sits with the variant name, so it's never scrolled out of view.
+                            <span
+                              className={`mt-0.5 inline-flex items-center gap-1.5 text-xs font-normal ${
+                                !v.statistically_significant ? "text-muted" : gain(selectedExp, v.relative_lift_pct) > 0 ? "text-ok" : "text-danger"
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 rounded-full ${
+                                  !v.statistically_significant ? "bg-line-strong" : gain(selectedExp, v.relative_lift_pct) > 0 ? "bg-ok" : "bg-danger"
+                                }`}
+                                aria-hidden
+                              />
+                              {!v.statistically_significant
+                                ? "Not yet significant"
+                                : gain(selectedExp, v.relative_lift_pct) > 0
+                                  ? "Significantly better"
+                                  : "Significantly worse"}
+                            </span>
+                          )}
                         </td>
                         <td className="tabular py-3 text-right text-ink-2">{formatCount(v.sample_size)}</td>
                         {isConversion && <td className="tabular py-3 text-right text-ink-2">{formatCount(v.conversions)}</td>}
@@ -2085,21 +2187,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           {v.is_control
                             ? "–"
                             : formatProbability(lowerIsBetter(selectedExp) ? 1 - v.bayesian_prob_to_beat_control : v.bayesian_prob_to_beat_control)}
-                        </td>
-                        <td className="py-3 pl-4">
-                          {v.is_control ? (
-                            <span className="text-faint">–</span>
-                          ) : v.statistically_significant ? (
-                            <span className="inline-flex items-center gap-1.5 text-ok">
-                              <span className="h-2 w-2 rounded-full bg-ok" aria-hidden />
-                              Significant
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1.5 text-muted">
-                              <span className="h-2 w-2 rounded-full bg-line-strong" aria-hidden />
-                              Not yet significant
-                            </span>
-                          )}
                         </td>
                       </tr>
                     );
@@ -2305,6 +2392,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         )}
       </Panel>
 
+      </div>
+      )}
+
+      {tab === "flags" && (
+      <div role="tabpanel" id="exp-panel-flags" aria-labelledby="exp-tab-flags">
       <Panel title="Feature flags">
         <div className="space-y-4">
           {flagError && <ErrorNotice message={flagError} />}
@@ -2360,7 +2452,10 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           <button
                             type="button"
                             className="font-medium text-ink underline"
-                            onClick={() => void handleSelectExperiment(live.id)}
+                            onClick={() => {
+                              setTab("experiments");
+                              void handleSelectExperiment(live.id);
+                            }}
                           >
                             {live.name}
                           </button>{" "}
@@ -2490,15 +2585,22 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         </div>
       </Panel>
 
-      <HoldoutsAndLayers
-        projectId={projectId}
-        holdouts={holdouts}
-        layers={layers}
-        events={availableEvents}
-        canEdit={canEdit}
-        experiments={experiments}
-        onChanged={loadAll}
-      />
+      </div>
+      )}
+
+      {tab === "traffic" && (
+        <div role="tabpanel" id="exp-panel-traffic" aria-labelledby="exp-tab-traffic">
+          <HoldoutsAndLayers
+            projectId={projectId}
+            holdouts={holdouts}
+            layers={layers}
+            events={availableEvents}
+            canEdit={canEdit}
+            experiments={experiments}
+            onChanged={loadAll}
+          />
+        </div>
+      )}
 
       {review === "form" && (() => {
         const flag = formFlag;

@@ -12,8 +12,8 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use pulse_control::{
-    build_admin_control_router, build_public_flag_router, BootstrapCredentials,
-    ControlPlaneService, MetaStore,
+    build_admin_control_router, build_agent_ingest_router, build_public_flag_router,
+    BootstrapCredentials, ControlPlaneService, MetaStore,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
@@ -213,6 +213,10 @@ impl RunningNode {
             self.http_task.abort();
         }
         self.qengine.cache().close().await;
+        // Drains the agent WAL group commit and flushes agent L0 (no-op flush when read-only).
+        if let Err(e) = self.control.agent_store().close().await {
+            tracing::error!(error = %e, "closing agent trace store on shutdown failed");
+        }
         if !self.storage.identity_router().is_read_only() {
             // Losing these would lose acknowledged data from memory: say so loudly.
             if let Err(e) = self.storage.flush_all_projects().await {
@@ -388,6 +392,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         let existing_rows = ps.total_l0_rows() as u64 + ps.snapshot().manifest.total_l1_rows();
         if existing_rows == 0 {
             seed_indian_fintech_dataset(&control, &ingest, &config.default_project_id).await?;
+            seeder::seed_agent_demo(&control, &config.default_project_id).await?;
         }
     }
 
@@ -404,9 +409,50 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                         alerts_control.evaluate_experiment_guardrails().await;
                         alerts_control.evaluate_bandits().await;
                         alerts_control.advance_staged_rollouts().await;
+                        alerts_control.evaluate_agent_alerts().await;
+                        alerts_control.prune_expired_agent_data().await;
                     }
                     changed = alerts_shutdown.changed() => {
                         if changed.is_err() || *alerts_shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
+    if config.role != NodeRole::Compactor {
+        control.spawn_agent_eval_worker(shutdown_bg_rx.clone());
+    }
+    if config.role.serves_ingest() {
+        // The agent trace store only flushes and compacts when asked; writers own both.
+        let agent_control = control.clone();
+        let mut agent_shutdown = shutdown_bg_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            let mut ticks: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let store = agent_control.agent_store();
+                        if let Err(e) = store.flush_l0().await {
+                            tracing::warn!(error = %e, "agent L0 flush failed");
+                        }
+                        ticks += 1;
+                        // ponytail: compaction every minute on each writer; the manifest CAS
+                        // settles races between ingest nodes. Elect one compactor if that churns.
+                        if ticks % 12 == 0 {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
+                                Ok(tombstones) => {
+                                    if let Err(e) = store.compact_and_gc(None, &tombstones).await {
+                                        tracing::warn!(error = %e, "agent compaction failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, "loading agent erasure tombstones failed"),
+                            }
+                        }
+                    }
+                    changed = agent_shutdown.changed() => {
+                        if changed.is_err() || *agent_shutdown.borrow() { break; }
                     }
                 }
             }
@@ -502,6 +548,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     if config.role.serves_ingest() {
         let ingest_public = Router::new()
             .merge(build_ingest_router(ingest.clone()))
+            .merge(build_agent_ingest_router(control.clone()))
             .merge(build_public_flag_router(control.clone()))
             .layer(CorsLayer::permissive());
         api_router = api_router.merge(ingest_public);
@@ -520,7 +567,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     let app = if config.role.serves_query_and_admin() {
         let spa_router = if index_file.exists() {
             let serve_dir =
-                ServeDir::new(&config.web_dist_dir).not_found_service(ServeFile::new(index_file));
+                ServeDir::new(&config.web_dist_dir).fallback(ServeFile::new(index_file));
             // ponytail: everything in dist except index.html is under content-hashed assets/, so
             // non-HTML can be cached forever. Add a path check if un-hashed files land in dist/.
             let cached_dir = SetResponseHeader::overriding(
@@ -948,7 +995,11 @@ mod tests {
                 "query_flows",
                 "get_user",
                 "list_property_values",
-                "list_cohorts"
+                "list_cohorts",
+                "list_agent_traces",
+                "get_agent_trace",
+                "query_agent_analytics",
+                "list_agent_evaluations"
             ]
         );
 

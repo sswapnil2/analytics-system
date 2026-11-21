@@ -1330,3 +1330,169 @@ async fn seed_starter_dashboard(
         .await?;
     Ok(())
 }
+
+/// Seeds the demo project's AI agent data: ~60 support-agent traces over the last 7 days
+/// (LLM, retrieval and tool spans, some failures) grouped into sessions, three evaluators
+/// (trace, span and session level), a dataset built from a real trace, and a pending experiment.
+/// Evaluations aren't written directly: eval jobs are queued so the worker scores the traces.
+/// Runs only from the first-boot seed branch, so restarts don't duplicate it.
+pub async fn seed_agent_demo(
+    ctrl: &Arc<ControlPlaneService>,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    use pulse_agent::{
+        AgentDataset, AgentDatasetItem, AgentExperiment, EvaluatorConfig, TraceIngestBatch,
+    };
+    use pulse_control::EvalJob;
+    use serde_json::json;
+
+    let now = Utc::now().timestamp_millis();
+    let questions = [
+        (
+            "How do I reset my PIN?",
+            "Open Settings > Security > Reset PIN.",
+        ),
+        (
+            "Why was my loan application declined?",
+            "Your credit check didn't meet the minimum score.",
+        ),
+        (
+            "When is my next EMI due?",
+            "Your next EMI of Rs 4,250 is due on the 5th.",
+        ),
+        (
+            "Can I prepay my personal loan?",
+            "Yes, prepayment is free after 6 EMIs.",
+        ),
+    ];
+    let (mut traces, mut spans) = (Vec::new(), Vec::new());
+    let mut sessions = Vec::new();
+    for i in 0..60i64 {
+        let tid = format!("tr_demo_{i:03}");
+        let sid = format!("sess_demo_{:03}", i / 2);
+        let start = now - (i * 7 * 86_400_000 / 60) - 60_000;
+        let (q, a) = questions[(i % 4) as usize];
+        let version = if i % 3 == 0 { "1.1.0" } else { "1.0.0" };
+        let model = if i % 5 == 0 {
+            "claude-haiku-5-5"
+        } else {
+            "gpt-4o-mini"
+        };
+        let provider = if i % 5 == 0 { "anthropic" } else { "openai" };
+        let tool_fails = i % 9 == 4;
+        let llm_ms = 600 + (i * 37) % 900;
+        let tool_ms = 80 + (i * 13) % 200;
+        let dur = 40 + llm_ms + tool_ms;
+        let status = if tool_fails { "error" } else { "ok" };
+        traces.push(json!({
+            "trace_id": tid, "agent_name": "support-agent", "agent_version": version,
+            "environment": "production", "session_id": sid, "user_id": format!("user_demo_{:02}", i % 17),
+            "status": status, "start_ts_ms": start, "end_ts_ms": start + dur, "duration_ms": dur,
+            "input": {"question": q}, "output": if tool_fails { json!(null) } else { json!({"answer": a}) },
+            "error_type": if tool_fails { json!("ToolError") } else { json!(null) },
+            "error_message": if tool_fails { json!("lookup_account failed: core banking API timed out") } else { json!(null) },
+            "failure_source": if tool_fails { json!("tool") } else { json!(null) },
+        }));
+        let root = format!("sp_{tid}_root");
+        let mk = |id: String,
+                  parent: Option<&str>,
+                  name: &str,
+                  kind: &str,
+                  s: i64,
+                  d: i64,
+                  extra: serde_json::Value| {
+            let mut v = json!({"span_id": id, "trace_id": tid, "parent_span_id": parent, "name": name,
+                "span_type": kind, "status": "ok", "start_ts_ms": s, "end_ts_ms": s + d, "duration_ms": d});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        spans.push(mk(
+            root.clone(),
+            None,
+            "support-agent",
+            "agent",
+            start,
+            dur,
+            json!({"status": status, "input": {"question": q}}),
+        ));
+        spans.push(mk(
+            format!("sp_{tid}_ret"),
+            Some(&root),
+            "search_help_center",
+            "retrieval",
+            start + 10,
+            30,
+            json!({"output": {"documents": 3}}),
+        ));
+        let (tin, tout) = (900 + (i * 31) % 700, 120 + (i * 17) % 200);
+        // Store-level ingest skips the pricing step, so price the demo calls here (USD per 1M tokens).
+        let (pin, pout) = if provider == "anthropic" {
+            (1.0, 5.0)
+        } else {
+            (0.15, 0.60)
+        };
+        let cost_nanos = ((tin as f64 * pin + tout as f64 * pout) * 1_000.0) as i64;
+        spans.push(mk(format!("sp_{tid}_llm"), Some(&root), "answer", "llm", start + 40, llm_ms, json!({
+            "provider": provider, "model": model, "input_tokens": tin, "output_tokens": tout,
+            "cost_nanos": cost_nanos, "cost_usd": cost_nanos as f64 / 1e9, "finish_reason": "stop",
+            "input": {"messages": [{"role": "system", "content": "You are a support agent for a lending app. Answer from the help center articles."}, {"role": "user", "content": q}]}, "output": {"role": "assistant", "content": a}})));
+        spans.push(mk(format!("sp_{tid}_tool"), Some(&root), "lookup_account", "tool", start + 40 + llm_ms, tool_ms, json!({
+            "tool_name": "lookup_account", "status": if tool_fails { "error" } else { "ok" },
+            "error_type": if tool_fails { json!("Timeout") } else { json!(null) },
+            "error_message": if tool_fails { json!("core banking API timed out") } else { json!(null) },
+            "tool_retry_count": if tool_fails { 2 } else { 0 }})));
+        if i % 2 == 0 {
+            sessions.push((sid, tid));
+        }
+    }
+    let batch: TraceIngestBatch =
+        serde_json::from_value(json!({"traces": traces, "spans": spans}))?;
+    ctrl.agent_store().ingest_batch(project_id, batch).await?;
+
+    let meta = ctrl.meta();
+    for (id, name, target, kind) in [
+        ("evc_demo_no_errors", "No errors", "trace", "no_errors"),
+        (
+            "evc_demo_output",
+            "Answer not empty",
+            "span",
+            "output_not_empty",
+        ),
+        ("evc_demo_no_loop", "No tool loops", "session", "no_loop"),
+    ] {
+        let cfg: EvaluatorConfig = serde_json::from_value(json!({
+            "id": id, "project_id": project_id, "name": name, "target_type": target, "kind": kind,
+            "enabled": true, "created_at_ms": now, "updated_at_ms": now}))?;
+        meta.upsert_evaluator_config(&cfg).await?;
+    }
+    for (sid, tid) in sessions {
+        ctrl.try_enqueue_eval(EvalJob {
+            project_id: project_id.to_string(),
+            session_id: Some(sid),
+            trace_id: Some(tid),
+            span_id: None,
+            evaluator_ids: None,
+        });
+    }
+
+    let ds: AgentDataset = serde_json::from_value(json!({
+        "id": "ds_demo_support", "project_id": project_id, "name": "Support regressions",
+        "description": "Questions the support agent got wrong in production.", "version": 1,
+        "item_count": 1, "created_at_ms": now, "updated_at_ms": now}))?;
+    meta.upsert_agent_dataset(&ds).await?;
+    let item: AgentDatasetItem = serde_json::from_value(json!({
+        "id": "dsi_demo_001", "project_id": project_id, "dataset_id": ds.id, "dataset_version": 1,
+        "input": {"question": questions[0].0}, "expected_output": {"answer": questions[0].1},
+        "source_trace_id": "tr_demo_004", "created_at_ms": now, "updated_at_ms": now}))?;
+    meta.upsert_dataset_item(&item).await?;
+    let exp: AgentExperiment = serde_json::from_value(json!({
+        "id": "exp_demo_v110", "project_id": project_id, "name": "support-agent 1.1.0 vs regressions",
+        "dataset_id": ds.id, "dataset_version": 1, "agent_name": "support-agent", "agent_version": "1.1.0",
+        "evaluator_ids": ["evc_demo_no_errors"], "status": "pending", "total_items": 1,
+        "created_at_ms": now, "updated_at_ms": now}))?;
+    meta.upsert_agent_experiment(&exp).await?;
+    info!(project_id, traces = 60, "Seeded demo AI agent data");
+    Ok(())
+}
