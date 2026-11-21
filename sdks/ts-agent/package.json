@@ -1,0 +1,36 @@
+{
+  "name": "@pulse-analytics/agent",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "Zero-dependency TypeScript PLST v1 SDK for Pulse Analytics AI Agent Observability",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sswapnil2/analytics-system.git",
+    "directory": "sdks/ts-agent"
+  },
+  "homepage": "https://github.com/sswapnil2/analytics-system/blob/main/docs/agent-observability-architecture.md",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

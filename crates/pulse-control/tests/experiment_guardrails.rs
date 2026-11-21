@@ -183,16 +183,39 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
     );
 
     // Without auto_stop, a regression is reported but nothing changes.
+    let mut watch_body = experiment(false, true);
+    watch_body["guardrail_metrics"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "Refunds", "event_name": "Refund_Issued"}));
     let (status, watch) = call(
         &app,
         &token,
         "POST",
         "/v1/projects/proj_g/experiments",
-        experiment(false, true),
+        watch_body,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     ctrl.evaluate_experiment_guardrails().await;
+    ctrl.evaluate_experiment_guardrails().await;
+
+    // Milestones are audited (and sent to the webhook) once each, however many ticks see them.
+    let audit = ctrl.meta().list_enterprise_audit(50).await.unwrap();
+    let mut milestones: Vec<&str> = audit
+        .iter()
+        .filter(|a| a.action == "experiment.milestone")
+        .map(|a| a.details_json["milestone"].as_str().unwrap())
+        .collect();
+    milestones.sort();
+    assert_eq!(
+        milestones,
+        vec![
+            "guardrail_harmed:Errors",
+            "guardrail_no_data:Refunds",
+            "significant:treatment"
+        ]
+    );
     let (_, list) = call(
         &app,
         &token,
@@ -243,15 +266,28 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    // Names are unique per project, so the rerun gets its own.
+    let mut rerun = experiment(true, true);
+    rerun["name"] = json!("Checkout guardrail rerun");
     let (_, exp) = call(
         &app,
         &token,
         "POST",
         "/v1/projects/proj_g/experiments",
-        experiment(true, true),
+        rerun,
     )
     .await;
     let id = exp["id"].as_str().unwrap();
+    // Paused still serves the variant, so the guardrail keeps watching.
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &format!("/v1/projects/proj_g/experiments/{id}"),
+        json!({"status": "paused"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     ctrl.evaluate_experiment_guardrails().await;
 
     let (_, list) = call(

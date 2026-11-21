@@ -52,6 +52,13 @@ Tokens minted at startup change on every restart unless `PULSE_ADMIN_TOKEN` is s
 | `get_user` | `distinct_id` (required), `limit` (default 50, up to 200) | The user's merged profile properties (all merged ids, newest value wins), `total_revenue`, and their most recent events |
 | `list_property_values` | `property` (required; `user.<name>` for profile properties), `event_name` (default all events), `limit` (default 20, up to 100), plus `days` or `start_ts_ms`/`end_ts_ms` | The most common values with event counts, so filters use values that exist |
 | `list_cohorts` | none | Saved cohorts with their definitions and current size |
+| `list_agent_traces` | `agent_name`, `agent_version`, `environment`, `status`, `session_id`, `user_id`, `has_error`, `has_loop_warning`, `min_eval_score`, `max_eval_score`, `search`, `limit` (default 20), `cursor`, plus `days` or `start_ts_ms`/`end_ts_ms` | AI agent runs, newest first, with duration, tokens, cost and eval score |
+| `get_agent_trace` | `trace_id` (required) | One run with its span tree, span events and evaluations |
+| `query_agent_analytics` | `agent_name`, `agent_version`, `environment`, `model`, `tool_name`, `session_id`, plus `days` (default 14) or `start_ts_ms`/`end_ts_ms` | Runs, error rate, p50–p99 latency, tokens, cost, failure sources, and breakdowns by agent, version, model, tool and environment |
+| `list_agent_evaluations` | `trace_id`, `session_id`, `span_id`, `target_type` (`trace` / `span` / `session`), `limit` (default 50) | Evaluation results with score, pass/fail and reasoning |
+
+The four `*agent*` tools appear when the node has AI agent observability enabled (the default); see
+[the architecture](agent-observability-architecture.md).
 
 All query tools also accept `start_ts_ms` and `end_ts_ms` (epoch ms) in place of `days` (1–365); both
 are advertised in each tool's `inputSchema`. `days` counts whole days ending today in the project's

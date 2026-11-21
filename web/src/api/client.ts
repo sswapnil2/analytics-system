@@ -290,6 +290,8 @@ export interface TrafficGroup {
   name: string;
   bps: number;
   created_at_ms: number;
+  /** Holdouts: the event last used to measure their impact. */
+  metric_event?: string | null;
   flags: { flag_key: string; enabled: boolean; start_bps?: number; end_bps?: number }[];
   /** Layers: share no live flag uses yet. */
   free_bps?: number;
@@ -319,9 +321,20 @@ export interface Experiment {
   end_ts_ms: number;
   primary_metric: ExperimentMetric;
   guardrail_metrics: ExperimentMetric[];
+  /** Reported next to the primary metric; never decide or stop anything. */
+  secondary_metrics?: ExperimentMetric[];
+  /** Email of whoever created it (or "admin token"). */
+  created_by?: string;
+  /** The problem it tests a fix for. */
+  problem?: string;
+  /** Who answers for it; empty means `created_by`. */
+  owner?: string;
+  /** Whether milestones go to the project webhook. */
+  notify?: boolean;
   analysis?: ExperimentAnalysis;
   /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
   stop_reason?: string | null;
+  pause_reason?: string | null;
   /** "ab" (fixed split, p-values) or "bandit" (traffic moves daily to the best variant). */
   kind?: ExperimentKind;
   bandit?: BanditConfig | null;
@@ -331,18 +344,42 @@ export interface Experiment {
 
 export type DecisionOutcome = "ship" | "keep_control" | "inconclusive";
 /** rollout: everyone gets the variant; rollback: flag off; keep: flag unchanged. */
-export type FlagAction = "rollout" | "rollback" | "keep";
+export type FlagAction = "rollout" | "staged" | "rollback" | "keep";
 
 export interface DecisionInput {
   outcome: DecisionOutcome;
   variant?: string | null;
   reason: string;
   flag_action: FlagAction;
+  /** Caveats the decider accepted when shipping. */
+  acknowledged?: string[];
+  /** With `flag_action: "staged"`: days between rollout steps (1 to 14). */
+  every_days?: number;
+}
+
+/** A ship whose rollout rises step by step. */
+export interface StagedRollout {
+  steps_pct: number[];
+  every_ms: number;
+  /** Index of the next step; equals steps_pct.length once done. */
+  next_step: number;
+  next_at_ms: number;
+  halted?: string | null;
+}
+
+/** An experiment metric defined once and reused as a guardrail or secondary metric. */
+export interface SavedMetric {
+  id: string;
+  name: string;
+  spec: ExperimentMetric;
+  created_by: string;
+  created_at_ms: number;
 }
 
 export interface ExperimentDecision extends DecisionInput {
   decided_by: string;
   decided_at_ms: number;
+  staged?: StagedRollout | null;
 }
 
 export type ExperimentKind = "ab" | "bandit";
@@ -374,7 +411,9 @@ export interface BanditResults {
 
 export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
 
-export type MetricType = "conversion" | "count" | "sum" | "ratio";
+/** `step_through`: share of users who did `denominator.event_name` (A) and then `event_name` (B).
+ *  `time_between`: seconds from A to B among users who did both. */
+export type MetricType = "conversion" | "count" | "sum" | "ratio" | "step_through" | "time_between";
 
 export interface ExperimentMetric {
   name: string;
@@ -385,10 +424,14 @@ export interface ExperimentMetric {
   /** Required for `ratio`: a count of `event_name`, or the total of `numeric_prop`. */
   denominator?: { event_name: string; numeric_prop?: string | null } | null;
   conversion_window_ms: number;
-  /** Which way is bad, for guardrails. */
+  /** Only `event_name` events matching every condition count. */
+  filters?: { prop_name: string; filter: { op: string; val?: unknown } }[];
+  /** Which way is bad: guardrails flag a move this way, and for the primary it decides what "better" means. */
   direction?: MetricDirection;
   /** Guardrails: roll everyone back to control when a treatment makes this significantly worse. */
   auto_stop?: boolean;
+  /** What a sum or ratio value is in: a currency symbol ("₹") or a word ("items"). */
+  unit?: string | null;
 }
 
 export interface ExperimentAnalysis {
@@ -423,6 +466,16 @@ export interface VariantLiftRow {
   sequential?: boolean;
 }
 
+/** A guardrail's or secondary metric's results. */
+export interface MetricResult {
+  metric_name: string;
+  event_name: string;
+  direction: MetricDirection;
+  regressed_variants: string[];
+  metric_type?: MetricType;
+  variants: VariantLiftRow[];
+}
+
 export interface ExperimentResults {
   experiment_id: string;
   experiment_name: string;
@@ -439,14 +492,9 @@ export interface ExperimentResults {
   /** Confidence level of every interval, e.g. 0.95. */
   confidence_level: number;
   variants: VariantLiftRow[];
-  guardrails: {
-    metric_name: string;
-    event_name: string;
-    direction: MetricDirection;
-    regressed_variants: string[];
-    metric_type?: MetricType;
-    variants: VariantLiftRow[];
-  }[];
+  guardrails: MetricResult[];
+  /** Secondary metrics: reported only, `regressed_variants` always empty. */
+  secondary?: MetricResult[];
   metric_type: MetricType;
   cuped_applied: boolean;
   variance_reduction_pct: number;
@@ -878,6 +926,191 @@ export function default14DayRange(): TimeRange {
   };
 }
 
+// ---------------- AI agent observability ----------------
+
+export type AgentStatus = "running" | "ok" | "error" | "timeout" | "cancelled";
+
+export interface AgentLatency {
+  avg_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  p99_ms: number;
+}
+
+export interface AgentBreakdownRow {
+  key: string;
+  secondary: string | null;
+  executions: number;
+  failures: number;
+  error_rate: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  avg_eval_score: number | null;
+}
+
+export interface AgentToolRow {
+  tool_name: string;
+  invocations: number;
+  failures: number;
+  failure_rate: number;
+  total_retries: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+}
+
+export interface AgentAnalytics {
+  total_executions: number;
+  failed_executions: number;
+  success_rate: number;
+  error_rate: number;
+  loop_warning_count: number;
+  latency: AgentLatency;
+  total_tokens: number;
+  total_cost_usd: number;
+  cost_per_execution_usd: number;
+  avg_eval_score: number | null;
+  eval_pass_rate: number | null;
+  failure_sources: Record<string, number>;
+  timeseries: { bucket_ts_ms: number; executions: number; errors: number; p95_latency_ms: number }[];
+  by_agent: AgentBreakdownRow[];
+  by_version: AgentBreakdownRow[];
+  by_environment: AgentBreakdownRow[];
+  by_model: AgentBreakdownRow[];
+  by_tool: AgentToolRow[];
+}
+
+export interface AgentTraceQuery {
+  status?: string;
+  agent_name?: string;
+  agent_version?: string;
+  environment?: string;
+  model?: string;
+  has_loop_warning?: boolean;
+  search?: string;
+  sort_by?: string;
+  sort_dir?: "asc" | "desc";
+  start_ts_ms?: number;
+  cursor?: string | null;
+}
+
+export type AgentPage<T, K extends string> = { [key in K]: T[] } & {
+  total: number;
+  next_cursor: string | null;
+};
+
+export interface AgentTraceRow {
+  trace_id: string;
+  agent_name: string;
+  agent_version: string;
+  environment: string;
+  session_id: string | null;
+  user_id: string | null;
+  status: AgentStatus;
+  start_ts_ms: number;
+  duration_ms: number;
+  error_type: string | null;
+  error_message: string | null;
+  failure_source: string | null;
+  span_count: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  primary_model: string | null;
+  avg_eval_score: number | null;
+  has_loop_warning: boolean;
+}
+
+export interface AgentSpan {
+  span_id: string;
+  parent_span_id: string | null;
+  name: string;
+  span_type: string;
+  status: string;
+  start_ts_ms: number;
+  duration_ms: number;
+  provider: string | null;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  tool_name: string | null;
+  tool_retry_count: number;
+  input: unknown;
+  output: unknown;
+  error_type: string | null;
+  error_message: string | null;
+}
+
+export interface AgentEvaluation {
+  id: string;
+  target_type: "session" | "trace" | "span";
+  session_id: string;
+  trace_id: string | null;
+  span_id: string | null;
+  evaluator_id: string;
+  evaluator_name: string;
+  score: number;
+  passed: boolean | null;
+  label: string | null;
+  reasoning: string | null;
+  error: string | null;
+  created_at_ms: number;
+}
+
+export interface AgentTraceDetail {
+  trace: AgentTraceRow & { input: unknown; output: unknown };
+  spans: AgentSpan[];
+  evaluations: AgentEvaluation[];
+}
+
+export interface AgentSessionRow {
+  session_id: string;
+  user_id: string | null;
+  agent_names: string[];
+  first_ts_ms: number;
+  last_ts_ms: number;
+  trace_count: number;
+  error_count: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  avg_eval_score: number | null;
+}
+
+export interface AgentEvaluator {
+  id: string;
+  name: string;
+  kind: string;
+  target_type: string;
+  enabled: boolean;
+  agent_name: string | null;
+  sample_rate: number;
+  config: Record<string, unknown> | null;
+}
+
+export interface AgentDataset {
+  id: string;
+  name: string;
+  description: string;
+  version: number;
+  item_count: number;
+  updated_at_ms: number;
+}
+
+export interface AgentExperiment {
+  id: string;
+  name: string;
+  dataset_id: string;
+  agent_name: string;
+  agent_version: string;
+  status: string;
+  total_items: number;
+  completed_items: number;
+  passed_items: number;
+  avg_score: number | null;
+  created_at_ms: number;
+}
+
 export const api = {
   getAuthConfig: () => fetchJson<AuthConfig>("/v1/auth/config"),
   signUp: (body: { email: string; password: string; name?: string; setup_code?: string; org_name?: string; project_name?: string }) =>
@@ -1196,7 +1429,15 @@ export const api = {
   patchExperiment: (
     projectId: string,
     expId: string,
-    body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number; decision?: DecisionInput },
+    body: {
+      status?: "running" | "paused" | "concluded";
+      end_ts_ms?: number;
+      decision?: DecisionInput;
+      problem?: string;
+      owner?: string;
+      notify?: boolean;
+      reason?: string;
+    },
   ) =>
     fetchJson<Experiment>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}`,
@@ -1214,11 +1455,14 @@ export const api = {
       end_ts_ms: number;
       primary_metric: ExperimentMetric;
       guardrail_metrics: ExperimentMetric[];
+      secondary_metrics?: ExperimentMetric[];
       analysis: ExperimentAnalysis;
       kind?: ExperimentKind;
       status?: "draft" | "running";
       layer?: { layer_id: string; traffic_pct: number } | null;
       bandit?: BanditConfig;
+      problem?: string;
+      owner?: string;
     },
   ) =>
     fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {
@@ -1228,7 +1472,13 @@ export const api = {
 
   createFlag: (
     projectId: string,
-    body: { key: string; description: string; rollout_pct: number; enabled?: boolean },
+    body: {
+      key: string;
+      description: string;
+      rollout_pct: number;
+      enabled?: boolean;
+      variants?: { key: string; weight_bps: number; payload?: unknown }[];
+    },
   ) =>
     fetchJson<FeatureFlag>(`/v1/projects/${encodeURIComponent(projectId)}/flags`, {
       method: "POST",
@@ -1246,6 +1496,14 @@ export const api = {
 
   deleteTrafficGroup: (projectId: string, kind: "holdouts" | "layers", id: string) =>
     fetchJson<unknown>(projectPath(projectId, `/${kind}/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  listSavedMetrics: (projectId: string) => fetchJson<SavedMetric[]>(projectPath(projectId, "/saved-metrics")),
+
+  createSavedMetric: (projectId: string, spec: ExperimentMetric) =>
+    fetchJson<SavedMetric>(projectPath(projectId, "/saved-metrics"), { method: "POST", body: JSON.stringify(spec) }),
+
+  deleteSavedMetric: (projectId: string, id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/saved-metrics/${encodeURIComponent(id)}`), { method: "DELETE" }),
 
   /** Exposed users against held-back users, on any metric. */
   getHoldoutResults: (projectId: string, id: string, metric: ExperimentMetric, startTsMs: number) =>
@@ -1391,5 +1649,75 @@ export const api = {
         method,
         params,
       }),
+    }),
+  // AI agent observability (read-only views; writes go through the API or SDKs).
+  getAgentAnalytics: (projectId: string, startTsMs: number, signal?: AbortSignal) =>
+    fetchJson<AgentAnalytics>(projectPath(projectId, `/agent/analytics?start_ts_ms=${startTsMs}`), { signal }),
+
+  listAgentTraces: (projectId: string, q: AgentTraceQuery, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ limit: "50" });
+    for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
+    return fetchJson<AgentPage<AgentTraceRow, "traces">>(projectPath(projectId, `/agent/traces?${p}`), { signal });
+  },
+
+  getAgentTrace: (projectId: string, traceId: string, signal?: AbortSignal) =>
+    fetchJson<AgentTraceDetail>(projectPath(projectId, `/agent/traces/${encodeURIComponent(traceId)}`), { signal }),
+
+  listAgentSessions: (projectId: string, limit = 50, signal?: AbortSignal) =>
+    fetchJson<AgentPage<AgentSessionRow, "sessions">>(projectPath(projectId, `/agent/sessions?limit=${limit}`), { signal }),
+
+  listAgentEvaluators: (projectId: string, signal?: AbortSignal) =>
+    fetchJson<{ evaluators: AgentEvaluator[] }>(projectPath(projectId, "/agent/evaluators"), { signal }),
+
+  listAgentEvaluations: (projectId: string, limit = 100, signal?: AbortSignal) =>
+    fetchJson<{ evaluations: AgentEvaluation[] }>(projectPath(projectId, `/agent/evaluations?limit=${limit}`), { signal }),
+
+  listAgentDatasets: (projectId: string, signal?: AbortSignal) =>
+    fetchJson<{ datasets: AgentDataset[] }>(projectPath(projectId, "/agent/datasets"), { signal }),
+
+  listAgentExperiments: (projectId: string, signal?: AbortSignal) =>
+    fetchJson<{ experiments: AgentExperiment[] }>(projectPath(projectId, "/agent/experiments"), { signal }),
+
+  // Writes: the server enforces roles (Member for these); the UI hides them for viewers.
+  saveAgentEvaluator: (projectId: string, body: Partial<AgentEvaluator> & { name: string; kind: string; config?: unknown }) =>
+    fetchJson<AgentEvaluator>(projectPath(projectId, "/agent/evaluators"), { method: "POST", body: JSON.stringify(body) }),
+
+  deleteAgentEvaluator: (projectId: string, id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/agent/evaluators/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  runAgentTraceEvals: (projectId: string, traceId: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/agent/traces/${encodeURIComponent(traceId)}/evaluate`), {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  reviewAgentTrace: (projectId: string, t: { trace_id: string; session_id: string | null }, passed: boolean, note: string) =>
+    fetchJson<AgentEvaluation>(projectPath(projectId, "/agent/evaluations"), {
+      method: "POST",
+      body: JSON.stringify({
+        target_type: "trace",
+        trace_id: t.trace_id,
+        session_id: t.session_id ?? undefined,
+        evaluator_id: "human_review",
+        evaluator_name: "Human review",
+        evaluator_type: "custom",
+        score: passed ? 1 : 0,
+        score_type: "boolean",
+        passed,
+        label: passed ? "pass" : "fail",
+        reasoning: note || null,
+      }),
+    }),
+
+  createAgentDataset: (projectId: string, name: string, description: string) =>
+    fetchJson<AgentDataset>(projectPath(projectId, "/agent/datasets"), {
+      method: "POST",
+      body: JSON.stringify({ name, description }),
+    }),
+
+  addTraceToDataset: (projectId: string, traceId: string, datasetId: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/agent/traces/${encodeURIComponent(traceId)}/promote`), {
+      method: "POST",
+      body: JSON.stringify({ dataset_id: datasetId }),
     }),
 };

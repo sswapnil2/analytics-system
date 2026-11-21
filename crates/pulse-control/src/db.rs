@@ -13,7 +13,7 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
-    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedMetric, SavedReport,
     SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
 };
 
@@ -70,7 +70,7 @@ pub enum MetaStore {
 }
 
 /// Converts `?` placeholders (outside single-quoted SQL string literals) into PostgreSQL `$1, $2, ...`.
-fn pg_rewrite(sql: &str) -> String {
+pub(crate) fn pg_rewrite(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 16);
     let mut idx = 0usize;
     let mut in_quotes = false;
@@ -137,7 +137,7 @@ macro_rules! profile_from_row {
 }
 
 /// Escapes `LIKE` wildcards so user search text matches literally (paired with `ESCAPE '\\'`).
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '%' | '_' | '\\') {
@@ -869,6 +869,7 @@ impl MetaStore {
     pub async fn upsert_experiment(&self, exp: &Experiment) -> Result<(), MetaError> {
         let pjson = serde_json::to_string(&exp.primary_metric).unwrap_or_else(|_| "{}".into());
         let gjson = serde_json::to_string(&exp.guardrail_metrics).unwrap_or_else(|_| "[]".into());
+        let sjson = serde_json::to_string(&exp.secondary_metrics).unwrap_or_else(|_| "[]".into());
         let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
         let bjson = exp
             .bandit
@@ -880,8 +881,8 @@ impl MetaStore {
             .and_then(|d| serde_json::to_string(d).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -896,7 +897,12 @@ impl MetaStore {
                 stop_reason = excluded.stop_reason,
                 kind = excluded.kind,
                 bandit_json = excluded.bandit_json,
-                decision_json = excluded.decision_json
+                decision_json = excluded.decision_json,
+                secondary_metrics_json = excluded.secondary_metrics_json,
+                problem = excluded.problem,
+                owner = excluded.owner,
+                notify = excluded.notify,
+                pause_reason = excluded.pause_reason
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -915,6 +921,12 @@ impl MetaStore {
             &exp.kind,
             &bjson,
             &djson,
+            &sjson,
+            &exp.created_by,
+            &exp.problem,
+            &exp.owner,
+            i32::from(exp.notify),
+            &exp.pause_reason,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -928,7 +940,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -945,6 +957,17 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
+                    pause_reason: r.get("pause_reason"),
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())
@@ -975,7 +998,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -992,6 +1015,17 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
+                    pause_reason: r.get("pause_reason"),
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())
@@ -1165,6 +1199,55 @@ impl MetaStore {
         Ok(rows)
     }
 
+    pub async fn insert_saved_metric(&self, m: &SavedMetric) -> Result<(), MetaError> {
+        let spec = serde_json::to_string(&m.spec).unwrap_or_default();
+        db_exec!(
+            self,
+            "INSERT INTO saved_metrics (id, project_id, name, spec_json, created_by, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            m.id.as_str(),
+            m.project_id.as_str(),
+            m.name.as_str(),
+            spec.as_str(),
+            m.created_by.as_str(),
+            m.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// A project's saved metrics by name; rows whose spec no longer parses are skipped.
+    pub async fn list_saved_metrics(&self, project_id: &str) -> Result<Vec<SavedMetric>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, name, spec_json, created_by, created_at_ms FROM saved_metrics
+             WHERE project_id = ? ORDER BY name ASC",
+            |r| {
+                serde_json::from_str(&r.get::<String, _>("spec_json"))
+                    .ok()
+                    .map(|spec| SavedMetric {
+                        id: r.get("id"),
+                        project_id: r.get("project_id"),
+                        name: r.get("name"),
+                        spec,
+                        created_by: r.get("created_by"),
+                        created_at_ms: r.get("created_at_ms"),
+                    })
+            },
+            project_id,
+        );
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    pub async fn delete_saved_metric(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM saved_metrics WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
     pub async fn insert_traffic_group(&self, g: &TrafficGroup) -> Result<(), MetaError> {
         db_exec!(
             self,
@@ -1188,7 +1271,7 @@ impl MetaStore {
     ) -> Result<Vec<TrafficGroup>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, kind, name, bps, created_at_ms FROM traffic_groups
+            "SELECT id, project_id, kind, name, bps, created_at_ms, metric_event FROM traffic_groups
              WHERE project_id = ? AND kind = ? ORDER BY created_at_ms ASC",
             |r| {
                 TrafficGroup {
@@ -1198,12 +1281,50 @@ impl MetaStore {
                     name: r.get("name"),
                     bps: r.get::<i64, _>("bps") as u32,
                     created_at_ms: r.get("created_at_ms"),
+                    metric_event: r.get("metric_event"),
                 }
             },
             project_id,
             kind,
         );
         Ok(rows)
+    }
+
+    pub async fn set_traffic_group_metric(
+        &self,
+        project_id: &str,
+        id: &str,
+        metric_event: &str,
+    ) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "UPDATE traffic_groups SET metric_event = ? WHERE project_id = ? AND id = ?",
+            metric_event,
+            project_id,
+            id,
+        );
+        Ok(())
+    }
+
+    /// Records that `milestone` was announced for an experiment; false when it already was, so
+    /// each milestone goes out once even with several nodes checking.
+    pub async fn claim_experiment_milestone(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+        milestone: &str,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "INSERT INTO experiment_milestones (project_id, experiment_id, milestone, sent_at_ms) VALUES (?, ?, ?, ?)
+             ON CONFLICT(experiment_id, milestone) DO NOTHING",
+            project_id,
+            experiment_id,
+            milestone,
+            now_ms,
+        );
+        Ok(affected == 1)
     }
 
     pub async fn delete_traffic_group(

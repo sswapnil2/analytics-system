@@ -552,14 +552,14 @@ box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 2px 4px rgba(16,16,24,.06),0 30
 <div class="wrap">
 <a class="logo" href="#top" aria-label="Pulse home"><svg width="28" height="28" aria-hidden="true"><use href="#i-logo"/></svg>Pulse</a>
 <nav class="navlinks" aria-label="Primary">
-<a href="#product">Product</a><a href="#demo">Demo</a><a href="#ai">AI agents</a><a href="#performance">Performance</a><a href="#selfhost">Self-host</a><a href="#developers">Developers</a><a href="#editions">Pricing</a><a href="https://github.com/sswapnil2/analytics-system/tree/main/docs">Docs</a>
+<a href="#product">Product</a><a href="#demo">Demo</a><a href="#ai">AI agents</a><a href="#performance">Performance</a><a href="#selfhost">Self-host</a><a href="#developers">Developers</a><a href="#editions">Pricing</a><a href="docs/">Docs</a>
 </nav>
 <div class="navcta">
 <a class="btn btn-s gh" href="https://github.com/sswapnil2/analytics-system"><svg class="i" aria-hidden="true"><use href="#i-github"/></svg>GitHub</a>
 <a class="btn btn-p" href="#developers">Deploy Pulse</a>
 <details class="menu"><summary aria-label="Open menu"><svg class="i" aria-hidden="true"><use href="#i-menu"/></svg></summary>
 <div class="menu-p">
-<a href="#product">Product</a><a href="#demo">Demo</a><a href="#ai">AI agents</a><a href="#performance">Performance</a><a href="#selfhost">Self-host</a><a href="#privacy">Privacy</a><a href="#developers">Developers</a><a href="#editions">Pricing</a><a href="https://github.com/sswapnil2/analytics-system/tree/main/docs">Docs</a><a href="https://github.com/sswapnil2/analytics-system">GitHub</a>
+<a href="#product">Product</a><a href="#demo">Demo</a><a href="#ai">AI agents</a><a href="#performance">Performance</a><a href="#selfhost">Self-host</a><a href="#privacy">Privacy</a><a href="#developers">Developers</a><a href="#editions">Pricing</a><a href="docs/">Docs</a><a href="https://github.com/sswapnil2/analytics-system">GitHub</a>
 </div></details>
 </div>
 </div>
@@ -865,7 +865,7 @@ box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 2px 4px rgba(16,16,24,.06),0 30
 <pre class="snippet rv"><span class="c"># Connect Claude Code to your node with a project-scoped key</span>
 claude mcp add --transport http pulse http://127.0.0.1:8080/v1/mcp \
   --header "Authorization: Bearer sk_live_…"</pre>
-<p style="margin:22px 0 0" class="rv"><a class="link" href="https://github.com/sswapnil2/analytics-system/blob/main/docs/mcp.md">Read the MCP guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p>
+<p style="margin:22px 0 0" class="rv"><a class="link" href="docs/?p=mcp">Read the MCP guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p>
 </div>
 </section>
 
@@ -901,7 +901,7 @@ claude mcp add --transport http pulse http://127.0.0.1:8080/v1/mcp \
 <div class="rv" style="--rd:.1s">
 <div class="side-card"><h3>Storage you choose</h3><p>Segments live where you point them. Keep the data next to the rest of your stack.</p><div class="opt"><span>Local disk</span><span>S3-compatible bucket</span></div></div>
 <div class="side-card"><h3>Scale out with roles</h3><p>Run the same binary as separate <code>ingest</code>, <code>query</code> and <code>compactor</code> nodes over shared object storage, with Postgres for metadata.</p></div>
-<div class="side-card"><h3>Up in one command</h3><p><code>./pulse-node --seed</code> starts the node with a demo dataset. Studio, API and MCP share port 8080.</p><p style="margin-top:14px"><a class="link" href="https://github.com/sswapnil2/analytics-system/blob/main/docs/self-hosting-cloud.md">Self-hosting guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p></div>
+<div class="side-card"><h3>Up in one command</h3><p><code>./pulse-node --seed</code> starts the node with a demo dataset. Studio, API and MCP share port 8080.</p><p style="margin-top:14px"><a class="link" href="docs/?p=self-hosting-cloud">Self-hosting guide <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a></p></div>
 </div>
 </div>
 </div>
@@ -1054,7 +1054,7 @@ claude mcp add --transport http pulse http://127.0.0.1:8080/v1/mcp \
 
 pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>, { cart_value: 99, currency: <span class="st">"USD"</span> });
 <span class="kw">await</span> pulse.<span class="fnn">identify</span>(<span class="st">"usr_1042"</span>, { plan: <span class="st">"pro"</span> });</pre>
-<p class="note">Not on npm yet: install the packed <code>.tgz</code> from the <a href="https://github.com/sswapnil2/analytics-system/releases/latest">latest release</a> or build locally from <code>sdks/ts-web</code>. <a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/web-sdk.md">Web SDK guide →</a></p></div>
+<p class="note">Not on npm yet: install the packed <code>.tgz</code> from the <a href="https://github.com/sswapnil2/analytics-system/releases/latest">latest release</a> or build locally from <code>sdks/ts-web</code>. <a href="docs/?p=web-sdk">Web SDK guide →</a></p></div>
 <div class="tp" role="tabpanel" id="p-mcp" aria-labelledby="t-mcp" hidden><button class="copy" type="button">Copy</button>
 <pre><span class="cm"># 1. Create a key that can only see one project</span>
 <span class="p">$</span> curl -s -X POST http://127.0.0.1:8080/v1/projects/proj_default/api-keys \
@@ -1094,15 +1094,15 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
    /plugin marketplace add sswapnil2/analytics-system  then  /plugin install pulse@pulse
 6. Send one test event to /v1/ingest, then confirm it through MCP, and tell me the Studio URL
    (http://127.0.0.1:8080) and where the tokens are saved.</pre>
-<p class="note">Paste into Claude Code, Codex, Cursor or Gemini CLI from your app's repo. <a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/agent-setup.md">Agent setup guide →</a></p></div>
+<p class="note">Paste into Claude Code, Codex, Cursor or Gemini CLI from your app's repo. <a href="docs/?p=agent-setup">Agent setup guide →</a></p></div>
 </div>
 <nav class="docs rv" style="--rd:.1s" aria-label="Documentation">
-<a href="https://github.com/sswapnil2/analytics-system/tree/main/docs"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-book"/></svg></span><span><b>Documentation</b><span>docs/</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/self-hosting-cloud.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-server"/></svg></span><span><b>Self-hosting guide</b><span>docs/self-hosting-cloud.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a href="docs/"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-book"/></svg></span><span><b>Documentation</b><span>docs/</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a href="docs/?p=self-hosting-cloud"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-server"/></svg></span><span><b>Self-hosting guide</b><span>docs/self-hosting-cloud.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 <a href="https://github.com/sswapnil2/analytics-system/tree/main/sdks/ts-web"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-code"/></svg></span><span><b>TypeScript SDK</b><span>sdks/ts-web</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 <a href="https://github.com/sswapnil2/analytics-system/tree/main/crates"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-cpu"/></svg></span><span><b>Rust implementation</b><span>crates/</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/mcp.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg></span><span><b>MCP integration</b><span>docs/mcp.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-<a href="https://github.com/sswapnil2/analytics-system/blob/main/docs/mobile-core.md"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-phone"/></svg></span><span><b>Mobile core (beta)</b><span>docs/mobile-core.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a href="docs/?p=mcp"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg></span><span><b>MCP integration</b><span>docs/mcp.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a href="docs/?p=mobile-core"><span class="ic"><svg class="i" aria-hidden="true"><use href="#i-phone"/></svg></span><span><b>Mobile core (beta)</b><span>docs/mobile-core.md</span></span><svg class="i ar" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 </nav>
 </div>
 </div>
@@ -1142,7 +1142,7 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <li><svg class="i" aria-hidden="true"><use href="#i-book"/></svg><span><b>Audit log</b><span>A record of administrative actions.</span></span></li>
 <li><svg class="i" aria-hidden="true"><use href="#i-bolt"/></svg><span><b>Webhook alerts</b><span>Thresholds checked every 5 minutes, sent to signed webhooks.</span></span></li>
 </ul>
-<a class="btn btn-s" href="https://github.com/sswapnil2/analytics-system/tree/main/docs">Read the docs <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+<a class="btn btn-s" href="docs/">Read the docs <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a>
 </div>
 </div>
 
@@ -1166,7 +1166,7 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <div class="final-c rv">
 <h2>Own your analytics. Own your data.</h2>
 <p>Deploy Pulse on your infrastructure and understand every interaction happening inside your product.</p>
-<div class="ctas"><a class="btn btn-p" href="https://github.com/sswapnil2/analytics-system/blob/main/docs/quickstart.md">Deploy Pulse <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a><a class="btn btn-s" href="https://github.com/sswapnil2/analytics-system"><svg class="i" aria-hidden="true"><use href="#i-github"/></svg>Explore GitHub</a></div>
+<div class="ctas"><a class="btn btn-p" href="docs/?p=quickstart">Deploy Pulse <svg class="i arr" aria-hidden="true"><use href="#i-arrow"/></svg></a><a class="btn btn-s" href="https://github.com/sswapnil2/analytics-system"><svg class="i" aria-hidden="true"><use href="#i-github"/></svg>Explore GitHub</a></div>
 </div>
 </div>
 </section>
@@ -1175,7 +1175,7 @@ pulse.<span class="fnn">track</span>(<span class="st">"Checkout_Started"</span>,
 <footer class="foot">
 <div class="wrap">
 <a class="logo" href="#top"><svg width="24" height="24" aria-hidden="true"><use href="#i-logo"/></svg>Pulse <small style="margin-left:4px">Apache-2.0</small></a>
-<nav aria-label="Footer"><a href="https://github.com/sswapnil2/analytics-system/tree/main/docs">Docs</a><a href="https://github.com/sswapnil2/analytics-system">GitHub</a><a href="https://github.com/sswapnil2/analytics-system/blob/main/LICENSE">Licence</a><a href="https://github.com/sswapnil2/analytics-system/issues/new">Contact</a></nav>
+<nav aria-label="Footer"><a href="docs/">Docs</a><a href="https://github.com/sswapnil2/analytics-system">GitHub</a><a href="https://github.com/sswapnil2/analytics-system/blob/main/LICENSE">Licence</a><a href="https://github.com/sswapnil2/analytics-system/issues/new">Contact</a></nav>
 </div>
 </footer>
 

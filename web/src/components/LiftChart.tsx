@@ -15,12 +15,17 @@ const P = { left: 44, right: W - 12, top: 10, bottom: H - 24 };
 export const LiftChart: React.FC<{ series: ExperimentResults["timeseries"]; confidence: number }> = ({ series, confidence }) => {
   if (series.length < 2) return null;
   const keys = series[0].variants.filter((v) => !v.is_control).map((v) => v.variant_key);
-  const all = series.flatMap((p) => p.variants.filter((v) => !v.is_control));
-  const ticks = niceRange(Math.min(...all.map((v) => v.ci_low_pct)), Math.max(...all.map((v) => v.ci_high_pct)));
+  // The first days' intervals are huge and would flatten the rest, so scale to day 3 onward
+  // (and clip the early band); a lift can't go below -100%.
+  const all = series.slice(series.length > 3 ? 2 : 0).flatMap((p) => p.variants.filter((v) => !v.is_control));
+  const ticks = niceRange(
+    Math.min(0, ...all.map((v) => Math.max(-100, v.ci_low_pct))),
+    Math.max(0, ...all.map((v) => v.ci_high_pct)),
+  );
   const lo = ticks[0];
   const hi = ticks[ticks.length - 1];
   const xAt = (i: number) => P.left + (i / (series.length - 1)) * (P.right - P.left);
-  const yAt = (v: number) => P.bottom - ((v - lo) / (hi - lo)) * (P.bottom - P.top);
+  const yAt = (v: number) => P.bottom - ((Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo)) * (P.bottom - P.top);
   const labelEvery = Math.ceil(series.length / 6);
 
   return (
