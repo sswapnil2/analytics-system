@@ -5,6 +5,7 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 ## [Unreleased]
 
 ### Added
+- Developer documentation site at `/docs` (architecture, internals, ADRs, configuration, troubleshooting, limitations), with `llms.txt` and `llms-full.txt` for AI agents.
 - The Experiments page has tabs for experiments, feature flags, and holdouts and layers. Each variant's verdict sits beside its name ("Significantly worse" in red), stopped and draft experiments say so instead of showing live-test copy, and funnel drops are labelled "A → B" with a hint when a step gets no one.
 - The start review names A-to-B and time metrics in full, decisions recorded with an old user id read "a teammate", and the experiment list says "Stopped · shipped …" to match the experiment page.
 - Saved metrics: name a guardrail or secondary metric once (say, "KYC failure" as a KYC event where status isn't success) and add it to any experiment from a list.
@@ -63,9 +64,22 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Experiments can be paused and resumed from the Studio.
 - Bandits: a new experiment type that moves traffic to the best variant once a day, shows each variant's chance to be best and the cost of shipping it, and charts how traffic moved.
 
+## [0.1.2] - 2026-11-21
+
+### Added
+- Query sampling: exact while a query is under 10 M estimated rows, then deterministic user-bucket sampling, always disclosed in the result (`sampling`) and forceable with `"sampling": "exact"`. Covers Insights, Funnels, Retention and Flows.
+- Zero-I/O HyperLogLog sketches in segment footers for fast long-range Uniques, DAU, WAU and MAU.
+- Edit and delete saved cohorts.
+- Studio: chart export, funnel step picker, per-card intervals, save reports in place, shared trend chart with hover sync, property picker, and UX passes on Journeys, Cohorts, Users, Experiments, Events and Security.
+- React Native wrapper with a native recorder (`sdks/react-native`, experimental, not released).
+
 ### Changed
-- Internal review codes removed from comments and test names; process logs moved to `docs/history/`.
-- Crate manifests now carry descriptions, repository and homepage.
+- Scale work for 10 M–100 M events: streaming query engine, SlateDB profile store, compressed and batched manifests, identity graph GC.
+- Web SDK: fetch timeout (`fetchTimeoutMs`), incremental wireframe diffs, session dedup.
+- Open-source readiness: privacy fixes, CI, docs; internal review codes removed from comments and test names; process logs moved to `docs/history/`; crate manifests carry descriptions, repository and homepage.
+
+### Fixed
+- Mobile core no longer loses queued events when the app is killed.
 
 ## [0.1.1] - 2026-11-19
 
@@ -85,6 +99,7 @@ First public release.
 - Docker image `ghcr.io/sswapnil2/pulse` and Linux x86_64/aarch64 binaries.
 - Everything is Apache-2.0 with no licence key.
 
-[Unreleased]: https://github.com/sswapnil2/analytics-system/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sswapnil2/analytics-system/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/sswapnil2/analytics-system/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sswapnil2/analytics-system/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sswapnil2/analytics-system/releases/tag/v0.1.0

@@ -9,10 +9,10 @@ record privacy-masked DOM wireframes for session replay.
 ## Install
 
 Every [GitHub release](https://github.com/sswapnil2/analytics-system/releases/latest) attaches the
-packed SDK. Install it straight from the release (replace `0.1.1` with the release you want):
+packed SDK. Install it straight from the release (replace `0.1.2` with the release you want):
 
 ```bash
-npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.1/pulse-analytics-ts-web-0.1.1.tgz
+npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.2/pulse-analytics-ts-web-0.1.2.tgz
 ```
 
 It is not on the npm registry yet. To build it from source instead:
@@ -87,8 +87,10 @@ const variant = pulse.getVariantSync("pricing_test");  // or await pulse.getVari
 const payload = pulse.getVariantPayload("pricing_test");
 ```
 
-Assignment is deterministic (xxh3 bucketing on the user's routing seed), so the client and the
-server's experiment analysis agree. Record that a user saw a variant with `trackExposure(key, variant)`
+Assignment is deterministic: `xxh3_64("{flag_key}:{distinct_id}")` picks the rollout slot, so the client, the
+other SDKs and the server's experiment analysis agree. It uses the *current* distinct id, so a user can
+land in a different variant after `identify()` switches them from the anonymous id to their user id;
+call `identify()` before the first flag check when that matters. Record that a user saw a variant with `trackExposure(key, variant)`
 or `getVariant(key, { trackExposure: true })`; repeat exposures of the same variant are deduplicated.
 
 Flags are re-checked in the background once they are older than `flagsTtlMs`; reads never wait for
@@ -109,7 +111,7 @@ Replay records wireframes (element boxes and masked labels), not pixels or HTML.
 - Text is masked to `████` unless an element (or its ancestor) has `data-pulse-unmask` or matches `unmaskSelectors`. Inputs and `contenteditable` content stay masked regardless.
 - Errors and network calls are captured automatically (see `captureErrors` / `captureNetwork`). `recordConsoleError(message)` and `recordNetworkBreadcrumb(...)` remain for errors you catch yourself.
 - Autocapture pageviews follow `history.pushState`, `replaceState` and `popstate`, and send one `$pageview` per new path + query string (hash changes and same-URL `replaceState` calls are not pages).
-- `$current_url` includes the query string; strip sensitive parameters with `beforeSend`.
+- `$current_url` and `$referrer` are sent without their query string, fragment or embedded credentials. UTM parameters and ad click ids are read from the URL and kept as separate properties.
 
 Controls: `startSessionRecording()`, `stopSessionRecording()`, `pauseSessionRecording()`,
 `resumeSessionRecording()`, `isRecordingSession()`. Rage taps and dead taps are detected from clicks.

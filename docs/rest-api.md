@@ -89,7 +89,7 @@ password-reset links are appended to the owner-only `outbox` file in the data di
 
 | Method | Path | Body |
 |---|---|---|
-| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array. Up to 64 MB. |
+| POST | `/v1/ingest` | One event, Pulse `{"events": [...]}`, Segment `{"batch": [...]}`, or a top-level array, as JSON or the binary `PLSB` frame. Request body up to 8 MiB (`413` above that); a batch decodes to at most 64 MiB and 250,000 events. |
 | POST | `/v1/identify` | `{"anon_id", "user_id", "user_properties"?, "operations"?}`: merges an anonymous id into a user |
 | POST | `/v1/engage` | User-profile operations (`$set` and friends), one object, an array, or `{"profiles": [...]}` / `{"batch": [...]}` |
 | POST | `/v1/groups` | Group-profile operations |
@@ -247,6 +247,53 @@ Milestones stay in the audit log when an experiment has `notify: false`; only th
 **Bandits.** On the same timer, once a day, in the first hour after midnight in the project's timezone, each running bandit that is past burn-in gets new flag weights from Thompson sampling: every arm keeps `min_weight_bps` and the rest is shared by each arm's chance to be best. The change is recorded in the weight history and audited as `experiment.bandit_reweighted` (actor `system:bandit`). Arm estimates are stratified by exposure day, so traffic moving between arms doesn't bias them, and the SRM check compares users against the weights in effect on each day. `ready_to_ship` is true when the leader's expected loss is under 1% of its value.
 
 The edge flag bundle (`GET /v1/flags/:api_key`) is reused for up to 30 seconds while no flag changes, so polling SDKs don't re-run targeting cohorts on every request.
+
+## AI agent observability
+
+Design and storage: [agent observability architecture](agent-observability-architecture.md).
+
+**Ingest (ingest key).** Send `x-pulse-key: pk_…` (or `Authorization: Bearer pk_…`). CORS is open, the
+body cap is 8 MiB, and other methods return `405`.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/agent/traces` | `{"traces": [...], "spans": [...]}` as `application/json`, or the PLST binary format as `application/x-pulse-trace` (sent by `sdks/ts-agent` and `sdks/py-agent`). Returns accepted and rejected counts. |
+| POST | `/v1/otel/v1/traces` | OTLP traces, JSON or `application/x-protobuf`. GenAI and OpenInference attributes map to models, tokens and tools. |
+
+**Query and configuration (bearer token).** All paths start with `/v1/projects/:id`. Reads need
+`viewer`; writes need `member`, except where the table says `admin`.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/agent/traces` | Runs, newest first. Filters: `agent_name`, `agent_version`, `environment`, `status`, `model`, `session_id`, `user_id`, `has_error`, `has_loop_warning`, `min_eval_score`, `max_eval_score`, `start_ts_ms`, `end_ts_ms`, `search` (trace id, agent, version, model, error type). `sort_by`: `start_ts_ms`, `duration_ms`, `total_cost_usd`, `total_tokens`, `avg_eval_score`; `sort_dir`: `asc`/`desc`; `limit`, `cursor`. |
+| GET | `/agent/traces/:trace_id` | One run with its spans, span events and evaluations |
+| DELETE | `/agent/traces/:trace_id` | Erase one run. Admin. |
+| POST | `/agent/traces/:trace_id/evaluate` | Run the project's enabled evaluators on this run now |
+| POST | `/agent/traces/:trace_id/promote` | Copy the run into a dataset as a test case: `{"dataset_id", "expected_output"?, "name"?}` |
+| GET | `/agent/sessions`, `/agent/sessions/:session_id` | Runs grouped by `session_id`, with cost, errors and eval score |
+| GET | `/agent/analytics` | Runs, success rate, latency percentiles, tokens, cost, failure sources, a daily series, and breakdowns by agent, version, model, tool and environment. Same filters as traces. |
+| GET | `/agent/compare` | Baseline vs candidate (Welch t-test on latency, cost and eval score): `baseline_agent_version` and `candidate_agent_version` (or `_prompt_version`, `_model`, `_environment`) |
+| POST | `/agent/erasure` | `{"level": "trace" \| "session" \| "user", "target_id"}`. Hides the data at once; compaction purges it. Admin. |
+| GET, POST | `/agent/evaluators` | List / create or update (same `id`) an evaluator: `{"name", "kind", "target_type": "trace" \| "span" \| "session", "config", "sample_rate", "enabled", "agent_name"?}` |
+| DELETE | `/agent/evaluators/:eval_id` | Delete an evaluator; its past results stay |
+| POST | `/agent/evaluate` | Queue evaluators for one target: `{"trace_id"?, "session_id"?, "span_id"?}` (a trace or session id is required). `202`, or `503` when the queue is full. |
+| GET, POST | `/agent/evaluations` | List results (`trace_id`, `session_id`, `span_id`, `target_type`, `limit`) / record one, e.g. a human review |
+| GET, POST | `/agent/datasets` | List / create or update a dataset |
+| DELETE | `/agent/datasets/:dataset_id` | Delete a dataset |
+| GET, POST | `/agent/datasets/:dataset_id/items` | List / add test cases |
+| POST | `/agent/datasets/:dataset_id/import` | Import test cases in bulk |
+| DELETE | `/agent/datasets/:dataset_id/items/:item_id` | Delete a test case |
+| GET, POST | `/agent/experiments` | List / create an experiment (an agent version against a dataset) |
+| GET | `/agent/experiments/:exp_id` | One experiment with its results |
+| POST | `/agent/experiments/:exp_id/runs` | Record per-case results |
+| GET | `/agent/experiments/compare` | Compare two experiments, with sample-size guards |
+| GET, POST | `/agent/alerts` | List / create or update alert rules (`failure_rate`, `p95_latency_ms`, `cost_usd`, `eval_score_drop`, `tool_failure_rate`, `loop_rate`, `avg_tokens`) |
+| GET | `/agent/alerts/events` | Firing and recovery history |
+| POST | `/agent/alerts/evaluate`, `/agent/alerts/:rule_id/evaluate` | Evaluate all rules, or one, now |
+| DELETE | `/agent/alerts/:rule_id` | Delete a rule |
+| GET, PUT | `/agent/privacy` | The capture, redaction, sampling and retention policy. `PUT` is admin. |
+| GET, POST | `/agent/pricing` | Model price overrides (`provider`, `model_pattern`, per-1M-token prices). `POST` is admin. |
+| DELETE | `/agent/pricing/:rule_id` | Delete a price override. Admin. |
 
 ## MCP (bearer token)
 

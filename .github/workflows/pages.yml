@@ -3,7 +3,7 @@ name: Deploy site to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/pages.yml"]
+    paths: ["site/**", "docs/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # Copies docs/ into the viewer (site/docs/md/) and writes site/llms.txt + llms-full.txt.
+      - run: python3 scripts/build_docs_site.py
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
