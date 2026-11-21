@@ -53,7 +53,7 @@ These statements come from reading code; they were not exercised:
 - **Session replay.** The end-to-end replay path and the Studio player.
 - **Mobile.** The mobile core and the iOS and Android examples (the Android example is marked unverified upstream). React Native was not reviewed beyond its source.
 - **Web SDK snippets.** These were checked against the SDK's exported API and its CI tests, not run in a fresh app.
-- **Release binaries.** The v0.1.1 x86_64 tarball was downloaded and its checksum and contents verified. It was not run here (Linux binary, macOS machine); release CI smoke-tests both architectures with `/healthz`. The Docker image was not pulled.
+- **Release binaries.** For v0.1.2, all four assets were downloaded through the `releases/latest/download` URLs in the [Quickstart](quickstart.md#1-install): both Linux tarballs, the SDK `.tgz` and `SHA256SUMS`. Every checksum matched, the tarball layout matched the docs, and the binary contains the query-sampling code. The binaries were not run here (Linux binaries, macOS machine); release CI smoke-tests both architectures with `/healthz`. The Docker image was published by CI but not pulled here.
 - **Performance.** No performance numbers were reproduced. The docs quote none beyond pointing to the SLO test.
 
 ## Known documentation gaps

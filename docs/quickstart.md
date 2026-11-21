@@ -41,7 +41,7 @@ Release CI starts each binary and checks `/healthz` before publishing. Skip to s
 
 There are no prebuilt macOS or Windows binaries. On a Mac, use Docker or build from source.
 
-> **Releases lag `main`.** These docs describe `main`. The latest release (v0.1.1, 19 Nov 2026) predates several features documented here: [query sampling](how-it-works.md#4-how-queries-work) and the HyperLogLog fast path, the SlateDB profile store, and cohort edit/delete. Build from source to get them before the next release.
+> **Release vs. `main`.** These docs describe `main`. The latest release is built from `main` as it stood when it was tagged; anything merged since is listed under *Unreleased* in the [changelog](../CHANGELOG.md). Build from source to get it sooner.
 
 **From source** (macOS, or any other platform). Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it up) and Node.js for the Studio UI.
 

@@ -9,10 +9,10 @@ record privacy-masked DOM wireframes for session replay.
 ## Install
 
 Every [GitHub release](https://github.com/sswapnil2/analytics-system/releases/latest) attaches the
-packed SDK. Install it straight from the release (replace `0.1.1` with the release you want):
+packed SDK. Install it straight from the release (replace `0.1.2` with the release you want):
 
 ```bash
-npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.1/pulse-analytics-ts-web-0.1.1.tgz
+npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.2/pulse-analytics-ts-web-0.1.2.tgz
 ```
 
 It is not on the npm registry yet. To build it from source instead:
