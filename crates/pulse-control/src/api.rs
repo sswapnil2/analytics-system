@@ -4578,8 +4578,8 @@ impl ControlPlaneService {
 
     /// Checks every alert rule, records when one fires, and posts a signed webhook for it.
     /// `pulse-node` calls this on a timer.
-    // ponytail: every query-serving node runs this, so several query nodes each deliver; add a
-    // leader lease if you run more than one.
+    /// Every query-serving node runs this; the conditional update on `last_triggered_ms` is the
+    /// claim, so only one node delivers each trigger.
     pub async fn evaluate_alerts(&self) {
         let now_ms = Utc::now().timestamp_millis();
         let Ok(projects) = self.meta.list_projects().await else {
@@ -4590,6 +4590,7 @@ impl ControlPlaneService {
                 continue;
             };
             for mut a in rules {
+                let prev_triggered_ms = a.last_triggered_ms;
                 if a.last_triggered_ms
                     .is_some_and(|t| now_ms - t < ALERT_WINDOW_MS)
                 {
@@ -4600,9 +4601,17 @@ impl ControlPlaneService {
                     continue;
                 }
                 a.last_triggered_ms = Some(now_ms);
-                if let Err(e) = self.meta.upsert_alert_rule(&a).await {
-                    tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
-                    continue;
+                match self
+                    .meta
+                    .claim_alert_trigger(&a.id, prev_triggered_ms, now_ms)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue, // another node claimed this trigger
+                    Err(e) => {
+                        tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
+                        continue;
+                    }
                 }
                 match self.deliver_alert(&a, value, now_ms).await {
                     Ok(Some(status)) => {
