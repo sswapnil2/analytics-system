@@ -49,7 +49,7 @@ use crate::models::{
     unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
     BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
+    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag, SavedMetric, StagedRollout,
     FlagHoldout, FlagLayer, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization,
     Project, Role, SavedReport, SystemKeyringRecord, TrafficGroup, UserProfileRecord,
     VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS,
@@ -1504,6 +1504,14 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/holdouts/:group_id/results",
             post(handle_holdout_results),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics",
+            get(handle_list_saved_metrics).post(handle_create_saved_metric),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics/:metric_id",
+            axum::routing::delete(handle_delete_saved_metric),
         )
         .route(
             "/v1/projects/:id/layers",
@@ -3665,6 +3673,86 @@ fn first_free_slice(taken: &[(u32, u32, String)], need: u32) -> Option<(u32, u32
     (10_000u32.saturating_sub(cursor) >= need).then(|| (cursor, cursor + need))
 }
 
+async fn handle_list_saved_metrics(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<SavedMetric>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(ctrl.meta.list_saved_metrics(&id).await.map_err(CtrlError::meta)?))
+}
+
+const MAX_SAVED_METRICS: usize = 200;
+
+/// Saves `spec` under `name` (unique per project, ignoring case) for reuse in experiments.
+async fn handle_create_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut spec): Json<ExperimentMetricSpec>,
+) -> ApiRes<SavedMetric> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let name = spec.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    spec.name = name.clone();
+    // Auto-stop belongs to an experiment's guardrail, not to the definition.
+    spec.auto_stop = false;
+    crate::experiments::validate_metric_spec(&spec).map_err(CtrlError::bad)?;
+    let existing = ctrl.meta.list_saved_metrics(&id).await.map_err(CtrlError::meta)?;
+    if existing.len() >= MAX_SAVED_METRICS {
+        return Err(CtrlError::bad(format!(
+            "a project can save at most {MAX_SAVED_METRICS} metrics; delete one first"
+        )));
+    }
+    if existing.iter().any(|m| m.name.to_lowercase() == name.to_lowercase()) {
+        return Err(CtrlError::conflict(format!("a metric named '{name}' already exists")));
+    }
+    let m = SavedMetric {
+        id: format!("met_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id.clone(),
+        name,
+        spec,
+        created_by: ctrl.principal_label(&principal).await?,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta.insert_saved_metric(&m).await.map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.created",
+        &format!("project:{id}"),
+        json!({ "id": m.id, "name": m.name }),
+    )
+    .await;
+    Ok(Json(m))
+}
+
+/// Experiments keep their own copy of a metric, so deleting a saved one changes none of them.
+async fn handle_delete_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, metric_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_saved_metric(&id, &metric_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{metric_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.deleted",
+        &format!("project:{id}"),
+        json!({ "id": metric_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": metric_id })))
+}
+
 #[derive(Deserialize)]
 struct CreateTrafficGroupReq {
     name: String,
@@ -4366,7 +4454,12 @@ struct DecisionReq {
     flag_action: String,
     #[serde(default)]
     acknowledged: Vec<String>,
+    /// With `flag_action: "staged"`: days between steps (1 to 14, default 2).
+    every_days: Option<u32>,
 }
+
+/// The rollout steps a staged ship goes through.
+const STAGED_STEPS_PCT: [f64; 3] = [25.0, 50.0, 100.0];
 
 /// Running and paused experiments hold their flag; drafts and concluded ones don't.
 fn is_live(status: &str) -> bool {
@@ -4458,7 +4551,7 @@ async fn apply_decision_to_flag(
     else {
         return Err(CtrlError::bad("the experiment's flag no longer exists"));
     };
-    if d.flag_action == "rollout" {
+    if d.flag_action == "rollout" || d.flag_action == "staged" {
         let winner = d.variant.as_deref().unwrap_or_default();
         if !flag.variants.iter().any(|v| v.key == winner) {
             return Err(CtrlError::bad(format!(
@@ -4469,7 +4562,7 @@ async fn apply_decision_to_flag(
             v.weight_bps = if v.key == winner { 10_000 } else { 0 };
         }
         flag.enabled = true;
-        flag.rollout_pct = 100.0;
+        flag.rollout_pct = if d.flag_action == "staged" { STAGED_STEPS_PCT[0] } else { 100.0 };
         // Leave the layer so the winner reaches everyone, not just this experiment's slice.
         flag.layer = None;
     } else {
@@ -4560,10 +4653,17 @@ async fn handle_patch_experiment(
                 "decision.outcome must be ship, keep_control or inconclusive",
             ));
         }
-        if !matches!(d.flag_action.as_str(), "rollout" | "rollback" | "keep") {
+        if !matches!(d.flag_action.as_str(), "rollout" | "staged" | "rollback" | "keep") {
             return Err(CtrlError::bad(
-                "decision.flag_action must be rollout, rollback or keep",
+                "decision.flag_action must be rollout, staged, rollback or keep",
             ));
+        }
+        if d.flag_action == "staged" && d.outcome != "ship" {
+            return Err(CtrlError::bad("a staged rollout needs outcome ship"));
+        }
+        let every_days = d.every_days.unwrap_or(2);
+        if !(1..=14).contains(&every_days) {
+            return Err(CtrlError::bad("decision.every_days must be 1 to 14"));
         }
         if d.acknowledged.len() > 10 || d.acknowledged.iter().any(|a| a.chars().count() > 500) {
             return Err(CtrlError::bad(
@@ -4576,6 +4676,7 @@ async fn handle_patch_experiment(
             ));
         }
         apply_decision_to_flag(&ctrl, &exp, &d).await?;
+        let staged = d.flag_action == "staged";
         let now = Utc::now().timestamp_millis();
         exp.end_ts_ms = exp.end_ts_ms.min(now);
         let decided_by = ctrl.principal_label(&principal).await?;
@@ -4584,6 +4685,16 @@ async fn handle_patch_experiment(
             variant: d.variant,
             reason: d.reason.trim().to_string(),
             flag_action: d.flag_action,
+            staged: staged.then(|| {
+                let every_ms = i64::from(every_days) * 86_400_000;
+                StagedRollout {
+                    steps_pct: STAGED_STEPS_PCT.to_vec(),
+                    every_ms,
+                    next_step: 1,
+                    next_at_ms: now + every_ms,
+                    halted: None,
+                }
+            }),
             acknowledged: d.acknowledged,
             decided_by,
             decided_at_ms: now,
@@ -5455,7 +5566,7 @@ impl ControlPlaneService {
                 continue;
             };
             for exp in exps {
-                // Paused experiments still serve variants, so their guardrails keep watching.
+                // Paused experiments' flags are off, but users already in them can still trip a guardrail.
                 if exp.status != "running" && exp.status != "paused" {
                     continue;
                 }
@@ -5464,6 +5575,81 @@ impl ControlPlaneService {
                 }
             }
         }
+    }
+
+    /// Raises each staged ship's rollout to its next step once due. If the flag was changed by
+    /// hand since the last step (rollout, on/off or the winner's weight), it halts instead and
+    /// leaves the flag alone. `pulse-node` calls this on the guardrail timer.
+    pub async fn advance_staged_rollouts(&self) {
+        self.advance_staged_rollouts_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::advance_staged_rollouts`] as if the time were `now_ms`.
+    pub async fn advance_staged_rollouts_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                let due = exp.decision.as_ref().and_then(|d| d.staged.as_ref()).is_some_and(|st| {
+                    st.halted.is_none() && st.next_step < st.steps_pct.len() && now_ms >= st.next_at_ms
+                });
+                if due {
+                    if let Err(e) = self.advance_staged_rollout(exp, now_ms).await {
+                        tracing::warn!(project_id = %proj.id, "staged rollout failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn advance_staged_rollout(&self, mut exp: Experiment, now: i64) -> Result<(), String> {
+        let Some(d) = exp.decision.as_mut() else {
+            return Ok(());
+        };
+        let winner = d.variant.clone().unwrap_or_default();
+        let Some(st) = d.staged.as_mut() else {
+            return Ok(());
+        };
+        let flag = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
+        let expected = st.steps_pct[st.next_step - 1];
+        let action = match flag {
+            Some(mut f)
+                if f.enabled
+                    && (f.rollout_pct - expected).abs() < 0.01
+                    && f.variants.iter().any(|v| v.key == winner && v.weight_bps == 10_000) =>
+            {
+                f.rollout_pct = st.steps_pct[st.next_step];
+                f.updated_at_ms = now;
+                self.meta.upsert_feature_flag(&f).await.map_err(|e| e.to_string())?;
+                st.next_step += 1;
+                st.next_at_ms += st.every_ms;
+                json!({ "experiment_id": exp.id, "flag_key": f.key, "rollout_pct": f.rollout_pct })
+            }
+            _ => {
+                st.halted = Some("the flag was changed by hand, so Pulse stopped raising the rollout".into());
+                json!({ "experiment_id": exp.id, "halted": st.halted })
+            }
+        };
+        self.meta.upsert_experiment(&exp).await.map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "pulse",
+            "experiment.rollout_advanced",
+            &format!("project:{}", exp.project_id),
+            action,
+        )
+        .await;
+        Ok(())
     }
 
     /// Moves each running bandit's flag weights toward its best arm, once a day, in the first

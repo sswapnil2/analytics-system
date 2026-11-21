@@ -403,6 +403,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                         alerts_control.evaluate_alerts().await;
                         alerts_control.evaluate_experiment_guardrails().await;
                         alerts_control.evaluate_bandits().await;
+                        alerts_control.advance_staged_rollouts().await;
                     }
                     changed = alerts_shutdown.changed() => {
                         if changed.is_err() || *alerts_shutdown.borrow() { break; }

@@ -5,6 +5,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 ## [Unreleased]
 
 ### Added
+- The start review names A-to-B and time metrics in full, decisions recorded with an old user id read "a teammate", and the experiment list says "Stopped · shipped …" to match the experiment page.
+- Saved metrics: name a guardrail or secondary metric once (say, "KYC failure" as a KYC event where status isn't success) and add it to any experiment from a list.
+- Shipping can roll the winner out in steps: 25%, then 50%, then everyone, every 1 to 7 days. A hand change to the flag stops the schedule.
+- Create the experiment's flag from the experiment form (made off, 50/50, turned on when the experiment starts). Flags in use by another experiment are marked and can't be picked, and a taken name is flagged as soon as you leave the field.
 - Pausing an experiment now turns its flag off, so everyone gets the default until you resume; you're asked to confirm and can note why, and users get their same variant back on resume.
 - A flag used by a running or paused experiment shows which experiment, and its on/off switch, audience, holdout and rollout are locked until the experiment is stopped or shipped (pausing turns the flag off).
 - The experiment page shows Pulse's recommendation. Ship is no longer the main button when a guardrail has no data or got worse, the split is off, or the sample is short; concluding then needs each of those acknowledged, including a guardrail that got worse.

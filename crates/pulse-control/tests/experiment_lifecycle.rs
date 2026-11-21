@@ -649,3 +649,80 @@ async fn secondary_metrics_measure_step_through_and_time_between() {
     // Secondaries never flag regressions.
     assert_eq!(sec[1]["regressed_variants"], json!([]));
 }
+
+#[tokio::test]
+async fn saved_metrics_are_named_once_and_reused() {
+    let (app, _ctrl, token, _ingest) = setup().await;
+    let uri = "/v1/projects/proj_h/saved-metrics";
+    let kyc = json!({
+        "name": " KYC failure ", "event_name": "KYC_Verified", "metric_type": "conversion",
+        "conversion_window_ms": 7 * DAY, "direction": "increase_is_bad", "auto_stop": true,
+        "filters": [{"prop_name": "status", "filter": {"op": "neq", "val": "success"}}],
+    });
+    let (status, saved) = call(&app, &token, "POST", uri, kyc.clone()).await;
+    assert!(status.is_success(), "{saved}");
+    assert_eq!(saved["name"], "KYC failure");
+    assert_eq!(saved["spec"]["name"], "KYC failure");
+    assert_eq!(saved["spec"]["auto_stop"], false, "auto-stop belongs to an experiment");
+    let mut dup = kyc.clone();
+    dup["name"] = json!("kyc FAILURE");
+    let (status, _) = call(&app, &token, "POST", uri, dup).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let mut bad = kyc.clone();
+    bad["metric_type"] = json!("nonsense");
+    let (status, _) = call(&app, &token, "POST", uri, bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, list) = call(&app, &token, "GET", uri, json!(null)).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["spec"]["filters"][0]["prop_name"], "status");
+    let id = saved["id"].as_str().unwrap();
+    let (status, _) = call(&app, &token, "DELETE", &format!("{uri}/{id}"), json!(null)).await;
+    assert!(status.is_success());
+    let (_, list) = call(&app, &token, "GET", uri, json!(null)).await;
+    assert!(list.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn staged_ship_raises_the_rollout_until_someone_changes_the_flag() {
+    let (app, ctrl, token, _ingest) = setup().await;
+    let exps = "/v1/projects/proj_h/experiments";
+    let flags_uri = "/v1/projects/proj_h/flags";
+    let rollout = |flags: &Value, key: &str| flag(flags, key)["rollout_pct"].as_f64().unwrap();
+
+    let ship = |every_days: u32| json!({
+        "status": "concluded",
+        "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "staged", "every_days": every_days},
+    });
+    let (_, live) = call(&app, &token, "POST", exps, draft_or_running("b", "running")).await;
+    assert!(live["id"].is_string(), "{live}");
+    let live_uri = format!("{exps}/{}", live["id"].as_str().unwrap());
+    let (status, _) = call(&app, &token, "PATCH", &live_uri, ship(15)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "every_days is 1 to 14");
+    let (status, done) = call(&app, &token, "PATCH", &live_uri, ship(2)).await;
+    assert!(status.is_success(), "{done}");
+    let staged = &done["decision"]["staged"];
+    assert_eq!(staged["next_step"], 1);
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 25.0);
+    assert_eq!(flag(&flags, "b")["enabled"], true);
+
+    // Not due yet, then due: 25% → 50%.
+    let next = staged["next_at_ms"].as_i64().unwrap();
+    ctrl.advance_staged_rollouts_at(next - 1).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 25.0);
+    ctrl.advance_staged_rollouts_at(next).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 50.0);
+
+    // A hand edit halts the plan and is left alone.
+    let flag_uri = format!("{flags_uri}/{}", flag(&flags, "b")["id"].as_str().unwrap());
+    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"rollout_pct": 30.0})).await;
+    assert!(status.is_success(), "a concluded experiment doesn't lock its flag");
+    ctrl.advance_staged_rollouts_at(next + 2 * DAY).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 30.0);
+    let (_, all) = call(&app, &token, "GET", exps, json!(null)).await;
+    let exp = all.as_array().unwrap().iter().find(|e| e["id"] == live["id"]).unwrap();
+    assert!(exp["decision"]["staged"]["halted"].is_string(), "{exp}");
+}

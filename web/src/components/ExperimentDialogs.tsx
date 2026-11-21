@@ -103,6 +103,7 @@ export const ConcludeDialog: React.FC<{
   const [variant, setVariant] = useState(initialVariant ?? treatments[0] ?? "");
   const [action, setAction] = useState<FlagAction>(DEFAULT_ACTION[initialVariant ? "ship" : "inconclusive"]);
   const [reason, setReason] = useState("");
+  const [everyDays, setEveryDays] = useState(2);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const shipping = outcome === "ship";
   // Each reason the evidence is thin needs its own tick, and is saved with the decision.
@@ -125,7 +126,12 @@ export const ConcludeDialog: React.FC<{
     setAction(DEFAULT_ACTION[o]);
   };
   const actions: { value: FlagAction; label: string }[] = [
-    ...(shipping ? [{ value: "rollout" as const, label: `Give everyone ${variant}` }] : []),
+    ...(shipping
+      ? [
+          { value: "rollout" as const, label: `Give everyone ${variant}` },
+          { value: "staged" as const, label: `Give ${variant} to 25%, then 50%, then everyone` },
+        ]
+      : []),
     { value: "rollback", label: "Turn the flag off, so everyone gets the default" },
     { value: "keep", label: "Leave the flag as it is, so the current split keeps serving" },
   ];
@@ -138,7 +144,14 @@ export const ConcludeDialog: React.FC<{
         onSubmit={(e) => {
           e.preventDefault();
           if (ready)
-            onConclude({ outcome, variant: shipping ? variant : null, reason: reason.trim(), flag_action: action, acknowledged: caveats });
+            onConclude({
+              outcome,
+              variant: shipping ? variant : null,
+              reason: reason.trim(),
+              flag_action: action,
+              acknowledged: caveats,
+              ...(action === "staged" ? { every_days: everyDays } : {}),
+            });
         }}
       >
         <fieldset className="space-y-1.5">
@@ -178,6 +191,24 @@ export const ConcludeDialog: React.FC<{
               </option>
             ))}
           </select>
+          {action === "staged" && (
+            <span className="flex flex-wrap items-center gap-2 text-xs text-muted">
+              Next step every
+              <select
+                aria-label="Days between rollout steps"
+                value={everyDays}
+                onChange={(e) => setEveryDays(Number(e.target.value))}
+                className={`${field} w-auto py-0.5`}
+              >
+                {[1, 2, 3, 7].map((d) => (
+                  <option key={d} value={d}>
+                    {d} {d === 1 ? "day" : "days"}
+                  </option>
+                ))}
+              </select>
+              . Watch your dashboards between steps; changing the flag by hand stops the schedule.
+            </span>
+          )}
           {action === "keep" && (
             <span className="text-xs text-warn">Users keep getting both variants until you change the flag.</span>
           )}

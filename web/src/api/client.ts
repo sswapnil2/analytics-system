@@ -344,7 +344,7 @@ export interface Experiment {
 
 export type DecisionOutcome = "ship" | "keep_control" | "inconclusive";
 /** rollout: everyone gets the variant; rollback: flag off; keep: flag unchanged. */
-export type FlagAction = "rollout" | "rollback" | "keep";
+export type FlagAction = "rollout" | "staged" | "rollback" | "keep";
 
 export interface DecisionInput {
   outcome: DecisionOutcome;
@@ -353,11 +353,33 @@ export interface DecisionInput {
   flag_action: FlagAction;
   /** Caveats the decider accepted when shipping. */
   acknowledged?: string[];
+  /** With `flag_action: "staged"`: days between rollout steps (1 to 14). */
+  every_days?: number;
+}
+
+/** A ship whose rollout rises step by step. */
+export interface StagedRollout {
+  steps_pct: number[];
+  every_ms: number;
+  /** Index of the next step; equals steps_pct.length once done. */
+  next_step: number;
+  next_at_ms: number;
+  halted?: string | null;
+}
+
+/** An experiment metric defined once and reused as a guardrail or secondary metric. */
+export interface SavedMetric {
+  id: string;
+  name: string;
+  spec: ExperimentMetric;
+  created_by: string;
+  created_at_ms: number;
 }
 
 export interface ExperimentDecision extends DecisionInput {
   decided_by: string;
   decided_at_ms: number;
+  staged?: StagedRollout | null;
 }
 
 export type ExperimentKind = "ab" | "bandit";
@@ -1289,6 +1311,14 @@ export const api = {
 
   deleteTrafficGroup: (projectId: string, kind: "holdouts" | "layers", id: string) =>
     fetchJson<unknown>(projectPath(projectId, `/${kind}/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  listSavedMetrics: (projectId: string) => fetchJson<SavedMetric[]>(projectPath(projectId, "/saved-metrics")),
+
+  createSavedMetric: (projectId: string, spec: ExperimentMetric) =>
+    fetchJson<SavedMetric>(projectPath(projectId, "/saved-metrics"), { method: "POST", body: JSON.stringify(spec) }),
+
+  deleteSavedMetric: (projectId: string, id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/saved-metrics/${encodeURIComponent(id)}`), { method: "DELETE" }),
 
   /** Exposed users against held-back users, on any metric. */
   getHoldoutResults: (projectId: string, id: string, metric: ExperimentMetric, startTsMs: number) =>

@@ -282,6 +282,18 @@ pub struct FlagLayer {
     pub end_bps: u32,
 }
 
+/// An experiment metric defined once and reused as a guardrail or secondary metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedMetric {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub spec: ExperimentMetricSpec,
+    #[serde(default)]
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
 /// A holdout (`kind = "holdout"`, `bps` = share held back) or a layer (`kind = "layer"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficGroup {
@@ -464,6 +476,22 @@ pub struct ExperimentDecision {
     pub decided_by: String,
     #[serde(default)]
     pub decided_at_ms: i64,
+    /// Set for `flag_action: "staged"`: the rollout rises step by step on a timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<StagedRollout>,
+}
+
+/// A ship that raises the flag's rollout in steps (e.g. 25% → 50% → 100%) instead of at once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StagedRollout {
+    pub steps_pct: Vec<f64>,
+    pub every_ms: i64,
+    /// Index into `steps_pct` of the next step; equal to its length once done.
+    pub next_step: usize,
+    pub next_at_ms: i64,
+    /// Why it stopped early, e.g. the flag was changed by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted: Option<String>,
 }
 
 fn default_true() -> bool {
