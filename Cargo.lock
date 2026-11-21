@@ -4347,7 +4347,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.44.1",
  "vortex-file",
  "xxhash-rust",
  "zstd",
@@ -6336,7 +6336,7 @@ dependencies = [
  "vortex-decimal-byte-parts",
  "vortex-dict",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-expr",
  "vortex-fastlanes",
  "vortex-file",
@@ -6371,7 +6371,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-fastlanes",
  "vortex-mask",
  "vortex-scalar",
@@ -6416,7 +6416,7 @@ dependencies = [
  "static_assertions",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-flatbuffers",
  "vortex-mask",
  "vortex-scalar",
@@ -6443,7 +6443,7 @@ dependencies = [
  "vortex-decimal-byte-parts",
  "vortex-dict",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-fastlanes",
  "vortex-fsst",
  "vortex-mask",
@@ -6465,7 +6465,7 @@ dependencies = [
  "bytes",
  "itertools 0.14.0",
  "num-traits",
- "vortex-error",
+ "vortex-error 0.43.0",
 ]
 
 [[package]]
@@ -6479,7 +6479,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6494,7 +6494,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6511,7 +6511,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6529,7 +6529,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
  "vortex-utils",
@@ -6551,7 +6551,7 @@ dependencies = [
  "prost 0.14.6",
  "serde",
  "static_assertions",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-flatbuffers",
  "vortex-proto",
  "vortex-utils",
@@ -6573,6 +6573,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-error"
+version = "0.44.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840e2415179062afbe80e62299c51749e962e88d63c094d1aecc240f77aa8893"
+dependencies = [
+ "arrow-schema",
+ "jiff",
+ "url",
+]
+
+[[package]]
 name = "vortex-expr"
 version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6587,7 +6598,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-proto",
  "vortex-scalar",
@@ -6610,7 +6621,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6644,7 +6655,7 @@ dependencies = [
  "vortex-decimal-byte-parts",
  "vortex-dict",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-expr",
  "vortex-fastlanes",
  "vortex-flatbuffers",
@@ -6684,7 +6695,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6705,7 +6716,7 @@ dependencies = [
  "pin-project",
  "tokio",
  "vortex-buffer",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-metrics",
  "wasm-bindgen-futures",
 ]
@@ -6724,7 +6735,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-flatbuffers",
 ]
 
@@ -6761,7 +6772,7 @@ dependencies = [
  "vortex-buffer",
  "vortex-dict",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-expr",
  "vortex-flatbuffers",
  "vortex-mask",
@@ -6781,7 +6792,7 @@ checksum = "211f3772987a2942dcb4d1bc7d2a8640688b16a5053dabe5106958f62f60292d"
 dependencies = [
  "arrow-buffer",
  "itertools 0.14.0",
- "vortex-error",
+ "vortex-error 0.43.0",
 ]
 
 [[package]]
@@ -6807,7 +6818,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6835,7 +6846,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6855,7 +6866,7 @@ dependencies = [
  "prost 0.14.6",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-proto",
 ]
 
@@ -6876,7 +6887,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-expr",
  "vortex-layout",
  "vortex-mask",
@@ -6895,7 +6906,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-proto",
  "vortex-scalar",
@@ -6914,7 +6925,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
 ]
@@ -6937,7 +6948,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
  "zigzag",
@@ -6953,7 +6964,7 @@ dependencies = [
  "vortex-array",
  "vortex-buffer",
  "vortex-dtype",
- "vortex-error",
+ "vortex-error 0.43.0",
  "vortex-mask",
  "vortex-scalar",
  "zstd",

@@ -53,7 +53,7 @@ vortex-file = { version = "=0.43.0", features = ["object_store", "tokio"] }
 vortex-dtype = "=0.43.0"
 vortex-buffer = "=0.43.0"
 vortex-scalar = "=0.43.0"
-vortex-error = "=0.43.0"
+vortex-error = "=0.44.1"
 vortex-io = { version = "=0.43.0", features = ["object_store", "tokio"] }
 arrow = { version = "55.1.0", features = ["prettyprint"] }
 arrow-array = "55.1.0"
