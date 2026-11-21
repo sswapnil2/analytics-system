@@ -57,11 +57,11 @@ use crate::models::{
     unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
     BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag, SavedMetric, StagedRollout,
+    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
     FlagHoldout, FlagLayer, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization,
-    Project, Role, SavedReport, SystemKeyringRecord, TrafficGroup, UserProfileRecord,
-    VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS,
-    REPORT_KINDS,
+    Project, Role, SavedMetric, SavedReport, StagedRollout, SystemKeyringRecord, TrafficGroup,
+    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -3851,7 +3851,12 @@ async fn handle_list_saved_metrics(
     AxumPath(id): AxumPath<String>,
 ) -> ApiRes<Vec<SavedMetric>> {
     ctrl.authorize_and_check(&principal, &id).await?;
-    Ok(Json(ctrl.meta.list_saved_metrics(&id).await.map_err(CtrlError::meta)?))
+    Ok(Json(
+        ctrl.meta
+            .list_saved_metrics(&id)
+            .await
+            .map_err(CtrlError::meta)?,
+    ))
 }
 
 const MAX_SAVED_METRICS: usize = 200;
@@ -3872,14 +3877,23 @@ async fn handle_create_saved_metric(
     // Auto-stop belongs to an experiment's guardrail, not to the definition.
     spec.auto_stop = false;
     crate::experiments::validate_metric_spec(&spec).map_err(CtrlError::bad)?;
-    let existing = ctrl.meta.list_saved_metrics(&id).await.map_err(CtrlError::meta)?;
+    let existing = ctrl
+        .meta
+        .list_saved_metrics(&id)
+        .await
+        .map_err(CtrlError::meta)?;
     if existing.len() >= MAX_SAVED_METRICS {
         return Err(CtrlError::bad(format!(
             "a project can save at most {MAX_SAVED_METRICS} metrics; delete one first"
         )));
     }
-    if existing.iter().any(|m| m.name.to_lowercase() == name.to_lowercase()) {
-        return Err(CtrlError::conflict(format!("a metric named '{name}' already exists")));
+    if existing
+        .iter()
+        .any(|m| m.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(CtrlError::conflict(format!(
+            "a metric named '{name}' already exists"
+        )));
     }
     let m = SavedMetric {
         id: format!("met_{}", &Uuid::new_v4().simple().to_string()[..12]),
@@ -3889,7 +3903,10 @@ async fn handle_create_saved_metric(
         created_by: ctrl.principal_label(&principal).await?,
         created_at_ms: Utc::now().timestamp_millis(),
     };
-    ctrl.meta.insert_saved_metric(&m).await.map_err(CtrlError::meta)?;
+    ctrl.meta
+        .insert_saved_metric(&m)
+        .await
+        .map_err(CtrlError::meta)?;
     ctrl.record_enterprise_audit(
         &principal.actor_label(),
         "saved_metric.created",
@@ -4638,7 +4655,11 @@ fn is_live(status: &str) -> bool {
     matches!(status, "running" | "paused")
 }
 
-async fn set_flag_enabled(ctrl: &ControlPlaneService, exp: &Experiment, enabled: bool) -> Result<(), CtrlError> {
+async fn set_flag_enabled(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    enabled: bool,
+) -> Result<(), CtrlError> {
     let Some(mut flag) = ctrl
         .meta
         .list_feature_flags(&exp.project_id)
@@ -4734,7 +4755,11 @@ async fn apply_decision_to_flag(
             v.weight_bps = if v.key == winner { 10_000 } else { 0 };
         }
         flag.enabled = true;
-        flag.rollout_pct = if d.flag_action == "staged" { STAGED_STEPS_PCT[0] } else { 100.0 };
+        flag.rollout_pct = if d.flag_action == "staged" {
+            STAGED_STEPS_PCT[0]
+        } else {
+            100.0
+        };
         // Leave the layer so the winner reaches everyone, not just this experiment's slice.
         flag.layer = None;
     } else {
@@ -4825,7 +4850,10 @@ async fn handle_patch_experiment(
                 "decision.outcome must be ship, keep_control or inconclusive",
             ));
         }
-        if !matches!(d.flag_action.as_str(), "rollout" | "staged" | "rollback" | "keep") {
+        if !matches!(
+            d.flag_action.as_str(),
+            "rollout" | "staged" | "rollback" | "keep"
+        ) {
             return Err(CtrlError::bad(
                 "decision.flag_action must be rollout, staged, rollback or keep",
             ));
@@ -5774,9 +5802,15 @@ impl ControlPlaneService {
                 continue;
             };
             for exp in exps {
-                let due = exp.decision.as_ref().and_then(|d| d.staged.as_ref()).is_some_and(|st| {
-                    st.halted.is_none() && st.next_step < st.steps_pct.len() && now_ms >= st.next_at_ms
-                });
+                let due = exp
+                    .decision
+                    .as_ref()
+                    .and_then(|d| d.staged.as_ref())
+                    .is_some_and(|st| {
+                        st.halted.is_none()
+                            && st.next_step < st.steps_pct.len()
+                            && now_ms >= st.next_at_ms
+                    });
                 if due {
                     if let Err(e) = self.advance_staged_rollout(exp, now_ms).await {
                         tracing::warn!(project_id = %proj.id, "staged rollout failed: {e}");
@@ -5806,21 +5840,31 @@ impl ControlPlaneService {
             Some(mut f)
                 if f.enabled
                     && (f.rollout_pct - expected).abs() < 0.01
-                    && f.variants.iter().any(|v| v.key == winner && v.weight_bps == 10_000) =>
+                    && f.variants
+                        .iter()
+                        .any(|v| v.key == winner && v.weight_bps == 10_000) =>
             {
                 f.rollout_pct = st.steps_pct[st.next_step];
                 f.updated_at_ms = now;
-                self.meta.upsert_feature_flag(&f).await.map_err(|e| e.to_string())?;
+                self.meta
+                    .upsert_feature_flag(&f)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 st.next_step += 1;
                 st.next_at_ms += st.every_ms;
                 json!({ "experiment_id": exp.id, "flag_key": f.key, "rollout_pct": f.rollout_pct })
             }
             _ => {
-                st.halted = Some("the flag was changed by hand, so Pulse stopped raising the rollout".into());
+                st.halted = Some(
+                    "the flag was changed by hand, so Pulse stopped raising the rollout".into(),
+                );
                 json!({ "experiment_id": exp.id, "halted": st.halted })
             }
         };
-        self.meta.upsert_experiment(&exp).await.map_err(|e| e.to_string())?;
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
         self.record_enterprise_audit(
             "pulse",
             "experiment.rollout_advanced",

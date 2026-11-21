@@ -342,7 +342,11 @@ async fn layer_experiments_get_disjoint_slices() {
     .await;
     assert_eq!(flag(&flags, "c")["layer"]["start_bps"], 0);
     let (status, _) = call(&app, &token, "PATCH", &a_uri, json!({"status": "running"})).await;
-    assert_eq!(status, StatusCode::CONFLICT, "the layer has no free slice to resume into");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the layer has no free slice to resume into"
+    );
 
     // Shipping leaves the layer so the winner reaches everyone; joining needs an experiment.
     let (status, done) = call(&app, &token, "PATCH", &b_uri, json!({
@@ -351,7 +355,14 @@ async fn layer_experiments_get_disjoint_slices() {
     }))
     .await;
     assert!(status.is_success(), "{done}");
-    let (_, flags) = call(&app, &token, "GET", "/v1/projects/proj_h/flags", json!(null)).await;
+    let (_, flags) = call(
+        &app,
+        &token,
+        "GET",
+        "/v1/projects/proj_h/flags",
+        json!(null),
+    )
+    .await;
     assert!(flag(&flags, "b").get("layer").is_none());
     let (status, _) = call(
         &app,
@@ -446,22 +457,51 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
 
     // While it's live, the flag's serving is locked; its description isn't.
     let flag_uri = format!("{flags_uri}/{}", flag(&flags, "a")["id"].as_str().unwrap());
-    for body in [json!({"rollout_pct": 10.0}), json!({"enabled": false}), json!({"targeting_cohort_id": ""})] {
+    for body in [
+        json!({"rollout_pct": 10.0}),
+        json!({"enabled": false}),
+        json!({"targeting_cohort_id": ""}),
+    ] {
         let (status, err) = call(&app, &token, "PATCH", &flag_uri, body).await;
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
     }
-    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"description": "1-tap"})).await;
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &flag_uri,
+        json!({"description": "1-tap"}),
+    )
+    .await;
     assert!(status.is_success());
 
     // Pause turns the flag off and keeps why; resume turns it back on and clears it.
-    let (status, paused) = call(&app, &token, "PATCH", &live_uri, json!({"status": "paused", "reason": " Payment errors spiked "})).await;
+    let (status, paused) = call(
+        &app,
+        &token,
+        "PATCH",
+        &live_uri,
+        json!({"status": "paused", "reason": " Payment errors spiked "}),
+    )
+    .await;
     assert!(status.is_success(), "{paused}");
     assert_eq!(paused["pause_reason"], "Payment errors spiked");
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
     assert_eq!(flag(&flags, "a")["enabled"], false);
     let (status, err) = call(&app, &token, "PATCH", &flag_uri, json!({"enabled": true})).await;
-    assert_eq!(status, StatusCode::CONFLICT, "still locked while paused: {err}");
-    let (status, resumed) = call(&app, &token, "PATCH", &live_uri, json!({"status": "running"})).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "still locked while paused: {err}"
+    );
+    let (status, resumed) = call(
+        &app,
+        &token,
+        "PATCH",
+        &live_uri,
+        json!({"status": "running"}),
+    )
+    .await;
     assert!(status.is_success(), "{resumed}");
     assert!(resumed["pause_reason"].is_null());
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
@@ -663,7 +703,10 @@ async fn saved_metrics_are_named_once_and_reused() {
     assert!(status.is_success(), "{saved}");
     assert_eq!(saved["name"], "KYC failure");
     assert_eq!(saved["spec"]["name"], "KYC failure");
-    assert_eq!(saved["spec"]["auto_stop"], false, "auto-stop belongs to an experiment");
+    assert_eq!(
+        saved["spec"]["auto_stop"], false,
+        "auto-stop belongs to an experiment"
+    );
     let mut dup = kyc.clone();
     dup["name"] = json!("kyc FAILURE");
     let (status, _) = call(&app, &token, "POST", uri, dup).await;
@@ -689,10 +732,12 @@ async fn staged_ship_raises_the_rollout_until_someone_changes_the_flag() {
     let flags_uri = "/v1/projects/proj_h/flags";
     let rollout = |flags: &Value, key: &str| flag(flags, key)["rollout_pct"].as_f64().unwrap();
 
-    let ship = |every_days: u32| json!({
-        "status": "concluded",
-        "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "staged", "every_days": every_days},
-    });
+    let ship = |every_days: u32| {
+        json!({
+            "status": "concluded",
+            "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "staged", "every_days": every_days},
+        })
+    };
     let (_, live) = call(&app, &token, "POST", exps, draft_or_running("b", "running")).await;
     assert!(live["id"].is_string(), "{live}");
     let live_uri = format!("{exps}/{}", live["id"].as_str().unwrap());
@@ -717,12 +762,27 @@ async fn staged_ship_raises_the_rollout_until_someone_changes_the_flag() {
 
     // A hand edit halts the plan and is left alone.
     let flag_uri = format!("{flags_uri}/{}", flag(&flags, "b")["id"].as_str().unwrap());
-    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"rollout_pct": 30.0})).await;
-    assert!(status.is_success(), "a concluded experiment doesn't lock its flag");
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &flag_uri,
+        json!({"rollout_pct": 30.0}),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "a concluded experiment doesn't lock its flag"
+    );
     ctrl.advance_staged_rollouts_at(next + 2 * DAY).await;
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
     assert_eq!(rollout(&flags, "b"), 30.0);
     let (_, all) = call(&app, &token, "GET", exps, json!(null)).await;
-    let exp = all.as_array().unwrap().iter().find(|e| e["id"] == live["id"]).unwrap();
+    let exp = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == live["id"])
+        .unwrap();
     assert!(exp["decision"]["staged"]["halted"].is_string(), "{exp}");
 }

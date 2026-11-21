@@ -13,8 +13,8 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
-    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedMetric, SavedReport,
-    SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedMetric,
+    SavedReport, SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
 };
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
@@ -1216,7 +1216,10 @@ impl MetaStore {
     }
 
     /// A project's saved metrics by name; rows whose spec no longer parses are skipped.
-    pub async fn list_saved_metrics(&self, project_id: &str) -> Result<Vec<SavedMetric>, MetaError> {
+    pub async fn list_saved_metrics(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SavedMetric>, MetaError> {
         let rows = db_map_all!(
             self,
             "SELECT id, project_id, name, spec_json, created_by, created_at_ms FROM saved_metrics
