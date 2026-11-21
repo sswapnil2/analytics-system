@@ -180,11 +180,31 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
     );
     let agent = p.control.agent_metrics();
     for (name, help, v) in [
-        ("pulse_agent_traces_ingested_total", "Agent traces stored.", &agent.traces_ingested),
-        ("pulse_agent_spans_ingested_total", "Agent spans stored.", &agent.spans_ingested),
-        ("pulse_agent_blobs_deduped_total", "Agent payload blobs deduplicated.", &agent.blobs_deduped),
-        ("pulse_agent_evals_executed_total", "Agent evaluations executed.", &agent.evals_executed),
-        ("pulse_agent_eval_queue_dropped_total", "Agent eval jobs dropped because the queue was full.", &agent.eval_queue_dropped),
+        (
+            "pulse_agent_traces_ingested_total",
+            "Agent traces stored.",
+            &agent.traces_ingested,
+        ),
+        (
+            "pulse_agent_spans_ingested_total",
+            "Agent spans stored.",
+            &agent.spans_ingested,
+        ),
+        (
+            "pulse_agent_blobs_deduped_total",
+            "Agent payload blobs deduplicated.",
+            &agent.blobs_deduped,
+        ),
+        (
+            "pulse_agent_evals_executed_total",
+            "Agent evaluations executed.",
+            &agent.evals_executed,
+        ),
+        (
+            "pulse_agent_eval_queue_dropped_total",
+            "Agent eval jobs dropped because the queue was full.",
+            &agent.eval_queue_dropped,
+        ),
     ] {
         counter(name, help, v.load(Ordering::Relaxed));
     }

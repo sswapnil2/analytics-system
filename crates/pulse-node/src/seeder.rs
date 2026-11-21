@@ -1263,17 +1263,34 @@ async fn seed_starter_dashboard(
 /// (trace, span and session level), a dataset built from a real trace, and a pending experiment.
 /// Evaluations aren't written directly: eval jobs are queued so the worker scores the traces.
 /// Runs only from the first-boot seed branch, so restarts don't duplicate it.
-pub async fn seed_agent_demo(ctrl: &Arc<ControlPlaneService>, project_id: &str) -> anyhow::Result<()> {
-    use pulse_agent::{AgentDataset, AgentDatasetItem, AgentExperiment, EvaluatorConfig, TraceIngestBatch};
+pub async fn seed_agent_demo(
+    ctrl: &Arc<ControlPlaneService>,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    use pulse_agent::{
+        AgentDataset, AgentDatasetItem, AgentExperiment, EvaluatorConfig, TraceIngestBatch,
+    };
     use pulse_control::EvalJob;
     use serde_json::json;
 
     let now = Utc::now().timestamp_millis();
     let questions = [
-        ("How do I reset my PIN?", "Open Settings > Security > Reset PIN."),
-        ("Why was my loan application declined?", "Your credit check didn't meet the minimum score."),
-        ("When is my next EMI due?", "Your next EMI of Rs 4,250 is due on the 5th."),
-        ("Can I prepay my personal loan?", "Yes, prepayment is free after 6 EMIs."),
+        (
+            "How do I reset my PIN?",
+            "Open Settings > Security > Reset PIN.",
+        ),
+        (
+            "Why was my loan application declined?",
+            "Your credit check didn't meet the minimum score.",
+        ),
+        (
+            "When is my next EMI due?",
+            "Your next EMI of Rs 4,250 is due on the 5th.",
+        ),
+        (
+            "Can I prepay my personal loan?",
+            "Yes, prepayment is free after 6 EMIs.",
+        ),
     ];
     let (mut traces, mut spans) = (Vec::new(), Vec::new());
     let mut sessions = Vec::new();
@@ -1283,7 +1300,11 @@ pub async fn seed_agent_demo(ctrl: &Arc<ControlPlaneService>, project_id: &str) 
         let start = now - (i * 7 * 86_400_000 / 60) - 60_000;
         let (q, a) = questions[(i % 4) as usize];
         let version = if i % 3 == 0 { "1.1.0" } else { "1.0.0" };
-        let model = if i % 5 == 0 { "claude-haiku-5-5" } else { "gpt-4o-mini" };
+        let model = if i % 5 == 0 {
+            "claude-haiku-5-5"
+        } else {
+            "gpt-4o-mini"
+        };
         let provider = if i % 5 == 0 { "anthropic" } else { "openai" };
         let tool_fails = i % 9 == 4;
         let llm_ms = 600 + (i * 37) % 900;
@@ -1300,18 +1321,45 @@ pub async fn seed_agent_demo(ctrl: &Arc<ControlPlaneService>, project_id: &str) 
             "failure_source": if tool_fails { json!("tool") } else { json!(null) },
         }));
         let root = format!("sp_{tid}_root");
-        let mk = |id: String, parent: Option<&str>, name: &str, kind: &str, s: i64, d: i64, extra: serde_json::Value| {
+        let mk = |id: String,
+                  parent: Option<&str>,
+                  name: &str,
+                  kind: &str,
+                  s: i64,
+                  d: i64,
+                  extra: serde_json::Value| {
             let mut v = json!({"span_id": id, "trace_id": tid, "parent_span_id": parent, "name": name,
                 "span_type": kind, "status": "ok", "start_ts_ms": s, "end_ts_ms": s + d, "duration_ms": d});
-            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             v
         };
-        spans.push(mk(root.clone(), None, "support-agent", "agent", start, dur, json!({"status": status, "input": {"question": q}})));
-        spans.push(mk(format!("sp_{tid}_ret"), Some(&root), "search_help_center", "retrieval", start + 10, 30,
-            json!({"output": {"documents": 3}})));
+        spans.push(mk(
+            root.clone(),
+            None,
+            "support-agent",
+            "agent",
+            start,
+            dur,
+            json!({"status": status, "input": {"question": q}}),
+        ));
+        spans.push(mk(
+            format!("sp_{tid}_ret"),
+            Some(&root),
+            "search_help_center",
+            "retrieval",
+            start + 10,
+            30,
+            json!({"output": {"documents": 3}}),
+        ));
         let (tin, tout) = (900 + (i * 31) % 700, 120 + (i * 17) % 200);
         // Store-level ingest skips the pricing step, so price the demo calls here (USD per 1M tokens).
-        let (pin, pout) = if provider == "anthropic" { (1.0, 5.0) } else { (0.15, 0.60) };
+        let (pin, pout) = if provider == "anthropic" {
+            (1.0, 5.0)
+        } else {
+            (0.15, 0.60)
+        };
         let cost_nanos = ((tin as f64 * pin + tout as f64 * pout) * 1_000.0) as i64;
         spans.push(mk(format!("sp_{tid}_llm"), Some(&root), "answer", "llm", start + 40, llm_ms, json!({
             "provider": provider, "model": model, "input_tokens": tin, "output_tokens": tout,
@@ -1326,13 +1374,19 @@ pub async fn seed_agent_demo(ctrl: &Arc<ControlPlaneService>, project_id: &str) 
             sessions.push((sid, tid));
         }
     }
-    let batch: TraceIngestBatch = serde_json::from_value(json!({"traces": traces, "spans": spans}))?;
+    let batch: TraceIngestBatch =
+        serde_json::from_value(json!({"traces": traces, "spans": spans}))?;
     ctrl.agent_store().ingest_batch(project_id, batch).await?;
 
     let meta = ctrl.meta();
     for (id, name, target, kind) in [
         ("evc_demo_no_errors", "No errors", "trace", "no_errors"),
-        ("evc_demo_output", "Answer not empty", "span", "output_not_empty"),
+        (
+            "evc_demo_output",
+            "Answer not empty",
+            "span",
+            "output_not_empty",
+        ),
         ("evc_demo_no_loop", "No tool loops", "session", "no_loop"),
     ] {
         let cfg: EvaluatorConfig = serde_json::from_value(json!({
@@ -1342,8 +1396,11 @@ pub async fn seed_agent_demo(ctrl: &Arc<ControlPlaneService>, project_id: &str) 
     }
     for (sid, tid) in sessions {
         ctrl.try_enqueue_eval(EvalJob {
-            project_id: project_id.to_string(), session_id: Some(sid), trace_id: Some(tid),
-            span_id: None, evaluator_ids: None,
+            project_id: project_id.to_string(),
+            session_id: Some(sid),
+            trace_id: Some(tid),
+            span_id: None,
+            evaluator_ids: None,
         });
     }
 

@@ -13,8 +13,7 @@ use axum::routing::get;
 use axum::Router;
 use pulse_control::{
     build_admin_control_router, build_agent_ingest_router, build_public_flag_router,
-    BootstrapCredentials,
-    ControlPlaneService, MetaStore,
+    BootstrapCredentials, ControlPlaneService, MetaStore,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;

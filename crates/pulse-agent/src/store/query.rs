@@ -2077,7 +2077,10 @@ fn span_metric_from_row(
         tool_name_rank,
         tool_retry_count: r.tool_retry_count.max(0),
         // Senders often omit total_tokens; same rule as the trace rollup.
-        total_tokens: r.total_tokens.max(r.input_tokens.saturating_add(r.output_tokens)).max(0),
+        total_tokens: r
+            .total_tokens
+            .max(r.input_tokens.saturating_add(r.output_tokens))
+            .max(0),
         cost_nanos: r.cost_nanos.max(0),
     })
 }
@@ -2193,7 +2196,11 @@ where
 }
 
 /// One breakdown row over a set of runs (traces).
-fn breakdown_row(key: String, secondary: Option<String>, items: &[&AgentTrace]) -> DimensionBreakdown {
+fn breakdown_row(
+    key: String,
+    secondary: Option<String>,
+    items: &[&AgentTrace],
+) -> DimensionBreakdown {
     let execs = items.len() as i64;
     let fails = items.iter().filter(|t| is_error_status(t.status)).count() as i64;
     let durs: Vec<i64> = items.iter().map(|t| t.duration_ms).collect();

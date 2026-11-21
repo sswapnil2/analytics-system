@@ -917,7 +917,12 @@ mod tests {
         )]);
         for stage in ["l0", "plss"] {
             let qa = store
-                .query_analytics_with_rollups("proj_e2e", &AnalyticsFilter::default(), &[], &rollups)
+                .query_analytics_with_rollups(
+                    "proj_e2e",
+                    &AnalyticsFilter::default(),
+                    &[],
+                    &rollups,
+                )
                 .await
                 .unwrap();
             let row = qa.by_model.iter().find(|r| r.key == "gpt-4o").unwrap();
