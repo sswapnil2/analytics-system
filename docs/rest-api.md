@@ -127,7 +127,7 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | GET, PUT | `/v1/projects/:id/byok` | Inspect or save project BYOK credentials (LLM, S3 warehouse, webhooks) |
 | DELETE | `/v1/projects/:id/byok/:category` | Delete a stored BYOK credential category |
 | POST | `/v1/projects/:id/byok-verify` | Test a stored BYOK configuration |
-| POST | `/v1/projects/:id/export/warehouse` | Trigger an on-demand Parquet export to a configured BYOK S3 bucket |
+| POST | `/v1/projects/:id/export/warehouse` | Write an NDJSON export (`exports/{id}/events_{ts}.ndjson`) to the configured BYOK S3 bucket. Body: `start_ts_ms` + `end_ts_ms`, `limit` (default 10000, max 50000) |
 | POST | `/v1/projects/:id/ai/copilot` | Run an AI Copilot analytics query using the project's BYOK LLM |
 | PATCH | `/v1/projects/:id/experiments/:exp_id` | Update an existing experiment definition |
 

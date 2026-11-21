@@ -446,6 +446,73 @@ mod tests {
         id_router.close_all().await.unwrap();
     }
 
+    /// #69: export of L1 rows returns real SDK session ids, decoding each segment's session index
+    /// once instead of per row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn export_from_l1_returns_real_session_ids_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(StorageConfig::default(), store, id_router.clone());
+        let ingest = IngestService::new(storage.clone(), InMemoryGovernance::new());
+        let qengine = QueryEngine::new(
+            storage.clone(),
+            64 * 1024 * 1024,
+            None,
+            64 * 1024 * 1024,
+            CatalogRegistry::new(),
+        )
+        .await
+        .unwrap();
+
+        let base_ts: i64 = 1_760_000_000_000;
+        let n: u32 = 20_000;
+        for chunk in 0..n / 1_000 {
+            let events = (chunk * 1_000..(chunk + 1) * 1_000)
+                .map(|i| {
+                    let mut uuid = [0u8; 16];
+                    uuid[..4].copy_from_slice(&i.to_le_bytes());
+                    uuid[15] = 1;
+                    WireEvent {
+                        event_uuid: uuid,
+                        routing_seed: format!("user_{}", i % 2_000),
+                        distinct_id: format!("user_{}", i % 2_000),
+                        session_id: format!("sdk_sess_{}", i % 4_000),
+                        event_name: "App_Open".to_string(),
+                        client_event_ts_ms: base_ts + i as i64,
+                        client_sent_ts_ms: base_ts + i as i64 + 5,
+                        props: Vec::new(),
+                        replay_offset_kb: 0,
+                    }
+                })
+                .collect();
+            ingest
+                .ingest_for_project("proj_export", WireBatch::new(events), base_ts + 60_000)
+                .await
+                .unwrap();
+        }
+        storage.flush_all_projects().await.unwrap();
+
+        let t = Instant::now();
+        let rows = qengine
+            .export_events("proj_export", None, None, n as usize, false)
+            .await
+            .unwrap();
+        println!(
+            "[BENCHMARK] export of {} L1 rows took {:?}",
+            rows.len(),
+            t.elapsed()
+        );
+        assert_eq!(rows.len(), n as usize);
+        assert!(
+            rows.iter().all(|r| r.session_id.starts_with("sdk_sess_")),
+            "expected real session ids, got e.g. {}",
+            rows[0].session_id
+        );
+        id_router.close_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn search_sessions_merges_l0_and_multiple_l1_segments_and_applies_rage_tap_once() {
         let dir = tempfile::tempdir().unwrap();
