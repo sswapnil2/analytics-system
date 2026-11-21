@@ -231,6 +231,17 @@ take simpler arguments.
 
 **Guardrail auto-stop.** Every 5 minutes the node checks running sequential experiments with an `auto_stop` guardrail. When a treatment makes one significantly worse, the flag's weights move to 10000 on control (the flag is turned off if it has no control variant), the experiment is concluded with a `stop_reason`, an `experiment.auto_stopped` row goes to the audit log, and `pulse.experiment.auto_stopped` is POSTed to the project's webhook credential URL, signed like alerts. SDKs pick the change up on their next flag refresh (`flagsTtlMs` / `flags_ttl_ms`, 5 minutes by default). Flag and experiment changes made through the API are audited too (`flag.saved`, `flag.updated`, `experiment.created`, `experiment.updated`).
 
+**Experiment milestones.** On the same timer, each running A/B experiment announces these once, as an `experiment.milestone` audit row and a signed `pulse.experiment.milestone` webhook (`{event, project_id, experiment: {id, name, flag_key}, milestone, message, timestamp_ms}`):
+
+| `milestone` | When |
+|---|---|
+| `planned_sample_reached` | Every variant has `analysis.planned_users_per_variant` users. |
+| `significant:<variant>` | A treatment moved the primary metric significantly, with no traffic-split mismatch. |
+| `guardrail_harmed:<name>` | A treatment made a guardrail significantly worse (auto-stop or not). |
+| `guardrail_no_data:<name>` | 1,000+ users are in the test and a guardrail has no events from any of them. |
+
+Significance and harm are only announced once results are safe to read: the experiment is sequential, or it has reached its planned sample. Paused experiments are not checked.
+
 **Bandits.** On the same timer, once a day, in the first hour after midnight in the project's timezone, each running bandit that is past burn-in gets new flag weights from Thompson sampling: every arm keeps `min_weight_bps` and the rest is shared by each arm's chance to be best. The change is recorded in the weight history and audited as `experiment.bandit_reweighted` (actor `system:bandit`). Arm estimates are stratified by exposure day, so traffic moving between arms doesn't bias them, and the SRM check compares users against the weights in effect on each day. `ready_to_ship` is true when the leader's expected loss is under 1% of its value.
 
 The edge flag bundle (`GET /v1/flags/:api_key`) is reused for up to 30 seconds while no flag changes, so polling SDKs don't re-run targeting cohorts on every request.

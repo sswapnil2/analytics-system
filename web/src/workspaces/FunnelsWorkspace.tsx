@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ArrowDown, Download, FlaskConical, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult, isAbortError, SamplingMode } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { useAccess } from "../auth/access";
@@ -706,10 +706,17 @@ const DropOffDrawer: React.FC<{
             </p>
             {downloadError && <p className="mt-1 text-sm text-danger">{downloadError}</p>}
           </div>
+          <a
+            href={`#/experiments?${new URLSearchParams({ p: projectId, new: "1", from: fromEvent, to: toEvent })}`}
+            className={`${btn.secondary} ml-auto`}
+            title={`Start an experiment measuring how many users go from ${fromStep} to ${toStep}`}
+          >
+            <FlaskConical className="h-4 w-4" /> Test a fix
+          </a>
           {canAdmin && (
             <button
               type="button"
-              className={`${btn.secondary} ml-auto`}
+              className={btn.secondary}
               disabled={downloading || droppedCount === 0}
               onClick={() => void downloadAll()}
             >

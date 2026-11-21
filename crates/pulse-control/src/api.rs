@@ -5322,8 +5322,8 @@ impl ControlPlaneService {
 
     /// Stops running sequential experiments whose `auto_stop` guardrail a treatment made
     /// significantly worse: everyone gets control, the experiment is concluded with a
-    /// `stop_reason`, and it is audited and sent to the project webhook. `pulse-node` calls this
-    /// on a timer.
+    /// `stop_reason`, and it is audited and sent to the project webhook. Also announces A/B
+    /// milestones (see [`Self::announce_milestones`]). `pulse-node` calls this on a timer.
     // ponytail: same multi-node ceiling as `evaluate_alerts`; also re-runs every guardrail query
     // each tick, fine at the 5-minute cadence.
     pub async fn evaluate_experiment_guardrails(&self) {
@@ -5335,13 +5335,10 @@ impl ControlPlaneService {
                 continue;
             };
             for exp in exps {
-                if exp.status != "running"
-                    || !exp.analysis.sequential
-                    || !exp.guardrail_metrics.iter().any(|g| g.auto_stop)
-                {
+                if exp.status != "running" {
                     continue;
                 }
-                if let Err(e) = self.auto_stop_if_regressed(exp).await {
+                if let Err(e) = self.check_running_experiment(exp).await {
                     tracing::warn!(project_id = %proj.id, "guardrail check failed: {e}");
                 }
             }
@@ -5456,13 +5453,15 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    async fn auto_stop_if_regressed(&self, mut exp: Experiment) -> Result<(), String> {
+    /// One results query per running experiment per tick: announce new milestones, then
+    /// auto-stop it if an `auto_stop` guardrail regressed.
+    async fn check_running_experiment(&self, exp: Experiment) -> Result<(), String> {
         let flags = self
             .meta
             .list_feature_flags(&exp.project_id)
             .await
             .map_err(|e| e.to_string())?;
-        let Some(mut flag) = flags
+        let Some(flag) = flags
             .into_iter()
             .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
         else {
@@ -5471,6 +5470,125 @@ impl ControlPlaneService {
         let res = evaluate_experiment_results(&exp, Some(&flag), &self.qengine, None)
             .await
             .map_err(|e| e.to_string())?;
+        // Bandits report P(best), not p-values, so they have no significance milestones.
+        if exp.kind != "bandit" {
+            self.announce_milestones(&exp, &res).await;
+        }
+        if exp.analysis.sequential && exp.guardrail_metrics.iter().any(|g| g.auto_stop) {
+            self.auto_stop_if_regressed(exp, flag, &res).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends each milestone once, as audit row `experiment.milestone` and webhook event
+    /// `pulse.experiment.milestone`. Significance and guardrail harm only count when it's safe to
+    /// look: a sequential test, or a fixed one that reached its planned sample.
+    async fn announce_milestones(&self, exp: &Experiment, res: &ExperimentResults) {
+        let users: u64 = res.variants.iter().map(|v| v.sample_size).sum();
+        let min_users = res
+            .variants
+            .iter()
+            .map(|v| v.sample_size)
+            .min()
+            .unwrap_or(0);
+        let planned_reached = exp
+            .analysis
+            .planned_users_per_variant
+            .is_some_and(|p| p > 0 && min_users >= p);
+        let safe_to_read = res.sequential || planned_reached;
+        let mut found: Vec<(String, String)> = Vec::new();
+        if planned_reached {
+            found.push((
+                "planned_sample_reached".into(),
+                format!("Every variant has reached its planned {min_users}+ users."),
+            ));
+        }
+        if safe_to_read && !res.sample_ratio_mismatch {
+            for v in res
+                .variants
+                .iter()
+                .filter(|v| !v.is_control && v.statistically_significant)
+            {
+                found.push((
+                    format!("significant:{}", v.variant_key),
+                    format!(
+                        "{} changed {} by {:+.1}% (p = {:.4}).",
+                        v.variant_key, res.metric_name, v.relative_lift_pct, v.p_value
+                    ),
+                ));
+            }
+        }
+        for g in &res.guardrails {
+            if safe_to_read && !g.regressed_variants.is_empty() {
+                found.push((
+                    format!("guardrail_harmed:{}", g.metric_name),
+                    format!(
+                        "{} got worse in {}.",
+                        g.metric_name,
+                        g.regressed_variants.join(", ")
+                    ),
+                ));
+            }
+            // ponytail: 1,000 users is a fixed "should have seen one by now" bar; make it a
+            // setting if rare guardrail events trip it.
+            if users >= 1_000
+                && g.variants
+                    .iter()
+                    .all(|v| v.conversions == 0 && v.mean_value == 0.0)
+            {
+                found.push((
+                    format!("guardrail_no_data:{}", g.metric_name),
+                    format!(
+                        "{} has no events from {users} users in this test, so it can't catch harm. Check the event name or that your app sends it.",
+                        g.metric_name
+                    ),
+                ));
+            }
+        }
+        let now = Utc::now().timestamp_millis();
+        for (milestone, message) in found {
+            match self
+                .meta
+                .claim_experiment_milestone(&exp.project_id, &exp.id, &milestone, now)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(experiment_id = %exp.id, "milestone store failed: {e}");
+                    continue;
+                }
+            }
+            self.record_enterprise_audit(
+                "system:experiments",
+                "experiment.milestone",
+                &format!("project:{}", exp.project_id),
+                json!({"experiment_id": exp.id, "milestone": milestone, "message": message}),
+            )
+            .await;
+            let body = json!({
+                "event": "pulse.experiment.milestone",
+                "project_id": exp.project_id,
+                "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+                "milestone": milestone,
+                "message": message,
+                "timestamp_ms": now,
+            });
+            if let Err(e) = self
+                .post_project_webhook(&exp.project_id, None, &body)
+                .await
+            {
+                tracing::warn!(experiment_id = %exp.id, "milestone webhook failed: {e}");
+            }
+        }
+    }
+
+    async fn auto_stop_if_regressed(
+        &self,
+        mut exp: Experiment,
+        mut flag: FeatureFlag,
+        res: &ExperimentResults,
+    ) -> Result<(), String> {
         let auto: std::collections::HashSet<&str> = exp
             .guardrail_metrics
             .iter()

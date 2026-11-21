@@ -1241,6 +1241,27 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Records that `milestone` was announced for an experiment; false when it already was, so
+    /// each milestone goes out once even with several nodes checking.
+    pub async fn claim_experiment_milestone(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+        milestone: &str,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "INSERT INTO experiment_milestones (project_id, experiment_id, milestone, sent_at_ms) VALUES (?, ?, ?, ?)
+             ON CONFLICT(experiment_id, milestone) DO NOTHING",
+            project_id,
+            experiment_id,
+            milestone,
+            now_ms,
+        );
+        Ok(affected == 1)
+    }
+
     pub async fn delete_traffic_group(
         &self,
         project_id: &str,

@@ -25,6 +25,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - An experiments list with search, a status filter, progress, decisions and owners. Experiment names are now unique within a project.
 - Flags can be created with your own variants: names, splits, more than two arms, and an optional JSON payload each.
 - Segments hide experiment plumbing, ids and personal-data properties, show no lift for segments with too few users, and name the "no value" segment.
+- Experiments send a webhook (and an audit row) once when a result turns significant, the planned sample is reached, a guardrail gets worse, or a guardrail has no data.
+- "Test a fix" on a funnel drop-off opens a new experiment measuring that step.
+- Experiment results can be shared: each experiment has its own link, and "Copy summary" gives a plain-text write-up of the setup, results and decision.
+- Paused experiments explain what pausing does: users keep their variants and results keep counting, but guardrail checks and auto-stop are off.
 - Holdouts remember the metric they were last measured on, say plainly when there are no conversions yet, and explain that their counts are users assigned, not experiment exposures.
 
 ### Changed

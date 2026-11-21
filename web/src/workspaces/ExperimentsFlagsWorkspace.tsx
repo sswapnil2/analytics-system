@@ -12,7 +12,7 @@ import { useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
 import { PropertyPicker } from "../components/PropertyPicker";
-import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent, propertyOptions } from "../lib/format";
+import { errorMessage, formatCount, formatDuration, formatPValue, formatPercent, formatProbability, humanizeEvent, propertyOptions } from "../lib/format";
 import { usersPerVariant } from "../lib/power";
 
 interface Props {
@@ -31,16 +31,6 @@ const METRIC_TYPES: { value: MetricType; label: string; eventLabel: string }[] =
   { value: "time_between", label: "Time from A to B", eventLabel: "Then did (B)" },
 ];
 
-/** Seconds as "45s", "6m 29s", "3h 10m" or "2d 4h". */
-function formatDuration(sec: number): string {
-  const s = Math.round(Math.abs(sec));
-  const sign = sec < 0 ? "−" : "";
-  if (s < 60) return `${sign}${s}s`;
-  if (s < 3600) return `${sign}${Math.floor(s / 60)}m ${s % 60}s`;
-  if (s < 86_400) return `${sign}${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-  return `${sign}${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
-}
-
 /** Metrics shown as a rate: conversions and step-throughs. */
 const isRate = (type: MetricType | undefined) => !type || type === "conversion" || type === "step_through";
 
@@ -48,7 +38,7 @@ const isRate = (type: MetricType | undefined) => !type || type === "conversion" 
 function formatMetricValue(type: MetricType | undefined, v: VariantLiftRow): string {
   if (!type || type === "conversion") return formatPercent(v.conversion_rate, 2);
   if (type === "step_through") return formatPercent(v.mean_value, 1);
-  if (type === "time_between") return formatDuration(v.mean_value);
+  if (type === "time_between") return formatDuration(v.mean_value * 1000);
   return v.mean_value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v.mean_value) < 10 ? 3 : 2 });
 }
 
@@ -112,7 +102,7 @@ function describeMetric(m: Experiment["primary_metric"]): string {
 
 /** Absolute difference from control: percentage points for rates, metric units otherwise. */
 function formatAbsDiff(type: MetricType | undefined, d: number): string {
-  if (type === "time_between") return `${d > 0 ? "+" : d < 0 ? "−" : ""}${formatDuration(Math.abs(d))}`;
+  if (type === "time_between") return `${d > 0 ? "+" : d < 0 ? "−" : ""}${formatDuration(Math.abs(d) * 1000)}`;
   const conv = isRate(type);
   const n = conv ? d * 100 : d;
   const text = n.toLocaleString(undefined, { maximumFractionDigits: Math.abs(n) < 10 ? 2 : 1 });
@@ -128,11 +118,13 @@ function hasNoMetricData(type: MetricType | undefined, rows: VariantLiftRow[]): 
  * One plain sentence on what the primary result means for the decision, checked against the
  * lift the experiment was planned to detect, so a "significant" +0.3% doesn't read as a win.
  */
-const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuardrails: string[] }> = ({
-  exp,
-  results,
-  blindGuardrails,
-}) => {
+type Tone = "ok" | "warn" | "danger" | "muted";
+
+function verdict(
+  exp: Experiment,
+  results: ExperimentResults,
+  blindGuardrails: string[],
+): { tone: Tone; lines: string[] } | null {
   const treatments = results.variants.filter((v) => !v.is_control);
   if (!treatments.length) return null;
   const target = exp.analysis?.target_lift_pct ?? null;
@@ -141,7 +133,7 @@ const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuar
   const pct = (x: number) => `${x > 0 ? "+" : ""}${x.toFixed(1)}%`;
   const range = (v: VariantLiftRow) => `${pct(v.ci95_low_pct)} to ${pct(v.ci95_high_pct)}`;
 
-  let tone = "muted" as "ok" | "warn" | "danger" | "muted";
+  let tone = "muted" as Tone;
   let lines: string[];
   if (results.sample_ratio_mismatch) {
     tone = "danger";
@@ -171,6 +163,17 @@ const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuar
     if (tone === "ok") tone = "warn";
     lines.push(`${blindGuardrails.join(", ")} ${blindGuardrails.length > 1 ? "have" : "has"} no data, so harm can't be ruled out.`);
   }
+  return { tone, lines };
+}
+
+const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuardrails: string[] }> = ({
+  exp,
+  results,
+  blindGuardrails,
+}) => {
+  const v = verdict(exp, results, blindGuardrails);
+  if (!v) return null;
+  const { tone, lines } = v;
   const box = {
     ok: "border-ok/40 bg-ok/10",
     warn: "border-warn/40 bg-warn-soft",
@@ -183,6 +186,82 @@ const Verdict: React.FC<{ exp: Experiment; results: ExperimentResults; blindGuar
         <p key={l}>{l}</p>
       ))}
     </div>
+  );
+};
+
+/** A plain-text write-up to paste into a doc or chat: setup, result, verdict, guardrails, decision. */
+function experimentSummary(
+  exp: Experiment,
+  flag: FeatureFlag | undefined,
+  results: ExperimentResults,
+  blindGuardrails: string[],
+  link: string,
+): string {
+  const day = (ms: number) => new Date(ms).toLocaleDateString();
+  const out = [
+    `${exp.name} (${STATUS_LABEL[exp.status] ?? exp.status}, ${day(exp.start_ts_ms)} to ${day(exp.end_ts_ms)})`,
+    "",
+  ];
+  if (exp.hypothesis) out.push(`Hypothesis: ${exp.hypothesis}`);
+  out.push(`Primary metric: ${exp.primary_metric.name} (${describeMetric(exp.primary_metric)})`);
+  if (flag) {
+    out.push(`Variants: ${flag.variants.map((v) => `${v.key} ${formatPercent(v.weight_bps / 10_000, 0)}`).join(" / ")}. ${trafficSentence(flag, null)}`);
+  }
+  out.push("", "Result:");
+  for (const v of results.variants) {
+    const pct = (x: number) => `${x > 0 ? "+" : ""}${x.toFixed(1)}%`;
+    const lift = v.is_control
+      ? ""
+      : `, ${pct(v.relative_lift_pct)} vs control (likely ${pct(v.ci95_low_pct)} to ${pct(v.ci95_high_pct)})${v.statistically_significant ? ", significant" : ", not significant"}`;
+    out.push(`- ${v.variant_key}: ${formatMetricValue(results.metric_type, v)} of ${formatCount(v.sample_size)} users${lift}`);
+  }
+  const vd = verdict(exp, results, blindGuardrails);
+  if (vd) out.push("", "What it means:", ...vd.lines.map((l) => `- ${l}`));
+  if (results.guardrails.length) {
+    out.push("", "Guardrails:");
+    for (const g of results.guardrails) {
+      const state = blindGuardrails.includes(g.metric_name)
+        ? "no data"
+        : g.regressed_variants.length
+          ? `harmed by ${g.regressed_variants.join(", ")}`
+          : "not harmed";
+      out.push(`- ${g.metric_name}: ${state}`);
+    }
+  }
+  if (results.secondary?.length) {
+    out.push("", "Secondary metrics:");
+    for (const m of results.secondary) {
+      out.push(`- ${m.metric_name}: ${m.variants.map((v) => `${v.variant_key} ${formatMetricValue(m.metric_type, v)}`).join(", ")}`);
+    }
+  }
+  if (results.sample_ratio_mismatch) out.push("", "Warning: the traffic split is off, so these results can't be trusted.");
+  if (exp.decision) {
+    const d = exp.decision;
+    const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
+    out.push("", `Decision: ${what}, by ${d.decided_by} on ${day(d.decided_at_ms)}.${d.reason ? ` ${d.reason}` : ""}`);
+  }
+  out.push("", link);
+  return out.join("\n");
+}
+
+/** Copies text, then says so on the button for a moment. */
+const CopyButton: React.FC<{ label: string; text: () => string }> = ({ label, text }) => {
+  const [done, setDone] = useState<"ok" | "fail" | null>(null);
+  return (
+    <button
+      type="button"
+      className={btn.ghost}
+      onClick={() => {
+        navigator.clipboard
+          .writeText(text())
+          .then(() => setDone("ok"))
+          .catch(() => setDone("fail"))
+          .finally(() => setTimeout(() => setDone(null), 2000));
+      }}
+    >
+      {done === "ok" ? <Check className="h-3.5 w-3.5" /> : null}
+      <span aria-live="polite">{done === "ok" ? "Copied" : done === "fail" ? "Couldn't copy" : label}</span>
+    </button>
   );
 };
 
@@ -569,6 +648,41 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     }
   }, [projectId]);
 
+  // Deep links: `exp=<id>` opens that experiment (shareable); `new=1&from=A&to=B` (from a
+  // funnel drop-off) opens the form with an A-to-B step-through metric filled in.
+  const selectRef = useRef<(id: string) => void>(() => {});
+  useEffect(() => {
+    const apply = (initial: boolean) => {
+      const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+      if (!path.replace(/^\//, "").startsWith("experiments")) return;
+      const params = new URLSearchParams(search);
+      const exp = params.get("exp");
+      if (exp && exp !== selectedExpIdRef.current) {
+        if (initial) {
+          selectedExpIdRef.current = exp; // loadAll picks it up
+          setSelectedExpId(exp);
+        } else selectRef.current(exp);
+      }
+      if (params.get("new") === "1") {
+        const from = params.get("from");
+        const to = params.get("to");
+        setExpFormOpen(true);
+        if (from && to) {
+          setExpMetricType("step_through");
+          setExpDenominator(from);
+          setExpMetric(to);
+          setExpHypothesis(`If we fix what stops people after ${humanizeEvent(from)}, more of them will reach ${humanizeEvent(to)}.`);
+        }
+        for (const k of ["new", "from", "to"]) params.delete(k);
+        window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+      }
+    };
+    apply(true);
+    const onHash = () => apply(false);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
   useEffect(() => {
     void loadAll();
   }, [loadAll, refreshToken]);
@@ -576,6 +690,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const handleSelectExperiment = async (expId: string, seg = segmentRef.current) => {
     selectedExpIdRef.current = expId;
     setSelectedExpId(expId);
+    // Keep the URL on this experiment, so it can be shared.
+    {
+      const [path, search = ""] = window.location.hash.replace(/^#/, "").split("?");
+      const params = new URLSearchParams(search);
+      if (expId) params.set("exp", expId);
+      else params.delete("exp");
+      window.history.replaceState(null, "", `#${path}?${params.toString()}`);
+    }
     const seq = ++resultsSeqRef.current;
     if (!expId) {
       setExpResults(null);
@@ -592,6 +714,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       if (resultsSeqRef.current === seq) setLoading(false);
     }
   };
+  selectRef.current = (id) => void handleSelectExperiment(id);
 
   const clearDraftIfIdle = useCallback((flagId: string) => {
     if (rolloutTimersRef.current.has(flagId)) return;
@@ -1230,6 +1353,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
+            {selectedExp?.status === "paused" && (
+              <p role="status" className="rounded-lg border border-line bg-sunken px-3.5 py-2.5 text-sm text-ink-2">
+                <span className="font-medium text-ink">Paused.</span> Users keep getting their variants and results keep
+                counting. Guardrail checks, auto-stop{selectedExp.kind === "bandit" ? " and daily traffic moves" : ""} are
+                off until you resume. The end date doesn't move. To stop users getting variants, stop the experiment or
+                turn its flag off.
+              </p>
+            )}
+
             {selectedExp?.stop_reason && (
               <div
                 role="alert"
@@ -1328,6 +1460,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       type="button"
                       disabled={acting}
                       onClick={() => void setStatus(selectedExp, selectedExp.status === "paused" ? "running" : "paused")}
+                      title={
+                        selectedExp.status === "paused"
+                          ? "Turn guardrail checks back on"
+                          : "Users keep their variants and results keep counting; only guardrail checks and auto-stop pause"
+                      }
                       className={btn.secondary}
                     >
                       {selectedExp.status === "paused" ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
@@ -1338,6 +1475,18 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       Stop experiment…
                     </button>
                   </>
+                )}
+              </div>
+            )}
+
+            {selectedExp && (
+              <div className="flex flex-wrap gap-1">
+                <CopyButton label="Copy link" text={() => window.location.href} />
+                {!banditResults && (
+                  <CopyButton
+                    label="Copy summary"
+                    text={() => experimentSummary(selectedExp, selectedFlag, expResults, blindGuardrails, window.location.href)}
+                  />
                 )}
               </div>
             )}
@@ -1732,7 +1881,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           disabled={!canEdit}
                           onChange={(e) => {
                             if (confirmFlagChange(f, "Changing the holdout"))
-                              void patchFlag(f, { holdout_id: e.target.value });
+                              void patchFlag(f, { holdout_id: e.target.value }).then(loadAll);
                           }}
                           className={`${field} min-w-0 max-w-full py-1`}
                         >
@@ -1834,6 +1983,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         layers={layers}
         events={availableEvents}
         canEdit={canEdit}
+        experiments={experiments}
         onChanged={loadAll}
       />
 

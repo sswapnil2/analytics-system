@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
-import { api, ExperimentResults, TrafficGroup } from "../api/client";
+import { api, Experiment, ExperimentResults, TrafficGroup } from "../api/client";
 import { ErrorNotice, Panel, btn, field, fieldLabel } from "./ui";
 import { errorMessage, formatCount, formatPercent, formatPValue, humanizeEvent } from "../lib/format";
 
@@ -131,8 +131,15 @@ export const HoldoutsAndLayers: React.FC<{
   layers: TrafficGroup[];
   events: string[];
   canEdit: boolean;
+  experiments: Experiment[];
   onChanged: () => Promise<void>;
-}> = ({ projectId, holdouts, layers, events, canEdit, onChanged }) => {
+}> = ({ projectId, holdouts, layers, events, canEdit, experiments, onChanged }) => {
+  /** The experiment on a flag (live first, then the newest), so layer slices are named for what they test. */
+  const expFor = (flagKey: string) =>
+    experiments
+      .filter((e) => e.flag_key === flagKey)
+      .sort((a, b) => Number(b.status === "running" || b.status === "paused") - Number(a.status === "running" || a.status === "paused") || b.start_ts_ms - a.start_ts_ms)[0];
+  const sliceName = (flagKey: string) => expFor(flagKey)?.name ?? flagKey;
   const [name, setName] = useState<Record<Kind, string>>({ holdouts: "", layers: "" });
   const [holdoutPct, setHoldoutPct] = useState(5);
   const [error, setError] = useState<string | null>(null);
@@ -268,20 +275,29 @@ export const HoldoutsAndLayers: React.FC<{
                   {l.flags.map((f) => (
                     <div
                       key={f.flag_key}
-                      title={`${f.flag_key}: ${pct((f.end_bps ?? 0) - (f.start_bps ?? 0))}${f.enabled ? "" : " (off, slice reusable)"}`}
+                      title={`${sliceName(f.flag_key)}: ${pct((f.end_bps ?? 0) - (f.start_bps ?? 0))}${f.enabled ? "" : " (off, slice reusable)"}`}
                       className={`absolute inset-y-0 truncate border-r border-panel px-1 text-[0.6875rem] leading-6 ${
                         f.enabled ? "bg-brand text-on-brand" : "bg-hover text-muted"
                       }`}
                       style={{ left: `${(f.start_bps ?? 0) / 100}%`, width: `${((f.end_bps ?? 0) - (f.start_bps ?? 0)) / 100}%` }}
                     >
-                      {f.flag_key}
+                      {sliceName(f.flag_key)}
                     </div>
                   ))}
                 </div>
                 <ul className="text-xs text-muted">
                   {l.flags.map((f) => (
                     <li key={f.flag_key}>
-                      <span className="font-mono">{f.flag_key}</span> · {pct((f.end_bps ?? 0) - (f.start_bps ?? 0))}
+                      {expFor(f.flag_key) ? (
+                        <>
+                          <span className="text-ink-2">{expFor(f.flag_key)!.name}</span> · {expFor(f.flag_key)!.status} ·{" "}
+                        </>
+                      ) : (
+                        <>
+                          <span className="font-mono">{f.flag_key}</span> ·{" "}
+                        </>
+                      )}
+                      {pct((f.end_bps ?? 0) - (f.start_bps ?? 0))}
                       {f.enabled ? "" : " · off, its slice can be reused"}
                     </li>
                   ))}
