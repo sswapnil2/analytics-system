@@ -10,7 +10,7 @@ pub mod wal;
 
 pub use error::{StoreError, StoreResult};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -65,6 +65,10 @@ pub struct AgentTraceStoreConfig {
     pub l0_max_bytes_project: usize,
     /// Unflushed bytes all projects together may hold (`PULSE_AGENT_L0_MAX_MB`).
     pub l0_max_bytes_node: usize,
+    /// Span records one trace may accumulate across batches; further spans are dropped.
+    pub max_trace_spans: usize,
+    /// Estimated bytes one trace may accumulate across batches.
+    pub max_trace_bytes: usize,
 }
 
 fn env_mb(name: &str, default_mb: usize) -> usize {
@@ -95,6 +99,8 @@ impl Default for AgentTraceStoreConfig {
             wal_max_group_bytes: DEFAULT_WAL_MAX_GROUP_BYTES,
             l0_max_bytes_project: env_mb("PULSE_AGENT_L0_PROJECT_MAX_MB", 256),
             l0_max_bytes_node: env_mb("PULSE_AGENT_L0_MAX_MB", 512),
+            max_trace_spans: 10_000,
+            max_trace_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -129,6 +135,11 @@ pub(crate) struct ProjectAgentState {
     /// Unflushed memtable bytes, refreshed after every append and flush. Backpressure reads
     /// this instead of locking every project's memtable.
     pub l0_bytes: AtomicUsize,
+    /// Span records and bytes accepted so far per trace, kept across flushes so a looping
+    /// agent cannot grow one trace without limit.
+    // ponytail: in memory, so a restart resets the counts; entries idle for an hour or beyond
+    // 100k traces are forgotten. Persist in the manifest if a hard cap across restarts matters.
+    pub trace_usage: moka::sync::Cache<String, (usize, usize)>,
 }
 
 /// Binary storage engine for AI Agent traces and spans (`PTWL` WAL + Sharded L0 + `PLSS` 7-tag segments + MVCC Manifest).
@@ -243,6 +254,17 @@ impl AgentTraceStore {
 
         let state = self.get_or_open_project(project_id).await?;
         self.check_l0_backpressure(&state)?;
+        let dropped_spans = self.enforce_trace_limits(&state, &mut batch);
+        if batch.traces.is_empty() && batch.spans.is_empty() {
+            return Ok(TraceIngestResponse {
+                accepted_traces: 0,
+                accepted_spans: 0,
+                truncated_payloads: 0,
+                redacted_fields: 0,
+                dropped_spans,
+                warnings: Vec::new(),
+            });
+        }
         let writer = state.wal_writer.as_ref().ok_or_else(|| {
             StoreError::Corrupted("missing WAL writer on writable project state".to_string())
         })?;
@@ -257,12 +279,44 @@ impl AgentTraceStore {
 
         Ok(TraceIngestResponse {
             accepted_traces,
-            accepted_spans,
+            accepted_spans: accepted_spans - dropped_spans,
             truncated_payloads: 0,
             redacted_fields: 0,
-            dropped_spans: 0,
+            dropped_spans,
             warnings: Vec::new(),
         })
+    }
+
+    /// Drops a trace's spans from `batch` once that trace has reached its span or byte cap.
+    /// Returns how many spans were dropped. The trace header is kept: it merges, it does not grow.
+    // ponytail: read-then-insert, so concurrent batches for one trace can overshoot by a batch.
+    fn enforce_trace_limits(
+        &self,
+        state: &ProjectAgentState,
+        batch: &mut TraceIngestBatch,
+    ) -> usize {
+        let mut incoming: HashMap<&str, (usize, usize)> = HashMap::new();
+        for sp in &batch.spans {
+            let e = incoming.entry(sp.trace_id.as_str()).or_default();
+            e.0 += 1;
+            e.1 += memtable::approx_span_bytes(sp);
+        }
+        let mut over: HashSet<String> = HashSet::new();
+        for (tid, (spans, bytes)) in incoming {
+            let (used_spans, used_bytes) = state.trace_usage.get(tid).unwrap_or_default();
+            let total = (used_spans + spans, used_bytes + bytes);
+            if total.0 > self.config.max_trace_spans || total.1 > self.config.max_trace_bytes {
+                over.insert(tid.to_string());
+            } else {
+                state.trace_usage.insert(tid.to_string(), total);
+            }
+        }
+        if over.is_empty() {
+            return 0;
+        }
+        let before = batch.spans.len();
+        batch.spans.retain(|sp| !over.contains(&sp.trace_id));
+        before - batch.spans.len()
     }
 
     /// Refuses ingest while this project, or the node as a whole, holds more unflushed bytes
@@ -728,6 +782,10 @@ impl AgentTraceStore {
             applied_wal_seq: AsyncMutex::new(applied),
             flush_lock: AsyncMutex::new(()),
             l0_bytes: AtomicUsize::new(memtable_bytes),
+            trace_usage: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
         });
         self.projects.insert(project_id.to_string(), state.clone());
         Ok(state)
