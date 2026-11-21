@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
+import { api, BanditResults, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
 import { HoldoutsAndLayers } from "../components/HoldoutsAndLayers";
 import { ConcludeDialog, StartReview } from "../components/ExperimentDialogs";
 import { ExperimentIndex } from "../components/ExperimentIndex";
@@ -159,6 +159,9 @@ function verdict(
       return `No clear difference for ${v.variant_key} at the planned sample (likely ${range(v)}). If a change this size would matter, it didn't show up: treat as inconclusive.`;
     });
   }
+  if (target === null && treatments.some((v) => v.statistically_significant && v.relative_lift_pct > 0)) {
+    lines.push("No target lift was set, so Pulse can't say whether this gain is big enough to be worth shipping.");
+  }
   if (blindGuardrails.length) {
     if (tone === "ok") tone = "warn";
     lines.push(`${blindGuardrails.join(", ")} ${blindGuardrails.length > 1 ? "have" : "has"} no data, so harm can't be ruled out.`);
@@ -239,6 +242,7 @@ function experimentSummary(
     const d = exp.decision;
     const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
     out.push("", `Decision: ${what}, by ${d.decided_by} on ${day(d.decided_at_ms)}.${d.reason ? ` ${d.reason}` : ""}`);
+    for (const a of d.acknowledged ?? []) out.push(`- Accepted: ${a}`);
   }
   out.push("", link);
   return out.join("\n");
@@ -379,6 +383,13 @@ const ExperimentSetup: React.FC<{
         <span className="font-medium text-ink">{what}</span> · {flagDid} · {d.decided_by},{" "}
         {new Date(d.decided_at_ms).toLocaleDateString()}
         {d.reason && <div className="whitespace-pre-wrap">{d.reason}</div>}
+        {!!d.acknowledged?.length && (
+          <ul className="mt-1 list-disc pl-4 text-xs text-warn">
+            {d.acknowledged.map((a) => (
+              <li key={a}>Accepted: {a}</li>
+            ))}
+          </ul>
+        )}
       </>,
     ]);
   }
@@ -453,11 +464,59 @@ function useBaseline(projectId: string, event: string) {
   return b;
 }
 
+/**
+ * Why a metric has no data from users in the test: the event never fired since it started, or it fired
+ * but not from those users within the window (wrong user id, fired before exposure, other platform).
+ */
+const WhyNoData: React.FC<{ projectId: string; event: string; exp: Experiment }> = ({ projectId, event, exp }) => {
+  const [users, setUsers] = useState<number | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setUsers(null);
+    api
+      .queryInsights(projectId, {
+        time_range: { start_ts_ms: exp.start_ts_ms, end_ts_ms: Math.min(Date.now(), exp.end_ts_ms) },
+        interval: "day",
+        series: [{ label: "0", event_name: event, metric: { type: "uniques" }, filters: [] }],
+        breakdown_by: [],
+      })
+      .then((res) => alive && setUsers(res.series[0]?.overall_value ?? 0))
+      .catch(() => alive && setUsers(null));
+    return () => {
+      alive = false;
+    };
+  }, [projectId, event, exp.start_ts_ms, exp.end_ts_ms]);
+  if (users === null) return null;
+  const name = humanizeEvent(event);
+  return (
+    <p className="mb-1.5 text-xs text-ink-2">
+      {users === 0
+        ? `No one has sent ${name} since this test started. Check the event name, or that your app tracks it.`
+        : `${formatCount(users)} users sent ${name} since this test started, but none of them within the window after seeing this test. They may be users outside it, it may fire before the flag is checked, or it may be tracked under a different user id than the exposure. Ask your engineer which.`}
+    </p>
+  );
+};
+
 function validateFlagKey(key: string): string | null {
   if (!key.trim()) return "Enter a flag key.";
   if (!FLAG_KEY_PATTERN.test(key.trim())) return "Use lowercase letters, numbers and underscores only.";
   return null;
 }
+
+/** Why the users seen so far can't back shipping, or null when they can. */
+function sampleCaveat(exp: Experiment, results: ExperimentResults | null, bandit: BanditResults | null): string | null {
+  const sizes = bandit ? bandit.arms.map((a) => a.users) : (results?.variants ?? []).map((v) => v.sample_size);
+  const total = sizes.reduce((a, n) => a + n, 0);
+  if (exp.status === "draft" || total === 0) return "No one has been in this experiment, so there is no evidence either way.";
+  const planned = exp.analysis?.planned_users_per_variant;
+  const least = Math.min(...sizes);
+  if (planned && least < planned)
+    return `Only ${formatCount(least)} of the planned ${formatCount(planned)} users per variant (${Math.round((least / planned) * 100)}%) have been in the test, so this result may not hold.`;
+  return null;
+}
+
+/** Longest an experiment can be planned to run from the form. */
+const MAX_DAYS = 120;
 
 const SampleEstimate: React.FC<{
   baseline: { rate: number; dailyUsers: number } | null;
@@ -467,7 +526,8 @@ const SampleEstimate: React.FC<{
   event: string;
   sequential: boolean;
   layerPct: number | null;
-}> = ({ baseline, mde, flag, days, event, sequential, layerPct }) => {
+  onUseDays: (days: number) => void;
+}> = ({ baseline, mde, flag, days, event, sequential, layerPct, onUseDays }) => {
   if (!baseline) return null;
   const name = humanizeEvent(event);
   const variants = Math.max(2, flag?.variants.length ?? 2);
@@ -484,6 +544,15 @@ const SampleEstimate: React.FC<{
           {formatCount(Math.round(perDay))} users a day, that's about{" "}
           <span className="font-semibold text-ink">{need} days</span>
           {short ? `, longer than the ${days} days you picked.` : "."}
+          {short && need <= MAX_DAYS && (
+            <>
+              {" "}
+              <button type="button" onClick={() => onUseDays(need)} className="font-medium text-ink underline">
+                Run for {need} days
+              </button>
+            </>
+          )}
+          {short && need > MAX_DAYS && ` That's more than ${MAX_DAYS} days: aim for a bigger change or more traffic.`}
           {sequential && " Sequential testing needs more users, but you can stop as soon as a result is significant."}
         </>
       ) : (
@@ -1124,16 +1193,20 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   ))}
                 </select>
               </label>
-              {expMetricType === "conversion" && expKind === "ab" && (
+              {expKind === "ab" && (
               <label className="flex flex-col gap-1">
-                <span className={fieldLabel}>Smallest lift worth detecting</span>
-                <select value={mde} onChange={(e) => setMde(Number(e.target.value))} className={field}>
-                  {[5, 10, 20, 30].map((d) => (
-                    <option key={d} value={d}>
-                      {d}% relative change
-                    </option>
-                  ))}
-                </select>
+                <span className={fieldLabel}>Smallest lift worth shipping (%)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={mde}
+                  onChange={(e) => setMde(Math.min(100, Math.max(1, Number(e.target.value) || 1)))}
+                  className={field}
+                />
+                <span className="text-xs text-muted">
+                  Relative change vs control. The verdict checks results against it, and the sample size is planned for it.
+                </span>
               </label>
               )}
               {layers.length > 0 && (
@@ -1172,14 +1245,16 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </div>
               )}
               <label className="flex flex-col gap-1">
-                <span className={fieldLabel}>Run for</span>
-                <select value={expDays} onChange={(e) => setExpDays(Number(e.target.value))} className={field}>
-                  {[7, 14, 28].map((d) => (
-                    <option key={d} value={d}>
-                      {d} days from today
-                    </option>
-                  ))}
-                </select>
+                <span className={fieldLabel}>Run for (days)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_DAYS}
+                  value={expDays}
+                  onChange={(e) => setExpDays(Math.min(MAX_DAYS, Math.max(1, Math.round(Number(e.target.value)) || 1)))}
+                  className={field}
+                />
+                <span className="text-xs text-muted">Ends {new Date(Date.now() + expDays * DAY_MS).toLocaleDateString()}</span>
               </label>
               {expKind === "ab" && (
                 <>
@@ -1242,6 +1317,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               event={expMetric}
               sequential={expSequential}
               layerPct={expLayerId ? expLayerPct : null}
+              onUseDays={setExpDays}
             />
             )}
             </>
@@ -1355,10 +1431,10 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
             {selectedExp?.status === "paused" && (
               <p role="status" className="rounded-lg border border-line bg-sunken px-3.5 py-2.5 text-sm text-ink-2">
-                <span className="font-medium text-ink">Paused.</span> Users keep getting their variants and results keep
-                counting. Guardrail checks, auto-stop{selectedExp.kind === "bandit" ? " and daily traffic moves" : ""} are
-                off until you resume. The end date doesn't move. To stop users getting variants, stop the experiment or
-                turn its flag off.
+                <span className="font-medium text-ink">Paused.</span> Users keep getting their variants, results keep
+                counting, and guardrails{selectedExp.guardrail_metrics.some((g) => g.auto_stop) ? " and auto-stop" : ""} keep
+                watching.{selectedExp.kind === "bandit" ? " Daily traffic moves are on hold." : ""} The end date doesn't
+                move. To take the variant away from users, stop the experiment and keep control.
               </p>
             )}
 
@@ -1463,7 +1539,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       title={
                         selectedExp.status === "paused"
                           ? "Turn guardrail checks back on"
-                          : "Users keep their variants and results keep counting; only guardrail checks and auto-stop pause"
+                          : selectedExp.kind === "bandit"
+                            ? "Stops daily traffic moves; users keep their variants and guardrails keep watching"
+                            : "Marks the test as on hold; users keep their variants and guardrails keep watching"
                       }
                       className={btn.secondary}
                     >
@@ -1758,6 +1836,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         </span>
                         <span className={`rounded px-1.5 py-0.5 font-medium ${tone}`}>{status}</span>
                       </p>
+                      {noData && selectedExp && (
+                        <WhyNoData projectId={projectId} event={g.event_name} exp={selectedExp} />
+                      )}
                       {noData && selectedExp?.guardrail_metrics.find((m) => m.name === g.metric_name)?.auto_stop && (
                         <p className="mb-1.5 text-xs text-warn">
                           Auto-stop can't protect you while this has no data: it only acts on a measured harm.
@@ -2028,6 +2109,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           initialVariant={concludeFor.variant}
           blindGuardrails={blindGuardrails}
           harmedBy={harmedBy}
+          sampleCaveat={sampleCaveat(selectedExp, expResults, banditResults)}
           busy={acting}
           onConclude={(d) => void conclude(selectedExp, d)}
           onClose={() => setConcludeFor(null)}

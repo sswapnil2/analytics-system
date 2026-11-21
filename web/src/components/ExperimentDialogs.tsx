@@ -79,19 +79,31 @@ export const ConcludeDialog: React.FC<{
   blindGuardrails: string[];
   /** Guardrails a variant made significantly worse, by variant. */
   harmedBy: Record<string, string[]>;
+  /** Why the sample can't back a ship yet (no users, or short of the plan); null when it can. */
+  sampleCaveat: string | null;
   busy: boolean;
   onConclude: (d: DecisionInput) => void;
   onClose: () => void;
-}> = ({ experimentName, flagKey, treatments, initialVariant, blindGuardrails, harmedBy, busy, onConclude, onClose }) => {
+}> = ({ experimentName, flagKey, treatments, initialVariant, blindGuardrails, harmedBy, sampleCaveat, busy, onConclude, onClose }) => {
   const [outcome, setOutcome] = useState<DecisionOutcome>(initialVariant ? "ship" : "inconclusive");
   const [variant, setVariant] = useState(initialVariant ?? treatments[0] ?? "");
   const [action, setAction] = useState<FlagAction>(DEFAULT_ACTION[initialVariant ? "ship" : "inconclusive"]);
   const [reason, setReason] = useState("");
-  const [checked, setChecked] = useState(false);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
   const shipping = outcome === "ship";
-  const needsCheck = shipping && blindGuardrails.length > 0;
+  // Each reason the evidence is thin needs its own tick, and is saved with the decision.
+  const caveats = shipping
+    ? [
+        ...(sampleCaveat ? [sampleCaveat] : []),
+        ...(blindGuardrails.length
+          ? [
+              `${blindGuardrails.join(", ")} ${blindGuardrails.length > 1 ? "have" : "has"} no data from users in this test, so Pulse can't tell whether ${variant} harmed ${blindGuardrails.length > 1 ? "them" : "it"}.`,
+            ]
+          : []),
+      ]
+    : [];
   const harmed = shipping ? harmedBy[variant] ?? [] : [];
-  const ready = reason.trim().length > 0 && (!needsCheck || checked) && (!shipping || !!variant);
+  const ready = reason.trim().length > 0 && caveats.every((c) => checked.has(c)) && (!shipping || !!variant);
 
   const pickOutcome = (o: DecisionOutcome) => {
     setOutcome(o);
@@ -110,7 +122,8 @@ export const ConcludeDialog: React.FC<{
         className="space-y-4"
         onSubmit={(e) => {
           e.preventDefault();
-          if (ready) onConclude({ outcome, variant: shipping ? variant : null, reason: reason.trim(), flag_action: action });
+          if (ready)
+            onConclude({ outcome, variant: shipping ? variant : null, reason: reason.trim(), flag_action: action, acknowledged: caveats });
         }}
       >
         <fieldset className="space-y-1.5">
@@ -172,15 +185,26 @@ export const ConcludeDialog: React.FC<{
             {variant} made {harmed.join(", ")} significantly worse.
           </p>
         )}
-        {needsCheck && (
-          <label className="flex items-start gap-2 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm text-ink">
-            <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} className="mt-1" />
+        {caveats.map((c) => (
+          <label key={c} className="flex items-start gap-2 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm text-ink">
+            <input
+              type="checkbox"
+              checked={checked.has(c)}
+              onChange={(e) =>
+                setChecked((prev) => {
+                  const next = new Set(prev);
+                  if (e.target.checked) next.add(c);
+                  else next.delete(c);
+                  return next;
+                })
+              }
+              className="mt-1"
+            />
             <span>
-              {blindGuardrails.join(", ")} {blindGuardrails.length > 1 ? "have" : "has"} no data from users in this test, so
-              Pulse can't tell whether {variant} harmed {blindGuardrails.length > 1 ? "them" : "it"}. I've checked another way.
+              {c} I accept this, and it's saved with the decision.
             </span>
           </label>
-        )}
+        ))}
 
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onClose} className={btn.ghost}>

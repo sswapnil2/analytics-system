@@ -270,6 +270,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         analysis: AnalysisConfig {
             sequential: true,
             cuped: true,
+            // The hypothesis promises >12%, so the verdict checks the range against it.
+            target_lift_pct: Some(12.0),
             ..AnalysisConfig::default()
         },
         created_at_ms: now_ms,

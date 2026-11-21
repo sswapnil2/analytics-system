@@ -442,6 +442,9 @@ pub struct ExperimentDecision {
     pub reason: String,
     /// `"rollout"` (everyone gets `variant`), `"rollback"` (flag off) or `"keep"` (unchanged).
     pub flag_action: String,
+    /// Caveats the decider accepted when shipping (blind guardrails, an unfinished sample).
+    #[serde(default)]
+    pub acknowledged: Vec<String>,
     #[serde(default)]
     pub decided_by: String,
     #[serde(default)]

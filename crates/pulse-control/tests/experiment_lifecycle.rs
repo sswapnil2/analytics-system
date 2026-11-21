@@ -446,12 +446,16 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
     );
     let (status, done) = call(&app, &token, "PATCH", &live_uri, json!({
         "status": "concluded",
-        "decision": {"outcome": "inconclusive", "reason": "No difference after 3 weeks", "flag_action": "rollback"},
+        "decision": {"outcome": "inconclusive", "reason": "No difference after 3 weeks", "flag_action": "rollback", "acknowledged": ["Only 40% of the planned sample."]},
     }))
     .await;
     assert!(status.is_success(), "{done}");
     assert_eq!(done["decision"]["outcome"], "inconclusive");
     assert_eq!(done["decision"]["reason"], "No difference after 3 weeks");
+    assert_eq!(
+        done["decision"]["acknowledged"],
+        json!(["Only 40% of the planned sample."])
+    );
     assert!(done["decision"]["decided_at_ms"].as_i64().unwrap() > 0);
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
     assert_eq!(flag(&flags, "a")["enabled"], false);

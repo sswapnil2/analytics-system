@@ -278,6 +278,16 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
     )
     .await;
     let id = exp["id"].as_str().unwrap();
+    // Paused still serves the variant, so the guardrail keeps watching.
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &format!("/v1/projects/proj_g/experiments/{id}"),
+        json!({"status": "paused"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     ctrl.evaluate_experiment_guardrails().await;
 
     let (_, list) = call(

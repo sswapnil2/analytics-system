@@ -344,6 +344,8 @@ export interface DecisionInput {
   variant?: string | null;
   reason: string;
   flag_action: FlagAction;
+  /** Caveats the decider accepted when shipping. */
+  acknowledged?: string[];
 }
 
 export interface ExperimentDecision extends DecisionInput {

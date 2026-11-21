@@ -4295,6 +4295,8 @@ struct DecisionReq {
     #[serde(default)]
     reason: String,
     flag_action: String,
+    #[serde(default)]
+    acknowledged: Vec<String>,
 }
 
 /// Running and paused experiments hold their flag; drafts and concluded ones don't.
@@ -4451,6 +4453,11 @@ async fn handle_patch_experiment(
                 "decision.flag_action must be rollout, rollback or keep",
             ));
         }
+        if d.acknowledged.len() > 10 || d.acknowledged.iter().any(|a| a.chars().count() > 500) {
+            return Err(CtrlError::bad(
+                "decision.acknowledged takes at most 10 items of 500 characters",
+            ));
+        }
         if d.reason.chars().count() > 2_000 {
             return Err(CtrlError::bad(
                 "decision.reason must be at most 2000 characters",
@@ -4465,6 +4472,7 @@ async fn handle_patch_experiment(
             variant: d.variant,
             reason: d.reason.trim().to_string(),
             flag_action: d.flag_action,
+            acknowledged: d.acknowledged,
             decided_by,
             decided_at_ms: now,
         });
@@ -5335,7 +5343,8 @@ impl ControlPlaneService {
                 continue;
             };
             for exp in exps {
-                if exp.status != "running" {
+                // Paused experiments still serve variants, so their guardrails keep watching.
+                if exp.status != "running" && exp.status != "paused" {
                     continue;
                 }
                 if let Err(e) = self.check_running_experiment(exp).await {
