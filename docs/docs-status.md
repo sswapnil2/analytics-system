@@ -53,6 +53,7 @@ These statements come from reading code; they were not exercised:
 - **Session replay.** The end-to-end replay path and the Studio player.
 - **Mobile.** The mobile core and the iOS and Android examples (the Android example is marked unverified upstream). React Native was not reviewed beyond its source.
 - **Web SDK snippets.** These were checked against the SDK's exported API and its CI tests, not run in a fresh app.
+- **Release binaries.** The v0.1.1 x86_64 tarball was downloaded and its checksum and contents verified. It was not run here (Linux binary, macOS machine); release CI smoke-tests both architectures with `/healthz`. The Docker image was not pulled.
 - **Performance.** No performance numbers were reproduced. The docs quote none beyond pointing to the SLO test.
 
 ## Known documentation gaps

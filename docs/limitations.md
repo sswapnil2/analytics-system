@@ -57,5 +57,6 @@ These are the things Pulse does not do, or does with known limits. This list com
 
 ## Platform support
 
-- **Release binaries.** Linux x86_64 and aarch64 with glibc 2.35+ (Ubuntu 22.04+, Debian 12+). Build from source anywhere else.
+- **Release binaries.** Linux x86_64 and aarch64 with glibc 2.35+ (Ubuntu 22.04+, Debian 12+), plus a multi-arch Docker image. No macOS or Windows binaries; build from source there.
+- **Releases lag `main`.** These docs describe `main`. The latest release (v0.1.1, 19 Nov 2026) predates query sampling, the HyperLogLog fast path, the SlateDB profile store and cohort edit/delete.
 - **Rust toolchain.** Pinned to 1.88 (`rust-toolchain.toml`).

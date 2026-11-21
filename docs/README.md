@@ -32,6 +32,7 @@ The data stays on your infrastructure. Concretely:
 
 | If you want to… | Read |
 |---|---|
+| Download Pulse (Linux binaries, Docker image) | [Quickstart → Install](quickstart.md#1-install) |
 | Understand the vocabulary | [Concepts](concepts.md) |
 | Run Pulse and send a first event in 5 minutes | [Quickstart](quickstart.md) |
 | Let a coding agent set everything up | [Set up with an AI agent](agent-setup.md) |

@@ -16,10 +16,32 @@ Inside the container the node listens on `0.0.0.0:8080` and keeps everything in 
 `--seed` for an empty node. To build a Docker image locally from source instead, run
 `docker build -f Dockerfile.source -t pulse:local .`. Then skip to step 3.
 
-**Release tarball** (Linux x86_64 or aarch64, glibc 2.35+: Ubuntu 22.04+, Debian 12+): download
-`pulse-linux-<arch>.tar.gz` from the [latest release](https://github.com/sswapnil2/analytics-system/releases/latest),
-check it against `SHA256SUMS`, unpack it, and run `./pulse/pulse-node --web-dir pulse/web/dist`.
-The tarball also contains a systemd unit, a Caddyfile and an env template from `deploy/`.
+**Prebuilt binary** (Linux x86_64 or aarch64, glibc 2.35+: Ubuntu 22.04+, Debian 12+). Every
+[release](https://github.com/sswapnil2/analytics-system/releases/latest) attaches
+`pulse-linux-x86_64.tar.gz`, `pulse-linux-aarch64.tar.gz` and `SHA256SUMS`:
+
+```bash
+ARCH=$(uname -m)    # x86_64 or aarch64
+curl -fLO https://github.com/sswapnil2/analytics-system/releases/latest/download/pulse-linux-$ARCH.tar.gz
+curl -fLO https://github.com/sswapnil2/analytics-system/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing    # must print "OK"
+tar -xzf pulse-linux-$ARCH.tar.gz
+export PULSE_ADMIN_TOKEN="sk_root_$(openssl rand -hex 24)"   # keep this; see step 3
+./pulse/pulse-node --web-dir pulse/web/dist --data-dir ./pulse_data --seed
+```
+
+The tarball unpacks to `pulse/`. It contains:
+
+- `pulse-node`: the only binary
+- `web/dist`: the built Studio
+- `pulse.service`, `Caddyfile`, `pulse.env.example` and `backup.sh`: from `deploy/`, for a production install (see [Self-hosting](self-hosting-cloud.md))
+- `LICENSE` and `NOTICE`
+
+Release CI starts each binary and checks `/healthz` before publishing. Skip to step 3.
+
+There are no prebuilt macOS or Windows binaries. On a Mac, use Docker or build from source.
+
+> **Releases lag `main`.** These docs describe `main`. The latest release (v0.1.1, 19 Nov 2026) predates several features documented here: [query sampling](how-it-works.md#4-how-queries-work) and the HyperLogLog fast path, the SlateDB profile store, and cohort edit/delete. Build from source to get them before the next release.
 
 **From source** (macOS, or any other platform). Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it up) and Node.js for the Studio UI.
 

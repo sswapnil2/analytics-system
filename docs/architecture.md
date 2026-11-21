@@ -94,6 +94,19 @@ The diagram shows the following boundaries:
 
 ## Node roles and deployment
 
+### What a release ships
+
+Every `v*` tag runs `.github/workflows/release.yml`, which publishes:
+
+| Artifact | Where | Notes |
+|---|---|---|
+| `pulse-linux-x86_64.tar.gz`, `pulse-linux-aarch64.tar.gz` | [GitHub Releases](https://github.com/sswapnil2/analytics-system/releases) | `pulse-node`, the built Studio, the `deploy/` files, `LICENSE`, `NOTICE`. Built on Ubuntu 22.04 (needs glibc 2.35+) and smoke-tested with `/healthz` |
+| `SHA256SUMS` | GitHub Releases | Checksums for the tarballs and the SDK |
+| `pulse-analytics-ts-web-<ver>.tgz` | GitHub Releases | The Web SDK, installable with `npm install <url>` |
+| `ghcr.io/sswapnil2/pulse:<ver>` and `:latest` | GitHub Container Registry | Multi-arch (amd64, arm64) Debian image built from the tarballs; runs as uid 10001 |
+
+There are no macOS or Windows binaries, and nothing is published to npm unless the repo's `NPM_TOKEN` secret is set. See [Quickstart → Install](quickstart.md#1-install).
+
 ### Single node (default)
 
 ```mermaid
