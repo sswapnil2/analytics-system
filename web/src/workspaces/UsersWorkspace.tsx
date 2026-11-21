@@ -375,7 +375,7 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
                           type="button"
                           disabled={erasing}
                           onClick={() => void erase()}
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 font-semibold text-white hover:opacity-90 disabled:opacity-50"
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 font-semibold text-panel hover:opacity-90 disabled:opacity-50"
                         >
                           {erasing ? <Spinner label="Erasing" /> : "Erase permanently"}
                         </button>
@@ -394,7 +394,7 @@ export const UsersWorkspace: React.FC<{ projectId: string }> = ({ projectId }) =
                     <dl className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-4">
                       {Object.entries(detail.profile?.props ?? {}).map(([k, v]) => (
                         <div key={k} className="rounded-lg border border-line bg-panel px-2.5 py-1.5">
-                          <dt className="text-[11px] text-muted">{humanizeEvent(k)}</dt>
+                          <dt className="text-2xs text-muted">{humanizeEvent(k)}</dt>
                           <dd className="truncate text-sm font-medium text-ink" title={formatPropValue(v)}>{formatPropValue(v)}</dd>
                         </div>
                       ))}

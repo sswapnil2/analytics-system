@@ -316,19 +316,19 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
 
           <div className="grid grid-cols-1 gap-4 rounded-xl border border-line bg-sunken p-4 sm:grid-cols-3">
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Current key</div>
+              <div className="text-2xs font-semibold uppercase tracking-wide text-muted">Current key</div>
               <div className="font-mono text-xs font-medium text-ink">
                 {encryption?.status.active_key_id ?? "None"}
               </div>
             </div>
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Keys kept</div>
+              <div className="text-2xs font-semibold uppercase tracking-wide text-muted">Keys kept</div>
               <div className="text-xs font-medium text-ink">
                 {encryption?.status.keyring_size ?? 0}
               </div>
             </div>
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Since start</div>
+              <div className="text-2xs font-semibold uppercase tracking-wide text-muted">Since start</div>
               <div className="text-xs font-medium text-ink">
                 {formatCount(encryption?.status.ops_encrypted ?? 0)} encrypted · {formatCount(encryption?.status.ops_decrypted ?? 0)} decrypted
               </div>
@@ -392,7 +392,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                       </span>
                       {saved && (
                         <span
-                          className={`rounded border px-2 py-0.5 font-mono text-[11px] ${
+                          className={`rounded border px-2 py-0.5 font-mono text-2xs ${
                             saved.status === "verified"
                               ? "border-ok/30 bg-ok-soft text-ok"
                               : "border-line bg-sunken text-ink-2"
@@ -509,7 +509,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
 
                     {saved && (
                       <div className="flex items-center justify-between pt-1">
-                        <span className="text-[11px] text-muted">
+                        <span className="text-2xs text-muted">
                           {saved.last_verified_at_ms
                             ? `Verified ${formatTimestamp(saved.last_verified_at_ms)}`
                             : "Not verified yet"}
@@ -598,7 +598,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                     <td className="py-2 pr-3 font-mono text-ink">{log.actor}</td>
                     <td className="py-2 pr-3 font-semibold text-ink">{log.action}</td>
                     <td className="py-2 pr-3 font-mono text-ink-2">{log.resource}</td>
-                    <td className="py-2 text-right font-mono text-[11px] text-muted">
+                    <td className="py-2 text-right font-mono text-2xs text-muted">
                       {JSON.stringify(log.details_json)}
                     </td>
                   </tr>
@@ -696,7 +696,7 @@ export const SecurityPanel: React.FC<{ projectId: string }> = ({
                   {copilotRes.cited_sessions.map((sid) => (
                     <span
                       key={sid}
-                      className="rounded border border-line bg-panel px-2 py-0.5 font-mono text-[11px] text-ink"
+                      className="rounded border border-line bg-panel px-2 py-0.5 font-mono text-2xs text-ink"
                     >
                       {sid}
                     </span>

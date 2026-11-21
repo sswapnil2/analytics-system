@@ -198,7 +198,7 @@ const DashboardList: React.FC<{ projectId: string; refreshToken: number }> = ({ 
                   href={`#/dashboards/${d.id}`}
                   className="flex h-full flex-col gap-2 rounded-xl border border-line bg-panel p-5 hover:border-line-strong hover:bg-hover"
                 >
-                  <span className="text-[0.9375rem] font-semibold text-ink">{d.name}</span>
+                  <span className="text-md font-semibold text-ink">{d.name}</span>
                   {d.description && <span className="line-clamp-2 text-sm text-muted">{d.description}</span>}
                   <span className="mt-auto pt-2 text-xs text-muted">
                     {formatCount(reports)} {reports === 1 ? "report" : "reports"}
@@ -361,7 +361,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
             />
           ) : (
             <div className="group">
-              <h1 className="flex items-center gap-2 text-[1.875rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
+              <h1 className="flex items-center gap-2 text-[1.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
                 {dash.name}
                 {canEdit && (
                   <button type="button" onClick={() => setEditingTitle(true)} className={iconBtn} aria-label="Rename dashboard">
@@ -369,7 +369,7 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                   </button>
                 )}
               </h1>
-              {dash.description && <p className="mt-1 text-[0.9375rem] text-muted">{dash.description}</p>}
+              {dash.description && <p className="mt-1 text-md text-muted">{dash.description}</p>}
             </div>
           )}
         </div>
@@ -412,8 +412,8 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
 
       <div className="flex flex-wrap items-center gap-3">
         <RangePresets value={range} onChange={setRange} />
-        <span className="text-[0.8125rem] text-muted">Updated {ago(refreshedAt)}</span>
-        <button type="button" onClick={refresh} className="inline-flex items-center gap-1 text-[0.8125rem] font-medium text-brand hover:underline">
+        <span className="text-compact text-muted">Updated {ago(refreshedAt)}</span>
+        <button type="button" onClick={refresh} className="inline-flex items-center gap-1 text-compact font-medium text-brand hover:underline">
           <RefreshCw className="h-3.5 w-3.5" /> Refresh
         </button>
         {tv && (
@@ -526,12 +526,12 @@ const DashboardView: React.FC<{ projectId: string; dashboardId: string; refreshT
                     {report ? (
                       <a
                         href={reportHref(report, range)}
-                        className="block truncate text-[0.9375rem] font-semibold text-ink hover:underline"
+                        className="block truncate text-md font-semibold text-ink hover:underline"
                       >
                         {report.name}
                       </a>
                     ) : (
-                      <span className="text-[0.9375rem] font-semibold text-muted">Report removed</span>
+                      <span className="text-md font-semibold text-muted">Report removed</span>
                     )}
                     <span className="text-xs text-muted">{report ? cardSubtitle(report, range) : "It was deleted"}</span>
                   </div>
@@ -765,8 +765,8 @@ const SharePopover: React.FC<{ dashboardId: string; onClose: () => void }> = ({ 
       aria-label="Share dashboard"
       className="absolute right-0 top-full z-40 mt-2 w-[min(22.5rem,calc(100vw-2rem))] space-y-3 rounded-xl border border-line-strong bg-panel p-4 shadow-pop motion-safe:animate-pop"
     >
-      <h2 className="text-[0.9375rem] font-semibold">Share this dashboard</h2>
-      <p className="text-[0.8125rem] leading-relaxed text-ink-2">
+      <h2 className="text-md font-semibold">Share this dashboard</h2>
+      <p className="text-compact leading-relaxed text-ink-2">
         Anyone signed in to this Pulse workspace can open the link and see the same charts. User ids stay masked.
       </p>
       <div className="flex gap-2">
@@ -775,7 +775,7 @@ const SharePopover: React.FC<{ dashboardId: string; onClose: () => void }> = ({ 
           value={link}
           aria-label="Dashboard link"
           onFocus={(e) => e.currentTarget.select()}
-          className={`${field} min-w-0 flex-1 bg-canvas text-[0.8125rem]`}
+          className={`${field} min-w-0 flex-1 bg-canvas text-compact`}
         />
         <button type="button" className={btn.primary} onClick={() => void copy()}>
           {copied ? "Copied" : "Copy link"}

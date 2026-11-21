@@ -11,10 +11,8 @@ export const PageHeader: React.FC<{
 }> = ({ title, description, actions }) => (
   <header className="flex flex-wrap items-end justify-between gap-3 pb-1">
     <div className="min-w-0 max-w-2xl">
-      <h1 className="text-[1.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink sm:text-[1.875rem]">
-        {title}
-      </h1>
-      <p className="mt-1 text-[0.9375rem] text-muted">{description}</p>
+      <h1 className="text-[1.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink">{title}</h1>
+      <p className="mt-1 text-sm text-muted">{description}</p>
     </div>
     {actions && <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">{actions}</div>}
   </header>
@@ -31,10 +29,10 @@ export const Panel: React.FC<{
     {(title || actions || meta) && (
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-5 py-3.5">
         <div className="flex items-baseline gap-3 min-w-0">
-          {title && <h2 className="text-[0.9375rem] font-semibold text-ink">{title}</h2>}
+          {title && <h2 className="text-md font-semibold text-ink">{title}</h2>}
           {meta && <span className="text-xs text-faint tabular">{meta}</span>}
         </div>
-        {actions && <div className="flex items-center gap-2">{actions}</div>}
+        {actions && <div className="flex min-w-0 max-w-full flex-wrap items-center gap-x-2 gap-y-1">{actions}</div>}
       </div>
     )}
     <div className="p-5">{children}</div>
@@ -77,7 +75,7 @@ export const SamplingMeta: React.FC<{
     <div className="flex flex-wrap items-center gap-2">
       {sampling?.is_sampled && (
         <span
-          className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300 tabular"
+          className="inline-flex items-center gap-1.5 rounded-full border border-warn/30 bg-warn-soft px-2.5 py-0.5 text-2xs font-medium text-warn tabular"
           title={
             isHll
               ? `Instant HyperLogLog sketch across 100% of segments (${sampling.total_buckets}/${sampling.total_buckets} buckets, zero segment I/O).`
@@ -91,7 +89,7 @@ export const SamplingMeta: React.FC<{
           <button
             type="button"
             onClick={() => onChangeMode("exact")}
-            className="ml-0.5 rounded px-1 py-0.25 text-[11px] font-semibold text-amber-200 underline decoration-amber-400/60 underline-offset-2 hover:text-white"
+            className="ml-0.5 rounded px-1 text-2xs font-semibold text-ink underline decoration-warn/60 underline-offset-2 hover:decoration-warn"
           >
             Run exact
           </button>
@@ -101,7 +99,7 @@ export const SamplingMeta: React.FC<{
         aria-label="Query sampling mode"
         value={samplingModeToKey(mode)}
         onChange={(e) => onChangeMode(keyToSamplingMode(e.target.value))}
-        className="h-6 rounded-md border border-line bg-surface px-1.5 text-[11px] font-medium text-muted hover:text-ink focus:border-accent focus:outline-none"
+        className="h-6 rounded-md border border-line bg-field px-1.5 text-2xs font-medium text-muted hover:text-ink focus:border-brand focus:outline-none"
         title="Auto stays exact on fast queries and samples user buckets on very large ranges."
       >
         <option value="auto">Auto</option>
@@ -127,7 +125,7 @@ export const EmptyState: React.FC<{
 }> = ({ title, body, action, icon: Icon }) => (
   <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
     {Icon && <Icon className="mb-1 h-6 w-6 text-faint" />}
-    <p className="text-[0.9375rem] font-semibold text-ink">{title}</p>
+    <p className="text-md font-semibold text-ink">{title}</p>
     {body && <p className="max-w-sm text-sm text-muted">{body}</p>}
     {action && <div className="mt-2">{action}</div>}
   </div>
@@ -171,7 +169,7 @@ export const btn = {
 export const field =
   "rounded-lg border border-line-strong bg-field px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25 aria-[invalid=true]:border-danger";
 
-export const fieldLabel = "text-[0.8125rem] font-semibold text-ink-2";
+export const fieldLabel = "text-compact font-semibold text-ink-2";
 
 /**
  * Report page body: results on the left, the query on a sticky rail on the
@@ -301,4 +299,98 @@ export const RoleBadge: React.FC<{ role: Role }> = ({ role }) => (
   >
     {role[0].toUpperCase() + role.slice(1)}
   </span>
+);
+
+/**
+ * Tab strip with the standard keyboard model: one tab stop, arrows move and select,
+ * Home/End jump. Pair with `<div role="tabpanel" id={panelId} aria-labelledby={tabId(id)}>`.
+ */
+export function Tabs<T extends string>({
+  label,
+  tabs,
+  value,
+  onChange,
+  panelId,
+  variant = "underline",
+}: {
+  label: string;
+  tabs: { id: T; label: string }[];
+  value: T;
+  onChange: (id: T) => void;
+  panelId?: string;
+  variant?: "underline" | "pill";
+}) {
+  const onKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const i = tabs.findIndex((t) => t.id === value);
+    const n =
+      e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
+    if (n === null) return;
+    e.preventDefault();
+    const next = tabs[(n + tabs.length) % tabs.length];
+    onChange(next.id);
+    e.currentTarget.querySelector<HTMLElement>(`[data-tab="${next.id}"]`)?.focus();
+  };
+  const cls = (on: boolean) =>
+    variant === "underline"
+      ? `-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors duration-150 ${on ? "border-brand text-ink" : "border-transparent text-muted hover:text-ink"}`
+      : `whitespace-nowrap rounded-md px-2.5 py-1 text-sm font-medium ${on ? "bg-sunken text-ink" : "text-muted hover:text-ink"}`;
+  return (
+    <div
+      role="tablist"
+      aria-label={label}
+      onKeyDown={onKey}
+      className={variant === "underline" ? "no-scrollbar flex gap-1 overflow-x-auto border-b border-line" : "flex gap-1"}
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          id={panelId ? `${panelId}-tab-${t.id}` : undefined}
+          data-tab={t.id}
+          aria-selected={value === t.id}
+          aria-controls={panelId}
+          tabIndex={value === t.id ? 0 : -1}
+          onClick={() => onChange(t.id)}
+          className={cls(value === t.id)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Segmented choice (time range, direction): the same look as the report date bar. */
+export function Segmented<T extends string | number>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: { value: T; label: string }[];
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div role="group" aria-label={label} className="no-scrollbar flex max-w-full overflow-x-auto rounded-lg border border-line bg-panel p-0.5 text-compact">
+      {options.map((o) => (
+        <button
+          key={String(o.value)}
+          type="button"
+          aria-pressed={value === o.value}
+          onClick={() => onChange(o.value)}
+          className={`whitespace-nowrap rounded-md px-2.5 py-1.5 font-medium ${value === o.value ? "bg-brand text-on-brand" : "text-ink-2 hover:bg-hover"}`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Keyboard key hint, e.g. <Kbd>⌘K</Kbd>. */
+export const Kbd: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <kbd className="rounded border border-line-strong bg-panel px-1 font-sans text-2xs font-medium text-muted">{children}</kbd>
 );

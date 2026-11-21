@@ -102,7 +102,7 @@ const AuthLayout: React.FC<{ heading: string; body: string; aside: React.ReactNo
   </div>
 );
 
-const inputCls = `${field} h-11 w-full text-[0.9375rem]`;
+const inputCls = `${field} h-11 w-full text-md`;
 const labelCls = "flex flex-col gap-1.5 text-sm font-medium text-ink";
 
 function useAuthConfig(): AuthConfig | null {
@@ -120,7 +120,7 @@ function useAuthConfig(): AuthConfig | null {
 const GoogleButton: React.FC<{ label: string }> = ({ label }) => (
   <a
     href="/v1/auth/google/start"
-    className="flex h-11 items-center justify-center gap-2.5 rounded-lg border border-line-strong bg-panel text-[0.9375rem] font-medium text-ink hover:bg-hover"
+    className="flex h-11 items-center justify-center gap-2.5 rounded-lg border border-line-strong bg-panel text-md font-medium text-ink hover:bg-hover"
   >
     <GoogleMark />
     {label}
@@ -128,7 +128,7 @@ const GoogleButton: React.FC<{ label: string }> = ({ label }) => (
 );
 
 const OrDivider: React.FC = () => (
-  <div className="flex items-center gap-3 text-[0.8125rem] text-muted">
+  <div className="flex items-center gap-3 text-compact text-muted">
     <span className="h-px flex-1 bg-line" />
     or with email
     <span className="h-px flex-1 bg-line" />
@@ -211,7 +211,7 @@ export const SignInScreen: React.FC<{ onSignedIn: () => void; reason?: string; g
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Sign in</h2>
-          <p className="text-[0.9375rem] text-muted">
+          <p className="text-md text-muted">
             {showToken ? "Use the root admin token in the root_admin_token file in the server's data directory. It starts with sk_." : "Welcome back. Use your work account."}
           </p>
         </div>
@@ -266,7 +266,7 @@ export const SignInScreen: React.FC<{ onSignedIn: () => void; reason?: string; g
           </div>
         )}
 
-        <button type="submit" disabled={busy || cfg === null} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+        <button type="submit" disabled={busy || cfg === null} className={`${btn.primary} h-11 text-md`}>
           {busy ? "Signing in…" : "Sign in"}
         </button>
 
@@ -382,7 +382,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
         <div className="flex flex-col gap-6" role="status">
           <div className="space-y-1.5">
             <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Verify your email</h2>
-            <p className="text-[0.9375rem] text-muted">
+            <p className="text-md text-muted">
               Your account for <span className="font-medium text-ink">{pendingEmail}</span> is waiting. Open the
               verification link to finish: it works once and expires in 24 hours.
             </p>
@@ -399,7 +399,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Create your account</h2>
-          <p className="text-[0.9375rem] text-muted">You'll be looking at your own data in a few minutes.</p>
+          <p className="text-md text-muted">You'll be looking at your own data in a few minutes.</p>
         </div>
 
         {cfg && !cfg.signup_open && (
@@ -438,7 +438,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
                   aria-describedby="project-hint"
                   className={inputCls}
                 />
-                <span id="project-hint" className="text-[0.8125rem] font-normal text-muted">
+                <span id="project-hint" className="text-compact font-normal text-muted">
                   One project per app or site. You can add more later.
                 </span>
               </label>
@@ -455,7 +455,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
                 aria-describedby="org-hint"
                 className={inputCls}
               />
-              <span id="org-hint" className="text-[0.8125rem] font-normal text-muted">
+              <span id="org-hint" className="text-compact font-normal text-muted">
                 You get a private workspace with its own project. Leave it blank to join your company's workspace, if
                 your email domain is allowed on this server.
               </span>
@@ -486,7 +486,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
             />
             <span
               id="pw-hint"
-              className={`text-[0.8125rem] font-normal ${touchedPw && password.length < 10 ? "text-danger" : "text-muted"}`}
+              className={`text-compact font-normal ${touchedPw && password.length < 10 ? "text-danger" : "text-muted"}`}
             >
               Use at least 10 characters.
             </span>
@@ -502,7 +502,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
                 aria-describedby="setup-hint"
                 className={inputCls}
               />
-              <span id="setup-hint" className="text-[0.8125rem] font-normal text-muted">
+              <span id="setup-hint" className="text-compact font-normal text-muted">
                 Proves you run this Pulse server, so the first account becomes its owner. It's in the file{" "}
                 <code className="font-mono">root_admin_token</code> in Pulse's data folder (or the PULSE_ADMIN_TOKEN you set).
               </span>
@@ -510,7 +510,7 @@ export const SignUpScreen: React.FC<{ onSignedIn: () => void }> = ({ onSignedIn 
           )}
         </div>
 
-        <button type="submit" disabled={busy || cfg === null} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+        <button type="submit" disabled={busy || cfg === null} className={`${btn.primary} h-11 text-md`}>
           {busy ? "Creating account…" : "Create account"}
         </button>
         <span className="text-sm text-muted">
@@ -655,14 +655,14 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
         <div className="flex flex-col gap-6">
           <div className="space-y-1.5">
             <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Join {info.org_name ?? "your team"}</h2>
-            <p className="text-[0.9375rem] text-muted">
+            <p className="text-md text-muted">
               You're invited as {info.role}: you can {ROLE_WORDS[info.role] ?? "use Pulse"}. You already have an account,
               and an account belongs to one organisation, so joining moves it here.
             </p>
           </div>
           <FormError id="invite-error" message={error} />
           {me === info.email ? (
-            <button type="button" onClick={() => void join()} disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+            <button type="button" onClick={() => void join()} disabled={busy} className={`${btn.primary} h-11 text-md`}>
               {busy ? "Joining…" : `Join as ${info.email}`}
             </button>
           ) : (
@@ -672,7 +672,7 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
                   You're signed in as {me}. This invite is for {info.email}.
                 </p>
               )}
-              <a href={`#/signin?next=invite/${encodeURIComponent(token)}`} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+              <a href={`#/signin?next=invite/${encodeURIComponent(token)}`} className={`${btn.primary} h-11 text-md`}>
                 Sign in as {info.email}
               </a>
             </>
@@ -684,7 +684,7 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
             <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">
               Join {info?.org_name ?? "your team"}
             </h2>
-            <p className="text-[0.9375rem] text-muted">
+            <p className="text-md text-muted">
               {info
                 ? `You're invited as ${info.role}: you can ${ROLE_WORDS[info.role] ?? "use Pulse"}.`
                 : "Checking your invite…"}
@@ -710,12 +710,12 @@ export const AcceptInviteScreen: React.FC<{ token: string; onSignedIn: () => voi
                 className={inputCls}
                 aria-describedby="invite-pw-hint"
               />
-              <span id="invite-pw-hint" className="text-[0.8125rem] font-normal text-muted">
+              <span id="invite-pw-hint" className="text-compact font-normal text-muted">
                 Use at least 10 characters.
               </span>
             </label>
           </div>
-          <button type="submit" disabled={busy || !info} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+          <button type="submit" disabled={busy || !info} className={`${btn.primary} h-11 text-md`}>
             {busy ? "Joining…" : "Join and sign in"}
           </button>
         </form>
@@ -750,7 +750,7 @@ export const ForgotPasswordScreen: React.FC = () => {
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Reset your password</h2>
-          <p className="text-[0.9375rem] text-muted">
+          <p className="text-md text-muted">
             This server doesn't send email. If the account exists, a reset link is written to the outbox file in the
             server's data directory, and an admin can also give you one from Settings.
           </p>
@@ -766,7 +766,7 @@ export const ForgotPasswordScreen: React.FC = () => {
               Work email
               <input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputCls} autoFocus />
             </label>
-            <button type="submit" disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+            <button type="submit" disabled={busy} className={`${btn.primary} h-11 text-md`}>
               {busy ? "Requesting…" : "Request reset link"}
             </button>
           </>
@@ -807,14 +807,14 @@ export const ResetPasswordScreen: React.FC<{ token: string; onSignedOut?: () => 
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-6" noValidate>
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Choose a new password</h2>
-          <p className="text-[0.9375rem] text-muted">Every session on this account is signed out when you save it.</p>
+          <p className="text-md text-muted">Every session on this account is signed out when you save it.</p>
         </div>
         {done ? (
           <>
             <p role="status" className="rounded-lg bg-ok-soft px-3 py-2.5 text-sm text-ok">
               Password saved. Sign in with it now.
             </p>
-            <a href="#/signin" className={`${btn.primary} h-11 text-[0.9375rem]`}>
+            <a href="#/signin" className={`${btn.primary} h-11 text-md`}>
               Sign in
             </a>
           </>
@@ -832,7 +832,7 @@ export const ResetPasswordScreen: React.FC<{ token: string; onSignedOut?: () => 
                 autoFocus
               />
             </label>
-            <button type="submit" disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+            <button type="submit" disabled={busy} className={`${btn.primary} h-11 text-md`}>
               {busy ? "Saving…" : "Save password"}
             </button>
           </>
@@ -867,10 +867,10 @@ export const VerifyEmailScreen: React.FC<{ token: string; onSignedIn: () => void
       <div className="flex flex-col gap-6">
         <div className="space-y-1.5">
           <h2 className="text-[1.625rem] font-semibold tracking-[-0.015em]">Verify your email</h2>
-          <p className="text-[0.9375rem] text-muted">Confirm this is your address to finish creating your account.</p>
+          <p className="text-md text-muted">Confirm this is your address to finish creating your account.</p>
         </div>
         <FormError id="verify-error" message={error} />
-        <button type="button" onClick={() => void verify()} disabled={busy} className={`${btn.primary} h-11 text-[0.9375rem]`}>
+        <button type="button" onClick={() => void verify()} disabled={busy} className={`${btn.primary} h-11 text-md`}>
           {busy ? "Verifying…" : "Verify and sign in"}
         </button>
         <a href="#/signin" className="text-sm text-muted hover:text-ink hover:underline">
