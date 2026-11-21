@@ -4,6 +4,21 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+- Sequential testing for experiments: results stay valid however often you check them, so you can stop a test early. It is on by default for new experiments.
+- Experiments can set their significance level and planned sample size, and the sample-size estimate accounts for sequential testing and extra variants.
+- Guardrails show lift and significance, say which way is bad, and flag variants that made them significantly worse.
+- The Studio warns when an experiment's traffic split doesn't match its flag weights.
+- Experiment metrics can count events per user, add up a property per user (revenue), or divide one total by another (spend per visit), not just measure conversion.
+- CUPED: experiments can use each user's behaviour before the test to cut noise, so results get significant sooner. The Studio shows how much noise it removed.
+- Experiment results can be split by a property (country, plan, …) and show lift over time.
+- Users who saw more than one variant are left out of experiment results and counted separately.
+- Guardrails can stop an experiment on their own: if a treatment makes one significantly worse, everyone goes back to control, and the Studio shows why it stopped.
+- The web and mobile SDKs re-check feature flags every 5 minutes (configurable), so rollbacks reach apps that are already open.
+- Flag and experiment changes are recorded in the audit log.
+- Experiments can be paused and resumed from the Studio.
+- Bandits: a new experiment type that moves traffic to the best variant once a day, shows each variant's chance to be best and the cost of shipping it, and charts how traffic moved.
+
 ### Changed
 - Internal review codes removed from comments and test names; process logs moved to `docs/history/`.
 - Crate manifests now carry descriptions, repository and homepage.

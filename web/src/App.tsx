@@ -1032,6 +1032,7 @@ export const App: React.FC = () => {
                       <ExperimentsFlagsWorkspace
                         projectId={activePid}
                         availableEvents={availableEvents}
+                        availableProps={availableProps}
                         refreshToken={refreshToken}
                       />
                     )}

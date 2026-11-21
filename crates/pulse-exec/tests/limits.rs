@@ -1873,3 +1873,85 @@ async fn deterministic_entity_bucket_sampling_scales_counts_preserves_ratios_and
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn experiment_metric_query_obeys_row_and_memory_budgets() {
+    use pulse_exec::{ExperimentMetricEvent, ExperimentMetricQuery, MetricValue};
+    let (storage, ingest, qengine, id_router) = budget_engine().await;
+    let ts = 1_762_000_000_000i64;
+    let events: Vec<_> = (0..5_000)
+        .flat_map(|i| {
+            let uid = format!("u{i}");
+            let variant = if i % 2 == 0 { "control" } else { "treatment" };
+            [
+                ev(
+                    2 * i,
+                    &uid,
+                    "s",
+                    "$experiment_started",
+                    ts + i as i64,
+                    vec![
+                        ("flag_key", PropValue::Str("f".into())),
+                        ("variant", PropValue::Str(variant.into())),
+                    ],
+                ),
+                ev(
+                    2 * i + 1,
+                    &uid,
+                    "s",
+                    "Purchase",
+                    ts + i as i64 + 10,
+                    vec![("amount", PropValue::Int(i as i64 % 50))],
+                ),
+            ]
+        })
+        .collect();
+    ingest
+        .ingest_for_project("proj_expb", WireBatch::new(events), ts + 1_000_000)
+        .await
+        .unwrap();
+    storage.flush_all_projects().await.unwrap();
+    let q = ExperimentMetricQuery {
+        time_range: TimeRange {
+            start_ts_ms: ts - 1_000,
+            end_ts_ms: ts + 1_000_000,
+        },
+        exposure_event: "$experiment_started".into(),
+        exposure_filters: vec![PropPredicate {
+            prop_name: "flag_key".into(),
+            filter: PropFilterOp::Eq(PropValue::Str("f".into())),
+        }],
+        variant_prop: "variant".into(),
+        segment_by: None,
+        metric: ExperimentMetricEvent {
+            event_name: "Purchase".into(),
+            filters: vec![],
+            value: MetricValue::Sum("amount".into()),
+        },
+        denominator: None,
+        window_ms: 3_600_000,
+        pre_window_ms: 0,
+    };
+
+    let ok = qengine
+        .query_experiment_metric("proj_expb", &q)
+        .await
+        .unwrap();
+    assert_eq!(ok.variants["control"].n + ok.variants["treatment"].n, 5_000);
+
+    qengine.set_max_memory_bytes(64 * 1024);
+    let res = qengine.query_experiment_metric("proj_expb", &q).await;
+    assert!(
+        matches!(res, Err(ExecError::QueryMemoryExceeded { .. })),
+        "expected QueryMemoryExceeded, got {res:?}"
+    );
+
+    qengine.set_max_memory_bytes(1 << 30);
+    qengine.set_max_rows(100);
+    let res = qengine.query_experiment_metric("proj_expb", &q).await;
+    assert!(
+        matches!(res, Err(ExecError::QueryTooLarge { .. })),
+        "expected QueryTooLarge, got {res:?}"
+    );
+    id_router.close_all().await.unwrap();
+}

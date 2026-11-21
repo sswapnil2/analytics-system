@@ -15,7 +15,8 @@ for replay, touch hooks) yourself. Expect an afternoon for a first integration.
 ## API (`PulseClient`)
 
 ```text
-PulseClient(config: SdkConfig)        // endpoint_url, api_key (pk_), storage_dir, flush_batch_size, flush_interval_ms
+PulseClient(config: SdkConfig)        // endpoint_url, api_key (pk_), storage_dir, flush_batch_size, flush_interval_ms,
+                                      // flags_ttl_ms (default 300000: stale flags re-fetch in the background)
 distinct_id() -> String               session_id() -> String          queued_packet_count() -> u32
 track(event_name, props_json)         identify(user_id)               reset()
 register_super_props(props_json)      time_event(event_name)          set_user_properties(props_json)

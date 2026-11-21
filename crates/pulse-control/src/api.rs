@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,17 +39,19 @@ pub use auth::AuthConfig;
 
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
 use crate::db::{MetaError, MetaStore};
-use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
+use crate::experiments::{
+    build_edge_flag_bundle_with_cohorts, evaluate_bandit_results, evaluate_experiment_results,
+};
 use crate::mcp::{handle_mcp_request, JsonRpcRequest};
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
-    unseal_byok_config_json, unseal_secret, AlertRule, Annotation, ApiKeyRecord,
-    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
+    BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
     Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
     LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
-    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
     KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
@@ -168,6 +170,17 @@ pub struct ControlPlaneService {
     auth_state: auth::AuthState,
     /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// Per project: the edge flag bundle, keyed by the flags' latest `updated_at_ms` and count.
+    /// SDKs poll it, and building it evaluates targeting cohorts.
+    flag_bundle_cache: DashMap<
+        String,
+        (
+            i64,
+            usize,
+            std::time::Instant,
+            Arc<crate::models::EdgeFlagBundle>,
+        ),
+    >,
 }
 
 impl ControlPlaneService {
@@ -236,6 +249,7 @@ impl ControlPlaneService {
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
             outbox_path: parking_lot::RwLock::new(None),
+            flag_bundle_cache: DashMap::new(),
         });
 
         let generated_ingest = svc
@@ -3423,6 +3437,7 @@ async fn handle_upsert_flag(
         }
     }
 
+    let actor = principal.actor_label();
     let flag = FeatureFlag {
         id: format!("flg_{}_{}", id, req.key),
         project_id: id,
@@ -3438,6 +3453,13 @@ async fn handle_upsert_flag(
         .upsert_feature_flag(&flag)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &actor,
+        "flag.saved",
+        &format!("project:{}", flag.project_id),
+        json!({ "flag_key": flag.key, "enabled": flag.enabled, "rollout_pct": flag.rollout_pct, "variants": flag.variants }),
+    )
+    .await;
     Ok(Json(flag))
 }
 
@@ -3506,8 +3528,18 @@ async fn handle_patch_flag(
         .upsert_feature_flag(&found)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "flag.updated",
+        &format!("project:{id}"),
+        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants }),
+    )
+    .await;
     Ok(Json(found))
 }
+
+/// How long a built flag bundle is reused when no flag changed; cohort membership can still move.
+const FLAG_BUNDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn handle_edge_flag_bundle(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3522,30 +3554,51 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    let bundle = build_edge_flag_bundle_with_cohorts(
-        &project_id,
-        &flags,
-        &ctrl.qengine,
-        Utc::now().timestamp_millis(),
-    )
-    .await
-    .map_err(CtrlError::internal)?;
+    let version = flags.iter().map(|f| f.updated_at_ms).max().unwrap_or(0);
+    let cached = ctrl
+        .flag_bundle_cache
+        .get(&project_id)
+        .filter(|c| c.0 == version && c.1 == flags.len() && c.2.elapsed() < FLAG_BUNDLE_TTL)
+        .map(|c| c.3.clone());
+    let bundle = match cached {
+        Some(b) => b,
+        None => {
+            let b = Arc::new(
+                build_edge_flag_bundle_with_cohorts(
+                    &project_id,
+                    &flags,
+                    &ctrl.qengine,
+                    Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(CtrlError::internal)?,
+            );
+            ctrl.flag_bundle_cache.insert(
+                project_id.clone(),
+                (version, flags.len(), std::time::Instant::now(), b.clone()),
+            );
+            b
+        }
+    };
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
         if inm.trim() == bundle.etag {
-            return Ok(
-                (StatusCode::NOT_MODIFIED, [(header::ETAG, bundle.etag)], "").into_response(),
-            );
+            return Ok((
+                StatusCode::NOT_MODIFIED,
+                [(header::ETAG, bundle.etag.clone())],
+                "",
+            )
+                .into_response());
         }
     }
 
     Ok((
         StatusCode::OK,
         [(header::ETAG, bundle.etag.clone())],
-        Json(bundle),
+        Json(bundle.as_ref().clone()),
     )
         .into_response())
 }
@@ -3577,6 +3630,13 @@ struct CreateExpReq {
     primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     guardrail_metrics: Vec<ExperimentMetricSpec>,
+    #[serde(default)]
+    analysis: AnalysisConfig,
+    /// `"ab"` (default) or `"bandit"`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    bandit: Option<BanditConfig>,
 }
 
 async fn handle_create_experiment(
@@ -3590,6 +3650,84 @@ async fn handle_create_experiment(
         return Err(CtrlError::bad(
             "experiment id is generated by the server and must not be client-supplied",
         ));
+    }
+    if !(req.analysis.alpha > 0.0 && req.analysis.alpha < 0.5) {
+        return Err(CtrlError::bad("analysis.alpha must be between 0 and 0.5"));
+    }
+    if req.analysis.planned_users_per_variant == Some(0) {
+        return Err(CtrlError::bad(
+            "analysis.planned_users_per_variant must be at least 1",
+        ));
+    }
+    if req.analysis.cuped_pre_window_ms < 0 {
+        return Err(CtrlError::bad(
+            "analysis.cuped_pre_window_ms must not be negative",
+        ));
+    }
+    for m in std::iter::once(&req.primary_metric).chain(&req.guardrail_metrics) {
+        crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
+    }
+    if req.guardrail_metrics.iter().any(|g| g.auto_stop) && !req.analysis.sequential {
+        return Err(CtrlError::bad(
+            "auto_stop guardrails need analysis.sequential: results are checked every few minutes",
+        ));
+    }
+    let kind = req.kind.unwrap_or_else(|| "ab".to_string());
+    let mut bandit_start: Option<BTreeMap<String, u32>> = None;
+    match kind.as_str() {
+        "ab" => {}
+        "bandit" => {
+            if !req.guardrail_metrics.is_empty() {
+                return Err(CtrlError::bad(
+                    "bandits don't support guardrails: their traffic moves, so guardrails can't be tested fairly",
+                ));
+            }
+            let flags = ctrl
+                .meta
+                .list_feature_flags(&id)
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(flag) = flags.iter().find(|f| f.key == req.flag_key) else {
+                return Err(CtrlError::bad(
+                    "create the flag with its variants before starting a bandit on it",
+                ));
+            };
+            let cfg = req.bandit.clone().unwrap_or_default();
+            let arms = flag.variants.len() as u32;
+            if arms < 2 {
+                return Err(CtrlError::bad(
+                    "a bandit needs a flag with at least two variants",
+                ));
+            }
+            if cfg.min_weight_bps.saturating_mul(arms) > 10_000 {
+                return Err(CtrlError::bad(format!(
+                    "bandit.min_weight_bps {} is too high for {arms} variants",
+                    cfg.min_weight_bps
+                )));
+            }
+            bandit_start = Some(
+                flag.variants
+                    .iter()
+                    .map(|v| (v.key.clone(), v.weight_bps))
+                    .collect(),
+            );
+        }
+        _ => return Err(CtrlError::bad("kind must be ab or bandit")),
+    }
+    // A bandit rewrites its flag's weights, which would break any other test on that flag.
+    let active = ctrl
+        .meta
+        .list_experiments(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .filter(|e| e.flag_key == req.flag_key && e.status != "concluded")
+        .find(|e| kind == "bandit" || e.kind == "bandit");
+    if let Some(other) = active {
+        return Err(CtrlError::conflict(format!(
+            "flag '{}' is already used by the active experiment '{}'; a bandit needs its flag to itself",
+            req.flag_key, other.name
+        )));
     }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
@@ -3606,12 +3744,33 @@ async fn handle_create_experiment(
         end_ts_ms: req.end_ts_ms.unwrap_or(now + 14 * 86_400_000),
         primary_metric: req.primary_metric,
         guardrail_metrics: req.guardrail_metrics,
+        analysis: req.analysis,
         created_at_ms: now,
+        stop_reason: None,
+        bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
+        kind,
     };
     ctrl.meta
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    if let Some(weights) = bandit_start {
+        let snap = WeightSnapshot {
+            effective_from_ms: exp.start_ts_ms,
+            weights,
+        };
+        ctrl.meta
+            .insert_weight_snapshot(&id, &exp.id, &snap)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.created",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "name": exp.name, "flag_key": exp.flag_key }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -3643,6 +3802,9 @@ async fn handle_patch_experiment(
                 "status must be one of running, paused, concluded",
             ));
         }
+        if status == "running" {
+            exp.stop_reason = None;
+        }
         exp.status = status;
     }
     if let Some(end) = req.end_ts_ms {
@@ -3652,6 +3814,13 @@ async fn handle_patch_experiment(
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.updated",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -3659,6 +3828,7 @@ async fn handle_experiment_results_scoped(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((project_id, exp_id)): AxumPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<crate::models::ExperimentResults> {
     ctrl.authorize_and_check(&principal, &project_id).await?;
     let Some(exp) = ctrl
@@ -3677,9 +3847,21 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
-    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
-        .await
-        .map_err(CtrlError::internal)?;
+    let segment = params
+        .get("segment")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let results = if exp.kind == "bandit" {
+        let history = ctrl
+            .meta
+            .list_weight_history(&project_id, &exp.id)
+            .await
+            .map_err(CtrlError::meta)?;
+        evaluate_bandit_results(&exp, flag, &history, &ctrl.qengine).await
+    } else {
+        evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment).await
+    }
+    .map_err(CtrlError::internal)?;
     Ok(Json(results))
 }
 
@@ -4432,20 +4614,6 @@ impl ControlPlaneService {
         value: f64,
         now_ms: i64,
     ) -> Result<Option<reqwest::StatusCode>, String> {
-        let Some(rec) = self
-            .meta
-            .get_byok_credential(&a.project_id, "webhook")
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
-        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
-        let signing_secret = webhook_signing_secret(&cfg)
-            .ok_or("webhook credential has no signing_secret")?
-            .to_string();
-        let url = a.webhook_url.clone().unwrap_or(cred_url);
         let body = json!({
             "event": "pulse.alert.triggered",
             "project_id": a.project_id,
@@ -4460,9 +4628,262 @@ impl ControlPlaneService {
             "window_ms": ALERT_WINDOW_MS,
             "timestamp_ms": now_ms,
         });
-        post_signed_webhook(&url, &signing_secret, &body)
+        self.post_project_webhook(&a.project_id, a.webhook_url.clone(), &body)
+            .await
+    }
+
+    /// Posts `body` to `url` (or the project's webhook credential URL), signed with that
+    /// credential's secret. `Ok(None)` when the project has no webhook credential.
+    async fn post_project_webhook(
+        &self,
+        project_id: &str,
+        url: Option<String>,
+        body: &Value,
+    ) -> Result<Option<reqwest::StatusCode>, String> {
+        let Some(rec) = self
+            .meta
+            .get_byok_credential(project_id, "webhook")
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
+        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
+        let signing_secret = webhook_signing_secret(&cfg)
+            .ok_or("webhook credential has no signing_secret")?
+            .to_string();
+        post_signed_webhook(&url.unwrap_or(cred_url), &signing_secret, body)
             .await
             .map(Some)
+    }
+
+    /// Stops running sequential experiments whose `auto_stop` guardrail a treatment made
+    /// significantly worse: everyone gets control, the experiment is concluded with a
+    /// `stop_reason`, and it is audited and sent to the project webhook. `pulse-node` calls this
+    /// on a timer.
+    // ponytail: same multi-node ceiling as `evaluate_alerts`; also re-runs every guardrail query
+    // each tick, fine at the 5-minute cadence.
+    pub async fn evaluate_experiment_guardrails(&self) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running"
+                    || !exp.analysis.sequential
+                    || !exp.guardrail_metrics.iter().any(|g| g.auto_stop)
+                {
+                    continue;
+                }
+                if let Err(e) = self.auto_stop_if_regressed(exp).await {
+                    tracing::warn!(project_id = %proj.id, "guardrail check failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Moves each running bandit's flag weights toward its best arm, once a day, in the first
+    /// hour after midnight in the project's timezone, once every arm is past burn-in. Weights only
+    /// change at day boundaries so each exposure day (the unit results are stratified and
+    /// SRM-checked by) has one set of weights. `pulse-node` calls this on the guardrail timer.
+    // ponytail: users exposed between midnight and the next tick (up to 5 minutes) get yesterday's
+    // weights but count in today's stratum; a node that's down for that hour skips a day.
+    pub async fn evaluate_bandits(&self) {
+        self.evaluate_bandits_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::evaluate_bandits`] as if the time were `now_ms`.
+    pub async fn evaluate_bandits_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running" || exp.kind != "bandit" {
+                    continue;
+                }
+                if let Err(e) = self.reweight_bandit(exp, now_ms).await {
+                    tracing::warn!(project_id = %proj.id, "bandit update failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn reweight_bandit(&self, exp: Experiment, now: i64) -> Result<(), String> {
+        let tz = self
+            .qengine
+            .catalogs()
+            .for_project(&exp.project_id)
+            .timezone();
+        let today = pulse_exec::TimeInterval::Day.align_floor_tz(now, tz);
+        if now - today >= 3_600_000 {
+            return Ok(());
+        }
+        let history = self
+            .meta
+            .list_weight_history(&exp.project_id, &exp.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if history.last().is_some_and(|s| s.effective_from_ms >= today) {
+            return Ok(());
+        }
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_bandit_results(&exp, Some(&flag), &history, &self.qengine)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(b) = res.bandit.filter(|b| b.burn_in_complete) else {
+            return Ok(());
+        };
+        let prob: BTreeMap<String, f64> = b
+            .arms
+            .iter()
+            .map(|a| (a.variant_key.clone(), a.prob_best))
+            .collect();
+        let cfg = exp.bandit.clone().unwrap_or_default();
+        let weights = crate::experiments::bandit::weights_from_prob_best(&prob, cfg.min_weight_bps);
+        let previous = flag.variants.clone();
+        for v in &mut flag.variants {
+            if let Some(&w) = weights.get(&v.key) {
+                v.weight_bps = w;
+            }
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.meta
+            .insert_weight_snapshot(
+                &exp.project_id,
+                &exp.id,
+                &WeightSnapshot {
+                    effective_from_ms: today,
+                    weights: weights.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:bandit",
+            "experiment.bandit_reweighted",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key,
+                "prob_best": prob, "previous_variants": previous, "weights": weights,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn auto_stop_if_regressed(&self, mut exp: Experiment) -> Result<(), String> {
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_experiment_results(&exp, Some(&flag), &self.qengine, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let auto: std::collections::HashSet<&str> = exp
+            .guardrail_metrics
+            .iter()
+            .filter(|g| g.auto_stop)
+            .map(|g| g.name.as_str())
+            .collect();
+        let hits: Vec<(String, String, f64)> = res
+            .guardrails
+            .iter()
+            .filter(|g| auto.contains(g.metric_name.as_str()))
+            .flat_map(|g| {
+                g.variants
+                    .iter()
+                    .filter(|v| g.regressed_variants.contains(&v.variant_key))
+                    .map(|v| (g.metric_name.clone(), v.variant_key.clone(), v.p_value))
+            })
+            .collect();
+        let Some((metric, variant, p)) = hits.first().cloned() else {
+            return Ok(());
+        };
+        let control = res
+            .variants
+            .iter()
+            .find(|v| v.is_control)
+            .map(|v| v.variant_key.clone())
+            .unwrap_or_else(|| "control".to_string());
+        let now = Utc::now().timestamp_millis();
+        let old_variants = flag.variants.clone();
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == control { 10_000 } else { 0 };
+        }
+        // A flag without a control variant can't be rolled back by weight; turn it off instead.
+        if !flag.variants.iter().any(|v| v.key == control) {
+            flag.enabled = false;
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        let reason =
+            format!("{metric} got worse in {variant} (p = {p:.4}); everyone now gets {control}");
+        exp.status = "concluded".to_string();
+        exp.end_ts_ms = now;
+        exp.stop_reason = Some(reason.clone());
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:guardrail",
+            "experiment.auto_stopped",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key, "reason": reason,
+                "regressions": hits.iter().map(|(m, v, p)| json!({"metric": m, "variant": v, "p_value": p})).collect::<Vec<_>>(),
+                "previous_variants": old_variants, "variants": flag.variants,
+            }),
+        )
+        .await;
+        tracing::warn!(experiment_id = %exp.id, %reason, "experiment stopped by guardrail");
+        let body = json!({
+            "event": "pulse.experiment.auto_stopped",
+            "project_id": exp.project_id,
+            "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+            "reason": reason,
+            "timestamp_ms": now,
+        });
+        if let Err(e) = self
+            .post_project_webhook(&exp.project_id, None, &body)
+            .await
+        {
+            tracing::warn!(experiment_id = %exp.id, "auto-stop webhook failed: {e}");
+        }
+        Ok(())
     }
 }
 
