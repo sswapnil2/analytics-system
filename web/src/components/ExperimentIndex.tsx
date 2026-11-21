@@ -11,18 +11,20 @@ const FILTERS = [
   { value: "all", label: "All", match: () => true },
 ] as const;
 
+/** "Day 3 of 14": the same count everywhere (list, setup, summary). */
+export function dayOfTotal(e: Experiment, now = Date.now()): { day: number; total: number } {
+  const total = Math.max(1, Math.ceil((e.end_ts_ms - e.start_ts_ms) / DAY_MS));
+  return { day: Math.min(Math.max(1, Math.ceil((now - e.start_ts_ms) / DAY_MS)), total), total };
+}
+
 function statusText(e: Experiment): string {
   if (e.status === "draft") return "Draft";
   if (e.status === "concluded") {
     const d = e.decision;
     if (!d) return "Stopped";
-    return d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
+    return `Stopped · ${d.outcome === "ship" ? `shipped ${d.variant}` : d.outcome === "keep_control" ? "kept control" : "inconclusive"}`;
   }
-  const day = Math.min(
-    Math.max(1, Math.ceil((Date.now() - e.start_ts_ms) / DAY_MS)),
-    Math.max(1, Math.round((e.end_ts_ms - e.start_ts_ms) / DAY_MS)),
-  );
-  const total = Math.max(1, Math.round((e.end_ts_ms - e.start_ts_ms) / DAY_MS));
+  const { day, total } = dayOfTotal(e);
   return `${e.status === "paused" ? "Paused" : "Running"} · day ${day} of ${total}`;
 }
 
@@ -39,7 +41,7 @@ export const ExperimentIndex: React.FC<{
   const rows = experiments.filter(
     (e) =>
       match(e.status) &&
-      (!needle || [e.name, e.flag_key, e.created_by ?? ""].some((t) => t.toLowerCase().includes(needle))),
+      (!needle || [e.name, e.flag_key, e.owner || e.created_by || ""].some((t) => t.toLowerCase().includes(needle))),
   );
   return (
     <div className="space-y-2">
@@ -85,7 +87,7 @@ export const ExperimentIndex: React.FC<{
                 </td>
                 <td className="py-2 text-ink-2">{statusText(e)}</td>
                 <td className="py-2 font-mono text-xs text-ink-2">{e.flag_key}</td>
-                <td className="py-2 text-muted">{e.created_by || "–"}</td>
+                <td className="py-2 text-muted">{e.owner || e.created_by || "–"}</td>
               </tr>
             ))}
             {rows.length === 0 && (

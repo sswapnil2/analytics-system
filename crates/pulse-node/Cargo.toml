@@ -15,6 +15,7 @@ pulse-identity.workspace = true
 pulse-storage.workspace = true
 pulse-ingest.workspace = true
 pulse-exec.workspace = true
+pulse-agent.workspace = true
 pulse-control.workspace = true
 
 anyhow.workspace = true

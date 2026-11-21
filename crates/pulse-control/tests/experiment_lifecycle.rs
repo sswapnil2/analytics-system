@@ -290,12 +290,14 @@ async fn layer_experiments_get_disjoint_slices() {
     let lid = l["id"].as_str().unwrap().to_string();
     let exps = "/v1/projects/proj_h/experiments";
 
-    let (status, body) = call(&app, &token, "POST", exps, exp_in_layer("a", &lid, 60.0)).await;
-    assert!(status.is_success(), "{body}");
+    let (status, exp_a) = call(&app, &token, "POST", exps, exp_in_layer("a", &lid, 60.0)).await;
+    assert!(status.is_success(), "{exp_a}");
+    let a_uri = format!("{exps}/{}", exp_a["id"].as_str().unwrap());
     let (status, body) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 50.0)).await;
     assert_eq!(status, StatusCode::CONFLICT, "only 40% is left: {body}");
-    let (status, _) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 40.0)).await;
+    let (status, exp_b) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 40.0)).await;
     assert!(status.is_success());
+    let b_uri = format!("{exps}/{}", exp_b["id"].as_str().unwrap());
 
     let (_, flags) = call(
         &app,
@@ -324,16 +326,10 @@ async fn layer_experiments_get_disjoint_slices() {
     assert_eq!(layers[0]["free_bps"], 0);
     assert_eq!(layers[0]["flags"].as_array().unwrap().len(), 2);
 
-    // A turned-off flag serves no one, so its slice is free again; turning it back on would
-    // overlap the experiment that took the slice.
-    call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/a",
-        json!({"enabled": false}),
-    )
-    .await;
+    // Pausing turns the flag off, which serves no one, so its slice is free again; resuming
+    // would overlap the experiment that took the slice.
+    let (status, _) = call(&app, &token, "PATCH", &a_uri, json!({"status": "paused"})).await;
+    assert!(status.is_success());
     let (status, _) = call(&app, &token, "POST", exps, exp_in_layer("c", &lid, 30.0)).await;
     assert!(status.is_success());
     let (_, flags) = call(
@@ -345,26 +341,18 @@ async fn layer_experiments_get_disjoint_slices() {
     )
     .await;
     assert_eq!(flag(&flags, "c")["layer"]["start_bps"], 0);
-    let (status, _) = call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/a",
-        json!({"enabled": true}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(&app, &token, "PATCH", &a_uri, json!({"status": "running"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the layer has no free slice to resume into");
 
     // Shipping leaves the layer so the winner reaches everyone; joining needs an experiment.
-    let (status, f) = call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/b",
-        json!({"layer_id": ""}),
-    )
+    let (status, done) = call(&app, &token, "PATCH", &b_uri, json!({
+        "status": "concluded",
+        "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "rollout"},
+    }))
     .await;
-    assert!(status.is_success() && f.get("layer").is_none());
+    assert!(status.is_success(), "{done}");
+    let (_, flags) = call(&app, &token, "GET", "/v1/projects/proj_h/flags", json!(null)).await;
+    assert!(flag(&flags, "b").get("layer").is_none());
     let (status, _) = call(
         &app,
         &token,
@@ -402,6 +390,32 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
     let (status, draft) = call(&app, &token, "POST", exps, draft_or_running("a", "draft")).await;
     assert!(status.is_success(), "{draft}");
     let draft_uri = format!("{exps}/{}", draft["id"].as_str().unwrap());
+    // Problem and owner default empty, notifications on; all three can be changed later.
+    assert_eq!(draft["problem"], "");
+    assert_eq!(draft["notify"], true);
+    let (status, edited) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({
+            "problem": "  Users quit at PAN entry  ", "owner": "Asha (growth)", "notify": false,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{edited}");
+    assert_eq!(edited["problem"], "Users quit at PAN entry");
+    assert_eq!(edited["owner"], "Asha (growth)");
+    assert_eq!(edited["notify"], false);
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({"owner": "x".repeat(201)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
     assert_eq!(flag(&flags, "a")["enabled"], false);
     let (status, _) = call(
@@ -429,6 +443,29 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+
+    // While it's live, the flag's serving is locked; its description isn't.
+    let flag_uri = format!("{flags_uri}/{}", flag(&flags, "a")["id"].as_str().unwrap());
+    for body in [json!({"rollout_pct": 10.0}), json!({"enabled": false}), json!({"targeting_cohort_id": ""})] {
+        let (status, err) = call(&app, &token, "PATCH", &flag_uri, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    }
+    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"description": "1-tap"})).await;
+    assert!(status.is_success());
+
+    // Pause turns the flag off and keeps why; resume turns it back on and clears it.
+    let (status, paused) = call(&app, &token, "PATCH", &live_uri, json!({"status": "paused", "reason": " Payment errors spiked "})).await;
+    assert!(status.is_success(), "{paused}");
+    assert_eq!(paused["pause_reason"], "Payment errors spiked");
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], false);
+    let (status, err) = call(&app, &token, "PATCH", &flag_uri, json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "still locked while paused: {err}");
+    let (status, resumed) = call(&app, &token, "PATCH", &live_uri, json!({"status": "running"})).await;
+    assert!(status.is_success(), "{resumed}");
+    assert!(resumed["pause_reason"].is_null());
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], true);
 
     // Concluding records the decision and rolls the flag back.
     let (status, _) = call(
@@ -611,4 +648,81 @@ async fn secondary_metrics_measure_step_through_and_time_between() {
     );
     // Secondaries never flag regressions.
     assert_eq!(sec[1]["regressed_variants"], json!([]));
+}
+
+#[tokio::test]
+async fn saved_metrics_are_named_once_and_reused() {
+    let (app, _ctrl, token, _ingest) = setup().await;
+    let uri = "/v1/projects/proj_h/saved-metrics";
+    let kyc = json!({
+        "name": " KYC failure ", "event_name": "KYC_Verified", "metric_type": "conversion",
+        "conversion_window_ms": 7 * DAY, "direction": "increase_is_bad", "auto_stop": true,
+        "filters": [{"prop_name": "status", "filter": {"op": "neq", "val": "success"}}],
+    });
+    let (status, saved) = call(&app, &token, "POST", uri, kyc.clone()).await;
+    assert!(status.is_success(), "{saved}");
+    assert_eq!(saved["name"], "KYC failure");
+    assert_eq!(saved["spec"]["name"], "KYC failure");
+    assert_eq!(saved["spec"]["auto_stop"], false, "auto-stop belongs to an experiment");
+    let mut dup = kyc.clone();
+    dup["name"] = json!("kyc FAILURE");
+    let (status, _) = call(&app, &token, "POST", uri, dup).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let mut bad = kyc.clone();
+    bad["metric_type"] = json!("nonsense");
+    let (status, _) = call(&app, &token, "POST", uri, bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, list) = call(&app, &token, "GET", uri, json!(null)).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["spec"]["filters"][0]["prop_name"], "status");
+    let id = saved["id"].as_str().unwrap();
+    let (status, _) = call(&app, &token, "DELETE", &format!("{uri}/{id}"), json!(null)).await;
+    assert!(status.is_success());
+    let (_, list) = call(&app, &token, "GET", uri, json!(null)).await;
+    assert!(list.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn staged_ship_raises_the_rollout_until_someone_changes_the_flag() {
+    let (app, ctrl, token, _ingest) = setup().await;
+    let exps = "/v1/projects/proj_h/experiments";
+    let flags_uri = "/v1/projects/proj_h/flags";
+    let rollout = |flags: &Value, key: &str| flag(flags, key)["rollout_pct"].as_f64().unwrap();
+
+    let ship = |every_days: u32| json!({
+        "status": "concluded",
+        "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "staged", "every_days": every_days},
+    });
+    let (_, live) = call(&app, &token, "POST", exps, draft_or_running("b", "running")).await;
+    assert!(live["id"].is_string(), "{live}");
+    let live_uri = format!("{exps}/{}", live["id"].as_str().unwrap());
+    let (status, _) = call(&app, &token, "PATCH", &live_uri, ship(15)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "every_days is 1 to 14");
+    let (status, done) = call(&app, &token, "PATCH", &live_uri, ship(2)).await;
+    assert!(status.is_success(), "{done}");
+    let staged = &done["decision"]["staged"];
+    assert_eq!(staged["next_step"], 1);
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 25.0);
+    assert_eq!(flag(&flags, "b")["enabled"], true);
+
+    // Not due yet, then due: 25% → 50%.
+    let next = staged["next_at_ms"].as_i64().unwrap();
+    ctrl.advance_staged_rollouts_at(next - 1).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 25.0);
+    ctrl.advance_staged_rollouts_at(next).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 50.0);
+
+    // A hand edit halts the plan and is left alone.
+    let flag_uri = format!("{flags_uri}/{}", flag(&flags, "b")["id"].as_str().unwrap());
+    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"rollout_pct": 30.0})).await;
+    assert!(status.is_success(), "a concluded experiment doesn't lock its flag");
+    ctrl.advance_staged_rollouts_at(next + 2 * DAY).await;
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(rollout(&flags, "b"), 30.0);
+    let (_, all) = call(&app, &token, "GET", exps, json!(null)).await;
+    let exp = all.as_array().unwrap().iter().find(|e| e["id"] == live["id"]).unwrap();
+    assert!(exp["decision"]["staged"]["halted"].is_string(), "{exp}");
 }

@@ -1,0 +1,12 @@
+{
+  "name": "pulse-agent-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency TypeScript/Node & Python AI Agent Observability demos for Pulse Analytics",
+  "scripts": {
+    "start": "node index.mjs",
+    "start:py": "python3 main.py",
+    "self-test": "node index.mjs --self-test && python3 main.py --self-test"
+  }
+}
