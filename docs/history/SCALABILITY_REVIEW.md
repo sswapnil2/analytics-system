@@ -725,7 +725,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before any deployment with more than one ingest-capable node, including two `all` nodes.
 - Validation: a test that starts two ingest nodes on one data directory and asserts the second refuses writes; a kill test where the standby takes over and no acknowledged event is missing.
 
-**P0-2. Group commit for the event WAL.**
+**P0-2. Group commit for the event WAL.** — In review: [#97](https://github.com/sswapnil2/analytics-system/pull/97) (15 → 1,236 req/s at concurrency 64, batch 100; p99 4.7 s → 86 ms)
 - Problem: R-02. Evidence: sections 5.1 and 9.
 - Solution: per bucket, queue pending batches; the lock holder drains the queue, runs the dedup re-check for each, writes one WAL object containing all of them, appends to L0 in order, and completes every waiter. A commit window of a few milliseconds is enough. Preferable on S3: one WAL object per node per window covering all buckets, as the agent store does.
 - Why it matters: it is the difference between tens and thousands of requests per second on the same hardware.
