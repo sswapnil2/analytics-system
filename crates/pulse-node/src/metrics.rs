@@ -191,6 +191,11 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
             &agent.spans_ingested,
         ),
         (
+            "pulse_agent_spans_dropped_trace_limit_total",
+            "Agent spans dropped because their trace reached its span or byte cap.",
+            &agent.spans_dropped_trace_limit,
+        ),
+        (
             "pulse_agent_blobs_deduped_total",
             "Agent payload blobs deduplicated.",
             &agent.blobs_deduped,
