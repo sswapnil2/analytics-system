@@ -948,3 +948,118 @@ async fn ingest_rate_limit_is_per_project_and_returns_429_with_retry_after() {
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(resp.headers()["retry-after"], "1");
 }
+
+fn group_commit_fixture() -> (Arc<HookStore>, Arc<StorageEngine>, Arc<IngestService>) {
+    let hook = HookStore::new();
+    let store: Arc<dyn ObjectStore> = hook.clone();
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 100_000,
+            l0_flush_max_age: Duration::from_secs(600),
+            compaction_min_segments: 4,
+        },
+        store.clone(),
+        Arc::new(IdentityRouter::new(store)),
+    );
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_test", "proj_group");
+    let ingest = IngestService::new(storage.clone(), gov);
+    (hook, storage, ingest)
+}
+
+/// Requests that arrive while a WAL write is in flight used to queue for one durable PUT each.
+/// They now share the next one, and each is still acknowledged only after it is durable.
+#[tokio::test]
+async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
+    let (hook, storage, ingest) = group_commit_fixture();
+    // Warm the project so the delayed PUT below is the first of the concurrent wave.
+    let warm = WireBatch::new(vec![make_event(0xF0, "s", "warm", 1_762_000_000_000)]);
+    ingest
+        .ingest_raw("pk_test", None, &warm.encode_binary(1).unwrap())
+        .await
+        .unwrap();
+    hook.wal_put_counter.store(0, Ordering::SeqCst);
+    hook.delay_first_wal_ms.store(200, Ordering::SeqCst);
+
+    // 32 requests with one distinct event each, plus two that repeat request 0's event.
+    let bodies: Vec<Vec<u8>> = (0..34u8)
+        .map(|i| {
+            let id = if i >= 32 { 0 } else { i };
+            WireBatch::new(vec![make_event(
+                id,
+                "s",
+                &format!("u{id}"),
+                1_762_000_000_000 + i64::from(id),
+            )])
+            .encode_binary(1)
+            .unwrap()
+        })
+        .collect();
+    let results = futures::future::join_all(
+        bodies
+            .iter()
+            .map(|raw| ingest.ingest_raw("pk_test", None, raw)),
+    )
+    .await;
+
+    let (mut accepted, mut deduped) = (0, 0);
+    for r in results {
+        let r = r.expect("every request is acknowledged");
+        accepted += r.accepted;
+        deduped += r.deduped;
+    }
+    assert_eq!(accepted, 32, "each distinct event is stored exactly once");
+    assert_eq!(deduped, 2, "a repeat inside the same group is deduplicated");
+    let puts = hook.wal_put_counter.load(Ordering::SeqCst);
+    assert!(puts <= 3, "34 concurrent requests made {puts} WAL writes");
+
+    // What was acknowledged is in the WAL: a second engine on the same store replays all of it.
+    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 33);
+    let store: Arc<dyn ObjectStore> = hook.clone();
+    let recovered = StorageEngine::new(
+        ps.config().clone(),
+        store.clone(),
+        Arc::new(IdentityRouter::new(store)),
+    )
+    .get_or_open_project("proj_group")
+    .await
+    .unwrap();
+    assert_eq!(recovered.total_l0_rows(), 33);
+}
+
+/// A failed group write fails or retries every request in it; none is acknowledged, none is
+/// remembered by dedup, and a client retry is stored.
+#[tokio::test]
+async fn failed_group_write_acknowledges_nothing_and_retries_are_stored() {
+    let (hook, storage, ingest) = group_commit_fixture();
+    let bodies: Vec<Vec<u8>> = (0..8u8)
+        .map(|i| {
+            WireBatch::new(vec![make_event(
+                i,
+                "s",
+                &format!("u{i}"),
+                1_762_000_000_000,
+            )])
+            .encode_binary(1)
+            .unwrap()
+        })
+        .collect();
+    let send_all = || {
+        futures::future::join_all(
+            bodies
+                .iter()
+                .map(|raw| ingest.ingest_raw("pk_test", None, raw)),
+        )
+    };
+    hook.fail_wal_puts.store(true, Ordering::SeqCst);
+    assert!(send_all().await.iter().all(|r| r.is_err()));
+    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 0);
+
+    hook.fail_wal_puts.store(false, Ordering::SeqCst);
+    let retried = send_all().await;
+    assert!(retried.iter().all(|r| r.as_ref().unwrap().accepted == 1));
+    assert_eq!(ps.total_l0_rows(), 8);
+}
