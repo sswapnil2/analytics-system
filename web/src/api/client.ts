@@ -1182,7 +1182,7 @@ export const api = {
 
   createFlag: (
     projectId: string,
-    body: { key: string; description: string; rollout_pct: number },
+    body: { key: string; description: string; rollout_pct: number; enabled?: boolean },
   ) =>
     fetchJson<FeatureFlag>(`/v1/projects/${encodeURIComponent(projectId)}/flags`, {
       method: "POST",

@@ -194,7 +194,8 @@ async fn setup() -> (Router, String, Truth) {
 
 fn experiment(metric: Value, analysis: Value) -> Value {
     json!({
-        "name": "Bigger cart", "flag_key": "bigger_cart", "hypothesis": "",
+        // Concluded, so several analyses of the same flag can coexist (one live experiment per flag).
+        "name": "Bigger cart", "flag_key": "bigger_cart", "hypothesis": "", "status": "concluded",
         "start_ts_ms": BASE, "end_ts_ms": BASE + 5 * DAY,
         "primary_metric": metric, "guardrail_metrics": [], "analysis": analysis,
     })

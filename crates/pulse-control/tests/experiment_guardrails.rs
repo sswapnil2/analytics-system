@@ -219,6 +219,30 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
         json!(["treatment"])
     );
 
+    // One live experiment per flag: a second is refused until the first stops.
+    let (status, _) = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/projects/proj_g/experiments",
+        experiment(true, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let watch_uri = format!(
+        "/v1/projects/proj_g/experiments/{}",
+        watch["id"].as_str().unwrap()
+    );
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &watch_uri,
+        json!({"status": "concluded"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
     let (_, exp) = call(
         &app,
         &token,
@@ -279,6 +303,16 @@ async fn regressed_auto_stop_guardrail_rolls_back_to_control() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(resumed["stop_reason"].is_null());
+    // The flag is busy again, so the older experiment can't be resumed alongside it.
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &watch_uri,
+        json!({"status": "running"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 /// The edge bundle is cached, but a flag change shows up on the next poll.

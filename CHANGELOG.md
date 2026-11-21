@@ -12,6 +12,11 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Experiment metrics can count events per user, add up a property per user (revenue), or divide one total by another (spend per visit), not just measure conversion.
 - CUPED: experiments can use each user's behaviour before the test to cut noise, so results get significant sooner. The Studio shows how much noise it removed.
 - Experiment results can be split by a property (country, plan, …) and show lift over time.
+- Experiment results show the setup at a glance (metric, guardrails, flag split, audience, dates), progress toward the planned sample, the absolute difference from control, a traffic-split check, and a clear "no data, check tracking" state for metrics nobody has sent yet.
+
+### Changed
+- A flag can back only one running or paused experiment at a time; a second one is refused with 409 until the first is stopped.
+- New flags from the Studio start off. Starting an experiment turns its flag on, and the Studio asks before you toggle, retarget or re-roll a flag a live experiment uses.
 - Users who saw more than one variant are left out of experiment results and counted separately.
 - Guardrails can stop an experiment on their own: if a treatment makes one significantly worse, everyone goes back to control, and the Studio shows why it stopped.
 - The web and mobile SDKs re-check feature flags every 5 minutes (configurable), so rollbacks reach apps that are already open.

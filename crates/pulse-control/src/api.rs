@@ -3714,20 +3714,10 @@ async fn handle_create_experiment(
         }
         _ => return Err(CtrlError::bad("kind must be ab or bandit")),
     }
-    // A bandit rewrites its flag's weights, which would break any other test on that flag.
-    let active = ctrl
-        .meta
-        .list_experiments(&id)
-        .await
-        .map_err(CtrlError::meta)?
-        .into_iter()
-        .filter(|e| e.flag_key == req.flag_key && e.status != "concluded")
-        .find(|e| kind == "bandit" || e.kind == "bandit");
-    if let Some(other) = active {
-        return Err(CtrlError::conflict(format!(
-            "flag '{}' is already used by the active experiment '{}'; a bandit needs its flag to itself",
-            req.flag_key, other.name
-        )));
+    // Two live experiments on one flag share users and assignment, so their results conflict
+    // (and a bandit rewrites the weights under the other one).
+    if req.status.as_deref() != Some("concluded") {
+        ensure_flag_free(&ctrl, &id, &req.flag_key, None).await?;
     }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
@@ -3774,6 +3764,31 @@ async fn handle_create_experiment(
     Ok(Json(exp))
 }
 
+/// 409 when another running or paused experiment (other than `except_id`) uses `flag_key`.
+async fn ensure_flag_free(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+    except_id: Option<&str>,
+) -> Result<(), CtrlError> {
+    let other = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| {
+            e.flag_key == flag_key && e.status != "concluded" && Some(e.id.as_str()) != except_id
+        });
+    match other {
+        Some(o) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is already used by the experiment '{}'. Stop it first, or use another flag",
+            o.name
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[derive(Deserialize)]
 struct PatchExpReq {
     status: Option<String>,
@@ -3801,6 +3816,9 @@ async fn handle_patch_experiment(
             return Err(CtrlError::bad(
                 "status must be one of running, paused, concluded",
             ));
+        }
+        if exp.status == "concluded" && status != "concluded" {
+            ensure_flag_free(&ctrl, &id, &exp.flag_key, Some(&exp.id)).await?;
         }
         if status == "running" {
             exp.stop_reason = None;
