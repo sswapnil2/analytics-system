@@ -300,6 +300,8 @@ export interface Experiment {
   primary_metric: ExperimentMetric;
   guardrail_metrics: ExperimentMetric[];
   analysis?: ExperimentAnalysis;
+  /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
+  stop_reason?: string | null;
 }
 
 export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
@@ -317,6 +319,8 @@ export interface ExperimentMetric {
   conversion_window_ms: number;
   /** Which way is bad, for guardrails. */
   direction?: MetricDirection;
+  /** Guardrails: roll everyone back to control when a treatment makes this significantly worse. */
+  auto_stop?: boolean;
 }
 
 export interface ExperimentAnalysis {

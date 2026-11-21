@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
+import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
 import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricType, VariantLiftRow } from "../api/client";
 import { LiftChart } from "../components/LiftChart";
 import { useCohortNames } from "../components/FilterPanel";
@@ -178,6 +178,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expGuardrail, setExpGuardrail] = useState("");
   const [expGuardrailDirection, setExpGuardrailDirection] = useState<MetricDirection>("increase_is_bad");
   const [expSequential, setExpSequential] = useState(true);
+  const [expAutoStop, setExpAutoStop] = useState(true);
   const [expWindowDays, setExpWindowDays] = useState(7);
   const [expDays, setExpDays] = useState(14);
   const [expError, setExpError] = useState<string | null>(null);
@@ -333,7 +334,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         start_ts_ms: now,
         end_ts_ms: now + expDays * DAY_MS,
         primary_metric: primary,
-        guardrail_metrics: expGuardrail ? [metric(expGuardrail, expGuardrailDirection)] : [],
+        guardrail_metrics: expGuardrail
+          ? [{ ...metric(expGuardrail, expGuardrailDirection), auto_stop: expAutoStop && expSequential }]
+          : [],
         analysis: {
           sequential: expSequential,
           alpha: 0.05,
@@ -352,6 +355,20 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       setExpError(`Couldn't create experiment: ${errorMessage(e)}`);
     } finally {
       setExpCreating(false);
+    }
+  };
+
+  /** Pause keeps the flag as it is and only stops guardrail checks; resume picks them up again. */
+  const setStatus = async (exp: Experiment, status: "running" | "paused") => {
+    setActing(true);
+    setActionError(null);
+    try {
+      const done = await api.patchExperiment(projectId, exp.id, { status });
+      setExperiments((prev) => prev.map((e) => (e.id === exp.id ? done : e)));
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setActing(false);
     }
   };
 
@@ -602,6 +619,25 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </span>
               </span>
             </label>
+            {expGuardrail && (
+              <label className="flex items-start gap-2 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  checked={expAutoStop && expSequential}
+                  disabled={!expSequential}
+                  onChange={(e) => setExpAutoStop(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Stop automatically if the guardrail gets worse
+                  <span className="block text-xs text-muted">
+                    {expSequential
+                      ? "Checked every 5 minutes. If a variant makes it significantly worse, everyone goes back to control and the experiment stops."
+                      : "Needs sequential testing, since results are checked every few minutes."}
+                  </span>
+                </span>
+              </label>
+            )}
             <label className="flex items-start gap-2 text-sm text-ink">
               <input type="checkbox" checked={expCuped} onChange={(e) => setExpCuped(e.target.checked)} className="mt-0.5" />
               <span>
@@ -710,6 +746,18 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </div>
             )}
 
+            {selectedExp?.stop_reason && (
+              <div
+                role="alert"
+                className="flex items-start gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3.5 py-3 text-sm text-ink"
+              >
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+                <p>
+                  <span className="font-medium">Stopped by a guardrail.</span> {selectedExp.stop_reason}.
+                </p>
+              </div>
+            )}
+
             {actionError && <ErrorNotice message={`Couldn't update the experiment: ${actionError}`} />}
             {selectedExp && (
               <div className="flex flex-wrap items-center gap-2">
@@ -754,6 +802,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           Ship {v.variant_key}
                         </button>
                       ))}
+                    <button
+                      type="button"
+                      disabled={acting}
+                      onClick={() => void setStatus(selectedExp, selectedExp.status === "paused" ? "running" : "paused")}
+                      className={btn.secondary}
+                    >
+                      {selectedExp.status === "paused" ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+                      {selectedExp.status === "paused" ? "Resume" : "Pause"}
+                    </button>
                     <button type="button" disabled={acting} onClick={() => void conclude(selectedExp, selectedFlag)} className={btn.secondary}>
                       <Square className="h-3.5 w-3.5" />
                       Stop experiment

@@ -862,8 +862,8 @@ impl MetaStore {
         let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -874,7 +874,8 @@ impl MetaStore {
                 end_ts_ms = excluded.end_ts_ms,
                 primary_metric_json = excluded.primary_metric_json,
                 guardrail_metrics_json = excluded.guardrail_metrics_json,
-                analysis_json = excluded.analysis_json
+                analysis_json = excluded.analysis_json,
+                stop_reason = excluded.stop_reason
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -889,6 +890,7 @@ impl MetaStore {
             &gjson,
             &ajson,
             exp.created_at_ms,
+            &exp.stop_reason,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -902,7 +904,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -924,6 +926,7 @@ impl MetaStore {
                         .and_then(|a| serde_json::from_str(&a).ok())
                         .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
+                    stop_reason: r.get("stop_reason"),
                 })
             },
             project_id,
@@ -939,7 +942,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -961,6 +964,7 @@ impl MetaStore {
                         .and_then(|a| serde_json::from_str(&a).ok())
                         .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
+                    stop_reason: r.get("stop_reason"),
                 })
             },
             exp_id,

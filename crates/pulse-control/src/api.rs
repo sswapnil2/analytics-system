@@ -168,6 +168,17 @@ pub struct ControlPlaneService {
     auth_state: auth::AuthState,
     /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// Per project: the edge flag bundle, keyed by the flags' latest `updated_at_ms` and count.
+    /// SDKs poll it, and building it evaluates targeting cohorts.
+    flag_bundle_cache: DashMap<
+        String,
+        (
+            i64,
+            usize,
+            std::time::Instant,
+            Arc<crate::models::EdgeFlagBundle>,
+        ),
+    >,
 }
 
 impl ControlPlaneService {
@@ -236,6 +247,7 @@ impl ControlPlaneService {
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
             outbox_path: parking_lot::RwLock::new(None),
+            flag_bundle_cache: DashMap::new(),
         });
 
         let generated_ingest = svc
@@ -3423,6 +3435,7 @@ async fn handle_upsert_flag(
         }
     }
 
+    let actor = principal.actor_label();
     let flag = FeatureFlag {
         id: format!("flg_{}_{}", id, req.key),
         project_id: id,
@@ -3438,6 +3451,13 @@ async fn handle_upsert_flag(
         .upsert_feature_flag(&flag)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &actor,
+        "flag.saved",
+        &format!("project:{}", flag.project_id),
+        json!({ "flag_key": flag.key, "enabled": flag.enabled, "rollout_pct": flag.rollout_pct, "variants": flag.variants }),
+    )
+    .await;
     Ok(Json(flag))
 }
 
@@ -3506,8 +3526,18 @@ async fn handle_patch_flag(
         .upsert_feature_flag(&found)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "flag.updated",
+        &format!("project:{id}"),
+        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants }),
+    )
+    .await;
     Ok(Json(found))
 }
+
+/// How long a built flag bundle is reused when no flag changed; cohort membership can still move.
+const FLAG_BUNDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn handle_edge_flag_bundle(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3522,30 +3552,51 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    let bundle = build_edge_flag_bundle_with_cohorts(
-        &project_id,
-        &flags,
-        &ctrl.qengine,
-        Utc::now().timestamp_millis(),
-    )
-    .await
-    .map_err(CtrlError::internal)?;
+    let version = flags.iter().map(|f| f.updated_at_ms).max().unwrap_or(0);
+    let cached = ctrl
+        .flag_bundle_cache
+        .get(&project_id)
+        .filter(|c| c.0 == version && c.1 == flags.len() && c.2.elapsed() < FLAG_BUNDLE_TTL)
+        .map(|c| c.3.clone());
+    let bundle = match cached {
+        Some(b) => b,
+        None => {
+            let b = Arc::new(
+                build_edge_flag_bundle_with_cohorts(
+                    &project_id,
+                    &flags,
+                    &ctrl.qengine,
+                    Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(CtrlError::internal)?,
+            );
+            ctrl.flag_bundle_cache.insert(
+                project_id.clone(),
+                (version, flags.len(), std::time::Instant::now(), b.clone()),
+            );
+            b
+        }
+    };
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
         if inm.trim() == bundle.etag {
-            return Ok(
-                (StatusCode::NOT_MODIFIED, [(header::ETAG, bundle.etag)], "").into_response(),
-            );
+            return Ok((
+                StatusCode::NOT_MODIFIED,
+                [(header::ETAG, bundle.etag.clone())],
+                "",
+            )
+                .into_response());
         }
     }
 
     Ok((
         StatusCode::OK,
         [(header::ETAG, bundle.etag.clone())],
-        Json(bundle),
+        Json(bundle.as_ref().clone()),
     )
         .into_response())
 }
@@ -3609,6 +3660,11 @@ async fn handle_create_experiment(
     for m in std::iter::once(&req.primary_metric).chain(&req.guardrail_metrics) {
         crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
     }
+    if req.guardrail_metrics.iter().any(|g| g.auto_stop) && !req.analysis.sequential {
+        return Err(CtrlError::bad(
+            "auto_stop guardrails need analysis.sequential: results are checked every few minutes",
+        ));
+    }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
         id: format!("exp_{}", &Uuid::new_v4().simple().to_string()[..12]),
@@ -3626,11 +3682,19 @@ async fn handle_create_experiment(
         guardrail_metrics: req.guardrail_metrics,
         analysis: req.analysis,
         created_at_ms: now,
+        stop_reason: None,
     };
     ctrl.meta
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.created",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "name": exp.name, "flag_key": exp.flag_key }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -3662,6 +3726,9 @@ async fn handle_patch_experiment(
                 "status must be one of running, paused, concluded",
             ));
         }
+        if status == "running" {
+            exp.stop_reason = None;
+        }
         exp.status = status;
     }
     if let Some(end) = req.end_ts_ms {
@@ -3671,6 +3738,13 @@ async fn handle_patch_experiment(
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.updated",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -4456,20 +4530,6 @@ impl ControlPlaneService {
         value: f64,
         now_ms: i64,
     ) -> Result<Option<reqwest::StatusCode>, String> {
-        let Some(rec) = self
-            .meta
-            .get_byok_credential(&a.project_id, "webhook")
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
-        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
-        let signing_secret = webhook_signing_secret(&cfg)
-            .ok_or("webhook credential has no signing_secret")?
-            .to_string();
-        let url = a.webhook_url.clone().unwrap_or(cred_url);
         let body = json!({
             "event": "pulse.alert.triggered",
             "project_id": a.project_id,
@@ -4484,9 +4544,154 @@ impl ControlPlaneService {
             "window_ms": ALERT_WINDOW_MS,
             "timestamp_ms": now_ms,
         });
-        post_signed_webhook(&url, &signing_secret, &body)
+        self.post_project_webhook(&a.project_id, a.webhook_url.clone(), &body)
+            .await
+    }
+
+    /// Posts `body` to `url` (or the project's webhook credential URL), signed with that
+    /// credential's secret. `Ok(None)` when the project has no webhook credential.
+    async fn post_project_webhook(
+        &self,
+        project_id: &str,
+        url: Option<String>,
+        body: &Value,
+    ) -> Result<Option<reqwest::StatusCode>, String> {
+        let Some(rec) = self
+            .meta
+            .get_byok_credential(project_id, "webhook")
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
+        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
+        let signing_secret = webhook_signing_secret(&cfg)
+            .ok_or("webhook credential has no signing_secret")?
+            .to_string();
+        post_signed_webhook(&url.unwrap_or(cred_url), &signing_secret, body)
             .await
             .map(Some)
+    }
+
+    /// Stops running sequential experiments whose `auto_stop` guardrail a treatment made
+    /// significantly worse: everyone gets control, the experiment is concluded with a
+    /// `stop_reason`, and it is audited and sent to the project webhook. `pulse-node` calls this
+    /// on a timer.
+    // ponytail: same multi-node ceiling as `evaluate_alerts`; also re-runs every guardrail query
+    // each tick, fine at the 5-minute cadence.
+    pub async fn evaluate_experiment_guardrails(&self) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running"
+                    || !exp.analysis.sequential
+                    || !exp.guardrail_metrics.iter().any(|g| g.auto_stop)
+                {
+                    continue;
+                }
+                if let Err(e) = self.auto_stop_if_regressed(exp).await {
+                    tracing::warn!(project_id = %proj.id, "guardrail check failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn auto_stop_if_regressed(&self, mut exp: Experiment) -> Result<(), String> {
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_experiment_results(&exp, Some(&flag), &self.qengine, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let auto: std::collections::HashSet<&str> = exp
+            .guardrail_metrics
+            .iter()
+            .filter(|g| g.auto_stop)
+            .map(|g| g.name.as_str())
+            .collect();
+        let hits: Vec<(String, String, f64)> = res
+            .guardrails
+            .iter()
+            .filter(|g| auto.contains(g.metric_name.as_str()))
+            .flat_map(|g| {
+                g.variants
+                    .iter()
+                    .filter(|v| g.regressed_variants.contains(&v.variant_key))
+                    .map(|v| (g.metric_name.clone(), v.variant_key.clone(), v.p_value))
+            })
+            .collect();
+        let Some((metric, variant, p)) = hits.first().cloned() else {
+            return Ok(());
+        };
+        let control = res
+            .variants
+            .iter()
+            .find(|v| v.is_control)
+            .map(|v| v.variant_key.clone())
+            .unwrap_or_else(|| "control".to_string());
+        let now = Utc::now().timestamp_millis();
+        let old_variants = flag.variants.clone();
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == control { 10_000 } else { 0 };
+        }
+        // A flag without a control variant can't be rolled back by weight; turn it off instead.
+        if !flag.variants.iter().any(|v| v.key == control) {
+            flag.enabled = false;
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        let reason =
+            format!("{metric} got worse in {variant} (p = {p:.4}); everyone now gets {control}");
+        exp.status = "concluded".to_string();
+        exp.end_ts_ms = now;
+        exp.stop_reason = Some(reason.clone());
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:guardrail",
+            "experiment.auto_stopped",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key, "reason": reason,
+                "regressions": hits.iter().map(|(m, v, p)| json!({"metric": m, "variant": v, "p_value": p})).collect::<Vec<_>>(),
+                "previous_variants": old_variants, "variants": flag.variants,
+            }),
+        )
+        .await;
+        tracing::warn!(experiment_id = %exp.id, %reason, "experiment stopped by guardrail");
+        let body = json!({
+            "event": "pulse.experiment.auto_stopped",
+            "project_id": exp.project_id,
+            "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+            "reason": reason,
+            "timestamp_ms": now,
+        });
+        if let Err(e) = self
+            .post_project_webhook(&exp.project_id, None, &body)
+            .await
+        {
+            tracing::warn!(experiment_id = %exp.id, "auto-stop webhook failed: {e}");
+        }
+        Ok(())
     }
 }
 

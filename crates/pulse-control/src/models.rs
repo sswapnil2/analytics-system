@@ -287,6 +287,10 @@ pub struct ExperimentMetricSpec {
     /// Which way is bad, for guardrails: `"decrease_is_bad"` (default) or `"increase_is_bad"`.
     #[serde(default = "default_direction")]
     pub direction: String,
+    /// Guardrails only: stop the experiment and give everyone control when a treatment makes
+    /// this metric significantly worse. Needs sequential analysis.
+    #[serde(default)]
+    pub auto_stop: bool,
 }
 
 /// A ratio metric's denominator: a count of `event_name`, or the total of `numeric_prop`.
@@ -367,6 +371,9 @@ pub struct Experiment {
     #[serde(default)]
     pub analysis: AnalysisConfig,
     pub created_at_ms: i64,
+    /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

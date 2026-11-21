@@ -740,3 +740,44 @@ test("Public replay API and incremental wireframe snapshot diffing", async () =>
 
   sdk.shutdown();
 });
+
+test("Flag TTL: stale flags refresh in the background, so a rollback reaches a running app", async () => {
+  let weights = [5000, 5000];
+  let flagFetches = 0;
+  browserEnv({
+    fetchImpl: (url) => {
+      if (String(url).includes("/v1/flags/")) {
+        flagFetches += 1;
+        const body = {
+          flags: [
+            {
+              key: "checkout",
+              enabled: true,
+              rollout_bps: 10000,
+              variants: [
+                { key: "control", weight_bps: weights[0] },
+                { key: "treatment", weight_bps: weights[1] },
+              ],
+            },
+          ],
+        };
+        return Promise.resolve({ ok: true, status: 200, json: async () => body, headers: { get: () => null } });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}), headers: { get: () => null } });
+    },
+  });
+  const sdk = new PulseWebClient({ endpointUrl: "http://pulse.test", apiKey: "pk_ttl", flushIntervalMs: 0, flagsTtlMs: 30 });
+
+  await Promise.all([sdk.getVariant("checkout"), sdk.getVariant("checkout")]);
+  assert.equal(flagFetches, 1, "concurrent first calls share one request");
+  sdk.getVariantSync("checkout");
+  assert.equal(flagFetches, 1, "fresh flags are not refetched");
+
+  weights = [10000, 0];
+  await new Promise((r) => setTimeout(r, 40));
+  sdk.getVariantSync("checkout");
+  assert.equal(flagFetches, 2, "stale flags trigger a background refresh");
+  await sdk.refreshFlags();
+  assert.equal(sdk.getVariantSync("checkout"), "control", "rolled-back weights apply");
+  sdk.shutdown();
+});

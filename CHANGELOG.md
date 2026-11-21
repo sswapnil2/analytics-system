@@ -13,6 +13,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - CUPED: experiments can use each user's behaviour before the test to cut noise, so results get significant sooner. The Studio shows how much noise it removed.
 - Experiment results can be split by a property (country, plan, …) and show lift over time.
 - Users who saw more than one variant are left out of experiment results and counted separately.
+- Guardrails can stop an experiment on their own: if a treatment makes one significantly worse, everyone goes back to control, and the Studio shows why it stopped.
+- The web and mobile SDKs re-check feature flags every 5 minutes (configurable), so rollbacks reach apps that are already open.
+- Flag and experiment changes are recorded in the audit log.
+- Experiments can be paused and resumed from the Studio.
 
 ### Changed
 - Internal review codes removed from comments and test names; process logs moved to `docs/history/`.
