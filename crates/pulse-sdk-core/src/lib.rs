@@ -9,8 +9,8 @@ use std::time::Duration;
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use pulse_wire::{
-    evaluate_flag_rule, mask_input_value, InteractionKind, NodeKind, PropValue, ReplayChunk,
-    WireBatch, WireEvent, WireNode, WireframeOp, FIXED_MASK_PLACEHOLDER,
+    mask_input_value, InteractionKind, NodeKind, PropValue, ReplayChunk, WireBatch, WireEvent,
+    WireNode, WireframeOp, FIXED_MASK_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
@@ -471,7 +471,7 @@ struct EdgeVariant {
     weight_bps: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct EdgeRule {
     key: String,
     enabled: bool,
@@ -481,6 +481,35 @@ struct EdgeRule {
     #[serde(default)]
     cohort_member_hashes: Option<Vec<String>>,
     variants: Vec<EdgeVariant>,
+    #[serde(default)]
+    holdout_id: Option<String>,
+    #[serde(default)]
+    holdout_bps: u32,
+    #[serde(default)]
+    layer_id: Option<String>,
+    #[serde(default)]
+    layer_start_bps: u32,
+    #[serde(default)]
+    layer_end_bps: u32,
+}
+
+impl EdgeRule {
+    fn placement(&self) -> pulse_wire::Placement<'_> {
+        pulse_wire::Placement {
+            holdout: self
+                .holdout_id
+                .as_deref()
+                .map(|id| pulse_wire::HoldoutGate {
+                    id,
+                    bps: self.holdout_bps,
+                }),
+            layer: self.layer_id.as_deref().map(|id| pulse_wire::LayerGate {
+                id,
+                start_bps: self.layer_start_bps,
+                end_bps: self.layer_end_bps,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1025,11 +1054,12 @@ impl PulseClient {
                 cohort_id,
                 member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
             });
-        Ok(evaluate_flag_rule(
+        Ok(pulse_wire::evaluate_placed_flag_rule(
             &rule.key,
             rule.enabled,
             rule.rollout_bps,
             gate,
+            rule.placement(),
             rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
             &did,
         ))
@@ -1048,6 +1078,23 @@ impl PulseClient {
             {
                 let props = serde_json::json!({ "flag_key": flag_key, "variant": v }).to_string();
                 self.track("$experiment_started".to_string(), props)?;
+            }
+        }
+        // Once per holdout, whether or not a variant was served: both groups are "users who
+        // reached a flag in this holdout", so comparing them measures the flags' total effect.
+        let holdout = track_exposure
+            .then(|| {
+                let cache = self.flag_cache.read();
+                let rule = cache.rules.get(&flag_key)?;
+                let gate = rule.placement().holdout?;
+                Some((gate.id.to_string(), gate.holds_out(&self.distinct_id())))
+            })
+            .flatten();
+        if let Some((id, held)) = holdout {
+            if !self.is_opted_out() && self.exposures_sent.lock().insert(format!("holdout:{id}")) {
+                let group = if held { "holdout" } else { "exposed" };
+                let props = serde_json::json!({ "holdout_id": id, "group": group }).to_string();
+                self.track("$holdout_assigned".to_string(), props)?;
             }
         }
         Ok(variant)
@@ -2045,6 +2092,9 @@ mod tests {
                     key: "b".into(),
                     weight_bps: 10_000,
                 }],
+                // A 0 bps holdout holds no one back, so this user reports as "exposed".
+                holdout_id: Some("hld_q4".into()),
+                ..Default::default()
             },
         );
         let exposures = || {
@@ -2085,6 +2135,15 @@ mod tests {
             None
         );
         assert_eq!(exposures(), 1);
+        let holdout: Vec<String> = client
+            .event_ring
+            .lock()
+            .iter()
+            .filter(|e| e.event_name == "$holdout_assigned")
+            .map(|e| format!("{:?}", e.props))
+            .collect();
+        assert_eq!(holdout.len(), 1, "one $holdout_assigned per holdout");
+        assert!(holdout[0].contains("exposed") && holdout[0].contains("hld_q4"));
     }
 
     /// Stale flags refresh in the background, so a rollback reaches a running app.

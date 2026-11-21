@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use pulse_wire::{evaluate_flag_rule, flag_rollout_slot, flag_variant_slot};
+use pulse_wire::{
+    evaluate_flag_rule, flag_rollout_slot, flag_variant_slot, holdout_slot, layer_slot,
+};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -12,6 +14,10 @@ struct BucketingVector {
     rollout_slot: u32,
     variant_slot_10000: u32,
     variant_50_50: String,
+    /// `holdout_slot(flag_key, distinct_id)`: the flag key doubles as the holdout id.
+    holdout_slot: u32,
+    /// `layer_slot(flag_key, distinct_id)`.
+    layer_slot: u32,
 }
 
 fn vectors_file_path() -> PathBuf {
@@ -52,6 +58,8 @@ fn shared_bucketing_test_vectors_match_rust_xxh3_64() {
             )
             .unwrap();
             BucketingVector {
+                holdout_slot: holdout_slot(fk, &did),
+                layer_slot: layer_slot(fk, &did),
                 flag_key: fk.to_string(),
                 distinct_id: did,
                 xxh3_rollout_hex: format!("{h:016x}"),

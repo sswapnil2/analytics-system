@@ -38,6 +38,11 @@ Properties are passed as a JSON object string. Errors come back as `SdkError` (`
 Experiment results count users who sent `$experiment_started` with `flag_key` and `variant`
 properties: call `get_variant(key, true)` where the user first sees the variant.
 
+Holdouts and layers are applied here as in the web SDK: a user in a flag's holdout gets no variant,
+a flag in a layer only reaches its slice, and `get_variant(key, true)` on a flag in a holdout also
+sends `$holdout_assigned` once per holdout. Apps on older builds serve held-out users anyway, so
+ship this version everywhere before using holdouts or layers.
+
 In Swift and Kotlin the names are camel-cased (`registerSuperProps`, `recordWireframeSnapshot`, …).
 
 ## Build and bind (iOS example)

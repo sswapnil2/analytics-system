@@ -259,6 +259,38 @@ pub struct FeatureFlag {
     pub targeting_cohort_id: Option<String>,
     pub variants: Vec<VariantAllocation>,
     pub updated_at_ms: i64,
+    /// Users in this holdout get no variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout: Option<FlagHoldout>,
+    /// The flag only reaches users in this slice of a layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<FlagLayer>,
+}
+
+/// Copied onto the flag so the bundle needs no lookup; a holdout's share never changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlagHoldout {
+    pub id: String,
+    pub bps: u32,
+}
+
+/// `[start_bps, end_bps)` of `pulse_wire::layer_slot(id, user)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlagLayer {
+    pub id: String,
+    pub start_bps: u32,
+    pub end_bps: u32,
+}
+
+/// A holdout (`kind = "holdout"`, `bps` = share held back) or a layer (`kind = "layer"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficGroup {
+    pub id: String,
+    pub project_id: String,
+    pub kind: String,
+    pub name: String,
+    pub bps: u32,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -587,10 +619,44 @@ pub struct EdgeFlagRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort_member_hashes: Option<Vec<String>>,
     pub variants: Vec<VariantAllocation>,
+    /// Holdout and layer gates, read by SDKs that know `schema_version` 2. Older SDKs ignore
+    /// them and serve held-out users anyway, so check minimum SDK versions before relying on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_start_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_end_bps: Option<u32>,
+}
+
+impl EdgeFlagRule {
+    pub fn placement(&self) -> pulse_wire::Placement<'_> {
+        pulse_wire::Placement {
+            holdout: self
+                .holdout_id
+                .as_deref()
+                .map(|id| pulse_wire::HoldoutGate {
+                    id,
+                    bps: self.holdout_bps.unwrap_or(0),
+                }),
+            layer: self.layer_id.as_deref().map(|id| pulse_wire::LayerGate {
+                id,
+                start_bps: self.layer_start_bps.unwrap_or(0),
+                end_bps: self.layer_end_bps.unwrap_or(0),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeFlagBundle {
+    /// 2 adds holdout and layer gates to rules.
+    #[serde(default)]
+    pub schema_version: u32,
     pub project_id: String,
     pub etag: String,
     pub generated_at_ms: i64,

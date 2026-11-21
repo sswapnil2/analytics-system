@@ -49,10 +49,10 @@ use crate::models::{
     unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
     BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
-    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
-    KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    Experiment, ExperimentMetricSpec, ExperimentResults, FeatureFlag, FlagHoldout, FlagLayer,
+    GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project, Role, SavedReport,
+    SystemKeyringRecord, TrafficGroup, UserProfileRecord, VariantAllocation, WeightSnapshot,
+    BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -1491,6 +1491,26 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .route(
             "/v1/projects/:id/experiments/:exp_id/results",
             get(handle_experiment_results_scoped),
+        )
+        .route(
+            "/v1/projects/:id/holdouts",
+            get(handle_list_holdouts).post(handle_create_holdout),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id/results",
+            post(handle_holdout_results),
+        )
+        .route(
+            "/v1/projects/:id/layers",
+            get(handle_list_layers).post(handle_create_layer),
+        )
+        .route(
+            "/v1/projects/:id/layers/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
         )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
@@ -3438,8 +3458,19 @@ async fn handle_upsert_flag(
     }
 
     let actor = principal.actor_label();
+    let flag_id = format!("flg_{}_{}", id, req.key);
+    // Re-saving a flag keeps its holdout and layer slice; those change through their own routes.
+    let existing = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == flag_id);
     let flag = FeatureFlag {
-        id: format!("flg_{}_{}", id, req.key),
+        holdout: existing.as_ref().and_then(|f| f.holdout.clone()),
+        layer: existing.and_then(|f| f.layer),
+        id: flag_id,
         project_id: id,
         key: req.key,
         description: req.description,
@@ -3472,6 +3503,11 @@ struct PatchFlagReq {
     targeting_cohort_id: Option<String>,
     /// Replaces the variant split (e.g. shipping the winner at 10000 bps).
     variants: Option<Vec<VariantAllocation>>,
+    /// A holdout id to attach, or `""` to detach.
+    holdout_id: Option<String>,
+    /// Only `""`: leave the layer (e.g. when shipping to everyone). Joining one goes through an
+    /// experiment's `layer`, which picks a free slice.
+    layer_id: Option<String>,
 }
 
 async fn handle_patch_flag(
@@ -3523,6 +3559,47 @@ async fn handle_patch_flag(
         }
         found.variants = variants;
     }
+    if let Some(hid) = req.holdout_id {
+        found.holdout = if hid.is_empty() {
+            None
+        } else {
+            let groups = ctrl
+                .meta
+                .list_traffic_groups(&id, "holdout")
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(h) = groups.into_iter().find(|g| g.id == hid) else {
+                return Err(CtrlError::bad(format!("holdout '{hid}' does not exist")));
+            };
+            Some(FlagHoldout {
+                id: h.id,
+                bps: h.bps,
+            })
+        };
+    }
+    match req.layer_id.as_deref() {
+        None => {}
+        Some("") => found.layer = None,
+        Some(_) => {
+            return Err(CtrlError::bad(
+                "join a layer by starting an experiment with `layer`, which picks a free slice",
+            ))
+        }
+    }
+    if found.enabled {
+        if let Some(l) = &found.layer {
+            let taken = layer_slices(&ctrl, &id, &l.id, &found.id).await?;
+            if taken
+                .iter()
+                .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+            {
+                return Err(CtrlError::conflict(format!(
+                    "another live flag now uses this flag's slice of layer '{}'; start a new experiment on it to get a free slice",
+                    l.id
+                )));
+            }
+        }
+    }
     found.updated_at_ms = Utc::now().timestamp_millis();
     ctrl.meta
         .upsert_feature_flag(&found)
@@ -3532,10 +3609,313 @@ async fn handle_patch_flag(
         &principal.actor_label(),
         "flag.updated",
         &format!("project:{id}"),
-        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants }),
+        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants, "holdout": found.holdout, "layer": found.layer }),
     )
     .await;
     Ok(Json(found))
+}
+
+/// `(start_bps, end_bps, flag_key)` held by the enabled flags in `layer_id` other than
+/// `except_flag_id`, sorted. A disabled flag serves no one, so its slice is free to reuse.
+async fn layer_slices(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    layer_id: &str,
+    except_flag_id: &str,
+) -> Result<Vec<(u32, u32, String)>, CtrlError> {
+    let mut taken: Vec<(u32, u32, String)> = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .filter(|f| f.enabled && f.id != except_flag_id)
+        .filter_map(|f| {
+            f.layer
+                .filter(|l| l.id == layer_id)
+                .map(|l| (l.start_bps, l.end_bps, f.key))
+        })
+        .collect();
+    taken.sort();
+    Ok(taken)
+}
+
+/// The first gap of at least `need` bps between sorted `taken` slices.
+fn first_free_slice(taken: &[(u32, u32, String)], need: u32) -> Option<(u32, u32)> {
+    let mut cursor = 0u32;
+    for (s, e, _) in taken {
+        if s.saturating_sub(cursor) >= need {
+            break;
+        }
+        cursor = cursor.max(*e);
+    }
+    (10_000u32.saturating_sub(cursor) >= need).then(|| (cursor, cursor + need))
+}
+
+#[derive(Deserialize)]
+struct CreateTrafficGroupReq {
+    name: String,
+    /// Holdouts: the share of users held back, `0 < pct <= 50`.
+    #[serde(default)]
+    holdout_pct: f64,
+}
+
+async fn create_traffic_group(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+    req: CreateTrafficGroupReq,
+) -> ApiRes<TrafficGroup> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    let bps = if kind == "holdout" {
+        if !(req.holdout_pct > 0.0 && req.holdout_pct <= 50.0) {
+            return Err(CtrlError::bad("holdout_pct must be above 0 and at most 50"));
+        }
+        (req.holdout_pct * 100.0).round() as u32
+    } else {
+        0
+    };
+    let g = TrafficGroup {
+        id: format!(
+            "{}_{}",
+            &kind[..3],
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        project_id: project_id.to_string(),
+        kind: kind.to_string(),
+        name: name.to_string(),
+        bps,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .insert_traffic_group(&g)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        &format!("{kind}.created"),
+        &format!("project:{project_id}"),
+        json!({ "id": g.id, "name": g.name, "bps": g.bps }),
+    )
+    .await;
+    Ok(Json(g))
+}
+
+/// A group plus the flags in it (holdouts: attached flags; layers: each flag's slice).
+async fn list_traffic_groups_with_flags(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+) -> ApiRes<Vec<Value>> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let groups = ctrl
+        .meta
+        .list_traffic_groups(project_id, kind)
+        .await
+        .map_err(CtrlError::meta)?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let out = groups
+        .into_iter()
+        .map(|g| {
+            let members: Vec<Value> = flags
+                .iter()
+                .filter_map(|f| match kind {
+                    "holdout" => f.holdout.as_ref().filter(|h| h.id == g.id).map(|_| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled })
+                    }),
+                    _ => f.layer.as_ref().filter(|l| l.id == g.id).map(|l| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled, "start_bps": l.start_bps, "end_bps": l.end_bps })
+                    }),
+                })
+                .collect();
+            let used: u32 = flags
+                .iter()
+                .filter(|f| f.enabled)
+                .filter_map(|f| f.layer.as_ref().filter(|l| l.id == g.id))
+                .map(|l| l.end_bps - l.start_bps)
+                .sum();
+            let mut v = serde_json::to_value(&g).unwrap_or_default();
+            v["flags"] = json!(members);
+            if kind == "layer" {
+                v["free_bps"] = json!(10_000u32.saturating_sub(used));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn handle_list_holdouts(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "holdout").await
+}
+
+async fn handle_list_layers(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "layer").await
+}
+
+async fn handle_create_holdout(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "holdout", req).await
+}
+
+async fn handle_create_layer(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "layer", req).await
+}
+
+/// Deletes a holdout or layer no flag uses (409 otherwise).
+async fn handle_delete_traffic_group(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let users: Vec<&str> = flags
+        .iter()
+        .filter(|f| {
+            f.holdout.as_ref().is_some_and(|h| h.id == group_id)
+                || f.layer.as_ref().is_some_and(|l| l.id == group_id)
+        })
+        .map(|f| f.key.as_str())
+        .collect();
+    if !users.is_empty() {
+        return Err(CtrlError::conflict(format!(
+            "still used by {}; detach those flags first",
+            users.join(", ")
+        )));
+    }
+    if !ctrl
+        .meta
+        .delete_traffic_group(&id, &group_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{group_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "traffic_group.deleted",
+        &format!("project:{id}"),
+        json!({ "id": group_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": group_id })))
+}
+
+#[derive(Deserialize)]
+struct HoldoutResultsReq {
+    metric: ExperimentMetricSpec,
+    /// Defaults to when the holdout was created.
+    start_ts_ms: Option<i64>,
+    /// Defaults to now.
+    end_ts_ms: Option<i64>,
+}
+
+/// Users who reached any flag in the holdout ("exposed") against those held back ("holdout"),
+/// from `$holdout_assigned`: the combined effect of every attached flag.
+async fn handle_holdout_results(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+    Json(req): Json<HoldoutResultsReq>,
+) -> ApiRes<ExperimentResults> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    crate::experiments::validate_metric_spec(&req.metric).map_err(CtrlError::bad)?;
+    let Some(h) = ctrl
+        .meta
+        .list_traffic_groups(&id, "holdout")
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|g| g.id == group_id)
+    else {
+        return Err(CtrlError::not_found(format!(
+            "holdout '{group_id}' not found"
+        )));
+    };
+    let now = Utc::now().timestamp_millis();
+    let exp = Experiment {
+        id: h.id.clone(),
+        project_id: id.clone(),
+        name: h.name.clone(),
+        flag_id: h.id.clone(),
+        flag_key: h.id.clone(),
+        hypothesis: String::new(),
+        status: "running".to_string(),
+        start_ts_ms: req.start_ts_ms.unwrap_or(h.created_at_ms),
+        end_ts_ms: req.end_ts_ms.unwrap_or(now),
+        primary_metric: req.metric,
+        guardrail_metrics: Vec::new(),
+        // A holdout is read whenever someone looks, so its results must stay valid under peeking.
+        analysis: AnalysisConfig {
+            sequential: true,
+            ..AnalysisConfig::default()
+        },
+        created_at_ms: h.created_at_ms,
+        stop_reason: None,
+        kind: "holdout".to_string(),
+        bandit: None,
+    };
+    let groups = FeatureFlag {
+        id: h.id.clone(),
+        project_id: id,
+        key: h.id,
+        description: String::new(),
+        enabled: true,
+        rollout_pct: 100.0,
+        targeting_cohort_id: None,
+        variants: vec![
+            VariantAllocation {
+                key: "holdout".to_string(),
+                weight_bps: h.bps,
+                payload: Value::Null,
+            },
+            VariantAllocation {
+                key: "exposed".to_string(),
+                weight_bps: 10_000 - h.bps,
+                payload: Value::Null,
+            },
+        ],
+        updated_at_ms: now,
+        holdout: None,
+        layer: None,
+    };
+    let results =
+        crate::experiments::evaluate_experiment_results(&exp, Some(&groups), &ctrl.qengine, None)
+            .await
+            .map_err(CtrlError::internal)?;
+    Ok(Json(results))
 }
 
 /// How long a built flag bundle is reused when no flag changed; cohort membership can still move.
@@ -3637,6 +4017,16 @@ struct CreateExpReq {
     kind: Option<String>,
     #[serde(default)]
     bandit: Option<BanditConfig>,
+    /// Run in a slice of this layer, so no user is also in another of its experiments.
+    #[serde(default)]
+    layer: Option<ExperimentLayerReq>,
+}
+
+#[derive(Deserialize)]
+struct ExperimentLayerReq {
+    layer_id: String,
+    /// Share of the layer's users this experiment takes, `0 < pct <= 100`.
+    traffic_pct: f64,
 }
 
 async fn handle_create_experiment(
@@ -3718,6 +4108,54 @@ async fn handle_create_experiment(
     // (and a bandit rewrites the weights under the other one).
     if req.status.as_deref() != Some("concluded") {
         ensure_flag_free(&ctrl, &id, &req.flag_key, None).await?;
+    }
+    if let Some(lr) = &req.layer {
+        if !(lr.traffic_pct > 0.0 && lr.traffic_pct <= 100.0) {
+            return Err(CtrlError::bad(
+                "layer.traffic_pct must be above 0 and at most 100",
+            ));
+        }
+        let layers = ctrl
+            .meta
+            .list_traffic_groups(&id, "layer")
+            .await
+            .map_err(CtrlError::meta)?;
+        if !layers.iter().any(|l| l.id == lr.layer_id) {
+            return Err(CtrlError::bad(format!(
+                "layer '{}' does not exist",
+                lr.layer_id
+            )));
+        }
+        let flags = ctrl
+            .meta
+            .list_feature_flags(&id)
+            .await
+            .map_err(CtrlError::meta)?;
+        let Some(mut flag) = flags.into_iter().find(|f| f.key == req.flag_key) else {
+            return Err(CtrlError::bad(
+                "create the flag before starting an experiment in a layer",
+            ));
+        };
+        let need = ((lr.traffic_pct * 100.0).round() as u32).max(1);
+        let taken = layer_slices(&ctrl, &id, &lr.layer_id, &flag.id).await?;
+        let Some((start_bps, end_bps)) = first_free_slice(&taken, need) else {
+            let free = 10_000 - taken.iter().map(|(s, e, _)| e - s).sum::<u32>();
+            return Err(CtrlError::conflict(format!(
+                "layer has no free slice of {}% (free: {}%, possibly split); stop an experiment in it or ask for less",
+                lr.traffic_pct,
+                f64::from(free) / 100.0
+            )));
+        };
+        flag.layer = Some(FlagLayer {
+            id: lr.layer_id.clone(),
+            start_bps,
+            end_bps,
+        });
+        flag.updated_at_ms = Utc::now().timestamp_millis();
+        ctrl.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(CtrlError::meta)?;
     }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {

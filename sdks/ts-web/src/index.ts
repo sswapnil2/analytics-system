@@ -7,9 +7,9 @@
  * allowlisted via `data-pulse-unmask` (inputs and contenteditable remain masked unconditionally).
  */
 
-import { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 } from "./xxh3.js";
+import { cohortMemberHash, flagRolloutSlot, flagVariantSlot, holdoutSlot, layerSlot, xxh3_64 } from "./xxh3.js";
 
-export { cohortMemberHash, flagRolloutSlot, flagVariantSlot, xxh3_64 };
+export { cohortMemberHash, flagRolloutSlot, flagVariantSlot, holdoutSlot, layerSlot, xxh3_64 };
 
 export type PropPrimitive = string | number | boolean | null;
 export type EventProperties = Record<string, PropPrimitive>;
@@ -141,6 +141,18 @@ export interface EdgeFlagRule {
   /** Sorted `cohortMemberHash(targeting_cohort_id, distinctId)` of the cohort's members. */
   cohort_member_hashes?: string[];
   variants: Array<{ key: string; weight_bps: number; payload?: unknown }>;
+  /** Users with `holdoutSlot(holdout_id, id) < holdout_bps` get no variant. */
+  holdout_id?: string;
+  holdout_bps?: number;
+  /** Only users with `layerSlot(layer_id, id)` in `[layer_start_bps, layer_end_bps)` get a variant. */
+  layer_id?: string;
+  layer_start_bps?: number;
+  layer_end_bps?: number;
+}
+
+/** Whether `distinctId` is in the rule's holdout. */
+export function inHoldout(rule: EdgeFlagRule, distinctId: string): boolean {
+  return !!rule.holdout_id && holdoutSlot(rule.holdout_id, distinctId) < (rule.holdout_bps ?? 0);
 }
 
 interface PersistedWebState {
@@ -226,6 +238,11 @@ export function maskPiiText(raw: string, explicitlyUnmasked = false): string {
 
 export function evaluateEdgeFlag(rule: EdgeFlagRule, distinctId: string): string | null {
   if (!rule.enabled || rule.rollout_bps <= 0) return null;
+  if (inHoldout(rule, distinctId)) return null;
+  if (rule.layer_id) {
+    const slot = layerSlot(rule.layer_id, distinctId);
+    if (slot < (rule.layer_start_bps ?? 0) || slot >= (rule.layer_end_bps ?? 0)) return null;
+  }
   // A targeted rule with no hashes matches no one (fail closed).
   if (rule.targeting_cohort_id) {
     const hashes = rule.cohort_member_hashes ?? [];
@@ -1306,6 +1323,21 @@ export class PulseWebClient {
     this.track("$experiment_started", { flag_key: flagKey, variant });
   }
 
+  /**
+   * `$holdout_assigned` once per holdout, whether or not the user got a variant: both groups are
+   * "users who reached a flag in this holdout", so comparing them measures the flags' total effect.
+   */
+  private trackHoldout(rule: EdgeFlagRule): void {
+    const id = rule.holdout_id;
+    if (this.optedOut || !id) return;
+    const dedupKey = `holdout:${id}`;
+    if (this.exposuresSent.has(dedupKey)) return;
+    this.exposuresSent.add(dedupKey);
+    this.persistState();
+    const group = inHoldout(rule, this.getDistinctId()) ? "holdout" : "exposed";
+    this.track("$holdout_assigned", { holdout_id: id, group });
+  }
+
   public async getVariant(
     flagKey: string,
     options?: { trackExposure?: boolean },
@@ -1317,6 +1349,8 @@ export class PulseWebClient {
     if (options?.trackExposure && variant) {
       this.trackExposure(flagKey, variant);
     }
+    const rule = this.flagRules.get(flagKey);
+    if (options?.trackExposure && rule?.holdout_id) this.trackHoldout(rule);
     return variant;
   }
 

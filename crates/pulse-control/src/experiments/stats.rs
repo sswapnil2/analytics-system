@@ -345,8 +345,11 @@ pub fn compute_estimate_table(
     estimates: &BTreeMap<String, Estimate>,
     opts: LiftOptions,
 ) -> Vec<VariantLiftRow> {
-    let control_key = if estimates.contains_key("control") {
-        "control".to_string()
+    let control_key = if let Some(k) = ["control", "holdout"]
+        .into_iter()
+        .find(|k| estimates.contains_key(*k))
+    {
+        k.to_string()
     } else {
         estimates.keys().next().cloned().unwrap_or_default()
     };
@@ -435,8 +438,11 @@ pub fn compute_lift_table(
     counts_by_variant: &BTreeMap<String, (u64, u64)>,
     opts: LiftOptions,
 ) -> Vec<VariantLiftRow> {
-    let control_key = if counts_by_variant.contains_key("control") {
-        "control".to_string()
+    let control_key = if let Some(k) = ["control", "holdout"]
+        .into_iter()
+        .find(|k| counts_by_variant.contains_key(*k))
+    {
+        k.to_string()
     } else {
         counts_by_variant
             .keys()

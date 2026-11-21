@@ -94,6 +94,13 @@ or `getVariant(key, { trackExposure: true })`; repeat exposures of the same vari
 Flags are re-checked in the background once they are older than `flagsTtlMs`; reads never wait for
 that fetch, so a change shows up on the read after it lands.
 
+Holdouts and layers are applied on the client too: a user in a flag's holdout gets `null`, and a
+flag in a layer only reaches users in its slice. With `trackExposure`, reading a flag in a holdout
+also sends `$holdout_assigned` (`holdout_id`, `group`: `holdout` or `exposed`) once per holdout,
+which is what holdout results count. Older SDKs ignore these gates and serve every user, so update
+every app before attaching flags to a holdout or a layer (bundles with gates carry
+`schema_version: 2`).
+
 ## Session replay
 
 Replay records wireframes (element boxes and masked labels), not pixels or HTML. Current limits to know:

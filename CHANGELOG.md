@@ -14,6 +14,9 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Experiment results can be split by a property (country, plan, …) and show lift over time.
 - Experiment results show the setup at a glance (metric, guardrails, flag split, audience, dates), progress toward the planned sample, the absolute difference from control, a traffic-split check, and a clear "no data, check tracking" state for metrics nobody has sent yet.
 
+- Holdouts: keep a share of users off a set of flags, even after shipping, and measure what those flags added up to against them.
+- Layers: experiments in the same layer never share a user, so tests on the same page don't affect each other. Each experiment gets its own slice of the layer's users.
+
 ### Changed
 - A flag can back only one running or paused experiment at a time; a second one is refused with 409 until the first is stopped.
 - New flags from the Studio start off. Starting an experiment turns its flag on, and the Studio asks before you toggle, retarget or re-roll a flag a live experiment uses.

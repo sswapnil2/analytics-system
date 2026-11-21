@@ -175,6 +175,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         enabled: true,
         rollout_pct: 50.0,
         targeting_cohort_id: None,
+        holdout: None,
+        layer: None,
         variants: vec![
             VariantAllocation {
                 key: "control".to_string(),

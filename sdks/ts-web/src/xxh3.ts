@@ -269,6 +269,16 @@ export function cohortMemberHash(cohortId: string, distinctId: string): string {
   return xxh3_64(`cohort:${cohortId}:${distinctId}`).toString(16).padStart(16, "0");
 }
 
+/** Matches `pulse_wire::holdout_slot`: `xxh3_64("holdout:{id}:{distinctId}") % 10000`. */
+export function holdoutSlot(holdoutId: string, distinctId: string): number {
+  return Number(xxh3_64(`holdout:${holdoutId}:${distinctId}`) % 10000n);
+}
+
+/** Matches `pulse_wire::layer_slot`: `xxh3_64("layer:{id}:{distinctId}") % 10000`. */
+export function layerSlot(layerId: string, distinctId: string): number {
+  return Number(xxh3_64(`layer:${layerId}:${distinctId}`) % 10000n);
+}
+
 export function flagVariantSlot(flagKey: string, distinctId: string, totalWeight: number): number {
   if (totalWeight <= 0) return 0;
   return Number(xxh3_64(`var:${flagKey}:${distinctId}`) % BigInt(totalWeight));

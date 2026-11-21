@@ -5,7 +5,7 @@ use pulse_exec::{
     ExecError, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricValue,
     PropPredicate, QueryEngine, TimeRange,
 };
-use pulse_wire::{cohort_member_hash, evaluate_flag_rule, CohortGate, PropValue};
+use pulse_wire::{cohort_member_hash, CohortGate, PropValue};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub mod bandit;
@@ -34,11 +34,12 @@ pub fn evaluate_edge_flag(rule: &EdgeFlagRule, distinct_id: &str) -> Option<Stri
             cohort_id,
             member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
         });
-    evaluate_flag_rule(
+    pulse_wire::evaluate_placed_flag_rule(
         &rule.key,
         rule.enabled,
         rule.rollout_bps,
         gate,
+        rule.placement(),
         rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
         distinct_id,
     )
@@ -60,15 +61,7 @@ pub fn build_edge_flag_bundle(
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string());
             let empty = cohort_id.as_ref().map(|_| Vec::new());
-            EdgeFlagRule {
-                key: f.key.clone(),
-                enabled: f.enabled,
-                rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
-                targeting_cohort_id: cohort_id,
-                cohort_members: empty.clone(),
-                cohort_member_hashes: empty,
-                variants: f.variants.clone(),
-            }
+            edge_rule(f, cohort_id, empty)
         })
         .collect();
     finalize_bundle(project_id, rules, now_ms)
@@ -110,24 +103,38 @@ pub async fn build_edge_flag_bundle_with_cohorts(
             None
         };
 
-        rules.push(EdgeFlagRule {
-            key: f.key.clone(),
-            enabled: f.enabled,
-            rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
-            cohort_members: cohort_id.as_ref().map(|_| Vec::new()),
-            targeting_cohort_id: cohort_id,
-            cohort_member_hashes,
-            variants: f.variants.clone(),
-        });
+        rules.push(edge_rule(f, cohort_id, cohort_member_hashes));
     }
 
     Ok(finalize_bundle(project_id, rules, now_ms))
+}
+
+fn edge_rule(
+    f: &FeatureFlag,
+    targeting_cohort_id: Option<String>,
+    cohort_member_hashes: Option<Vec<String>>,
+) -> EdgeFlagRule {
+    EdgeFlagRule {
+        key: f.key.clone(),
+        enabled: f.enabled,
+        rollout_bps: ((f.rollout_pct.clamp(0.0, 100.0) * 100.0).round()) as u32,
+        cohort_members: targeting_cohort_id.as_ref().map(|_| Vec::new()),
+        targeting_cohort_id,
+        cohort_member_hashes,
+        variants: f.variants.clone(),
+        holdout_id: f.holdout.as_ref().map(|h| h.id.clone()),
+        holdout_bps: f.holdout.as_ref().map(|h| h.bps),
+        layer_id: f.layer.as_ref().map(|l| l.id.clone()),
+        layer_start_bps: f.layer.as_ref().map(|l| l.start_bps),
+        layer_end_bps: f.layer.as_ref().map(|l| l.end_bps),
+    }
 }
 
 fn finalize_bundle(project_id: &str, rules: Vec<EdgeFlagRule>, now_ms: i64) -> EdgeFlagBundle {
     let json_bytes = serde_json::to_vec(&rules).unwrap_or_default();
     let etag = format!("W/\"{:016x}\"", xxh3_64(&json_bytes));
     EdgeFlagBundle {
+        schema_version: 2,
         project_id: project_id.to_string(),
         etag,
         generated_at_ms: now_ms,
@@ -496,17 +503,23 @@ fn metric_query(
         7 * 86_400_000
     };
 
+    // A holdout's "experiment" is keyed by holdout id, and its groups are "holdout" / "exposed".
+    let (exposure_event, id_prop, variant_prop) = if exp.kind == "holdout" {
+        ("$holdout_assigned", "holdout_id", "group")
+    } else {
+        ("$experiment_started", "flag_key", "variant")
+    };
     ExperimentMetricQuery {
         time_range: TimeRange {
             start_ts_ms: exp.start_ts_ms,
             end_ts_ms: exp.end_ts_ms,
         },
-        exposure_event: "$experiment_started".to_string(),
+        exposure_event: exposure_event.to_string(),
         exposure_filters: vec![PropPredicate {
-            prop_name: "flag_key".to_string(),
+            prop_name: id_prop.to_string(),
             filter: pulse_exec::PropFilterOp::Eq(PropValue::Str(exp.flag_key.clone())),
         }],
-        variant_prop: "variant".to_string(),
+        variant_prop: variant_prop.to_string(),
         segment_by: segment_by.map(str::to_string),
         metric: metric_event(
             &metric.event_name,

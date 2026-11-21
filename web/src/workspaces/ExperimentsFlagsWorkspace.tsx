@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
-import { api, Experiment, ExperimentKind, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricType, VariantLiftRow } from "../api/client";
+import { api, Experiment, ExperimentKind, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
+import { HoldoutsAndLayers } from "../components/HoldoutsAndLayers";
 import { BanditResultsView } from "../components/BanditResults";
 import { LiftChart } from "../components/LiftChart";
 import { useCohortNames } from "../components/FilterPanel";
@@ -100,6 +101,8 @@ const ExperimentSetup: React.FC<{
         <code className="font-mono">{flag.key}</code> · {flag.enabled ? "on" : "off"} · {Math.round(flag.rollout_pct)}% of{" "}
         {flag.targeting_cohort_id ? `users in ${cohortName(flag.targeting_cohort_id)}` : "everyone"} · split{" "}
         {flag.variants.map((v) => `${v.key} ${formatPercent(v.weight_bps / 10_000, 0)}`).join(" / ")}
+        {flag.layer && ` · ${formatPercent((flag.layer.end_bps - flag.layer.start_bps) / 10_000, 0)} of a layer`}
+        {flag.holdout && ` · ${formatPercent(flag.holdout.bps / 10_000, 0)} held out`}
       </>
     ) : (
       <code className="font-mono">{exp.flag_key}</code>
@@ -256,6 +259,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [acting, setActing] = useState(false);
   const [flags, setFlags] = useState<FeatureFlag[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [holdouts, setHoldouts] = useState<TrafficGroup[]>([]);
+  const [layers, setLayers] = useState<TrafficGroup[]>([]);
   const [selectedExpId, setSelectedExpId] = useState<string>("");
   const [expResults, setExpResults] = useState<ExperimentResults | null>(null);
   const [newFlagKey, setNewFlagKey] = useState<string>("");
@@ -295,6 +300,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expAutoStop, setExpAutoStop] = useState(true);
   const [expWindowDays, setExpWindowDays] = useState(7);
   const [expDays, setExpDays] = useState(14);
+  const [expLayerId, setExpLayerId] = useState("");
+  const [expLayerPct, setExpLayerPct] = useState(50);
   const [expError, setExpError] = useState<string | null>(null);
   const baseline = useBaseline(projectId, expFormOpen ? expMetric : "");
   // A validation message is about the fields as they were; drop it once any of them changes.
@@ -320,12 +327,16 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setLoading(true);
     setLoadError(null);
     try {
-      const [fList, eList] = await Promise.all([
+      const [fList, eList, hList, lList] = await Promise.all([
         api.getFlags(projectId),
         api.getExperiments(projectId),
+        api.listTrafficGroups(projectId, "holdouts"),
+        api.listTrafficGroups(projectId, "layers"),
       ]);
       setFlags(fList);
       setExperiments(eList);
+      setHoldouts(hList);
+      setLayers(lList);
       const cur = selectedExpIdRef.current;
       const targetExp = eList.some((e) => e.id === cur) ? cur : eList[0]?.id || "";
       if (targetExp !== cur) {
@@ -438,6 +449,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpGuardrailDirection("increase_is_bad");
     setExpKind("ab");
     setExpLowerIsBetter(false);
+    setExpLayerId("");
     setExpError(null);
   };
 
@@ -490,6 +502,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         end_ts_ms: now + expDays * DAY_MS,
         primary_metric: primary,
         kind: expKind,
+        layer: expLayerId ? { layer_id: expLayerId, traffic_pct: expLayerPct } : null,
         guardrail_metrics: expGuardrail && !bandit
           ? [{ ...metric(expGuardrail, expGuardrailDirection), auto_stop: expAutoStop && expSequential }]
           : [],
@@ -543,6 +556,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
         const updated = await api.patchFlag(projectId, flag.id, {
           enabled: true,
           rollout_pct: 100,
+          // Leave the layer so the winner reaches everyone, not just this experiment's slice.
+          ...(flag.layer ? { layer_id: "" as const } : {}),
           variants: flag.variants.map((v) => ({ key: v.key, weight_bps: v.key === winner ? 10_000 : 0 })),
         });
         setFlags((prev) => prev.map((f) => (f.id === flag.id ? updated : f)));
@@ -781,6 +796,41 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   ))}
                 </select>
               </label>
+              )}
+              {layers.length > 0 && (
+                <div className="flex flex-col gap-1 sm:col-span-2">
+                  <span className={fieldLabel}>Layer</span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select aria-label="Layer" value={expLayerId} onChange={(e) => setExpLayerId(e.target.value)} className={field}>
+                      <option value="">None: can overlap other experiments</option>
+                      {layers.map((l) => (
+                        <option key={l.id} value={l.id}>
+                          {l.name} ({formatPercent((l.free_bps ?? 0) / 10_000, 0)} free)
+                        </option>
+                      ))}
+                    </select>
+                    {expLayerId && (
+                      <label className="flex items-center gap-2 text-sm text-ink-2">
+                        Use
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={expLayerPct}
+                          onChange={(e) => setExpLayerPct(Number(e.target.value))}
+                          className={`${field} w-20`}
+                        />
+                        % of the layer's users
+                      </label>
+                    )}
+                  </div>
+                  {expLayerId && (
+                    <span className="text-xs text-muted">
+                      No one in this experiment is in another experiment of the same layer. It gets a free slice, or an
+                      error if there isn't one that big.
+                    </span>
+                  )}
+                </div>
               )}
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Run for</span>
@@ -1396,6 +1446,34 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       </select>
                     </label>
 
+                    {holdouts.length > 0 && (
+                      <label className="flex min-w-0 max-w-full items-center gap-2">
+                        <span className={fieldLabel}>Holdout</span>
+                        <select
+                          value={f.holdout?.id ?? ""}
+                          disabled={!canEdit}
+                          onChange={(e) => {
+                            if (confirmFlagChange(f, "Changing the holdout"))
+                              void patchFlag(f, { holdout_id: e.target.value });
+                          }}
+                          className={`${field} min-w-0 max-w-full py-1`}
+                        >
+                          <option value="">None</option>
+                          {holdouts.map((h) => (
+                            <option key={h.id} value={h.id}>
+                              {h.name} ({formatPercent(h.bps / 10_000, 0)} held back)
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {f.layer && (
+                      <span className="rounded bg-hover px-2 py-0.5 text-xs text-muted">
+                        {layers.find((l) => l.id === f.layer?.id)?.name ?? "Layer"} ·{" "}
+                        {formatPercent((f.layer.end_bps - f.layer.start_bps) / 10_000, 0)} of its users
+                      </span>
+                    )}
+
                     <div className="flex w-full items-center gap-3 sm:w-auto">
                       <label htmlFor={sliderId} className={fieldLabel}>
                         Rollout
@@ -1468,6 +1546,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           </form>}
         </div>
       </Panel>
+
+      <HoldoutsAndLayers
+        projectId={projectId}
+        holdouts={holdouts}
+        layers={layers}
+        events={availableEvents}
+        canEdit={canEdit}
+        onChanged={loadAll}
+      />
     </div>
   );
 };

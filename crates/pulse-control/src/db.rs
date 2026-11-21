@@ -14,7 +14,7 @@ use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
     LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
-    SystemKeyringRecord, User, UserProfileRecord, WeightSnapshot,
+    SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
 };
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
@@ -797,10 +797,12 @@ impl MetaStore {
     pub async fn upsert_feature_flag(&self, f: &FeatureFlag) -> Result<(), MetaError> {
         let en = i32::from(f.enabled);
         let vjson = serde_json::to_string(&f.variants).unwrap_or_else(|_| "[]".into());
+        let placement = (f.holdout.is_some() || f.layer.is_some())
+            .then(|| serde_json::json!({ "holdout": f.holdout, "layer": f.layer }).to_string());
         let affected = db_exec!(
             self,
-            "INSERT INTO feature_flags (id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO feature_flags (id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms, placement_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 flag_key = excluded.flag_key,
                 description = excluded.description,
@@ -808,7 +810,8 @@ impl MetaStore {
                 rollout_pct = excluded.rollout_pct,
                 targeting_cohort_id = excluded.targeting_cohort_id,
                 variants_json = excluded.variants_json,
-                updated_at_ms = excluded.updated_at_ms
+                updated_at_ms = excluded.updated_at_ms,
+                placement_json = excluded.placement_json
              WHERE feature_flags.project_id = excluded.project_id",
             &f.id,
             &f.project_id,
@@ -819,6 +822,7 @@ impl MetaStore {
             &f.targeting_cohort_id,
             &vjson,
             f.updated_at_ms,
+            &placement,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -835,11 +839,17 @@ impl MetaStore {
     ) -> Result<Vec<FeatureFlag>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms
+            "SELECT id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms, placement_json
              FROM feature_flags WHERE project_id = ? ORDER BY flag_key ASC",
             |r| {
                 let vstr: String = r.get("variants_json");
+                let placement: serde_json::Value = r
+                    .get::<Option<String>, _>("placement_json")
+                    .and_then(|p| serde_json::from_str(&p).ok())
+                    .unwrap_or_default();
                 FeatureFlag {
+                    holdout: serde_json::from_value(placement["holdout"].clone()).ok().flatten(),
+                    layer: serde_json::from_value(placement["layer"].clone()).ok().flatten(),
                     id: r.get("id"),
                     project_id: r.get("project_id"),
                     key: r.get("flag_key"),
@@ -1141,6 +1151,61 @@ impl MetaStore {
             end_ms,
         );
         Ok(rows)
+    }
+
+    pub async fn insert_traffic_group(&self, g: &TrafficGroup) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "INSERT INTO traffic_groups (id, project_id, kind, name, bps, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            g.id.as_str(),
+            g.project_id.as_str(),
+            g.kind.as_str(),
+            g.name.as_str(),
+            g.bps as i64,
+            g.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Holdouts (`kind = "holdout"`) or layers (`"layer"`), oldest first.
+    pub async fn list_traffic_groups(
+        &self,
+        project_id: &str,
+        kind: &str,
+    ) -> Result<Vec<TrafficGroup>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, kind, name, bps, created_at_ms FROM traffic_groups
+             WHERE project_id = ? AND kind = ? ORDER BY created_at_ms ASC",
+            |r| {
+                TrafficGroup {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    kind: r.get("kind"),
+                    name: r.get("name"),
+                    bps: r.get::<i64, _>("bps") as u32,
+                    created_at_ms: r.get("created_at_ms"),
+                }
+            },
+            project_id,
+            kind,
+        );
+        Ok(rows)
+    }
+
+    pub async fn delete_traffic_group(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM traffic_groups WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
     }
 
     pub async fn delete_annotation(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {

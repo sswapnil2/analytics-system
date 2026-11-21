@@ -13,6 +13,8 @@ import {
   flagVariantSlot,
   maskPiiText,
   xxh3_64,
+  holdoutSlot,
+  layerSlot,
 } from "../dist/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +42,26 @@ test("P2-03: TypeScript xxh3_64 and bucketing match shared Rust test vectors 100
       v.distinct_id,
     );
     assert.equal(chosen, v.variant_50_50);
+    assert.equal(holdoutSlot(v.flag_key, v.distinct_id), v.holdout_slot);
+    assert.equal(layerSlot(v.flag_key, v.distinct_id), v.layer_slot);
   }
+});
+
+test("Holdouts and layers: held-out users get nothing, layer ranges never overlap", () => {
+  const base = { key: "f", enabled: true, rollout_bps: 10000, variants: [{ key: "a", weight_bps: 10000 }] };
+  let held = 0;
+  for (let i = 0; i < 5000; i++) {
+    const id = `u${i}`;
+    const h = evaluateEdgeFlag({ ...base, holdout_id: "h", holdout_bps: 1000 }, id);
+    if (h === null) {
+      held++;
+      assert.ok(holdoutSlot("h", id) < 1000);
+    }
+    const a = evaluateEdgeFlag({ ...base, layer_id: "l", layer_start_bps: 0, layer_end_bps: 4000 }, id);
+    const b = evaluateEdgeFlag({ ...base, layer_id: "l", layer_start_bps: 4000, layer_end_bps: 10000 }, id);
+    assert.ok((a === null) !== (b === null), `${id} must be in exactly one layer range`);
+  }
+  assert.ok(held > 400 && held < 600, `10% holdout held ${held} of 5000`);
 });
 
 test("P2-02: evaluateEdgeFlag gates on hashed cohort members, never raw ids", () => {

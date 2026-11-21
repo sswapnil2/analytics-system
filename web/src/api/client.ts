@@ -277,6 +277,22 @@ export interface FeatureFlag {
   targeting_cohort_id: string | null;
   variants: { key: string; weight_bps: number; payload?: unknown }[];
   updated_at_ms: number;
+  /** Users in this holdout get no variant. */
+  holdout?: { id: string; bps: number };
+  /** The flag only reaches this slice of the layer's users. */
+  layer?: { id: string; start_bps: number; end_bps: number };
+}
+
+/** A holdout (`bps` held back) or a layer, with the flags in it. */
+export interface TrafficGroup {
+  id: string;
+  kind: "holdout" | "layer";
+  name: string;
+  bps: number;
+  created_at_ms: number;
+  flags: { flag_key: string; enabled: boolean; start_bps?: number; end_bps?: number }[];
+  /** Layers: share no live flag uses yet. */
+  free_bps?: number;
 }
 
 export interface FlagPatch {
@@ -285,6 +301,10 @@ export interface FlagPatch {
   /** A cohort id, or "" for everyone. */
   targeting_cohort_id?: string;
   variants?: { key: string; weight_bps: number }[];
+  /** A holdout id, or "" to detach. */
+  holdout_id?: string;
+  /** Only "": leave the layer. */
+  layer_id?: "";
 }
 
 export interface Experiment {
@@ -1172,6 +1192,7 @@ export const api = {
       guardrail_metrics: ExperimentMetric[];
       analysis: ExperimentAnalysis;
       kind?: ExperimentKind;
+      layer?: { layer_id: string; traffic_pct: number } | null;
       bandit?: BanditConfig;
     },
   ) =>
@@ -1191,6 +1212,22 @@ export const api = {
 
   getExperiments: (projectId: string) =>
     fetchJson<Experiment[]>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`),
+
+  listTrafficGroups: (projectId: string, kind: "holdouts" | "layers") =>
+    fetchJson<TrafficGroup[]>(projectPath(projectId, `/${kind}`)),
+
+  createTrafficGroup: (projectId: string, kind: "holdouts" | "layers", body: { name: string; holdout_pct?: number }) =>
+    fetchJson<TrafficGroup>(projectPath(projectId, `/${kind}`), { method: "POST", body: JSON.stringify(body) }),
+
+  deleteTrafficGroup: (projectId: string, kind: "holdouts" | "layers", id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/${kind}/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  /** Exposed users against held-back users, on any metric. */
+  getHoldoutResults: (projectId: string, id: string, metric: ExperimentMetric, startTsMs: number) =>
+    fetchJson<ExperimentResults>(projectPath(projectId, `/holdouts/${encodeURIComponent(id)}/results`), {
+      method: "POST",
+      body: JSON.stringify({ metric, start_ts_ms: startTsMs }),
+    }),
 
   getExperimentResults: (projectId: string, expId: string, segment?: string) =>
     fetchJson<ExperimentResults>(
