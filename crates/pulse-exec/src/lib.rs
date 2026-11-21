@@ -19,7 +19,7 @@ pub use catalog::{
 pub use engine::{ExportedEventRow, QueryEngine};
 pub use experiment::{
     ExperimentDailyPoint, ExperimentEngine, ExperimentMetricEvent, ExperimentMetricQuery,
-    ExperimentMetricResult, ExperimentSegmentGroup, MetricMoments, MetricValue,
+    ExperimentMetricResult, ExperimentSegmentGroup, MetricMoments, MetricSequence, MetricValue,
 };
 pub use flows::FlowsEngine;
 pub use funnel::FunnelEngine;

@@ -1931,6 +1931,7 @@ async fn experiment_metric_query_obeys_row_and_memory_budgets() {
         denominator: None,
         window_ms: 3_600_000,
         pre_window_ms: 0,
+        sequence: None,
     };
 
     let ok = qengine

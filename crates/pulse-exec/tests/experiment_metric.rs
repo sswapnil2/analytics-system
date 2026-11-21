@@ -8,8 +8,8 @@ use std::time::Duration;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 use pulse_exec::{
-    CatalogRegistry, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricValue,
-    PropFilterOp, PropPredicate, QueryEngine, TimeRange,
+    CatalogRegistry, ExperimentMetricEvent, ExperimentMetricQuery, MetricMoments, MetricSequence,
+    MetricValue, PropFilterOp, PropPredicate, QueryEngine, TimeRange,
 };
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{IdentifyRequest, InMemoryGovernance, IngestService};
@@ -116,6 +116,7 @@ fn query(value: MetricValue, ratio: bool, segment: bool) -> ExperimentMetricQuer
         }),
         window_ms: 24 * HOUR,
         pre_window_ms: 48 * HOUR,
+        sequence: None,
     }
 }
 
@@ -208,12 +209,36 @@ fn oracle(world: &World, q: &ExperimentMetricQuery) -> Expected {
                 e.name == "Purchase" && e.ts < anchor.ts && e.ts >= anchor.ts - q.pre_window_ms
             })
             .collect();
-        let y = fin(&q.metric.value, &post("Purchase"));
-        let x = fin(&q.metric.value, &pre);
-        let d = if q.denominator.is_some() {
-            post("Visit").len() as f64
+        let (y, x, d) = if let Some(seq) = q.sequence {
+            // "from" = first Visit in the window, "to" = first Purchase at or after it.
+            let from = post("Visit").iter().map(|e| e.ts).min();
+            let to = from.and_then(|a| {
+                post("Purchase")
+                    .iter()
+                    .map(|e| e.ts)
+                    .filter(|&t| t >= a)
+                    .min()
+            });
+            let b = |v: bool| f64::from(u8::from(v));
+            match seq {
+                MetricSequence::StepThrough => (b(to.is_some()), 0.0, b(from.is_some())),
+                MetricSequence::TimeBetween => (
+                    from.zip(to).map_or(0.0, |(a, t)| (t - a) as f64 / 1000.0),
+                    0.0,
+                    b(to.is_some()),
+                ),
+            }
         } else {
-            0.0
+            let d = if q.denominator.is_some() {
+                post("Visit").len() as f64
+            } else {
+                0.0
+            };
+            (
+                fin(&q.metric.value, &post("Purchase")),
+                fin(&q.metric.value, &pre),
+                d,
+            )
         };
         let v = anchor.variant.unwrap().to_string();
         add(out.variants.entry(v.clone()).or_default(), y, x, d);
@@ -331,12 +356,25 @@ async fn load(world: &World) -> (Arc<QueryEngine>, Arc<IdentityRouter>) {
 
 async fn check(world: World) {
     let (qengine, id_router) = load(&world).await;
-    for (value, ratio, segment) in [
-        (MetricValue::Binary, false, true),
-        (MetricValue::Count, true, false),
-        (MetricValue::Sum("amount".into()), false, true),
+    for (value, ratio, segment, sequence) in [
+        (MetricValue::Binary, false, true, None),
+        (MetricValue::Count, true, false, None),
+        (MetricValue::Sum("amount".into()), false, true, None),
+        (
+            MetricValue::Binary,
+            true,
+            true,
+            Some(MetricSequence::StepThrough),
+        ),
+        (
+            MetricValue::Binary,
+            true,
+            false,
+            Some(MetricSequence::TimeBetween),
+        ),
     ] {
-        let q = query(value, ratio, segment);
+        let mut q = query(value, ratio, segment);
+        q.sequence = sequence;
         let got = qengine.query_experiment_metric(PROJECT, &q).await.unwrap();
         let want = oracle(&world, &q);
         assert_eq!(

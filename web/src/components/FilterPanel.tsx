@@ -100,8 +100,8 @@ export function clearFilterCaches(projectId?: string): void {
   }
 }
 
-/** Saved cohorts for the picker, cached briefly per project. */
-export function useCohortNames(projectId: string) {
+/** Saved cohorts for the picker, cached briefly per project. Bump `version` after clearFilterCaches to refetch. */
+export function useCohortNames(projectId: string, version = 0) {
   const [cohorts, setCohorts] = useState<{ id: string; name: string }[]>(() => {
     const hit = cohortCache.get(projectId);
     return hit && Date.now() - hit.ts < CACHE_TTL_MS ? hit.data : [];
@@ -124,7 +124,7 @@ export function useCohortNames(projectId: string) {
     return () => {
       alive = false;
     };
-  }, [projectId]);
+  }, [projectId, version]);
   return cohorts;
 }
 
