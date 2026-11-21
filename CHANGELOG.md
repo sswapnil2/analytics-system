@@ -5,6 +5,9 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 ## [Unreleased]
 
 ### Added
+- Pausing an experiment now turns its flag off, so everyone gets the default until you resume; you're asked to confirm and can note why, and users get their same variant back on resume.
+- A flag used by a running or paused experiment shows which experiment, and its on/off switch, audience, holdout and rollout are locked until the experiment is stopped or shipped (pausing turns the flag off).
+- The experiment page shows Pulse's recommendation. Ship is no longer the main button when a guardrail has no data or got worse, the split is off, or the sample is short; concluding then needs each of those acknowledged, including a guardrail that got worse.
 - Sequential testing for experiments: results stay valid however often you check them, so you can stop a test early. It is on by default for new experiments.
 - Experiments can set their significance level and planned sample size, and the sample-size estimate accounts for sequential testing and extra variants.
 - Guardrails show lift and significance, say which way is bad, and flag variants that made them significantly worse.

@@ -106,8 +106,10 @@ export const ConcludeDialog: React.FC<{
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const shipping = outcome === "ship";
   // Each reason the evidence is thin needs its own tick, and is saved with the decision.
+  const harmed = shipping ? harmedBy[variant] ?? [] : [];
   const caveats = shipping
     ? [
+        ...(harmed.length ? [`${variant} made ${harmed.join(", ")} significantly worse.`] : []),
         ...(sampleCaveat ? [sampleCaveat] : []),
         ...(blindGuardrails.length
           ? [
@@ -116,7 +118,6 @@ export const ConcludeDialog: React.FC<{
           : []),
       ]
     : [];
-  const harmed = shipping ? harmedBy[variant] ?? [] : [];
   const ready = reason.trim().length > 0 && caveats.every((c) => checked.has(c)) && (!shipping || !!variant);
 
   const pickOutcome = (o: DecisionOutcome) => {
@@ -194,11 +195,6 @@ export const ConcludeDialog: React.FC<{
           <span className="text-xs text-muted">Saved with the experiment, so the next person knows what was decided and why.</span>
         </label>
 
-        {harmed.length > 0 && (
-          <p role="alert" className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2 text-sm text-ink">
-            {variant} made {harmed.join(", ")} significantly worse.
-          </p>
-        )}
         {caveats.map((c) => (
           <label key={c} className="flex items-start gap-2 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm text-ink">
             <input
@@ -226,6 +222,57 @@ export const ConcludeDialog: React.FC<{
           </button>
           <button type="submit" disabled={busy || !ready} className={btn.primary}>
             {busy ? "Concluding…" : "Conclude"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+};
+
+/** Pausing serves everyone the app's default until resumed; say so and ask why. */
+export const PauseDialog: React.FC<{
+  experimentName: string;
+  flagKey: string;
+  busy: boolean;
+  onPause: (reason: string) => void;
+  onClose: () => void;
+}> = ({ experimentName, flagKey, busy, onPause, onClose }) => {
+  const [reason, setReason] = useState("");
+  return (
+    <Modal title={`Pause "${experimentName}"?`} onClose={onClose}>
+      <form
+        noValidate
+        className="space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          onPause(reason.trim());
+        }}
+      >
+        <ul className="list-disc space-y-1 pl-5 text-sm text-ink-2">
+          <li>
+            <code className="font-mono">{flagKey}</code> turns off, so everyone gets the app's default experience within a
+            few minutes. No new users join.
+          </li>
+          <li>Users already in the test who come back meanwhile see the default too, which can shrink the measured difference.</li>
+          <li>On resume, each user gets the same variant as before. The end date doesn't move.</li>
+        </ul>
+        <label className="flex flex-col gap-1">
+          <span className={fieldLabel}>Why (optional)</span>
+          <input
+            value={reason}
+            maxLength={500}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. Payment errors spiked; checking whether this test is the cause"
+            className={field}
+          />
+          <span className="text-xs text-muted">Shown on the experiment while it's paused, and kept in the audit log.</span>
+        </label>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className={btn.ghost}>
+            Cancel
+          </button>
+          <button type="submit" disabled={busy} className={btn.primary}>
+            {busy ? "Pausing…" : "Pause and serve the default"}
           </button>
         </div>
       </form>

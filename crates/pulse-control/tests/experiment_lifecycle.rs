@@ -290,12 +290,14 @@ async fn layer_experiments_get_disjoint_slices() {
     let lid = l["id"].as_str().unwrap().to_string();
     let exps = "/v1/projects/proj_h/experiments";
 
-    let (status, body) = call(&app, &token, "POST", exps, exp_in_layer("a", &lid, 60.0)).await;
-    assert!(status.is_success(), "{body}");
+    let (status, exp_a) = call(&app, &token, "POST", exps, exp_in_layer("a", &lid, 60.0)).await;
+    assert!(status.is_success(), "{exp_a}");
+    let a_uri = format!("{exps}/{}", exp_a["id"].as_str().unwrap());
     let (status, body) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 50.0)).await;
     assert_eq!(status, StatusCode::CONFLICT, "only 40% is left: {body}");
-    let (status, _) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 40.0)).await;
+    let (status, exp_b) = call(&app, &token, "POST", exps, exp_in_layer("b", &lid, 40.0)).await;
     assert!(status.is_success());
+    let b_uri = format!("{exps}/{}", exp_b["id"].as_str().unwrap());
 
     let (_, flags) = call(
         &app,
@@ -324,16 +326,10 @@ async fn layer_experiments_get_disjoint_slices() {
     assert_eq!(layers[0]["free_bps"], 0);
     assert_eq!(layers[0]["flags"].as_array().unwrap().len(), 2);
 
-    // A turned-off flag serves no one, so its slice is free again; turning it back on would
-    // overlap the experiment that took the slice.
-    call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/a",
-        json!({"enabled": false}),
-    )
-    .await;
+    // Pausing turns the flag off, which serves no one, so its slice is free again; resuming
+    // would overlap the experiment that took the slice.
+    let (status, _) = call(&app, &token, "PATCH", &a_uri, json!({"status": "paused"})).await;
+    assert!(status.is_success());
     let (status, _) = call(&app, &token, "POST", exps, exp_in_layer("c", &lid, 30.0)).await;
     assert!(status.is_success());
     let (_, flags) = call(
@@ -345,26 +341,18 @@ async fn layer_experiments_get_disjoint_slices() {
     )
     .await;
     assert_eq!(flag(&flags, "c")["layer"]["start_bps"], 0);
-    let (status, _) = call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/a",
-        json!({"enabled": true}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(&app, &token, "PATCH", &a_uri, json!({"status": "running"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the layer has no free slice to resume into");
 
     // Shipping leaves the layer so the winner reaches everyone; joining needs an experiment.
-    let (status, f) = call(
-        &app,
-        &token,
-        "PATCH",
-        "/v1/projects/proj_h/flags/b",
-        json!({"layer_id": ""}),
-    )
+    let (status, done) = call(&app, &token, "PATCH", &b_uri, json!({
+        "status": "concluded",
+        "decision": {"outcome": "ship", "variant": "treatment", "reason": "won", "flag_action": "rollout"},
+    }))
     .await;
-    assert!(status.is_success() && f.get("layer").is_none());
+    assert!(status.is_success(), "{done}");
+    let (_, flags) = call(&app, &token, "GET", "/v1/projects/proj_h/flags", json!(null)).await;
+    assert!(flag(&flags, "b").get("layer").is_none());
     let (status, _) = call(
         &app,
         &token,
@@ -455,6 +443,29 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+
+    // While it's live, the flag's serving is locked; its description isn't.
+    let flag_uri = format!("{flags_uri}/{}", flag(&flags, "a")["id"].as_str().unwrap());
+    for body in [json!({"rollout_pct": 10.0}), json!({"enabled": false}), json!({"targeting_cohort_id": ""})] {
+        let (status, err) = call(&app, &token, "PATCH", &flag_uri, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    }
+    let (status, _) = call(&app, &token, "PATCH", &flag_uri, json!({"description": "1-tap"})).await;
+    assert!(status.is_success());
+
+    // Pause turns the flag off and keeps why; resume turns it back on and clears it.
+    let (status, paused) = call(&app, &token, "PATCH", &live_uri, json!({"status": "paused", "reason": " Payment errors spiked "})).await;
+    assert!(status.is_success(), "{paused}");
+    assert_eq!(paused["pause_reason"], "Payment errors spiked");
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], false);
+    let (status, err) = call(&app, &token, "PATCH", &flag_uri, json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "still locked while paused: {err}");
+    let (status, resumed) = call(&app, &token, "PATCH", &live_uri, json!({"status": "running"})).await;
+    assert!(status.is_success(), "{resumed}");
+    assert!(resumed["pause_reason"].is_null());
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], true);
 
     // Concluding records the decision and rolls the flag back.
     let (status, _) = call(

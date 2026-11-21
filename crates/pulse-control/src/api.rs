@@ -3468,6 +3468,9 @@ async fn handle_upsert_flag(
         .map_err(CtrlError::meta)?
         .into_iter()
         .find(|f| f.id == flag_id);
+    if existing.is_some() {
+        ensure_flag_unlocked(&ctrl, &id, &req.key).await?;
+    }
     let flag = FeatureFlag {
         holdout: existing.as_ref().and_then(|f| f.holdout.clone()),
         layer: existing.and_then(|f| f.layer),
@@ -3529,6 +3532,15 @@ async fn handle_patch_flag(
     else {
         return Err(CtrlError::not_found("flag not found"));
     };
+    let changes_serving = req.enabled.is_some()
+        || req.rollout_pct.is_some()
+        || req.targeting_cohort_id.is_some()
+        || req.variants.is_some()
+        || req.holdout_id.is_some()
+        || req.layer_id.is_some();
+    if changes_serving {
+        ensure_flag_unlocked(&ctrl, &id, &found.key).await?;
+    }
     if let Some(en) = req.enabled {
         found.enabled = en;
     }
@@ -3898,6 +3910,7 @@ async fn handle_holdout_results(
         },
         created_at_ms: h.created_at_ms,
         stop_reason: None,
+        pause_reason: None,
         kind: "holdout".to_string(),
         bandit: None,
         decision: None,
@@ -4253,6 +4266,7 @@ async fn handle_create_experiment(
         owner: req.owner.trim().to_string(),
         notify: req.notify.unwrap_or(true),
         stop_reason: None,
+        pause_reason: None,
         bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
         kind,
         decision: None,
@@ -4282,6 +4296,29 @@ async fn handle_create_experiment(
     )
     .await;
     Ok(Json(exp))
+}
+
+/// 409 when a running or paused experiment uses `flag_key`: changing who gets which variant
+/// mid-test skews its results. Pause, stop or ship the experiment instead.
+async fn ensure_flag_unlocked(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+) -> Result<(), CtrlError> {
+    let live = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| e.flag_key == flag_key && is_live(&e.status));
+    match live {
+        Some(e) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is locked while the experiment '{}' is {}. Stop or ship it to change who sees what, or pause it to turn the flag off",
+            e.name, e.status
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// 409 when another running or paused experiment (other than `except_id`) uses `flag_key`.
@@ -4316,6 +4353,8 @@ struct PatchExpReq {
     problem: Option<String>,
     owner: Option<String>,
     notify: Option<bool>,
+    /// With `status: "paused"`: why, kept on the experiment and in the audit log.
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4332,6 +4371,25 @@ struct DecisionReq {
 /// Running and paused experiments hold their flag; drafts and concluded ones don't.
 fn is_live(status: &str) -> bool {
     matches!(status, "running" | "paused")
+}
+
+async fn set_flag_enabled(ctrl: &ControlPlaneService, exp: &Experiment, enabled: bool) -> Result<(), CtrlError> {
+    let Some(mut flag) = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    flag.enabled = enabled;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
 }
 
 /// Turns the experiment's flag on, first moving it to a free slice if its layer slice was
@@ -4476,6 +4534,20 @@ async fn handle_patch_experiment(
             exp.start_ts_ms = now;
             exp.end_ts_ms = now + length;
             turn_flag_on_for(&ctrl, &exp).await?;
+        }
+        if exp.status == "running" && status == "paused" {
+            // Pausing serves everyone the app's default until resumed. Bucketing is deterministic,
+            // so users get their same variant back on resume.
+            set_flag_enabled(&ctrl, &exp, false).await?;
+            let reason = req.reason.as_deref().unwrap_or("").trim();
+            if reason.chars().count() > 500 {
+                return Err(CtrlError::bad("reason must be at most 500 characters"));
+            }
+            exp.pause_reason = (!reason.is_empty()).then(|| reason.to_string());
+        }
+        if exp.status == "paused" && status == "running" {
+            turn_flag_on_for(&ctrl, &exp).await?;
+            exp.pause_reason = None;
         }
         if status == "running" {
             exp.stop_reason = None;

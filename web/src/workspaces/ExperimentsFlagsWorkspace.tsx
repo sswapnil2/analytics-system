@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FlaskConical, Pause, Play, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
 import { api, BanditResults, DecisionInput, Experiment, ExperimentKind, ExperimentMetric, ExperimentResults, FeatureFlag, FlagPatch, MetricDirection, MetricResult, MetricType, TrafficGroup, VariantLiftRow } from "../api/client";
 import { HoldoutsAndLayers } from "../components/HoldoutsAndLayers";
-import { ConcludeDialog, StartReview } from "../components/ExperimentDialogs";
+import { ConcludeDialog, PauseDialog, StartReview } from "../components/ExperimentDialogs";
 import { dayOfTotal, ExperimentIndex } from "../components/ExperimentIndex";
 import { defaultVariants, toAllocations, VariantDraft, VariantsEditor, variantsProblem } from "../components/VariantsEditor";
 import { isTwoStep, MetricRow, metricRowProblem, MetricRows } from "../components/MetricRows";
@@ -928,21 +928,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     });
   }, []);
 
-  /** Flags already confirmed this visit, so dragging a slider asks once, not on every step. */
-  const confirmedFlagsRef = useRef<Set<string>>(new Set());
-  /** Changing a flag under a live experiment changes who sees what mid-test; make that a deliberate step. */
-  const confirmFlagChange = (flag: FeatureFlag, effect: string) => {
-    if (confirmedFlagsRef.current.has(flag.id)) return true;
-    const live = experiments.find(
-      (e) => (e.flag_id === flag.id || e.flag_key === flag.key) && (e.status === "running" || e.status === "paused"),
-    );
-    if (!live) return true;
-    const ok = window.confirm(
-      `"${live.name}" is ${live.status} on ${flag.key}. ${effect} changes who sees each variant and can skew its results. Continue?`,
-    );
-    if (ok) confirmedFlagsRef.current.add(flag.id);
-    return ok;
-  };
+  /** The running or paused experiment holding this flag; its serving is locked while one does. */
+  const liveOn = (flag: FeatureFlag) =>
+    experiments.find((e) => (e.flag_id === flag.id || e.flag_key === flag.key) && (e.status === "running" || e.status === "paused"));
 
   const patchFlag = useCallback(async (flag: FeatureFlag, body: FlagPatch) => {
     setFlagError(null);
@@ -960,7 +948,6 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   }, [projectId, clearDraftIfIdle]);
 
   const scheduleRolloutPatch = (flag: FeatureFlag, pctValue: number) => {
-    if (!confirmFlagChange(flag, "Changing the rollout")) return;
     setRolloutDrafts((prev) => ({ ...prev, [flag.id]: pctValue }));
     const prevTimer = rolloutTimersRef.current.get(flag.id);
     if (prevTimer !== undefined) window.clearTimeout(prevTimer);
@@ -1117,13 +1104,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     }
   };
 
-  /** Pause keeps the flag as it is and only stops guardrail checks; resume picks them up again. */
-  const setStatus = async (exp: Experiment, status: "running" | "paused") => {
+  /** Pause turns the flag off (everyone gets the default); resume turns it back on with the same split. */
+  const setStatus = async (exp: Experiment, status: "running" | "paused", reason?: string) => {
     setActing(true);
     setActionError(null);
     try {
-      const done = await api.patchExperiment(projectId, exp.id, { status });
-      setExperiments((prev) => prev.map((e) => (e.id === exp.id ? done : e)));
+      await api.patchExperiment(projectId, exp.id, { status, ...(reason ? { reason } : {}) });
+      setPauseOpen(false);
+      await loadAll();
     } catch (err) {
       setActionError(errorMessage(err));
     } finally {
@@ -1193,6 +1181,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     }
   };
 
+  const [pauseOpen, setPauseOpen] = useState(false);
   const selectedExp = experiments.find((e) => e.id === selectedExpId);
   const selectedFlag = selectedExp
     ? flags.find((f) => f.id === selectedExp.flag_id || f.key === selectedExp.flag_key)
@@ -1676,10 +1665,10 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
 
             {selectedExp?.status === "paused" && (
               <p role="status" className="rounded-lg border border-line bg-sunken px-3.5 py-2.5 text-sm text-ink-2">
-                <span className="font-medium text-ink">Paused.</span> Users keep getting their variants, results keep
-                counting, and guardrails{selectedExp.guardrail_metrics.some((g) => g.auto_stop) ? " and auto-stop" : ""} keep
-                watching.{selectedExp.kind === "bandit" ? " Daily traffic moves are on hold." : ""} The end date doesn't
-                move. To take the variant away from users, stop the experiment and keep control.
+                <span className="font-medium text-ink">Paused{selectedExp.pause_reason ? `: ${selectedExp.pause_reason}` : ""}.</span>{" "}
+                The flag is off, so everyone gets the app's default and no one new joins. Guardrails keep watching users
+                already in it.{selectedExp.kind === "bandit" ? " Daily traffic moves are on hold." : ""} On resume, users get
+                their same variant back. The end date doesn't move.
               </p>
             )}
 
@@ -1765,33 +1754,43 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     )}
                     {expResults.variants
                       .filter((v) => !v.is_control && v.statistically_significant && gain(selectedExp, v.relative_lift_pct) > 0)
-                      .map((v) => (
-                        <button
-                          key={v.variant_key}
-                          type="button"
-                          disabled={acting}
-                          onClick={() => setConcludeFor({ variant: v.variant_key })}
-                          className={btn.primary}
-                        >
-                          <Rocket className="h-3.5 w-3.5" />
-                          Ship {v.variant_key}
-                        </button>
-                      ))}
+                      .map((v) => {
+                        // Ship is the obvious next step only when nothing undercuts the evidence.
+                        const doubts = [
+                          ...(expResults.sample_ratio_mismatch ? ["the traffic split is off"] : []),
+                          ...(harmedBy[v.variant_key]?.length ? [`${harmedBy[v.variant_key].join(", ")} got worse`] : []),
+                          ...(blindGuardrails.length ? [`no data on ${blindGuardrails.join(", ")}`] : []),
+                          ...(sampleCaveat(selectedExp, expResults, banditResults) ? ["the sample is short of plan"] : []),
+                        ];
+                        return (
+                          <button
+                            key={v.variant_key}
+                            type="button"
+                            disabled={acting}
+                            onClick={() => setConcludeFor({ variant: v.variant_key })}
+                            className={doubts.length ? btn.secondary : btn.primary}
+                            title={doubts.length ? `Needs your sign-off: ${doubts.join("; ")}` : undefined}
+                          >
+                            <Rocket className="h-3.5 w-3.5" />
+                            Ship {v.variant_key}…
+                          </button>
+                        );
+                      })}
                     <button
                       type="button"
                       disabled={acting}
-                      onClick={() => void setStatus(selectedExp, selectedExp.status === "paused" ? "running" : "paused")}
+                      onClick={() =>
+                        selectedExp.status === "paused" ? void setStatus(selectedExp, "running") : setPauseOpen(true)
+                      }
                       title={
                         selectedExp.status === "paused"
-                          ? "Turn guardrail checks back on"
-                          : selectedExp.kind === "bandit"
-                            ? "Stops daily traffic moves; users keep their variants and guardrails keep watching"
-                            : "Marks the test as on hold; users keep their variants and guardrails keep watching"
+                          ? "Turn the flag back on; users get their same variant"
+                          : "Turn the flag off so everyone gets the default until you resume"
                       }
                       className={btn.secondary}
                     >
                       {selectedExp.status === "paused" ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
-                      {selectedExp.status === "paused" ? "Resume" : "Pause"}
+                      {selectedExp.status === "paused" ? "Resume" : "Pause…"}
                     </button>
                     <button type="button" disabled={acting} onClick={() => setConcludeFor({})} className={btn.secondary}>
                       <Square className="h-3.5 w-3.5" />
@@ -1820,6 +1819,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               </p>
             )}
 
+            {selectedExp && !noExposures && !banditResults && (selectedExp.status === "running" || selectedExp.status === "paused") && (
+              <p className="rounded-lg border border-line-strong bg-sunken px-3.5 py-2.5 text-sm text-ink">
+                <span className="font-medium">Pulse recommends:</span> {recommendation(selectedExp, expResults, blindGuardrails)}
+              </p>
+            )}
             {selectedExp && !noExposures && !banditResults && (
               <Verdict exp={selectedExp} results={expResults} blindGuardrails={blindGuardrails} />
             )}
@@ -2191,6 +2195,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               {flags.map((f) => {
                 const pct = Math.round(rolloutDrafts[f.id] ?? f.rollout_pct);
                 const sliderId = `rollout-${f.id}`;
+                const live = liveOn(f);
+                const locked = !canEdit || !!live;
                 return (
                   <li
                     key={f.id}
@@ -2204,11 +2210,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           role="switch"
                           aria-checked={f.enabled}
                           aria-label={`${f.key} enabled`}
-                          disabled={!canEdit}
-                          onClick={() => {
-                            if (confirmFlagChange(f, f.enabled ? "Turning the flag off" : "Turning the flag on"))
-                              void patchFlag(f, { enabled: !f.enabled });
-                          }}
+                          disabled={locked}
+                          onClick={() => void patchFlag(f, { enabled: !f.enabled })}
                           className={`rounded px-2 py-0.5 text-xs font-medium ${
                             f.enabled ? "border border-ok/40 bg-ok/15 text-ok" : "border border-line bg-hover text-muted"
                           }`}
@@ -2224,17 +2227,28 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         </span>
                       </div>
                       {f.description && <div className="text-sm text-muted">{f.description}</div>}
+                      {live && (
+                        <div className="text-xs text-muted">
+                          Used by{" "}
+                          <button
+                            type="button"
+                            className="font-medium text-ink underline"
+                            onClick={() => void handleSelectExperiment(live.id)}
+                          >
+                            {live.name}
+                          </button>{" "}
+                          ({live.status}). Locked until it’s stopped or shipped, so its split stays fair.
+                        </div>
+                      )}
                     </div>
 
                     <label className="flex min-w-0 max-w-full items-center gap-2">
                       <span className={fieldLabel}>Who</span>
                       <select
                         value={f.targeting_cohort_id ?? ""}
-                        disabled={!canEdit}
-                        onChange={(e) => {
-                          if (confirmFlagChange(f, "Changing who gets the flag"))
-                            void patchFlag(f, { targeting_cohort_id: e.target.value });
-                        }}
+                        aria-label={`Who gets ${f.key}`}
+                        disabled={locked}
+                        onChange={(e) => void patchFlag(f, { targeting_cohort_id: e.target.value })}
                         className={`${field} min-w-0 max-w-full py-1`}
                       >
                         <option value="">Everyone</option>
@@ -2251,11 +2265,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         <span className={fieldLabel}>Holdout</span>
                         <select
                           value={f.holdout?.id ?? ""}
-                          disabled={!canEdit}
-                          onChange={(e) => {
-                            if (confirmFlagChange(f, "Changing the holdout"))
-                              void patchFlag(f, { holdout_id: e.target.value }).then(loadAll);
-                          }}
+                          aria-label={`Holdout for ${f.key}`}
+                          disabled={locked}
+                          onChange={(e) => void patchFlag(f, { holdout_id: e.target.value }).then(loadAll)}
                           className={`${field} min-w-0 max-w-full py-1`}
                         >
                           <option value="">None</option>
@@ -2285,7 +2297,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         max={100}
                         value={pct}
                         aria-valuetext={`${pct}% of users`}
-                        disabled={!canEdit}
+                        aria-label={`Rollout for ${f.key}`}
+                        disabled={locked}
                         onChange={(e) => scheduleRolloutPatch(f, Number(e.target.value))}
                         className="w-full accent-brand sm:w-40"
                       />
@@ -2430,6 +2443,15 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           busy={acting}
           onStart={() => void startDraft(selectedExp)}
           onClose={() => setReview(null)}
+        />
+      )}
+      {pauseOpen && selectedExp && (
+        <PauseDialog
+          experimentName={selectedExp.name}
+          flagKey={selectedExp.flag_key}
+          busy={acting}
+          onPause={(reason) => void setStatus(selectedExp, "paused", reason)}
+          onClose={() => setPauseOpen(false)}
         />
       )}
       {concludeFor && selectedExp && (

@@ -285,6 +285,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         owner: "Pulse demo".to_string(),
         notify: true,
         stop_reason: None,
+        pause_reason: None,
         kind: "ab".to_string(),
         bandit: None,
         decision: None,

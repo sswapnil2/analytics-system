@@ -428,6 +428,9 @@ pub struct Experiment {
     /// Send this experiment's milestones to the project webhook.
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Why it was paused, when someone said; cleared on resume.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
     /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
     #[serde(default)]
     pub stop_reason: Option<String>,

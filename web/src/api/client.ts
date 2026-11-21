@@ -334,6 +334,7 @@ export interface Experiment {
   analysis?: ExperimentAnalysis;
   /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
   stop_reason?: string | null;
+  pause_reason?: string | null;
   /** "ab" (fixed split, p-values) or "bandit" (traffic moves daily to the best variant). */
   kind?: ExperimentKind;
   bandit?: BanditConfig | null;
@@ -1228,6 +1229,7 @@ export const api = {
       problem?: string;
       owner?: string;
       notify?: boolean;
+      reason?: string;
     },
   ) =>
     fetchJson<Experiment>(
