@@ -834,3 +834,194 @@ Verification of these changes: `cargo test -p pulse-node -p pulse-control -p pul
 - Treating multiple instances as high availability.
 
 **Can Pulse become serious distributed infrastructure?** Yes. The foundations that are expensive to retrofit are already there: an object-store data plane, immutable segments, compare-and-swap manifests, an object-store WAL, per-query budgets and admission control, and a role split in one binary. The agent trace store already shows the multi-writer pattern the event store needs. The gaps are ownership (who may write), bounds (how much memory and work a request or tenant may take) and commit policy. Those are weeks of focused work each, not a new architecture.
+
+---
+
+## 15. Design note: log-first ingest with a leased processor (proposed)
+
+Status: proposal for the phase after the P0 items. Nothing here is built. It assumes P0-1 (writer lease) and P0-2 (group commit) have landed, and it replaces the sketch in section 11, Stage 4.
+
+Revision 2. The first draft proposed one ordered log per shard, fenced by create-if-absent on dense sequence numbers, with shards owned by different nodes. An independent review against the code found that design unsafe and larger than needed; section 15.12 records what it found. This revision adopts the simpler design the review pointed to.
+
+### 15.1 Goal
+
+Make the ingest node a thin appender, move the expensive work to a processor, and let several nodes accept writes for one project without sharing mutable state.
+
+Goals:
+
+- Ingest throughput is limited by log commit rate and decode CPU, not by segment building.
+- An acknowledged event survives the loss of the node that acknowledged it.
+- Any number of ingest nodes can accept writes for a project.
+- Identity, dictionary and segment building keep exactly one writer per project, so their code does not change.
+- Query nodes stay stateless.
+
+Non-goals:
+
+- Node-local segments. Segments stay in the shared object store.
+- A broker. The log is objects in the object store.
+- More than one processor per project. That is section 15.10, deferred.
+
+### 15.2 What exists today
+
+The path is already log, then memory, then segment: a WAL object per request per bucket, L0 rows in RAM, a background flush to a segment.
+
+Facts the design relies on, checked in code:
+
+- WAL records hold wire events with string ids. Interning happens before the WAL write but its result is not in the record; recovery interns again (`storage/engine.rs:257-268`, `396-405`).
+- Lexicon masking and clock-skew normalisation are applied before the WAL write (`ingest/service.rs:269`, `318-322`), so the record is already the cleaned event.
+- Events route by a hash of the device or anonymous id when one is present, and fall back to `distinct_id` otherwise (`ingest/service.rs:275-279`).
+
+What is in the way:
+
+- The request path does dedup, schema caps, identity interning and flush, and L0 insertion inline.
+- User ids, dictionary ids and `l0_seq` are assigned from process-local counters (`identity/lib.rs:959`, `storage/dictionary.rs:62-76`, `storage/engine.rs:147-153`). Any design with two processes assigning them needs allocators for all three.
+- A record that cannot be converted to a row aborts recovery with `?` (`storage/engine.rs:266`), which blocks the project.
+
+### 15.3 Design
+
+Two roles per project: many *appenders*, one *processor*.
+
+**Appender (any ingest node).**
+
+- Authenticate, decode, apply lexicon rules, normalise timestamps, validate shape.
+- Append the batch to this process's own log prefix, `wal/{project}/w_{writer_id}/seq_{N}.wal`, where `writer_id` is a fresh id per process start. Group-commit: one object per commit window, byte-capped and chunked the way `agent/store/wal.rs:579-615` does it, with exactly one PUT in flight per prefix.
+- Acknowledge when the PUT returns.
+- The appender holds no identity writer, no dictionary, no L0 and no dedup state.
+
+Because a prefix has one writer for its whole life, there is nothing to fence on the log. "Already exists" on a retry can only be the writer's own earlier attempt; it confirms by comparing a nonce in the record header.
+
+**Processor (one per project, by lease).**
+
+- Holds the project lease from P0-1, extended with a generation number that increases on every change of holder.
+- Discovers writer prefixes by listing `wal/{project}/`, and reads each prefix in sequence order with GETs from its recorded position.
+- For each record: consult the erased set, deduplicate, intern ids, assign dictionary ids, build L0, flush segments.
+- Commits the manifest with its generation and, per writer and bucket, the highest sequence folded into segments. This is the shape the agent manifest already has (`agent/store/manifest.rs:48`).
+- Deletes a log object only after a manifest commit under its own generation covers it for every bucket. A prefix whose writer is gone and which is fully consumed is removed after a grace period.
+
+**Fencing the processor.** The manifest is the only fence, and it already has compare-and-swap.
+
+- A new holder first commits a manifest that bumps the generation, then replays from the positions in that manifest.
+- `commit_manifest_cas` must stop merging on conflict when the stored generation is newer than its own: the old holder aborts the flush, drops its L0 and stops. Today it reloads and merges (`storage/engine.rs:546-610`); that merge is what would let a deposed holder double-apply.
+- Purge runs only after such a commit succeeds, so a deposed holder never deletes log objects.
+- Segments a deposed holder wrote but could not commit are orphans, removed by the sweeper in R-20.
+
+**Records that cannot be applied.** The processor never stops on one. It writes the event to `wal_dead/{project}/…`, increments a metric and advances.
+
+**Co-location.** On a single node the appender and processor are tasks in one process. That is Step A below, and it is the whole design for one machine.
+
+### 15.4 What changes for clients
+
+The first draft said the response contract would not change. That was wrong.
+
+| Today | After |
+|---|---|
+| `accepted` means the event is in the log and in L0 | `accepted` means durably logged. It is queryable after the processor applies it |
+| `deduped` is exact within the dedup window on that node | `deduped` is best-effort: exact only when the appender shares a process with the processor. Deduplication itself still happens, at the processor |
+| Schema caps return `422` for the whole batch | The appender checks against the last dictionary it has seen and may let a batch through. The processor enforces the cap and sends the excess events to the dead-letter path |
+| A query right after a `200` on the same node sees the event | Not guaranteed. Lag is the processor's apply delay |
+| Identity merge conflict returns `409` | Unchanged if `identify` and `alias` stay synchronous calls to the processor node; asynchronous if they become log records (15.11, question 2) |
+
+### 15.5 The log: where it lives
+
+| Option | Ack latency | Loss on node failure | What must be built | Verdict |
+|---|---|---|---|---|
+| Object store, group-committed | One PUT per window: tens of ms on S3, an fsync on local disk | None | 15.3 | **Recommended default** |
+| Local disk log, shipped to the object store asynchronously | One local fsync: a few ms | Events since the last ship (seconds) | 15.3 plus a shipper and recovery of unshipped tails | Opt-in mode if sub-10 ms acks are required |
+| Local disk log replicated to a peer before ack | Local fsync plus a network round trip | None unless both nodes fail | A replication protocol, membership, catch-up | Rejected: this is the cost of a full shared-nothing design |
+
+The choice between the first two is a product decision about acceptable loss. In the second mode the local log is a staging area in front of the same writer prefix.
+
+Create-if-absent must be verified, not assumed. The S3 client is built with defaults (`storage/store_factory.rs:162-175`), which send `If-None-Match: *`; a store that ignores the header overwrites silently. Every store, including customer-owned ones, gets a create-twice probe at startup, and multi-node mode is refused if it fails.
+
+### 15.6 Deduplication
+
+Deduplication moves entirely to the processor. Its limits today carry over and should be stated, not hidden:
+
+- Rings are in memory, cover 15–30 minutes of server time and at most 524,288 entries per bucket (`ingest/dedup.rs:6-8`).
+- After a change of processor the rings are seeded from segments whose newest event time is within 30 minutes (`storage/engine.rs:216-230`). A retry of an old or backfilled event after a takeover is stored twice until compaction merges that partition.
+
+Closing that gap means seeding by ingest time or keeping the fingerprints in the manifest for the window. It is a follow-up, not part of this design.
+
+### 15.7 Backpressure and memory
+
+Moving L0 building behind a log relocates the queue; it does not bound it. Three bounds are required:
+
+- Unconsumed log bytes per project. Above the limit, appenders return `429`. The processor publishes its lag in the manifest so appenders on other nodes can see it.
+- L0 bytes per project and per node (C5 is still open).
+- Bytes per log object, so one commit window cannot produce a multi-gigabyte object.
+
+Takeover time grows with unconsumed log, which is a second reason to keep the first bound small.
+
+### 15.8 Reads
+
+- Segments and manifests are shared, so historical queries are unchanged.
+- On the processor's node, queries read L0 as today.
+- On other query nodes, fresh data is harder than the first draft claimed. Log records carry string ids, and a read-only node cannot intern ids or assign dictionary ids, so it cannot build rows from the log the way the agent store's read-only path does. Options, none chosen yet: shorten the flush interval; have query nodes ask the processor for its L0; or give readers provisional ids. Until one is chosen, split deployments stay stale by the flush interval.
+
+### 15.9 Failure handling
+
+| Event | Behaviour |
+|---|---|
+| Appender crashes | Its acknowledged records are in its prefix; the processor consumes them. Unacknowledged requests are retried by the SDK |
+| Appender's PUT times out with unknown outcome | It retries the same sequence number and compares the nonce on "already exists". It does not start a new sequence number until the outcome is known |
+| Processor crashes | The lease expires; a new holder bumps the generation and replays from the manifest positions. Events stay durable but are not queryable until then |
+| Old processor is alive but deposed | Its next manifest commit fails on generation; it drops L0 and stops. It has deleted nothing |
+| Processor falls behind | Appenders return `429` on log lag |
+| A record cannot be applied | Dead-letter object, metric, advance |
+| Metadata DB down | The current processor continues; no takeover can start. Appenders are unaffected |
+| Session flags after replay | Not reproducible: they come from a process-local cache that also receives replay chunks outside the log (`storage/engine.rs:328-367`). Accept, or move the flags into log records |
+
+### 15.10 Deferred: more than one processor per project
+
+One processor per project measured at 155,000–324,000 events/s on a laptop with storage latency removed (section 9), which covers every stage in section 5.1 except the last. Projects are spread across nodes by lease, so total capacity scales with nodes.
+
+Splitting one project across processors is only needed when a single project exceeds a single node. It is a separate design, and it must solve all of these, none of which the first draft addressed:
+
+- A dictionary-id allocator, or string keys in segments.
+- `l0_seq` per shard.
+- Identity across shards. The cache must key on id and bucket, because interning also records which buckets hold a user (`identity/lib.rs:938-1009`) and funnels depend on it (`exec/funnel.rs:478`). Merging per-shard identity logs is not commutative with the current rules: the root is always the user side and merge conflicts depend on order (`identity/lib.rs:485-521`). That option is a redesign of identity, not an extension.
+- A fence that survives log purge, which needs the generation in the object key.
+
+### 15.11 Order of work, exit criteria and open questions
+
+| Step | Depends on | Exit criteria |
+|---|---|---|
+| A. Appender and processor as separate tasks in one process; dead-letter path; log-lag and L0-byte bounds | P0-2 | Sustained loadgen: no five-second sample below half the mean. A poisoned record does not block the project. RSS stays under the configured bounds |
+| B. Per-writer log prefixes; manifest positions per writer; generation fence on manifest commit and purge; create-if-absent probe; migration from the per-bucket layout | A, P0-1 | Fault-injection suite passes (below). PUTs per second independent of request rate |
+| C. Appenders on other nodes; lag published in the manifest | B, Postgres | Two ingest nodes and one processor: an appender kill and a processor kill each lose nothing and duplicate nothing outside the stated dedup window |
+| Fresh reads on query nodes | B, and a choice in 15.8 | An event is visible on a query node within five seconds |
+
+**Migration.** Step B changes the log layout and adds manifest fields. Upgrade: the new binary drains the old per-bucket WAL through the existing recovery path before it writes the new layout. Rollback: flush everything so no new-layout log remains, then start the old binary; the manifest fields must be additive and ignored by the old reader. Both directions need a test.
+
+**Test plan.** An object-store wrapper that can delay, drop, duplicate and time out individual operations, driven by a seed, with these scenarios: PUT timeout that succeeded; processor paused past lease expiry, then resumed; two processors started together; crash between segment write and manifest commit; crash between manifest commit and purge; appender killed mid-window. Each asserts that every acknowledged event is in exactly one committed segment or the dead-letter path.
+
+**Metrics.** Log lag in bytes and seconds per project, processor generation, step-downs, dead-lettered events, commit-window size and latency, takeover replay time.
+
+**Open questions.**
+
+1. Is a few seconds of loss on node failure acceptable in exchange for single-digit-millisecond acks? This decides whether the local-log mode is built.
+2. Which other writes go through the log? Today `identify` and `alias` inside a batch are applied after the append and outside the WAL (`ingest/service.rs:448-450`), and `engage`, `groups` and replay chunks write to their own stores. For appenders to hold no writers, these become log records or are forwarded to the processor node. Forwarding keeps the `409` synchronous; logging does not.
+3. How large may unconsumed log grow before appenders refuse writes?
+4. Does the agent trace store need any of this? It already has per-writer prefixes and group commit. It lacks the generation fence and a pickup of dead writers' logs by live peers (section 5.6, item 5), which the same lease would give it.
+5. Processor fairness when one node holds many projects: per-project tasks with a shared CPU budget, or a pool.
+
+### 15.12 Review record
+
+The first draft was reviewed by an independent agent that checked each claim against the source. Findings that changed the design:
+
+| Finding | Evidence | Change |
+|---|---|---|
+| Log purge frees sequence slots, so a stalled old owner could later create a fenced slot and acknowledge an event below the manifest position | `storage/wal.rs:201-217`; the manifest store needed a guard for the same hazard, `storage/manifest.rs:217-229` | No sequence fence on the log. Per-writer prefixes; the manifest generation is the only fence |
+| Manifest commit merges on conflict, so a deposed owner double-applies and then purges its successor's log | `storage/engine.rs:546-610` | Commit and purge abort on a newer generation |
+| Dictionary ids and `l0_seq` are per-project and process-local; shard owners would corrupt both | `storage/dictionary.rs:62-76,162-193`; `engine.rs:147-153` | One processor per project. Multi-processor deferred with these as stated prerequisites |
+| No rule for a PUT with unknown outcome, or for pipelined PUTs | `object_store` 0.12.5 sends create as non-idempotent | One PUT in flight per prefix; nonce comparison on retry |
+| A record that cannot be applied blocks the shard forever | `engine.rs:266,402` | Dead-letter path |
+| "The response contract does not change" was false | `ingest/service.rs:349-377` | Section 15.4 |
+| Identity option 2 relied on commutativity the code does not have | `identity/lib.rs:485-521,959` | Dropped; recorded as a redesign in 15.10 |
+| Query nodes cannot build rows from the log as the agent path does | `identity/lib.rs:104-109`; `agent/store/mod.rs:645-662` | Section 15.8 lists options instead of claiming a solution |
+| "Dedup at the processor makes retries safe" holds only inside a window, and seeding is by event time | `ingest/dedup.rs:6-8`; `engine.rs:216-230` | Section 15.6 |
+| The agent store shows writer isolation, not fencing: its writer id is new per process, so create never conflicts | `agent/store/mod.rs:70` | Wording corrected; the design now copies that isolation deliberately |
+| Events stay in one bucket only when a device or anonymous id is present | `ingest/service.rs:275-279` | Section 15.2 corrected |
+| Create-if-absent is unverified on S3-compatible stores | `storage/store_factory.rs:162-175` | Startup probe |
+
+Not verified by the review or by this revision: whether SlateDB's own writer fencing is enough to serve as the identity lease, and how the SDKs treat a transient error reported inside the per-event `rejected` list.
