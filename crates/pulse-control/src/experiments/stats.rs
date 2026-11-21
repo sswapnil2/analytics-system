@@ -138,37 +138,31 @@ fn cs_p_value(diff: f64, s2: f64, n: f64, rho: f64) -> f64 {
     ln_p.exp().clamp(0.0, 1.0)
 }
 
-/// Welch (unpooled, normal-approximation) comparison of two per-user means, with a delta-method
-/// relative-lift CI. With `opts.sequential_rho` the p-value and both CIs are always valid, so the
-/// result can be checked any number of times. `None` below two users per arm.
+/// Welch (unpooled, normal-approximation) comparison of two per-user means, with a Fieller
+/// relative-lift CI at the same critical value as the absolute CI, so the two intervals exclude 0
+/// together. With `opts.sequential_rho` the p-value and both CIs are always valid, so the result
+/// can be checked any number of times. `None` below two users per arm.
 pub fn compare_means(c: &Moments, t: &Moments, opts: LiftOptions) -> Option<Comparison> {
     if c.n < 2 || t.n < 2 {
         return None;
     }
     let (n_c, n_t) = (c.n as f64, t.n as f64);
     let (m_c, m_t) = (c.mean(), t.mean());
-    let (s2_c, s2_t) = (c.variance(), t.variance());
+    let (v_c, v_t) = (c.variance() / n_c, t.variance() / n_t);
     let diff = m_t - m_c;
-    let var_diff = s2_c / n_c + s2_t / n_t;
+    let var_diff = v_c + v_t;
+    let se = var_diff.sqrt();
 
-    // Delta method for `m_t / m_c - 1`.
-    let rel = (m_c.abs() > 1e-12).then(|| {
-        let var_rel = s2_t / (n_t * m_c * m_c) + (m_t * m_t * s2_c) / (n_c * m_c.powi(4));
-        (m_t / m_c - 1.0, var_rel)
-    });
-
-    let (abs_half, rel_half, p_value) = match opts.sequential_rho {
+    let (z, p_value) = match opts.sequential_rho {
         Some(rho) => {
             let n = n_c + n_t;
+            // Confidence-sequence half-width per unit standard error: the sequential "z".
             (
-                cs_half_width(var_diff * n, n, rho, opts.alpha),
-                rel.map(|(_, v)| cs_half_width(v * n, n, rho, opts.alpha)),
+                cs_half_width(n, n, rho, opts.alpha),
                 cs_p_value(diff, var_diff * n, n, rho),
             )
         }
         None => {
-            let z = normal_quantile(1.0 - opts.alpha / 2.0);
-            let se = var_diff.sqrt();
             let p = if se > 1e-15 {
                 two_sided_normal_p_value((diff / se).abs())
             } else if diff == 0.0 {
@@ -176,17 +170,21 @@ pub fn compare_means(c: &Moments, t: &Moments, opts: LiftOptions) -> Option<Comp
             } else {
                 0.0
             };
-            (z * se, rel.map(|(_, v)| z * v.sqrt()), p)
+            (normal_quantile(1.0 - opts.alpha / 2.0), p)
         }
     };
 
-    let (rel_lift_pct, rel_ci_pct) = match (rel, rel_half) {
-        (Some((r, _)), Some(h)) => (r * 100.0, ((r - h) * 100.0, (r + h) * 100.0)),
-        _ => (0.0, (0.0, 0.0)),
+    let (rel_lift_pct, rel_ci_pct) = if m_c.abs() > 1e-12 {
+        (
+            (m_t / m_c - 1.0) * 100.0,
+            relative_lift_ci_pct(m_c, v_c, m_t, v_t, z),
+        )
+    } else {
+        (0.0, (0.0, 0.0))
     };
     Some(Comparison {
         abs_diff: diff,
-        abs_ci: (diff - abs_half, diff + abs_half),
+        abs_ci: (diff - z * se, diff + z * se),
         rel_lift_pct,
         rel_ci_pct,
         p_value,
@@ -203,7 +201,8 @@ pub fn compute_statistical_lift_table(
 /// Conversion lift table over `(exposed, converted)` per variant. Treatments are compared with
 /// `control` (or the first key):
 /// - fixed horizon: pooled two-proportion Z-test and Fieller relative-lift CI;
-/// - sequential: Welch always-valid p-value and confidence sequences ([`compare_means`]).
+/// - sequential: Welch always-valid p-value, confidence sequence and Fieller CI at the sequential
+///   critical value ([`compare_means`]).
 ///
 /// p-values are Holm-Bonferroni adjusted across treatments. `P(beat control)` comes from 20,000
 /// Beta-Binomial Monte Carlo draws.
@@ -321,7 +320,17 @@ pub fn compute_lift_table(
                 };
                 (
                     rel,
-                    relative_lift_ci_pct(p_c, n_c, p_t, n_t, z_crit),
+                    if p_c > 1e-12 {
+                        relative_lift_ci_pct(
+                            p_c,
+                            p_c * (1.0 - p_c) / n_c as f64,
+                            p_t,
+                            var_t / n_t as f64,
+                            z_crit,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    },
                     (diff - z_crit * se_unpooled, diff + z_crit * se_unpooled),
                     p,
                 )
@@ -374,30 +383,22 @@ fn holm_adjust(rows: &mut [VariantLiftRow], treatment_indices: &[usize], alpha: 
     }
 }
 
-/// Fieller confidence interval at critical value `z` for relative lift `(p_t / p_c - 1) * 100%`
-/// (with Delta-method fallback when `g >= 0.99`), propagating variance from BOTH `p_t` and `p_c`.
-fn relative_lift_ci_pct(p_c: f64, n_c: u64, p_t: f64, n_t: u64, z: f64) -> (f64, f64) {
-    if p_c <= 1e-12 || n_c == 0 || n_t == 0 {
-        return (0.0, 0.0);
-    }
-    let v_c = (p_c * (1.0 - p_c)) / (n_c as f64);
-    let v_t = (p_t * (1.0 - p_t)) / (n_t as f64);
-    let ratio = p_t / p_c;
-    let g = (z * z * v_c) / (p_c * p_c);
-
-    if g < 0.99 {
-        let disc = (v_t + ratio * ratio * v_c - g * v_t).max(0.0).sqrt();
-        let half = (z / p_c) * disc;
-        let lo = ((ratio - half) / (1.0 - g) - 1.0) * 100.0;
-        let hi = ((ratio + half) / (1.0 - g) - 1.0) * 100.0;
-        (lo, hi)
+/// Fieller confidence interval at critical value `z` for relative lift `(m_t / m_c - 1) * 100%`,
+/// given each mean and the variance of that mean (`v = s^2 / n`). At the same `z` it excludes 0
+/// exactly when the unpooled absolute-difference CI `diff +/- z * sqrt(v_c + v_t)` does. Falls back
+/// to the delta method when `g >= 0.99` (control mean not clearly non-zero, Fieller unbounded).
+/// Callers ensure `m_c != 0`.
+fn relative_lift_ci_pct(m_c: f64, v_c: f64, m_t: f64, v_t: f64, z: f64) -> (f64, f64) {
+    let ratio = m_t / m_c;
+    let g = (z * z * v_c) / (m_c * m_c);
+    let (lo, hi) = if g < 0.99 {
+        let half = (z / m_c.abs()) * (v_t + ratio * ratio * v_c - g * v_t).max(0.0).sqrt();
+        ((ratio - half) / (1.0 - g), (ratio + half) / (1.0 - g))
     } else {
-        // Delta-method variance: Var(p_t / p_c) = v_t / p_c^2 + (p_t^2 / p_c^4) * v_c
-        let se_ratio = (v_t / (p_c * p_c) + (ratio * ratio * v_c) / (p_c * p_c)).sqrt();
-        let lo = (ratio - z * se_ratio - 1.0) * 100.0;
-        let hi = (ratio + z * se_ratio - 1.0) * 100.0;
-        (lo, hi)
-    }
+        let se_ratio = (v_t + ratio * ratio * v_c).sqrt() / m_c.abs();
+        (ratio - z * se_ratio, ratio + z * se_ratio)
+    };
+    ((lo - 1.0) * 100.0, (hi - 1.0) * 100.0)
 }
 
 /// Standard normal quantile (Acklam's rational approximation, relative error < 1.2e-9).
