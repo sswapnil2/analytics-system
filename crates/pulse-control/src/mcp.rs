@@ -101,7 +101,7 @@ pub async fn handle_mcp_request_with_agent_store(
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "pulse-analytics-mcp",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }),
         ),
