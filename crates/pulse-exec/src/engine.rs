@@ -45,6 +45,7 @@ pub struct QueryEngine {
     catalogs: Arc<CatalogRegistry>,
     query_timeout_ms: AtomicU64,
     max_rows: AtomicU64,
+    max_memory_bytes: AtomicU64,
     admission: crate::budget::Admission,
     last_query_latency_us: AtomicU64,
     queries_executed: AtomicU64,
@@ -74,6 +75,13 @@ impl QueryEngine {
             .filter(|&ms| ms > 0)
             .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS);
 
+        let max_memory_bytes = std::env::var("PULSE_QUERY_MAX_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(crate::budget::DEFAULT_MAX_MEMORY_BYTES);
+
         Ok(Arc::new(Self {
             storage,
             cache,
@@ -86,6 +94,7 @@ impl QueryEngine {
                     .filter(|&n| n > 0)
                     .unwrap_or(crate::budget::DEFAULT_MAX_ROWS),
             ),
+            max_memory_bytes: AtomicU64::new(max_memory_bytes),
             admission: crate::budget::Admission::from_env(),
             last_query_latency_us: AtomicU64::new(0),
             queries_executed: AtomicU64::new(0),
@@ -106,8 +115,13 @@ impl QueryEngine {
         self.max_rows.store(rows.max(1), Ordering::Relaxed);
     }
 
-    /// Admits the query (per-project and node-wide caps), then runs it under its deadline and row
-    /// budget. Nested calls (a cohort inside a funnel) reuse the outer query's slot and budget.
+    /// Working memory bytes one query may allocate before it fails with `QueryMemoryExceeded`.
+    pub fn set_max_memory_bytes(&self, bytes: u64) {
+        self.max_memory_bytes.store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// Admits the query (per-project and node-wide caps), then runs it under its deadline, row,
+    /// and memory budgets. Nested calls (a cohort inside a funnel) reuse the outer query's slot and budget.
     async fn with_deadline<T, F>(&self, project_id: &str, fut: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
@@ -119,9 +133,10 @@ impl QueryEngine {
         let timeout = Duration::from_millis(timeout_ms);
         // Queue for at most one deadline's worth; past that, tell the caller to back off.
         let _permits = self.admission.acquire(project_id, timeout).await?;
-        let ctx = Arc::new(crate::budget::QueryCtx::new(
+        let ctx = Arc::new(crate::budget::QueryCtx::with_memory_limit(
             timeout,
             self.max_rows.load(Ordering::Relaxed),
+            self.max_memory_bytes.load(Ordering::Relaxed),
         ));
         let out = tokio::time::timeout(timeout, crate::budget::scope(ctx.clone(), fut))
             .await
@@ -274,7 +289,9 @@ impl QueryEngine {
                 query.steps.len().saturating_sub(1)
             )));
         }
-        let mut res = self.query_funnel(project_id, query).await?;
+        let mut exact_query = query.clone();
+        exact_query.sampling = crate::ast::SamplingMode::Exact;
+        let mut res = self.query_funnel(project_id, &exact_query).await?;
         Ok(if step < res.dropped_uids_by_step.len() {
             res.dropped_uids_by_step.swap_remove(step)
         } else {
@@ -466,8 +483,12 @@ impl QueryEngine {
             let cap = limit.clamp(1, 50_000);
             let mut rows = Vec::new();
             for chunk in &chunks {
+                crate::budget::check_current()?;
                 let ta = &chunk.tier_a;
                 for r in 0..chunk.len() {
+                    if r & 1023 == 0 {
+                        crate::budget::check_current()?;
+                    }
                     let ts = ta.event_ts_ms[r];
                     if let Some(tr) = time_range {
                         if !tr.contains(ts) {
@@ -492,7 +513,7 @@ impl QueryEngine {
                         .get(&ta.event_id[r])
                         .cloned()
                         .unwrap_or_else(|| format!("event_{}", ta.event_id[r]));
-                    let session_id = chunk.session_id_for_row(r);
+                    let session_id = chunk.session_id_for_row(r, &self.cache).await;
 
                     let mut props = std::collections::BTreeMap::new();
                     for (pk, col) in &chunk.prop_cols {
@@ -629,17 +650,18 @@ impl QueryEngine {
                     {
                         continue;
                     }
-                    let entry = merged
-                        .entry(r.session_id.clone())
-                        .or_insert_with(|| MergedSession {
-                            canonical_uid: canon_uid,
-                            flags: ps.session_flags_for(&r.session_id),
-                            bloom: 0,
-                            start_ts_ms: r.event_ts_ms,
-                            end_ts_ms: r.event_ts_ms,
-                            l0_events: Vec::new(),
-                            l1_slices: Vec::new(),
-                        });
+                    let entry =
+                        merged
+                            .entry(r.session_id.clone())
+                            .or_insert_with(|| MergedSession {
+                                canonical_uid: canon_uid,
+                                flags: ps.session_flags_for(&r.session_id),
+                                bloom: 0,
+                                start_ts_ms: r.event_ts_ms,
+                                end_ts_ms: r.event_ts_ms,
+                                l0_events: Vec::new(),
+                                l1_slices: Vec::new(),
+                            });
                     entry.canonical_uid = canon_uid;
                     entry.flags |= r.session_flags;
                     entry.bloom |= SessionHeader::event_bit(r.event_id);
@@ -656,6 +678,7 @@ impl QueryEngine {
             segs.sort_by_key(|s| Reverse(s.footer.max_ts_ms));
 
             for (seg_idx, seg) in segs.iter().enumerate() {
+                crate::budget::check_current()?;
                 let sidx = self.cache.get_session_index(seg).await?;
                 total_sessions_inspected += sidx.headers.len();
 
@@ -720,13 +743,12 @@ impl QueryEngine {
 
             // Order newest-first so we only materialize Tier A for top `limit` sessions.
             candidates.sort_by(|(sid_a, a), (sid_b, b)| {
-                b.end_ts_ms
-                    .cmp(&a.end_ts_ms)
-                    .then_with(|| sid_a.cmp(sid_b))
+                b.end_ts_ms.cmp(&a.end_ts_ms).then_with(|| sid_a.cmp(sid_b))
             });
 
             // 4. Materialize Tier A events only for surviving top-`limit` sessions
-            let mut sessions: Vec<SessionSummaryItem> = Vec::with_capacity(limit.min(candidates.len()));
+            let mut sessions: Vec<SessionSummaryItem> =
+                Vec::with_capacity(limit.min(candidates.len()));
             for (session_id, ms) in candidates {
                 if sessions.len() >= limit {
                     break;

@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::future::try_join_all;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use pulse_identity::IdentitySnapshot;
 use pulse_storage::{
-    ProjectDictionary, ProjectStorage, SegmentMeta, StorageError, StorageSnapshot, StoredRow,
+    tier_c_key_bit, ProjectDictionary, ProjectStorage, SegmentMeta, StorageError, StorageSnapshot,
+    StoredRow,
 };
 use pulse_wire::PropValue;
 use rayon::prelude::*;
@@ -13,9 +15,10 @@ use roaring::RoaringBitmap;
 use thiserror::Error;
 
 use crate::ast::{
-    BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, TimeInterval, TimeRange,
+    BehavioralCohortDef, GlobalFilter, PropFilterOp, PropPredicate, SamplingInfo, SamplingMode,
+    TimeInterval, TimeRange,
 };
-use crate::cache::{SegmentBlockCache, TierAColumns};
+use crate::cache::{prop_col_approx_bytes, SegmentBlockCache, TierAColumns};
 use crate::catalog::{evaluate_custom_property, VirtualCatalog};
 
 #[derive(Debug, Error)]
@@ -38,9 +41,40 @@ pub enum ExecError {
     #[error("query would scan {rows} rows, over the {limit}-row limit; narrow the time range or add filters")]
     QueryTooLarge { rows: u64, limit: u64 },
 
+    #[error("query memory usage ({bytes} bytes) exceeded limit of {limit} bytes; narrow the time range or reduce breakdown cardinality")]
+    QueryMemoryExceeded { bytes: u64, limit: u64 },
+
     /// No query slot freed up in time; `"project"` or `"node"` says which cap was hit.
     #[error("too many queries running for this {0}; retry shortly")]
     Overloaded(&'static str),
+}
+
+/// Computes the adaptive per-query segment parallelism (`P`) from CPU count, per-query memory
+/// budget, and the average decoded segment size (`PULSE_QUERY_PARALLEL_SEGMENTS` overrides CPU cap).
+pub fn parallel_segments(segments: &[SegmentMeta], est_bytes_per_row: usize) -> usize {
+    if segments.len() <= 1 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let cpu_cap = std::env::var("PULSE_QUERY_PARALLEL_SEGMENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| cores.clamp(2, 16));
+
+    let avg_rows: u64 = segments
+        .iter()
+        .map(|s| u64::from(s.footer.row_count))
+        .sum::<u64>()
+        / (segments.len() as u64).max(1);
+    let est_seg_bytes = avg_rows
+        .saturating_mul(est_bytes_per_row.max(16) as u64)
+        .max(256 * 1024);
+    let query_mem_budget = crate::budget::current()
+        .map(|c| c.max_memory_bytes())
+        .unwrap_or(crate::budget::DEFAULT_MAX_MEMORY_BYTES);
+    let mem_cap = (query_mem_budget / est_seg_bytes.saturating_mul(4)).max(1) as usize;
+    cpu_cap.min(mem_cap).min(segments.len()).max(1)
 }
 
 pub type Result<T> = std::result::Result<T, ExecError>;
@@ -86,20 +120,22 @@ impl DataChunk {
         self.tier_a.is_empty()
     }
 
-    pub fn session_id_for_row(&self, row_idx: usize) -> String {
+    pub async fn session_id_for_row(&self, row_idx: usize, cache: &SegmentBlockCache) -> String {
         if let Some(rows) = &self.l0_rows {
             return rows
                 .get(row_idx)
                 .map(|r| r.session_id.clone())
                 .unwrap_or_default();
         }
-        // Binary search or scan SessionIndex prefix ranges
-        let sidx = &self.tier_a.session_index;
         let shash = self.tier_a.session_hash[row_idx];
         let raw_uid = self.tier_a.uid_internal[row_idx];
-        for hdr in &sidx.headers {
-            if hdr.raw_uid == raw_uid && hdr.session_hash == shash {
-                return sidx.session_id(hdr).to_string();
+        if let Some(meta) = &self.segment_meta {
+            if let Ok(sidx) = cache.get_session_index(meta).await {
+                for hdr in &sidx.headers {
+                    if hdr.raw_uid == raw_uid && hdr.session_hash == shash {
+                        return sidx.session_id(hdr).to_string();
+                    }
+                }
             }
         }
         format!("sess_{shash:016x}")
@@ -218,6 +254,181 @@ pub async fn load_project_chunks(
 /// Variant of `load_project_chunks` carrying `id_snap` so user profile properties (`user.*`)
 /// and DPDP erasure tombstones resolve consistently across pre-login and post-login events (`Gaps 1, 4`).
 #[allow(clippy::too_many_arguments)]
+/// Minimum estimated rows in the queried time range before `SamplingMode::Auto` engages
+/// deterministic entity-bucket sampling. Override with `PULSE_AUTO_SAMPLE_MIN_ROWS`.
+pub const DEFAULT_AUTO_SAMPLE_MIN_ROWS: u64 = 10_000_000;
+
+fn auto_sample_min_rows() -> u64 {
+    std::env::var("PULSE_AUTO_SAMPLE_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_AUTO_SAMPLE_MIN_ROWS)
+}
+
+/// Deterministic entity-bucket sampling plan resolved at query start from manifest metadata.
+///
+/// Because Pulse routes every event for a user to `xxh3_64(routing_seed) % num_buckets`,
+/// scanning buckets `0..sampled_buckets` yields an unbiased, user-consistent sample of
+/// fraction `sampled_buckets / total_buckets` across Insights, Funnels, Retention, and Flows.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingPlan {
+    pub total_buckets: u16,
+    pub sampled_buckets: u16,
+    pub estimated_total_rows: u64,
+}
+
+impl SamplingPlan {
+    pub fn exact(total_buckets: u16, estimated_total_rows: u64) -> Self {
+        let tb = total_buckets.max(1);
+        Self {
+            total_buckets: tb,
+            sampled_buckets: tb,
+            estimated_total_rows,
+        }
+    }
+
+    pub fn resolve(
+        mode: SamplingMode,
+        snap: &StorageSnapshot,
+        ps: &ProjectStorage,
+        time_range: TimeRange,
+    ) -> Self {
+        let total_buckets = ps.config().num_buckets.max(1);
+        let start_date = ts_to_date_floor(time_range.start_ts_ms);
+        let end_date = ts_to_date_floor(time_range.end_ts_ms);
+        let l1_rows: u64 = snap
+            .segments_for_range(start_date, end_date, None)
+            .into_iter()
+            .filter(|seg| {
+                seg.footer.max_ts_ms >= time_range.start_ts_ms
+                    && seg.footer.min_ts_ms <= time_range.end_ts_ms
+            })
+            .map(|seg| u64::from(seg.footer.row_count))
+            .sum();
+        let estimated_total_rows = l1_rows.saturating_add(ps.total_l0_rows() as u64);
+
+        if total_buckets <= 1 {
+            return Self::exact(total_buckets, estimated_total_rows);
+        }
+
+        match mode {
+            SamplingMode::Exact => Self::exact(total_buckets, estimated_total_rows),
+            SamplingMode::Rate(r) => {
+                if !r.is_finite() || r >= 1.0 {
+                    Self::exact(total_buckets, estimated_total_rows)
+                } else {
+                    let clamped = r.clamp(1.0 / (total_buckets as f64), 1.0);
+                    let k = ((total_buckets as f64) * clamped)
+                        .round()
+                        .clamp(1.0, total_buckets as f64) as u16;
+                    Self {
+                        total_buckets,
+                        sampled_buckets: k,
+                        estimated_total_rows,
+                    }
+                }
+            }
+            SamplingMode::Auto => {
+                let min_rows = auto_sample_min_rows();
+                if estimated_total_rows < min_rows {
+                    return Self::exact(total_buckets, estimated_total_rows);
+                }
+                let target_rate = if estimated_total_rows < min_rows.saturating_mul(4) {
+                    0.25
+                } else if estimated_total_rows < min_rows.saturating_mul(10) {
+                    0.125
+                } else {
+                    0.0625
+                };
+                let k = ((total_buckets as f64) * target_rate)
+                    .round()
+                    .clamp(1.0, total_buckets as f64) as u16;
+                Self {
+                    total_buckets,
+                    sampled_buckets: k,
+                    estimated_total_rows,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_sampled(&self) -> bool {
+        self.sampled_buckets < self.total_buckets
+    }
+
+    #[inline]
+    pub fn bucket_limit(&self) -> Option<u16> {
+        self.is_sampled().then_some(self.sampled_buckets)
+    }
+
+    #[inline]
+    pub fn scale_factor(&self) -> f64 {
+        (self.total_buckets as f64) / (self.sampled_buckets.max(1) as f64)
+    }
+
+    #[inline]
+    pub fn sample_rate(&self) -> f64 {
+        (self.sampled_buckets as f64) / (self.total_buckets.max(1) as f64)
+    }
+
+    #[inline]
+    pub fn scale_u64(&self, raw: u64) -> u64 {
+        if !self.is_sampled() {
+            raw
+        } else {
+            ((raw as f64) * self.scale_factor()).round() as u64
+        }
+    }
+
+    #[inline]
+    pub fn scale_f64(&self, raw: f64) -> f64 {
+        if !self.is_sampled() {
+            raw
+        } else {
+            raw * self.scale_factor()
+        }
+    }
+
+    /// Builds response `SamplingInfo` with a finite-population 95% relative margin of error
+    /// computed from `sample_count_basis` (the unscaled count of matching events/users in the sample).
+    pub fn to_info(&self, sample_count_basis: u64) -> SamplingInfo {
+        let p = self.sample_rate();
+        let relative_error_pct = if self.is_sampled() && sample_count_basis > 0 {
+            let moe = 196.0 * ((1.0 - p) / (sample_count_basis as f64)).sqrt();
+            Some((moe * 10.0).round() / 10.0)
+        } else {
+            None
+        };
+        SamplingInfo {
+            is_sampled: self.is_sampled(),
+            sample_rate: p,
+            sampled_buckets: self.sampled_buckets,
+            total_buckets: self.total_buckets,
+            scale_factor: self.scale_factor(),
+            estimated_total_rows: self.estimated_total_rows,
+            relative_error_pct,
+            method: self.is_sampled().then(|| "bucket_sample".to_string()),
+        }
+    }
+
+    /// Builds `SamplingInfo` for the zero-I/O footer HyperLogLog fast path.
+    pub fn to_hll_info(&self) -> SamplingInfo {
+        SamplingInfo {
+            is_sampled: true,
+            sample_rate: 1.0,
+            sampled_buckets: self.total_buckets,
+            total_buckets: self.total_buckets,
+            scale_factor: 1.0,
+            estimated_total_rows: self.estimated_total_rows,
+            relative_error_pct: Some(3.2),
+            method: Some("hll_sketch".to_string()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn load_project_chunks_with_id(
     ps: &ProjectStorage,
     snap: &StorageSnapshot,
@@ -227,6 +438,32 @@ pub async fn load_project_chunks_with_id(
     requested_props: &[String],
     event_bloom_hint: Option<u64>,
     id_snap: Option<&IdentitySnapshot>,
+) -> Result<Vec<DataChunk>> {
+    load_project_chunks_sampled(
+        ps,
+        snap,
+        cache,
+        catalog,
+        time_range,
+        requested_props,
+        event_bloom_hint,
+        id_snap,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn load_project_chunks_sampled(
+    ps: &ProjectStorage,
+    snap: &StorageSnapshot,
+    cache: &SegmentBlockCache,
+    catalog: &VirtualCatalog,
+    time_range: Option<TimeRange>,
+    requested_props: &[String],
+    event_bloom_hint: Option<u64>,
+    id_snap: Option<&IdentitySnapshot>,
+    bucket_limit: Option<u16>,
 ) -> Result<Vec<DataChunk>> {
     let dict = ps.dictionary();
     let erased = ps.erased_snapshot();
@@ -275,6 +512,11 @@ pub async fn load_project_chunks_with_id(
     let filtered_segments: Vec<SegmentMeta> = segments
         .into_iter()
         .filter(|seg| {
+            if let Some(lim) = bucket_limit {
+                if u16::from(seg.bucket_id) >= lim {
+                    return false;
+                }
+            }
             if let Some(tr) = time_range {
                 if seg.footer.max_ts_ms < tr.start_ts_ms || seg.footer.min_ts_ms > tr.end_ts_ms {
                     return false;
@@ -303,85 +545,112 @@ pub async fn load_project_chunks_with_id(
     let base_props_vec: Vec<String> = base_props_needed.into_iter().collect();
     let final_props_vec: Vec<String> = final_props_set.into_iter().collect();
 
-    // Parallel async fetch of all matching L1 Vortex segments through `foyer` SegmentBlockCache
-    let futs = filtered_segments.iter().map(|seg| {
-        let base_props_ref = &base_props_vec;
-        let final_props_ref = &final_props_vec;
-        let erased_ref = &erased;
-        let hidden_ref = &hidden;
-        async move {
-            let mut tier_a = cache.get_tier_a(seg).await?;
-            let orig_n = tier_a.len();
-            let mut base_map: HashMap<String, Arc<Vec<PropValue>>> = HashMap::new();
+    let est_bpr = 26 + base_props_vec.len() * 48;
+    let concurrency = parallel_segments(&filtered_segments, est_bpr);
+    let ctx_opt = crate::budget::current();
 
-            for bp in base_props_ref {
-                let col = if let Some(pk) = dict.lookup_prop_key(bp) {
-                    cache.get_property_column(seg, pk).await?
-                } else {
-                    Arc::new(vec![PropValue::Null; orig_n])
-                };
-                base_map.insert(bp.clone(), col);
-            }
-
-            let mut seg_meta_opt = Some(seg.clone());
-            if !erased_ref.is_empty()
-                && (0..orig_n).any(|r| hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
-            {
-                let keep_idx: Vec<usize> = (0..orig_n)
-                    .filter(|&r| !hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
-                    .collect();
-                let mut f_uid = Vec::with_capacity(keep_idx.len());
-                let mut f_sh = Vec::with_capacity(keep_idx.len());
-                let mut f_ev = Vec::with_capacity(keep_idx.len());
-                let mut f_ts = Vec::with_capacity(keep_idx.len());
-                let mut f_rkb = Vec::with_capacity(keep_idx.len());
-                for &idx in &keep_idx {
-                    f_uid.push(tier_a.uid_internal[idx]);
-                    f_sh.push(tier_a.session_hash[idx]);
-                    f_ev.push(tier_a.event_id[idx]);
-                    f_ts.push(tier_a.event_ts_ms[idx]);
-                    f_rkb.push(tier_a.replay_offset_kb[idx]);
+    // Bounded concurrent async fetch + spawn_blocking Vortex decode of matching L1 segments.
+    let mut chunks: Vec<DataChunk> = stream::iter(filtered_segments.into_iter())
+        .map(|seg| {
+            let base_props_ref = &base_props_vec;
+            let final_props_ref = &final_props_vec;
+            let erased_ref = &erased;
+            let hidden_ref = &hidden;
+            let ctx_ref = &ctx_opt;
+            async move {
+                if let Some(ctx) = ctx_ref {
+                    ctx.check()?;
                 }
-                tier_a = Arc::new(TierAColumns {
-                    uid_internal: f_uid,
-                    session_hash: f_sh,
-                    event_id: f_ev,
-                    event_ts_ms: f_ts,
-                    replay_offset_kb: f_rkb,
-                    session_index: tier_a.session_index.clone(),
-                });
-                for col in base_map.values_mut() {
-                    let compacted: Vec<PropValue> =
-                        keep_idx.iter().map(|&i| col[i].clone()).collect();
-                    *col = Arc::new(compacted);
+                let mut tier_a = cache.get_tier_a(&seg).await?;
+                let orig_n = tier_a.len();
+                let mut base_map: HashMap<String, Arc<Vec<PropValue>>> = HashMap::new();
+
+                for bp in base_props_ref {
+                    if let Some(ctx) = ctx_ref {
+                        ctx.check()?;
+                    }
+                    let col = if let Some(pk) = dict.lookup_prop_key(bp) {
+                        cache.get_property_column(&seg, pk).await?
+                    } else {
+                        Arc::new(vec![PropValue::Null; orig_n])
+                    };
+                    base_map.insert(bp.clone(), col);
                 }
-                seg_meta_opt = None;
+
+                let mut seg_meta_opt = Some(seg.clone());
+                if !erased_ref.is_empty()
+                    && (0..orig_n)
+                        .any(|r| hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
+                {
+                    let keep_idx: Vec<usize> = (0..orig_n)
+                        .filter(|&r| !hidden_ref(tier_a.uid_internal[r], tier_a.event_ts_ms[r]))
+                        .collect();
+                    let mut f_uid = Vec::with_capacity(keep_idx.len());
+                    let mut f_sh = Vec::with_capacity(keep_idx.len());
+                    let mut f_ev = Vec::with_capacity(keep_idx.len());
+                    let mut f_ts = Vec::with_capacity(keep_idx.len());
+                    let mut f_rkb = Vec::with_capacity(keep_idx.len());
+                    for &idx in &keep_idx {
+                        f_uid.push(tier_a.uid_internal[idx]);
+                        f_sh.push(tier_a.session_hash[idx]);
+                        f_ev.push(tier_a.event_id[idx]);
+                        f_ts.push(tier_a.event_ts_ms[idx]);
+                        f_rkb.push(tier_a.replay_offset_kb[idx]);
+                    }
+                    tier_a = Arc::new(TierAColumns {
+                        uid_internal: f_uid,
+                        session_hash: f_sh,
+                        event_id: f_ev,
+                        event_ts_ms: f_ts,
+                        replay_offset_kb: f_rkb,
+                    });
+                    for col in base_map.values_mut() {
+                        let compacted: Vec<PropValue> =
+                            keep_idx.iter().map(|&i| col[i].clone()).collect();
+                        *col = Arc::new(compacted);
+                    }
+                    seg_meta_opt = None;
+                }
+
+                let n = tier_a.len();
+                let prop_cols = materialize_virtual_columns(
+                    n,
+                    &tier_a.uid_internal,
+                    &base_map,
+                    final_props_ref,
+                    catalog,
+                    id_snap,
+                )?;
+
+                if let Some(ctx) = ctx_ref {
+                    let mut chunk_bytes = tier_a.approx_bytes() as u64;
+                    for col in prop_cols.values() {
+                        chunk_bytes = chunk_bytes.saturating_add(prop_col_approx_bytes(col) as u64);
+                    }
+                    ctx.charge_memory(chunk_bytes)?;
+                }
+
+                Ok::<DataChunk, ExecError>(DataChunk {
+                    bucket_id: seg.bucket_id,
+                    tier_a,
+                    prop_cols,
+                    l0_rows: None,
+                    segment_meta: seg_meta_opt,
+                })
             }
-
-            let n = tier_a.len();
-            let prop_cols = materialize_virtual_columns(
-                n,
-                &tier_a.uid_internal,
-                &base_map,
-                final_props_ref,
-                catalog,
-                id_snap,
-            )?;
-
-            Ok::<DataChunk, ExecError>(DataChunk {
-                bucket_id: seg.bucket_id,
-                tier_a,
-                prop_cols,
-                l0_rows: None,
-                segment_meta: seg_meta_opt,
-            })
-        }
-    });
-
-    let mut chunks = try_join_all(futs).await?;
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
 
     // Append L0 hot `MemBucket` rows per bucket within MVCC snapshot watermark
-    for b in 0..ps.config().num_buckets {
+    let max_bucket = bucket_limit
+        .unwrap_or(ps.config().num_buckets)
+        .min(ps.config().num_buckets);
+    for b in 0..max_bucket {
+        if let Some(ctx) = &ctx_opt {
+            ctx.check()?;
+        }
         let bucket_id = b as u8;
         let l0_rows: Vec<StoredRow> = ps
             .snapshot_l0_bucket(snap, bucket_id)
@@ -437,21 +706,24 @@ pub async fn load_project_chunks_with_id(
             catalog,
             id_snap,
         )?;
-        let empty_sidx = Arc::new(pulse_storage::SegmentSessionIndex {
-            headers: Vec::new(),
-            session_ids: Vec::new(),
+        let tier_a = Arc::new(TierAColumns {
+            uid_internal,
+            session_hash,
+            event_id,
+            event_ts_ms,
+            replay_offset_kb,
         });
+        if let Some(ctx) = &ctx_opt {
+            let mut chunk_bytes = tier_a.approx_bytes() as u64;
+            for col in prop_cols.values() {
+                chunk_bytes = chunk_bytes.saturating_add(prop_col_approx_bytes(col) as u64);
+            }
+            ctx.charge_memory(chunk_bytes)?;
+        }
 
         chunks.push(DataChunk {
             bucket_id,
-            tier_a: Arc::new(TierAColumns {
-                uid_internal,
-                session_hash,
-                event_id,
-                event_ts_ms,
-                replay_offset_kb,
-                session_index: empty_sidx,
-            }),
+            tier_a,
             prop_cols,
             l0_rows: Some(l0_rows),
             segment_meta: None,
@@ -540,30 +812,84 @@ pub fn row_matches_predicates(chunk: &DataChunk, row_idx: usize, preds: &[PropPr
     true
 }
 
-/// Computes segment-level `RoaringBitmap` row mask ONLY when the Tier B inverted index is strictly
-/// complete AND unmixed for the predicate's exact value type (`P1-15`, `P2-01`).
-pub async fn precompute_segment_row_mask(
-    chunk: &DataChunk,
+/// Zero-I/O footer pruning: returns `false` if any physical event-property predicate requires a
+/// non-null value on a property that is completely absent from this segment (not in Tier B and
+/// bit == 0 in Tier C bloom filter), and is not backed by a user profile / custom / lookup column.
+pub fn segment_can_match_preds(
+    meta: &SegmentMeta,
+    preds: &[PropPredicate],
+    dict: &ProjectDictionary,
+    catalog: &VirtualCatalog,
+) -> bool {
+    for pred in preds {
+        if pred.prop_name.starts_with("user.") || pred.prop_name.starts_with("$cohort:") {
+            continue;
+        }
+        // If `None` (missing property) satisfies the predicate (e.g. `Neq("US")` or `Eq(Null)`),
+        // we cannot prune the segment based on property absence.
+        if pred.matches(None) {
+            continue;
+        }
+        // Only prune purely physical event properties (not shadowed by user profiles, custom props, or lookup tables).
+        if catalog.has_user_prop(&pred.prop_name)
+            || catalog.custom_properties.contains_key(&pred.prop_name)
+            || catalog.resolve_lookup_column(&pred.prop_name).is_some()
+        {
+            continue;
+        }
+        let Some(pk) = dict.lookup_prop_key(&pred.prop_name) else {
+            return false;
+        };
+        let in_tier_b =
+            meta.footer.tier_b_columns.iter().any(|c| {
+                c.prop_key_id == pk && (c.has_i64 || c.has_f64 || c.has_bool || c.has_str)
+            });
+        if in_tier_b {
+            continue;
+        }
+        let in_tier_c = meta.footer.has_tier_c_column
+            && (meta.footer.tier_c_bloom_64 & tier_c_key_bit(pk)) != 0;
+        if !in_tier_c {
+            return false;
+        }
+    }
+    true
+}
+
+/// Evaluates all indexed Tier B `Eq(Str)` / `Eq(Bool)` predicates directly against `SegmentInvertedIndex`
+/// *before* touching any Vortex bytes.
+///
+/// Returns `(Option<RoaringBitmap>, satisfied_pred_indices)` so callers can:
+/// 1. Skip the entire segment if `Some(bm)` is empty,
+/// 2. Skip decoding any filter column whose predicate index is in `satisfied_pred_indices`,
+/// 3. Pass the surviving row indices to Vortex `Selection::IncludeByIndex` late materialization.
+pub async fn precompute_segment_row_mask_for_meta(
+    meta: &SegmentMeta,
     preds: &[PropPredicate],
     dict: &ProjectDictionary,
     catalog: &VirtualCatalog,
     cache: &SegmentBlockCache,
-) -> Result<Option<RoaringBitmap>> {
-    let Some(meta) = &chunk.segment_meta else {
-        return Ok(None);
-    };
+) -> Result<(Option<RoaringBitmap>, Vec<usize>)> {
     if preds.is_empty() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
-
     let mut combined: Option<RoaringBitmap> = None;
-    for pred in preds {
+    let mut satisfied = Vec::new();
+    let mut inv_cached: Option<Arc<pulse_storage::SegmentInvertedIndex>> = None;
+
+    for (idx, pred) in preds.iter().enumerate() {
+        if pred.prop_name.starts_with("user.") || pred.prop_name.starts_with("$cohort:") {
+            continue;
+        }
+        // If a user profile property can fill in Null event rows, the event-only inverted index
+        // does not include users whose value comes from their profile.
+        if catalog.has_user_prop(&pred.prop_name) {
+            continue;
+        }
         let PropFilterOp::Eq(target) = &pred.filter else {
             continue;
         };
-        // Skip physical index if property is not physical
         let Some(pk) = dict.lookup_prop_key(&pred.prop_name) else {
-            let _ = catalog;
             continue;
         };
         let Some(entry) = meta
@@ -580,22 +906,37 @@ pub async fn precompute_segment_row_mask(
                 if !entry.bool_indexed || entry.has_str || entry.has_i64 || entry.has_f64 {
                     continue;
                 }
-                let inv = cache.get_inverted_index(meta).await?;
+                crate::budget::check_current()?;
+                let inv = match &inv_cached {
+                    Some(i) => i.clone(),
+                    None => {
+                        let loaded = cache.get_inverted_index(meta).await?;
+                        inv_cached = Some(loaded.clone());
+                        loaded
+                    }
+                };
                 inv.get_bool(pk, *b).cloned().unwrap_or_default()
             }
-            // The row filter compares numeric-looking strings by value ("499" == "499.0" == 499);
-            // the index only knows exact strings, so it would drop matches. Let rows decide.
             PropValue::Str(s) if s.trim().parse::<f64>().is_ok() => continue,
             PropValue::Str(s) => {
                 if !entry.str_indexed_complete || entry.has_i64 || entry.has_f64 || entry.has_bool {
                     continue;
                 }
-                let inv = cache.get_inverted_index(meta).await?;
+                crate::budget::check_current()?;
+                let inv = match &inv_cached {
+                    Some(i) => i.clone(),
+                    None => {
+                        let loaded = cache.get_inverted_index(meta).await?;
+                        inv_cached = Some(loaded.clone());
+                        loaded
+                    }
+                };
                 inv.get_str(pk, s).cloned().unwrap_or_default()
             }
             _ => continue,
         };
 
+        satisfied.push(idx);
         combined = Some(match combined {
             Some(mut prev) => {
                 prev &= &bm;
@@ -603,8 +944,27 @@ pub async fn precompute_segment_row_mask(
             }
             None => bm,
         });
+        if combined.as_ref().is_some_and(RoaringBitmap::is_empty) {
+            break;
+        }
     }
-    Ok(combined)
+    Ok((combined, satisfied))
+}
+
+/// Computes segment-level `RoaringBitmap` row mask ONLY when the Tier B inverted index is strictly
+/// complete AND unmixed for the predicate's exact value type (`P1-15`, `P2-01`).
+pub async fn precompute_segment_row_mask(
+    chunk: &DataChunk,
+    preds: &[PropPredicate],
+    dict: &ProjectDictionary,
+    catalog: &VirtualCatalog,
+    cache: &SegmentBlockCache,
+) -> Result<Option<RoaringBitmap>> {
+    let Some(meta) = &chunk.segment_meta else {
+        return Ok(None);
+    };
+    let (mask, _) = precompute_segment_row_mask_for_meta(meta, preds, dict, catalog, cache).await?;
+    Ok(mask)
 }
 
 pub const MAX_COHORT_DEPTH: usize = 32;
@@ -798,12 +1158,19 @@ fn evaluate_cohort_bounded<'a>(
                             local
                         })
                         .reduce(HashMap::new, |mut acc, map| {
-                            for (uid, cnt) in map {
+                            if !stop.live() {
+                                return acc;
+                            }
+                            for (idx, (uid, cnt)) in map.into_iter().enumerate() {
+                                if !stop.live_every(idx) {
+                                    break;
+                                }
                                 *acc.entry(uid).or_insert(0) += cnt;
                             }
                             acc
                         })
                 });
+                crate::budget::check_current()?;
 
                 let needed = (*min_count).max(1);
                 let mut out = RoaringBitmap::new();
@@ -849,10 +1216,14 @@ fn evaluate_cohort_bounded<'a>(
                             local
                         })
                         .reduce(RoaringBitmap::new, |mut a, b| {
+                            if !stop.live() {
+                                return a;
+                            }
                             a |= b;
                             a
                         })
                 });
+                crate::budget::check_current()?;
                 let performed = evaluate_cohort_bounded(
                     &BehavioralCohortDef::PerformedEvent {
                         event_name: event_name.clone(),
@@ -912,10 +1283,14 @@ fn evaluate_cohort_bounded<'a>(
                             local
                         })
                         .reduce(RoaringBitmap::new, |mut a, b| {
+                            if !stop.live() {
+                                return a;
+                            }
                             a |= b;
                             a
                         })
                 });
+                crate::budget::check_current()?;
                 Ok(out)
             }
             BehavioralCohortDef::Users { canonical_uids } => {

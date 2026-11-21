@@ -65,6 +65,19 @@ export interface SeriesOutput {
   points: TimePoint[];
 }
 
+export type SamplingMode = "auto" | "exact" | { rate: number };
+
+export interface SamplingInfo {
+  is_sampled: boolean;
+  sample_rate: number;
+  sampled_buckets: number;
+  total_buckets: number;
+  scale_factor: number;
+  estimated_total_rows: number;
+  relative_error_pct?: number;
+  method?: "bucket_sample" | "hll_sketch" | string;
+}
+
 export interface InsightsResult {
   snapshot_epoch: number;
   exec_time_us: number;
@@ -72,6 +85,7 @@ export interface InsightsResult {
   series: SeriesOutput[];
   previous_series: SeriesOutput[];
   formula_series: SeriesOutput[];
+  sampling?: SamplingInfo;
 }
 
 export interface FunnelStepCount {
@@ -112,6 +126,7 @@ export interface FunnelResult {
     histogram_bins: [number, number, number][];
   };
   dropped_sample_sessions: DroppedSessionSample[];
+  sampling?: SamplingInfo;
 }
 
 export interface FlowNode {
@@ -132,6 +147,7 @@ export interface FlowsResult {
   exec_time_us: number;
   nodes: FlowNode[];
   links: FlowLink[];
+  sampling?: SamplingInfo;
 }
 
 export interface RetentionCohortRow {
@@ -147,6 +163,7 @@ export interface RetentionResult {
   exec_time_us: number;
   mode: string;
   cohorts: RetentionCohortRow[];
+  sampling?: SamplingInfo;
 }
 
 export interface SessionSummaryItem {
@@ -970,6 +987,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  updateReport: (projectId: string, reportId: string, body: { name: string; query_json: unknown }) =>
+    fetchJson<SavedReport>(
+      `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
   deleteReport: (projectId: string, reportId: string) =>
     fetchJson<unknown>(
       `/v1/projects/${encodeURIComponent(projectId)}/saved-reports/${encodeURIComponent(reportId)}`,
@@ -1166,6 +1188,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  updateCohort: (projectId: string, cohortId: string, body: { name: string; description: string; definition: unknown }) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  /** Refused with 409 while a cohort, flag, saved report or dashboard still uses it. */
+  deleteCohort: (projectId: string, cohortId: string) =>
+    fetchJson(projectPath(projectId, `/cohorts/${encodeURIComponent(cohortId)}`), { method: "DELETE" }),
 
   getSchemaExtensions: (projectId: string, signal?: AbortSignal) =>
     fetchJson<{

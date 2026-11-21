@@ -226,6 +226,9 @@ impl RunningNode {
             if let Err(e) = self.storage.identity_router().close_all().await {
                 tracing::error!(error = %e, "closing identity stores on shutdown failed");
             }
+            if let Err(e) = self.storage.profile_router().close_all().await {
+                tracing::error!(error = %e, "closing profile stores on shutdown failed");
+            }
         }
     }
 }
@@ -336,9 +339,15 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
         .role
         .serves_query_and_admin()
         .then_some(foyer_dir.as_path());
+    let cache_mem_bytes = std::env::var("PULSE_CACHE_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(128 * 1024 * 1024);
     let qengine = QueryEngine::new(
         storage.clone(),
-        128 * 1024 * 1024,
+        cache_mem_bytes,
         disk_cache_dir,
         512 * 1024 * 1024,
         catalogs,
@@ -464,12 +473,7 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
                                 let errs = bg_storage.maintenance_errors();
                                 errs.check(MaintenanceKind::IdentityFlush, bg_storage.identity_router().flush_all().await);
                                 for p in bg_storage.open_projects() {
-                                    for b in 0..p.config().num_buckets {
-                                        let bid = b as u8;
-                                        if p.should_flush_bucket(bid) {
-                                            errs.check(MaintenanceKind::Flush, p.flush_bucket(bid).await);
-                                        }
-                                    }
+                                    errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
                                 }
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
                                     tracing::warn!(error = %e, "reloading API key cache failed");

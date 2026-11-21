@@ -575,6 +575,7 @@ async fn invoke_tool_with_agent_store(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     formula: None,
+                    sampling: Default::default(),
                 }
             };
             let known = known_event_names(project_id, meta, qengine).await?;
@@ -636,6 +637,7 @@ async fn invoke_tool_with_agent_store(
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                     global_filter: GlobalFilter::default(),
+                    sampling: Default::default(),
                 }
             };
             let known = known_event_names(project_id, meta, qengine).await?;
@@ -683,6 +685,7 @@ async fn invoke_tool_with_agent_store(
                 unit: TimeInterval::Day,
                 num_periods,
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_retention(project_id, &q)
@@ -756,6 +759,7 @@ async fn invoke_tool_with_agent_store(
                         .clamp(1, 20) as usize,
                 ),
                 global_filter: GlobalFilter::default(),
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_flows(project_id, &q)
@@ -775,10 +779,17 @@ async fn invoke_tool_with_agent_store(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
-            let profile = meta
-                .get_user_profile(project_id, distinct_id)
+            let pstore = qengine
+                .storage()
+                .profile_router()
+                .get_or_open(project_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            let profile = pstore
+                .get_by_distinct_id(distinct_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(crate::ControlPlaneService::from_stored_profile);
             let id_graph = qengine
                 .storage()
                 .identity_router()
@@ -803,10 +814,13 @@ async fn invoke_tool_with_agent_store(
                 .await
                 .map_err(|e| e.to_string())?;
             // Every id merged into this user contributes; the newest value of each key wins.
-            let rows = meta
-                .list_user_profiles_for_canonical(project_id, canon)
+            let rows: Vec<_> = pstore
+                .list_for_canonical(canon)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(crate::ControlPlaneService::from_stored_profile)
+                .collect();
             let merged = crate::api::merge_profile_rows(rows).remove(&canon);
             Ok(json!({
                 "distinct_id": distinct_id,
@@ -848,6 +862,7 @@ async fn invoke_tool_with_agent_store(
                 global_filter: GlobalFilter::default(),
                 compare_previous_period: false,
                 formula: None,
+                sampling: Default::default(),
             };
             let res = qengine
                 .query_insights(project_id, &q)

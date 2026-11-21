@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: npm --prefix web ci && npm --prefix web test && npm --prefix web run build
@@ -49,7 +49,7 @@ jobs:
           ./out/pulse/pulse-node --port 18080 --data-dir "$RUNNER_TEMP/data" --web-dir out/pulse/web/dist --no-quic &
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/healthz && exit 0; sleep 1; done
           exit 1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pulse-linux-${{ matrix.arch }}
           path: pulse-linux-${{ matrix.arch }}.tar.gz
@@ -63,7 +63,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: pulse-linux-*
           merge-multiple: true
@@ -81,7 +81,7 @@ jobs:
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/healthz && exit 0; sleep 1; done
           docker logs pulse; exit 1
       - if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -99,7 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - run: sha256sum pulse-linux-*.tar.gz pulse-analytics-ts-web-*.tgz > SHA256SUMS
@@ -116,7 +116,7 @@ jobs:
       HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -128,7 +128,7 @@ jobs:
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" --allow-same-version || true
           npm pack
         working-directory: sdks/ts-web
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdk-tarball
           path: sdks/ts-web/pulse-analytics-ts-web-*.tgz

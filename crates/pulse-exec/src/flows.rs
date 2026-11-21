@@ -10,8 +10,8 @@ use crate::ast::{FlowDirection, FlowLink, FlowNode, FlowsQuery, FlowsResult};
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
-    row_matches_predicates, ExecError, Result,
+    load_project_chunks_sampled, resolve_event_target, resolve_global_cohort_bitmap,
+    row_matches_predicates, ExecError, Result, SamplingPlan,
 };
 
 const MAX_FLOWS_SCANNED_EVENTS: usize = 2_000_000;
@@ -60,7 +60,8 @@ impl FlowsEngine {
             .collect();
         props_needed.extend(anchor_tgt.required_props());
 
-        let chunks = load_project_chunks_with_id(
+        let sampling_plan = SamplingPlan::resolve(query.sampling, snap, ps, query.time_range);
+        let chunks = load_project_chunks_sampled(
             ps,
             snap,
             cache,
@@ -69,6 +70,7 @@ impl FlowsEngine {
             &props_needed,
             None,
             Some(id_snap),
+            sampling_plan.bucket_limit(),
         )
         .await?;
 
@@ -122,9 +124,11 @@ impl FlowsEngine {
                     .collect()
             });
 
+        crate::budget::check_current()?;
         let mut timelines: HashMap<u32, Vec<(i64, u16, bool)>> = HashMap::new();
         let mut total_collected = 0usize;
         for batch in chunk_batches {
+            crate::budget::check_current()?;
             for (canon_uid, ts, eid, is_anchor) in batch {
                 total_collected += 1;
                 if total_collected > MAX_FLOWS_SCANNED_EVENTS {
@@ -320,13 +324,20 @@ impl FlowsEngine {
             *merged_links.entry((src_id, dst_id)).or_default() |= bm;
         }
 
+        let mut sample_basis = 0u64;
         let mut nodes: Vec<FlowNode> = merged_nodes
             .into_iter()
-            .map(|((step_offset, event_name), bm)| FlowNode {
-                id: format_node_id(step_offset, &event_name),
-                step_offset,
-                event_name,
-                user_count: bm.len(),
+            .map(|((step_offset, event_name), bm)| {
+                let raw = bm.len();
+                if step_offset == 0 {
+                    sample_basis = sample_basis.saturating_add(raw);
+                }
+                FlowNode {
+                    id: format_node_id(step_offset, &event_name),
+                    step_offset,
+                    event_name,
+                    user_count: sampling_plan.scale_u64(raw),
+                }
             })
             .collect();
         nodes.sort_by(|a, b| {
@@ -341,7 +352,7 @@ impl FlowsEngine {
             .map(|((source, target), bm)| FlowLink {
                 source,
                 target,
-                user_count: bm.len(),
+                user_count: sampling_plan.scale_u64(bm.len()),
             })
             .collect();
         links.sort_by(|a, b| {
@@ -356,6 +367,7 @@ impl FlowsEngine {
             exec_time_us: t0.elapsed().as_micros() as u64,
             nodes,
             links,
+            sampling: Some(sampling_plan.to_info(sample_basis)),
         })
     }
 }

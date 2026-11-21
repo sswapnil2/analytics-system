@@ -1,6 +1,6 @@
 import React, { useId, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
-import type { Role } from "../api/client";
+import { AlertTriangle, Loader2, Zap } from "lucide-react";
+import type { Role, SamplingInfo, SamplingMode } from "../api/client";
 import { formatRunTime } from "../lib/format";
 
 /** Page title plus a one-line description of what the page answers. */
@@ -16,7 +16,7 @@ export const PageHeader: React.FC<{
       </h1>
       <p className="mt-1 text-[0.9375rem] text-muted">{description}</p>
     </div>
-    {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+    {actions && <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">{actions}</div>}
   </header>
 );
 
@@ -45,6 +45,78 @@ export const Panel: React.FC<{
 export const RanIn: React.FC<{ us?: number | null }> = ({ us }) => {
   const text = formatRunTime(us);
   return text ? <span className="text-xs text-faint tabular">{text}</span> : null;
+};
+
+function samplingModeToKey(mode: SamplingMode): string {
+  if (mode === "auto") return "auto";
+  if (mode === "exact") return "exact";
+  return String(mode.rate);
+}
+
+function keyToSamplingMode(key: string): SamplingMode {
+  if (key === "auto") return "auto";
+  if (key === "exact") return "exact";
+  const rate = Number(key);
+  return Number.isFinite(rate) && rate > 0 && rate < 1 ? { rate } : "auto";
+}
+
+/** Transparent sampling badge + mode selector + run-time readout for query panels. */
+export const SamplingMeta: React.FC<{
+  sampling?: SamplingInfo | null;
+  mode: SamplingMode;
+  onChangeMode: (mode: SamplingMode) => void;
+  us?: number | null;
+  loading?: boolean;
+}> = ({ sampling, mode, onChangeMode, us, loading }) => {
+  const isHll = sampling?.method === "hll_sketch";
+  const pct = sampling ? +(sampling.sample_rate * 100).toFixed(1) : null;
+  const errText =
+    sampling?.relative_error_pct != null ? ` (±${sampling.relative_error_pct}%)` : "";
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {sampling?.is_sampled && (
+        <span
+          className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300 tabular"
+          title={
+            isHll
+              ? `Instant HyperLogLog sketch across 100% of segments (${sampling.total_buckets}/${sampling.total_buckets} buckets, zero segment I/O).`
+              : `Entity-consistent deterministic sample of ${sampling.sampled_buckets}/${sampling.total_buckets} user buckets (${pct}% of users, ${sampling.scale_factor}x scale).`
+          }
+        >
+          <Zap className="h-3 w-3 shrink-0" />
+          <span>
+            {isHll ? `~HLL sketch${errText}` : `~${pct}% sample${errText}`}
+          </span>
+          <button
+            type="button"
+            onClick={() => onChangeMode("exact")}
+            className="ml-0.5 rounded px-1 py-0.25 text-[11px] font-semibold text-amber-200 underline decoration-amber-400/60 underline-offset-2 hover:text-white"
+          >
+            Run exact
+          </button>
+        </span>
+      )}
+      <select
+        aria-label="Query sampling mode"
+        value={samplingModeToKey(mode)}
+        onChange={(e) => onChangeMode(keyToSamplingMode(e.target.value))}
+        className="h-6 rounded-md border border-line bg-surface px-1.5 text-[11px] font-medium text-muted hover:text-ink focus:border-accent focus:outline-none"
+        title="Auto stays exact on fast queries and samples user buckets on very large ranges."
+      >
+        <option value="auto">Auto</option>
+        <option value="exact">Exact (100%)</option>
+        <option value="0.25">Fast (25%)</option>
+        <option value="0.125">Faster (12.5%)</option>
+        <option value="0.0625">Turbo (6.25%)</option>
+      </select>
+      {loading ? (
+        <span className="text-xs text-faint">Updating…</span>
+      ) : (
+        <RanIn us={us} />
+      )}
+    </div>
+  );
 };
 
 export const EmptyState: React.FC<{

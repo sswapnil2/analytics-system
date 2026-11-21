@@ -4,6 +4,9 @@ use pulse_node::{start_pulse_node, NodeConfig, NodeRole};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
+import { AlertTriangle, Check, FlaskConical, Plus, RefreshCw, Rocket, Square, ToggleLeft } from "lucide-react";
 import { api, Experiment, ExperimentResults, FeatureFlag, FlagPatch } from "../api/client";
 import { useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
+import { PropertyPicker } from "../components/PropertyPicker";
 import { errorMessage, formatCount, formatPValue, formatPercent, formatProbability, humanizeEvent } from "../lib/format";
 
 interface Props {
@@ -68,8 +69,10 @@ const SampleEstimate: React.FC<{
   mde: number;
   flag: FeatureFlag | undefined;
   days: number;
-}> = ({ baseline, mde, flag, days }) => {
+  event: string;
+}> = ({ baseline, mde, flag, days, event }) => {
   if (!baseline) return null;
+  const name = humanizeEvent(event);
   const variants = Math.max(2, flag?.variants.length ?? 2);
   const n = usersPerVariant(baseline.rate, mde);
   const perDay = baseline.dailyUsers * ((flag?.rollout_pct ?? 100) / 100);
@@ -86,7 +89,11 @@ const SampleEstimate: React.FC<{
           {short ? `, longer than the ${days} days you picked.` : "."}
         </>
       ) : (
-        "Not enough data on this event yet to estimate how long the test needs."
+        baseline.rate >= 1
+          ? `Every active user already does ${name}, so there's no lift left to measure. Pick an event fewer people reach.`
+          : baseline.rate <= 0
+            ? `No one did ${name} in the last 14 days, so there's no baseline to estimate from.`
+            : "Not enough data on this event yet to estimate how long the test needs."
       )}
     </p>
   );
@@ -138,15 +145,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [loaded, setLoaded] = useState<boolean>(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [flagError, setFlagError] = useState<string | null>(null);
+  // The flag whose change last saved; shows a short "Saved" next to it.
+  const [savedFlag, setSavedFlag] = useState<string | null>(null);
+  const savedTimerRef = useRef<number>();
+  useEffect(() => () => window.clearTimeout(savedTimerRef.current), []);
   const [creating, setCreating] = useState<boolean>(false);
 
   const [expFormOpen, setExpFormOpen] = useState(false);
   const [expName, setExpName] = useState("");
   const [expFlagId, setExpFlagId] = useState("");
   const [expHypothesis, setExpHypothesis] = useState("");
-  const [expMetricPick, setExpMetric] = useState("");
-  // This page can open before the event list loads, so fall back to the busiest event.
-  const expMetric = expMetricPick || availableEvents[0] || "";
+  // No default: the busiest event is usually one everyone does, which a test can't move.
+  const [expMetric, setExpMetric] = useState("");
+  const eventOptions = availableEvents.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }));
   const [expGuardrail, setExpGuardrail] = useState("");
   const [expWindowDays, setExpWindowDays] = useState(7);
   const [expDays, setExpDays] = useState(14);
@@ -241,6 +252,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       const updated = await api.patchFlag(projectId, flag.id, body);
       setFlags((prev) => prev.map((f) => (f.id === flag.id ? updated : f)));
       if (body.rollout_pct !== undefined) clearDraftIfIdle(flag.id);
+      setSavedFlag(flag.id);
+      window.clearTimeout(savedTimerRef.current);
+      savedTimerRef.current = window.setTimeout(() => setSavedFlag(null), 2500);
     } catch (err) {
       if (body.rollout_pct !== undefined) clearDraftIfIdle(flag.id);
       setFlagError(`Couldn't update ${flag.key}: ${errorMessage(err)}`);
@@ -415,28 +429,32 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   className={field}
                 />
               </label>
-              <label className="flex flex-col gap-1">
-                <span className={fieldLabel}>Counts as a conversion</span>
-                <select value={expMetric} onChange={(e) => setExpMetric(e.target.value)} className={field}>
-                  {availableEvents.length === 0 && <option value="">No events yet</option>}
-                  {availableEvents.map((ev) => (
-                    <option key={ev} value={ev}>
-                      {humanizeEvent(ev)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className={fieldLabel}>Guardrail (optional)</span>
-                <select value={expGuardrail} onChange={(e) => setExpGuardrail(e.target.value)} className={field}>
-                  <option value="">None</option>
-                  {availableEvents.map((ev) => (
-                    <option key={ev} value={ev}>
-                      {humanizeEvent(ev)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {availableEvents.length === 0 ? (
+                <label className="flex flex-col gap-1">
+                  <span className={fieldLabel}>Counts as a conversion</span>
+                  <select disabled className={field}>
+                    <option>No events yet</option>
+                  </select>
+                </label>
+              ) : (
+                <PropertyPicker
+                  label="Counts as a conversion"
+                  value={expMetric}
+                  onChange={setExpMetric}
+                  placeholder="Search events"
+                  recentKey={`pulse.recent-events.${projectId}`}
+                  options={eventOptions}
+                />
+              )}
+              <PropertyPicker
+                label="Guardrail (optional)"
+                value={expGuardrail}
+                onChange={setExpGuardrail}
+                noneLabel="None"
+                placeholder="Search events"
+                recentKey={`pulse.recent-events.${projectId}`}
+                options={eventOptions}
+              />
               <label className="flex flex-col gap-1">
                 <span className={fieldLabel}>Conversion window</span>
                 <select value={expWindowDays} onChange={(e) => setExpWindowDays(Number(e.target.value))} className={field}>
@@ -468,7 +486,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </select>
               </label>
             </div>
-            <SampleEstimate baseline={baseline} mde={mde / 100} flag={flags.find((f) => f.id === expFlagId)} days={expDays} />
+            <SampleEstimate baseline={baseline} mde={mde / 100} flag={flags.find((f) => f.id === expFlagId)} days={expDays} event={expMetric} />
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setExpFormOpen(false)} className={btn.ghost}>
                 Cancel
@@ -762,17 +780,24 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         >
                           {f.enabled ? "On" : "Off"}
                         </button>
+                        <span role="status" className="text-xs text-ok">
+                          {savedFlag === f.id && (
+                            <span className="inline-flex items-center gap-1 motion-safe:animate-fade-in">
+                              <Check className="h-3.5 w-3.5" aria-hidden="true" /> Saved
+                            </span>
+                          )}
+                        </span>
                       </div>
                       {f.description && <div className="text-sm text-muted">{f.description}</div>}
                     </div>
 
-                    <label className="flex items-center gap-2">
+                    <label className="flex min-w-0 max-w-full items-center gap-2">
                       <span className={fieldLabel}>Who</span>
                       <select
                         value={f.targeting_cohort_id ?? ""}
                         disabled={!canEdit}
                         onChange={(e) => void patchFlag(f, { targeting_cohort_id: e.target.value })}
-                        className={`${field} py-1`}
+                        className={`${field} min-w-0 max-w-full py-1`}
                       >
                         <option value="">Everyone</option>
                         {cohorts.map((c) => (

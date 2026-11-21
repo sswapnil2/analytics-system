@@ -15,8 +15,8 @@ use crate::ast::{
 use crate::cache::SegmentBlockCache;
 use crate::catalog::VirtualCatalog;
 use crate::scanner::{
-    load_project_chunks_with_id, resolve_event_target, resolve_global_cohort_bitmap,
-    row_matches_predicates, DataChunk, ExecError, Result,
+    load_project_chunks_sampled, resolve_event_target, resolve_global_cohort_bitmap,
+    row_matches_predicates, DataChunk, ExecError, Result, SamplingPlan,
 };
 
 const HOLD_MISSING: u64 = 0;
@@ -257,8 +257,9 @@ impl FunnelEngine {
             None
         };
 
+        let sampling_plan = SamplingPlan::resolve(query.sampling, snap, ps, query.time_range);
         let props_vec: Vec<String> = props_needed.into_iter().collect();
-        let chunks = load_project_chunks_with_id(
+        let chunks = load_project_chunks_sampled(
             ps,
             snap,
             cache,
@@ -267,6 +268,7 @@ impl FunnelEngine {
             &props_vec,
             bloom_hint,
             Some(id_snap),
+            sampling_plan.bucket_limit(),
         )
         .await?;
         let recorded_hashes = rstore.recorded_hashes_for_project(ps.project_id()).await;
@@ -505,7 +507,9 @@ impl FunnelEngine {
         let mut coord_bdown_names: Vec<String> = vec!["(none)".to_string()];
         coord_bdown_map.insert("(none)".to_string(), 0);
 
+        crate::budget::check_current()?;
         for (shard_sum, shard_names, mut cross) in shard_outputs {
+            crate::budget::check_current()?;
             if has_breakdown {
                 let mut remap = Vec::with_capacity(shard_names.len());
                 for name in shard_names {
@@ -545,7 +549,13 @@ impl FunnelEngine {
             final_summary.merge_remapped(cross_summary, k, None);
         }
 
-        let overall_steps = build_step_counts(&query.steps, &final_summary.step_counts);
+        let sample_basis = final_summary.step_counts.first().copied().unwrap_or(0);
+        let scaled_overall_counts: Vec<u64> = final_summary
+            .step_counts
+            .iter()
+            .map(|&c| sampling_plan.scale_u64(c))
+            .collect();
+        let overall_steps = build_step_counts(&query.steps, &scaled_overall_counts);
 
         let mut breakdowns = Vec::new();
         if has_breakdown {
@@ -583,21 +593,30 @@ impl FunnelEngine {
             }
 
             for (breakdown_value, counts) in raw_entries {
+                let scaled_counts: Vec<u64> =
+                    counts.iter().map(|&c| sampling_plan.scale_u64(c)).collect();
                 breakdowns.push(FunnelBreakdownGroup {
                     breakdown_value,
-                    steps: build_step_counts(&query.steps, &counts),
+                    steps: build_step_counts(&query.steps, &scaled_counts),
                 });
             }
         }
 
-        let time_to_convert = build_ttc_stats(&final_summary.ttc_values);
+        let mut time_to_convert = build_ttc_stats(&final_summary.ttc_values);
+        if sampling_plan.is_sampled() {
+            time_to_convert.converted_count =
+                sampling_plan.scale_u64(time_to_convert.converted_count);
+            for (_, _, count) in &mut time_to_convert.histogram_bins {
+                *count = sampling_plan.scale_u64(*count);
+            }
+        }
 
         // Materialize dropped sample sessions with `session_id`, `distinct_id`, `replay_offset_kb`, and `has_replay`
         let mut dropped_sample_sessions = Vec::with_capacity(final_summary.dropped_samples.len());
         for (dropped_before_step, ev) in final_summary.dropped_samples {
             let chunk = &chunks[ev.chunk_idx as usize];
             let r_idx = ev.row_idx as usize;
-            let session_id = chunk.session_id_for_row(r_idx);
+            let session_id = chunk.session_id_for_row(r_idx, cache).await;
             let replay_offset_kb = chunk.tier_a.replay_offset_kb[r_idx];
             let has_replay = rstore.has_session(ps.project_id(), &session_id).await;
             let raw_did = id_graph
@@ -626,6 +645,7 @@ impl FunnelEngine {
             time_to_convert,
             dropped_sample_sessions,
             dropped_uids_by_step: final_summary.dropped_uids,
+            sampling: Some(sampling_plan.to_info(sample_basis)),
         })
     }
 }

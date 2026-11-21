@@ -4,8 +4,7 @@ use std::time::Instant;
 use chrono::Utc;
 use pulse_control::{
     AlertRule, CohortRecord, ControlPlaneService, Dashboard, DashboardCard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, UserProfileRecord,
-    VariantAllocation,
+    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -1046,6 +1045,13 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         "instant_credit_q4",
         "organic",
     ];
+    let pstore = ctrl
+        .qengine()
+        .storage()
+        .profile_router()
+        .get_or_open(project_id)
+        .await?;
+    let mut seeded_profiles = Vec::with_capacity(profile_indices.len());
     for u in profile_indices {
         let active_did = if u < 6_800 {
             format!("+919845{:06}", 100_000 + u)
@@ -1097,17 +1103,16 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         props.insert("utm_campaign".to_string(), serde_json::json!(utm_cmp));
         props.insert("total_revenue".to_string(), serde_json::json!(total_rev));
 
-        ctrl.meta()
-            .upsert_user_profile(&UserProfileRecord {
-                project_id: project_id.to_string(),
-                distinct_id: active_did,
-                canonical_uid: canon_uid,
-                props,
-                total_revenue: total_rev,
-                updated_at_ms: now_ms - (pick_cohort_day(u) * 86_400_000),
-            })
-            .await?;
+        seeded_profiles.push(pulse_storage::StoredUserProfile {
+            project_id: project_id.to_string(),
+            distinct_id: active_did,
+            canonical_uid: canon_uid,
+            props,
+            total_revenue: total_rev,
+            updated_at_ms: now_ms - (pick_cohort_day(u) * 86_400_000),
+        });
     }
+    pstore.upsert_batch(&seeded_profiles).await?;
 
     ctrl.meta()
         .upsert_alert_rule(&AlertRule {

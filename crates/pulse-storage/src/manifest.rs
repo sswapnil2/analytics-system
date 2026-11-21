@@ -193,7 +193,7 @@ impl ManifestStore {
             return Ok(Manifest::default());
         };
         let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
-        let wire: ManifestWire = serde_json::from_slice(&bytes)?;
+        let wire = decode_manifest_payload(&bytes)?;
         Ok(Manifest::from_wire(wire))
     }
 
@@ -201,7 +201,7 @@ impl ManifestStore {
     pub async fn commit_next(&self, mut next: Manifest) -> Result<Manifest> {
         next.epoch += 1;
         let path = self.epoch_path(next.epoch);
-        let payload = serde_json::to_vec(&next.to_wire())?;
+        let payload = encode_manifest_payload(&next.to_wire())?;
 
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -233,6 +233,28 @@ impl ManifestStore {
             }
             Err(other) => Err(StorageError::ObjectStore(other)),
         }
+    }
+}
+
+const MANIFEST_ZSTD_MAGIC: &[u8; 4] = b"PZST";
+
+fn encode_manifest_payload(wire: &ManifestWire) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(wire)?;
+    let compressed = zstd::stream::encode_all(json.as_slice(), 3)
+        .map_err(|e| StorageError::Corrupted(format!("manifest zstd compress: {e}")))?;
+    let mut out = Vec::with_capacity(MANIFEST_ZSTD_MAGIC.len() + compressed.len());
+    out.extend_from_slice(MANIFEST_ZSTD_MAGIC);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn decode_manifest_payload(bytes: &[u8]) -> Result<ManifestWire> {
+    if let Some(rest) = bytes.strip_prefix(MANIFEST_ZSTD_MAGIC) {
+        let json = zstd::stream::decode_all(rest)
+            .map_err(|e| StorageError::Corrupted(format!("manifest zstd decompress: {e}")))?;
+        Ok(serde_json::from_slice(&json)?)
+    } else {
+        Ok(serde_json::from_slice(bytes)?)
     }
 }
 
@@ -406,5 +428,87 @@ mod tests {
 
         // The live writer keeps committing normally.
         assert_eq!(ms.commit_next(latest).await.unwrap().epoch, 41);
+    }
+
+    #[tokio::test]
+    async fn compressed_manifest_roundtrip_and_legacy_json_compat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ms = ManifestStore::new("p", store.clone());
+
+        // 1. Write a legacy uncompressed JSON epoch directly to object storage.
+        let mut legacy = Manifest {
+            epoch: 1,
+            ..Manifest::default()
+        };
+        legacy.committed_wal_seq.insert(7, 42);
+        let raw_json = serde_json::to_vec(&legacy.to_wire()).unwrap();
+        store
+            .put(
+                &ObjectPath::from("manifests/p/epoch_000000000001.json"),
+                PutPayload::from_bytes(Bytes::from(raw_json)),
+            )
+            .await
+            .unwrap();
+
+        let loaded = ms.load_latest().await.unwrap();
+        assert_eq!(loaded.epoch, 1);
+        assert_eq!(loaded.committed_wal_seq.get(&7), Some(&42));
+
+        // 2. Commit a large manifest with 512 segments and verify PZST compression + round-trip.
+        let mut big = loaded;
+        let date = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        for b in 0..256u16 {
+            for s in 0..2u8 {
+                let seg = SegmentMeta {
+                    segment_id: format!("seg_test_{b}_{s}"),
+                    date,
+                    bucket_id: b as u8,
+                    object_path: format!("segments/p/{date}/bucket_{b}/seg_test_{b}_{s}.vtx"),
+                    file_size: 128_000,
+                    vortex_len: 120_000,
+                    inverted_idx_offset: 120_000,
+                    session_idx_offset: 124_000,
+                    footer: crate::segment::SegmentFooterMeta {
+                        row_count: 10_000,
+                        session_count: 2_500,
+                        min_ts_ms: 1_790_000_000_000,
+                        max_ts_ms: 1_790_086_400_000,
+                        segment_event_bloom_64: 0xFF,
+                        tier_c_bloom_64: 0x0F,
+                        has_tier_c_column: true,
+                        tier_b_columns: vec![],
+                        event_counts: vec![(1, 5_000), (2, 5_000)],
+                        event_hlls: vec![],
+                    },
+                };
+                big.active_segments
+                    .entry((date, b as u8))
+                    .or_default()
+                    .push(seg);
+            }
+        }
+        let raw_big_len = serde_json::to_vec(&big.to_wire()).unwrap().len();
+        let committed = ms.commit_next(big).await.unwrap();
+        assert_eq!(committed.epoch, 2);
+
+        let stored_bytes = store
+            .get(&ObjectPath::from("manifests/p/epoch_000000000002.json"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(stored_bytes.starts_with(MANIFEST_ZSTD_MAGIC));
+        assert!(
+            stored_bytes.len() * 5 < raw_big_len,
+            "expected >=5x compression, got {} vs {}",
+            stored_bytes.len(),
+            raw_big_len
+        );
+
+        let reloaded = ms.load_latest().await.unwrap();
+        assert_eq!(reloaded.epoch, 2);
+        assert_eq!(reloaded.active_segments.len(), 256);
+        assert_eq!(reloaded.total_l1_rows(), 512 * 10_000);
     }
 }

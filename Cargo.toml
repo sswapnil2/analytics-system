@@ -102,6 +102,7 @@ hex = "0.4.3"
 constant_time_eq = "0.4.2"
 chrono-tz = "0.10.4"
 moka = { version = "0.12.16", features = ["sync"] }
+mimalloc = "0.1"
 tempfile = "3.12"
 
 # FFI

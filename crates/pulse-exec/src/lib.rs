@@ -268,6 +268,7 @@ mod tests {
             global_filter: GlobalFilter::default(),
             compare_previous_period: true,
             formula: Some("(B / A) * 100".to_string()),
+            sampling: Default::default(),
         };
         let ins_res = qengine
             .query_insights("proj_diff", &ins_query)
@@ -410,6 +411,7 @@ mod tests {
             hold_constant_props: Vec::new(),
             breakdown_by: None,
             global_filter: GlobalFilter::default(),
+            sampling: Default::default(),
         };
 
         let warmup = qengine.query_funnel("proj_bench_1m", &query).await.unwrap();

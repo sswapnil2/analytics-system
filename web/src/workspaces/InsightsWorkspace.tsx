@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Download, LineChart, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, InsightsResult, isAbortError, SeriesOutput } from "../api/client";
+import { api, InsightsResult, isAbortError, SamplingMode, SeriesOutput } from "../api/client";
 import { buildCsv } from "../lib/csv";
-import { downloadTextFile, errorMessage, formatDate, formatDateTime, humanizeEvent } from "../lib/format";
+import { downloadTextFile, errorMessage, formatDate, formatDateTime, humanizeEvent, segmentName } from "../lib/format";
 import { SaveToDashboard, useSavedReport } from "../dashboards/SaveToDashboard";
 import { AnnotationsList, useAnnotations } from "../components/Annotations";
 import { RangePresets, RangeSel, rangeFor, rangePhrase } from "../dashboards/ReportCard";
@@ -14,12 +14,17 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
   SortHeader,
   useSort,
 } from "../components/ui";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
+import { ChartKindPicker, ChartSeries, TrendChart } from "../components/TrendChart";
+import { Menu } from "../components/Menu";
+import { downloadChartPng, downloadChartSvg } from "../lib/exportChart";
+import { CHART_KINDS, ChartKind, chartKindBlocker, isAdditive } from "../lib/chart";
 import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter, useCohortNames } from "../components/FilterPanel";
 
 interface Props {
@@ -37,8 +42,8 @@ interface SeriesDraft {
   propName: string;
 }
 
-// Theme tokens, so the chart follows light and dark mode.
-const COLORS = ["brand", "info", "warn", "ink-2", "muted"] /* no orange: it means drop-offs */.map((v) => `rgb(var(--${v}))`);
+// Theme tokens, so the chart follows light and dark mode. No orange or red: those mean drop-offs and deletes.
+const COLORS = Array.from({ length: 8 }, (_, i) => `rgb(var(--chart-${i + 1}))`);
 const color = (i: number) => COLORS[i % COLORS.length];
 
 const METRIC_OPTIONS: [string, string][] = [
@@ -121,14 +126,6 @@ function formatBucket(ts: number, interval: Interval = "day"): string {
   return formatDate(ts, { day: "numeric", month: "short" });
 }
 
-/** 1, 2, 5 x 10^n ceiling so axis ticks land on round numbers. */
-function niceCeil(v: number): number {
-  if (v <= 0) return 1;
-  const p = 10 ** Math.floor(Math.log10(v));
-  const m = v / p;
-  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
-}
-
 /** Engine labels formula series "Formula((B / A) * 100)"; show it the way a PM would say it. */
 function formulaLabel(raw: string): string {
   const expr = raw.replace(/^Formula\((.*)\)$/, "$1").trim();
@@ -137,11 +134,6 @@ function formulaLabel(raw: string): string {
   if (ratio) return `Conversion (${ratio[1]} ÷ ${ratio[2]})`;
   return `Formula (${expr.replace(/\//g, "÷")})`;
 }
-
-// Plot area inside the 900x240 viewBox.
-const PLOT = { left: 56, right: 885, top: 16, bottom: 200 };
-const PLOT_W = PLOT.right - PLOT.left;
-const PLOT_H = PLOT.bottom - PLOT.top;
 
 function defaultSeriesFromCatalog(events: string[], props: string[]): SeriesDraft[] {
   const clean = events.filter((e) => !e.startsWith("$"));
@@ -177,8 +169,11 @@ export const InsightsWorkspace: React.FC<Props> = ({
   const [breakdown, setBreakdown] = useState<string>("");
   const [interval, setInterval_] = useState<Interval>("day");
   const [comparePrev, setComparePrev] = useState<boolean>(false);
-  const [chartType, setChartType] = useState<"line" | "bar" | "number">("line");
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [chartType, setChartType] = useState<ChartKind>("line");
+  // Series hidden from the chart by the legend, keyed like ChartSeries.key.
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set());
+  // Series focused from the chart, its legend or the segment table; each highlights it in the others.
+  const [focusRaw, setFocus] = useState<string | null>(null);
   const sort = useSort<"metric" | "segment" | "overall">("overall", true, ["metric", "segment"]);
   const [filter, setFilter] = useState<FilterDraft>(EMPTY_FILTER);
   const [result, setResult] = useState<InsightsResult | null>(null);
@@ -206,17 +201,18 @@ export const InsightsWorkspace: React.FC<Props> = ({
         compare_previous_period: comparePrev,
         formula: f ? f : null,
         global_filter: toGlobalFilter(filter),
-        // Display only; the engine ignores it.
+        // Display only; the engine ignores these.
         display_currency: safeCurrency || undefined,
+        chart_type: chartType,
       };
     },
-    [interval, series, formula, breakdown, comparePrev, filter, safeCurrency],
+    [interval, series, formula, breakdown, comparePrev, filter, safeCurrency, chartType],
   );
 
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const queryAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { series?: { label: string; event_name: string; metric?: { type?: string; prop?: string; quantile?: number } }[];
@@ -232,10 +228,16 @@ export const InsightsWorkspace: React.FC<Props> = ({
       setFormula(nextFormula);
       setDebouncedFormula(nextFormula);
       setFilter(fromGlobalFilter((q as { global_filter?: unknown }).global_filter));
+      const ct = (q as { chart_type?: unknown }).chart_type;
+      // Reports saved before chart kinds were stored said "bar" for columns.
+      const kind = ct === "bar" ? "column" : ct;
+      setChartType(CHART_KINDS.some((c) => c.kind === kind) ? (kind as ChartKind) : "line");
     },
     setRange,
     { query: buildQuery, range },
   );
+
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
 
   const buildQueryRef = useRef(buildQuery);
   buildQueryRef.current = buildQuery;
@@ -254,23 +256,21 @@ export const InsightsWorkspace: React.FC<Props> = ({
     try {
       const res = await api.queryInsights(
         projectId,
-        { time_range: rangeFor(range), ...buildQueryRef.current(debouncedFormula) },
+        { time_range: rangeFor(range), ...buildQueryRef.current(debouncedFormula), sampling: samplingMode },
         ctrl.signal,
       );
-      // A cohort split comes back as in_cohort / not_in_cohort; the summary names the cohort.
-      const cohortKey = (k: string) => (k === "in_cohort" ? "In cohort" : k === "not_in_cohort" ? "Not in cohort" : k);
       if (id === reqId.current && !ctrl.signal.aborted)
         setResult({
           ...res,
-          series: res.series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
-          previous_series: res.previous_series.map((x) => ({ ...x, breakdown_key: cohortKey(x.breakdown_key) })),
+          series: res.series.map((x) => ({ ...x, breakdown_key: segmentName(x.breakdown_key) })),
+          previous_series: res.previous_series.map((x) => ({ ...x, breakdown_key: segmentName(x.breakdown_key) })),
         });
     } catch (err) {
       if (!isAbortError(err) && id === reqId.current && !ctrl.signal.aborted) setError(errorMessage(err));
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, interval, series, debouncedFormula, breakdown, comparePrev, filter, safeCurrency, range]);
+  }, [projectId, interval, series, debouncedFormula, breakdown, comparePrev, filter, safeCurrency, range, samplingMode]);
 
   useEffect(() => {
     void runQuery();
@@ -278,6 +278,9 @@ export const InsightsWorkspace: React.FC<Props> = ({
       queryAbortRef.current?.abort();
     };
   }, [runQuery, refreshToken]);
+
+  // A new breakdown or metric list brings new series; start with all of them visible.
+  useEffect(() => setHidden(new Set()), [breakdown, series.length, debouncedFormula]);
 
   const updateSeries = (idx: number, patch: Partial<SeriesDraft>) =>
     setSeries(series.map((s, i) => (i === idx ? { ...s, ...patch } : s)));
@@ -305,7 +308,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
   };
 
   const displayedSeries = result
-    ? (formula.trim() && result.formula_series.length > 0 ? result.formula_series : result.series).slice(0, 6)
+    ? (formula.trim() && result.formula_series.length > 0 ? result.formula_series : result.series).slice(0, COLORS.length)
     : [];
   const shownRange = rangeFor(range);
   const notes = useAnnotations(projectId, shownRange.start_ts_ms, shownRange.end_ts_ms);
@@ -318,15 +321,33 @@ export const InsightsWorkspace: React.FC<Props> = ({
       return { a, i };
     })
     .filter((m) => m.i >= 0);
-  const n = buckets.length;
-  const maxY = niceCeil(
-    Math.max(0, ...displayedSeries.flatMap((s) => s.points.map((p) => p.value ?? 0))),
-  );
-  const bandW = PLOT_W / Math.max(1, n);
-  const xAt = (i: number) => PLOT.left + (i + 0.5) * bandW;
-  const yAt = (v: number) => PLOT.bottom - (v / maxY) * PLOT_H;
-  const labelEvery = Math.max(1, Math.ceil(n / 8));
   const hasData = displayedSeries.some((s) => s.points.some((p) => p.value !== null && p.value !== 0));
+  const formulaShown = Boolean(formula.trim()) && (result?.formula_series.length ?? 0) > 0;
+  const additive = isAdditive(series.map((s) => s.metricKind), Boolean(breakdown), formulaShown);
+  const blocker = (k: ChartKind) => chartKindBlocker(k, { seriesCount: displayedSeries.length, additive });
+  // A kind this result can't show falls back to a line, and comes back when the query allows it again.
+  const kind: ChartKind = blocker(chartType) ? "line" : chartType;
+  const segmentOf = (s: SeriesOutput) => (breakdown ? s.breakdown_key : "");
+  const chartSeries: ChartSeries[] = displayedSeries.map((s, idx) => ({
+    key: `${s.label}-${s.breakdown_key}`,
+    // One metric split by a property: the segment is the name, like the legend of any split chart.
+    name: segmentOf(s) && displayedSeries.every((x) => x.label === s.label) ? segmentOf(s) : seriesName(s),
+    detail: segmentOf(s) && !displayedSeries.every((x) => x.label === s.label) ? segmentOf(s) : undefined,
+    color: color(idx),
+    points: s.points.map((p) => p.value),
+    overall: s.overall_value,
+  }));
+  const keyOf = (s: SeriesOutput) => `${s.label}-${s.breakdown_key}`;
+  const drawn = (key: string) => chartSeries.find((c) => c.key === key && !hidden.has(key));
+  // A key left over from an earlier result or a hidden series would dim everything; drop it.
+  const focus = focusRaw && drawn(focusRaw) ? focusRaw : null;
+  const toggleSeries = (key: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else if (chartSeries.some((c) => c.key !== key && !next.has(c.key))) next.add(key);
+      return next;
+    });
 
   const tableRows = result ? [...result.formula_series, ...result.series].slice(0, 18) : [];
   const tableBuckets = buckets.slice(-7);
@@ -355,6 +376,29 @@ export const InsightsWorkspace: React.FC<Props> = ({
             })
             .replace(/\*/g, "×")
         : series.map((s) => humanizeEvent(s.eventName)).join(" and ");
+  const chartBoxRef = useRef<HTMLDivElement>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const canExport = Boolean(result && hasData && kind !== "number");
+  const exportHint = kind === "number" ? "Not for Number" : "Run a report first";
+  const exportChart = async (format: "png" | "svg") => {
+    const svg = chartBoxRef.current?.querySelector<SVGSVGElement>("svg[role=img]");
+    if (!svg) return;
+    setExportError(null);
+    const meta = {
+      title: reportTitle,
+      subtitle: buckets.length
+        ? `${formatDate(buckets[0], { day: "numeric", month: "short", year: "numeric" })} – ${formatDate(buckets[buckets.length - 1], { day: "numeric", month: "short", year: "numeric" })}`
+        : undefined,
+      legend: chartSeries.filter((c) => !hidden.has(c.key)).map((c) => ({ name: c.detail ? `${c.name}, ${c.detail}` : c.name, color: c.color })),
+    };
+    const file = reportTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "chart";
+    try {
+      if (format === "svg") downloadChartSvg(svg, meta, file);
+      else await downloadChartPng(svg, meta, file);
+    } catch (err) {
+      setExportError(errorMessage(err));
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -364,7 +408,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="insights"
               defaultName={reportTitle}
@@ -513,35 +557,17 @@ export const InsightsWorkspace: React.FC<Props> = ({
               className={`${field} font-mono`}
             />
           </label>
-          <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Group by</span>
-            <select value={interval} onChange={(e) => setInterval_(e.target.value as Interval)} className={field}>
-              <option value="hour">Hour</option>
-              <option value="day">Day</option>
-              <option value="week">Week</option>
-              <option value="month">Month</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Break down by</span>
-            <select value={breakdown} onChange={(e) => setBreakdown(e.target.value)} className={field}>
-              <option value="">No breakdown</option>
-              {breakdownOptions.map((p) => (
-                <option key={p} value={p}>
-                  {p.replace(/_/g, " ")}
-                </option>
-              ))}
-              {cohortNames.length > 0 && (
-                <optgroup label="In a cohort or not">
-                  {cohortNames.map((c) => (
-                    <option key={c.id} value={`$cohort:${c.id}`}>
-                      {c.name}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
-          </label>
+          <PropertyPicker
+            label="Break down by"
+            value={breakdown}
+            onChange={setBreakdown}
+            noneLabel="No breakdown"
+            recentKey={`pulse.recent-props.${projectId}`}
+            options={[
+              ...propertyOptions(breakdownOptions),
+              ...cohortNames.map((c) => ({ value: `$cohort:${c.id}`, label: c.name, group: "In a cohort or not" })),
+            ]}
+          />
           <div className="flex flex-wrap items-end justify-between gap-3">
             <label className="flex items-center gap-2 py-1.5 text-sm text-ink-2">
               <input
@@ -560,34 +586,48 @@ export const InsightsWorkspace: React.FC<Props> = ({
 
       {openError && <ErrorNotice message={openError} />}
       {error && <ErrorNotice message={error} onRetry={() => void runQuery()} />}
+      {exportError && <ErrorNotice message={exportError} />}
 
       <Panel
-        title={chartType === "number" ? "For the whole period" : "Over time"}
-        meta={loading && result ? "Updating…" : <RanIn us={result?.exec_time_us} />}
+        title={kind === "number" ? "For the whole period" : kind === "pie" ? "Share of the whole period" : "Over time"}
+        meta={
+          <SamplingMeta
+            sampling={result?.sampling}
+            mode={samplingMode}
+            onChangeMode={setSamplingMode}
+            us={result?.exec_time_us}
+            loading={loading && !!result}
+          />
+        }
         actions={
-            <div className="flex rounded-lg border border-line-strong p-0.5" role="group" aria-label="Chart type">
-              {(
-                [
-                  ["line", "Line"],
-                  ["bar", "Bar"],
-                  ["number", "Number"],
-                ] as const
-              ).map(([k, text]) => (
-                <button
-                  key={k}
-                  type="button"
-                  aria-pressed={chartType === k}
-                  onClick={() => setChartType(k)}
-                  className={`rounded px-2.5 py-1 text-sm ${
-                    chartType === k ? "bg-brand text-on-brand" : "text-muted hover:text-ink"
-                  }`}
-                >
-                  {text}
-                </button>
-              ))}
-            </div>
+          <>
+            {kind !== "pie" && kind !== "number" && (
+              <select
+                aria-label="Group by"
+                value={interval}
+                onChange={(e) => setInterval_(e.target.value as Interval)}
+                className={`${field} py-1.5`}
+              >
+                <option value="hour">By hour</option>
+                <option value="day">By day</option>
+                <option value="week">By week</option>
+                <option value="month">By month</option>
+              </select>
+            )}
+            <ChartKindPicker value={kind} onChange={setChartType} blocker={blocker} />
+            <Menu
+              label="Download chart"
+              triggerClass={`${btn.ghost} h-9 w-9 px-0`}
+              trigger={<Download className="h-4 w-4" aria-hidden="true" />}
+              items={[
+                { label: "PNG image", onSelect: () => void exportChart("png"), disabled: !canExport, hint: canExport ? undefined : exportHint },
+                { label: "SVG image", onSelect: () => void exportChart("svg"), disabled: !canExport, hint: canExport ? undefined : exportHint },
+              ]}
+            />
+          </>
         }
       >
+        <div ref={chartBoxRef} aria-busy={loading} className={`transition-opacity duration-200 ${loading && result ? "opacity-60" : ""}`}>
         {!result ? (
           loading ? (
             <ChartSkeleton />
@@ -600,8 +640,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
             body={`None of these events happened ${rangePhrase(range)}. Try a different event or remove the breakdown.`}
             icon={LineChart}
           />
-        ) : chartType === "number" ? (
-          <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
+        ) : kind === "number" ? (
+          <ul className="grid grid-cols-1 gap-5 motion-safe:animate-fade-in sm:grid-cols-2 xl:grid-cols-3">
             {displayedSeries.map((s, idx) => {
               const prev = result.previous_series.find((p) => p.label === s.label && p.breakdown_key === s.breakdown_key);
               const change =
@@ -612,7 +652,7 @@ export const InsightsWorkspace: React.FC<Props> = ({
                 <li key={`${s.label}-${s.breakdown_key}`} className="border-l-[3px] pl-4" style={{ borderColor: color(idx) }}>
                   <p className="text-sm text-ink-2">
                     {seriesName(s)}
-                    {s.breakdown_key && <span className="text-muted">, {s.breakdown_key}</span>}
+                    {segmentOf(s) && <span className="text-muted">, {segmentOf(s)}</span>}
                   </p>
                   <p className="tabular text-[2.5rem] font-semibold leading-tight tracking-[-0.02em] text-ink">
                     {fmt(s.overall_value)}
@@ -628,182 +668,31 @@ export const InsightsWorkspace: React.FC<Props> = ({
             })}
           </ul>
         ) : (
-          <>
-            <ul className="mb-3 flex flex-wrap gap-x-4 gap-y-1.5 text-sm">
-              {displayedSeries.map((s, idx) => (
-                <li key={`${s.label}-${s.breakdown_key}`} className="flex items-center gap-1.5">
-                  <span className="h-0.5 w-3 rounded" style={{ backgroundColor: color(idx) }} aria-hidden="true" />
-                  <span className="font-medium text-ink-2">{seriesName(s)}</span>
-                  {s.breakdown_key && <span className="text-muted">{s.breakdown_key}</span>}
-                  <span className="tabular text-muted">{fmt(s.overall_value)}</span>
-                </li>
-              ))}
-            </ul>
-            <div className="relative h-64 w-full">
-              <svg
-                viewBox="0 0 900 230"
-                className="h-full w-full overflow-visible"
-                role="img"
-                aria-label="Trend chart; values are listed in the table below"
-                onMouseMove={(e) => {
-                  const r = e.currentTarget.getBoundingClientRect();
-                  const x = ((e.clientX - r.left) / r.width) * 900;
-                  const i = Math.floor((x - PLOT.left) / bandW);
-                  setHoverIdx(i >= 0 && i < n ? i : null);
-                }}
-                onMouseLeave={() => setHoverIdx(null)}
-              >
-                {hoverIdx !== null && (
-                  <line
-                    x1={xAt(hoverIdx)}
-                    x2={xAt(hoverIdx)}
-                    y1={PLOT.bottom - PLOT_H}
-                    y2={PLOT.bottom}
-                    stroke="rgb(var(--line-strong))"
-                    strokeWidth={1.5}
-                  />
-                )}
-                {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
-                  const y = yAt(maxY * frac);
-                  return (
-                    <g key={frac}>
-                      <line x1={PLOT.left} y1={y} x2={PLOT.right} y2={y} stroke="rgb(var(--line))" />
-                      <text
-                        x={PLOT.left - 8}
-                        y={y + 4}
-                        textAnchor="end"
-                        fill="rgb(var(--muted))"
-                        fontSize={11}
-                        className="tabular"
-                      >
-                        {fmt(maxY * frac, maxY >= 10 ? 0 : 1)}
-                      </text>
-                    </g>
-                  );
-                })}
-
-                {displayedSeries.map((s, sIdx) => {
-                  const c = color(sIdx);
-                  const key = `${s.label}-${s.breakdown_key}`;
-                  if (chartType === "bar") {
-                    const barW = Math.max(2, (bandW * 0.8) / displayedSeries.length);
-                    return (
-                      <g key={key}>
-                        {s.points.map((p, i) =>
-                          p.value === null ? null : (
-                            <rect
-                              key={p.bucket_ts_ms}
-                              x={PLOT.left + i * bandW + bandW * 0.1 + sIdx * barW}
-                              y={yAt(p.value)}
-                              width={Math.max(1, barW - 1)}
-                              height={Math.max(0, PLOT.bottom - yAt(p.value))}
-                              fill={c}
-                              rx={1.5}
-                            />
-                          ),
-                        )}
-                      </g>
-                    );
-                  }
-                  // Null points (e.g. formula with a zero denominator) break the line instead of dropping to 0.
-                  let d = "";
-                  let pen = false;
-                  // The last bucket is today and still filling up, so draw it dotted.
-                  const lastI = s.points.length - 1;
-                  const tail =
-                    lastI > 0 && s.points[lastI].value !== null && s.points[lastI - 1].value !== null
-                      ? `M${xAt(lastI - 1)},${yAt(s.points[lastI - 1].value!)} L${xAt(lastI)},${yAt(s.points[lastI].value!)}`
-                      : "";
-                  s.points.forEach((p, i) => {
-                    if (i === lastI && tail) return;
-                    if (p.value === null) {
-                      pen = false;
-                      return;
-                    }
-                    d += `${pen ? "L" : "M"}${xAt(i)},${yAt(p.value)} `;
-                    pen = true;
-                  });
-                  return (
-                    <g key={key}>
-                      <path d={d} fill="none" stroke={c} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-                      {tail && <path d={tail} fill="none" stroke={c} strokeWidth={2} strokeDasharray="3 4" strokeLinecap="round" />}
-                      {s.points.map((p, i) =>
-                        p.value === null ? null : (
-                          <circle key={p.bucket_ts_ms} cx={xAt(i)} cy={yAt(p.value)} r={2.5} fill={c}>
-                            <title>
-                              {`${seriesName(s)}${s.breakdown_key ? `, ${s.breakdown_key}` : ""}: ${fmt(
-                                p.value,
-                              )} on ${formatBucket(p.bucket_ts_ms, interval)}`}
-                            </title>
-                          </circle>
-                        ),
-                      )}
-                    </g>
-                  );
-                })}
-
-                {noteMarks.map(({ a, i }) => (
-                  <g key={a.id}>
-                    <line
-                      x1={xAt(i)}
-                      x2={xAt(i)}
-                      y1={PLOT.bottom - PLOT_H}
-                      y2={PLOT.bottom}
-                      stroke="rgb(var(--warn))"
-                      strokeWidth={1.5}
-                      strokeDasharray="4 3"
-                    />
-                    <circle cx={xAt(i)} cy={PLOT.bottom - PLOT_H} r={4} fill="rgb(var(--warn))">
-                      <title>{`${formatDate(a.ts_ms)}: ${a.text}`}</title>
-                    </circle>
-                  </g>
-                ))}
-
-                {buckets.map((ts, idx) =>
-                  idx % labelEvery !== 0 && idx !== n - 1 ? null : (
-                    <text
-                      key={ts}
-                      x={xAt(idx)}
-                      y={222}
-                      textAnchor="middle"
-                      fill="rgb(var(--muted))"
-                      fontSize={11}
-                    >
-                      {formatBucket(ts, interval)}
-                    </text>
-                  ),
-                )}
-              </svg>
-              {hoverIdx !== null && (
-                <div
-                  className="pointer-events-none absolute top-2 z-10 min-w-[11rem] rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-[0_8px_24px_rgb(0_0_0/0.12)]"
-                  style={
-                    xAt(hoverIdx) / 900 > 0.6
-                      ? { right: `${100 - (xAt(hoverIdx) / 900) * 100 + 1.5}%` }
-                      : { left: `${(xAt(hoverIdx) / 900) * 100 + 1.5}%` }
-                  }
-                >
-                  <p className="mb-1.5 font-semibold text-ink">
-                    {interval === "day"
-                      ? formatDate(buckets[hoverIdx], { weekday: "short", day: "numeric", month: "short" })
-                      : formatBucket(buckets[hoverIdx], interval)}
-                    {hoverIdx === n - 1 && <span className="font-normal text-muted"> (so far)</span>}
-                  </p>
-                  <ul className="space-y-1">
-                    {displayedSeries.map((s, idx) => (
-                      <li key={`${s.label}-${s.breakdown_key}`} className="flex items-center gap-2">
-                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color(idx) }} aria-hidden="true" />
-                        <span className="min-w-0 flex-1 truncate text-ink-2">
-                          {s.breakdown_key || seriesName(s)}
-                        </span>
-                        <span className="tabular font-semibold text-ink">{fmt(s.points[hoverIdx]?.value ?? null)}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </>
+          <TrendChart
+            kind={kind}
+            series={chartSeries}
+            buckets={buckets}
+            axisLabel={(ts) => formatBucket(ts, interval)}
+            bucketTitle={(i) =>
+              interval === "day"
+                ? formatDate(buckets[i], { weekday: "short", day: "numeric", month: "short" })
+                : formatBucket(buckets[i], interval)
+            }
+            fmt={fmt}
+            partialLast
+            marks={noteMarks.map(({ a, i }) => ({ key: a.id, i, title: `${formatDate(a.ts_ms)}: ${a.text}` }))}
+            hidden={hidden}
+            onToggle={toggleSeries}
+            focus={focus}
+            onFocus={setFocus}
+            ariaLabel={`${CHART_KINDS.find((c) => c.kind === kind)?.label} chart; values are listed in the table below`}
+          />
+        )}
+        </div>
+        {chartType !== kind && result && hasData && (
+          <p className="mt-2 text-xs text-muted">
+            Showing a line: {CHART_KINDS.find((c) => c.kind === chartType)?.label.toLowerCase()} {blocker(chartType)?.toLowerCase()}.
+          </p>
         )}
         <AnnotationsList projectId={projectId} annotations={notes.list} error={notes.error} onChanged={() => void notes.reload()} />
       </Panel>
@@ -834,13 +723,31 @@ export const InsightsWorkspace: React.FC<Props> = ({
               </thead>
               <tbody className="divide-y divide-line">
                 {sort.sortBy(tableRows, (r, k) =>
-                  k === "metric" ? seriesName(r) : k === "segment" ? r.breakdown_key || "All users" : r.overall_value ?? -Infinity,
-                ).map((row, idx) => (
-                  <tr key={`${row.label}-${row.breakdown_key}-${idx}`} className="hover:bg-hover">
+                  k === "metric" ? seriesName(r) : k === "segment" ? segmentOf(r) || "All users" : r.overall_value ?? -Infinity,
+                ).map((row, idx) => {
+                  const k = keyOf(row);
+                  const c = chartSeries.find((x) => x.key === k);
+                  const on = kind !== "number" && Boolean(drawn(k));
+                  const sync = on
+                    ? { tabIndex: 0, onMouseEnter: () => setFocus(k), onMouseLeave: () => setFocus(null), onFocus: () => setFocus(k), onBlur: () => setFocus(null) }
+                    : {};
+                  return (
+                  <tr
+                    key={`${k}-${idx}`}
+                    {...sync}
+                    className={`outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/40 ${focus === k ? "bg-hover" : "hover:bg-hover"}`}
+                  >
                     <td className="whitespace-nowrap py-2 pr-4 text-ink">
-                      {seriesName(row)}
+                      <span className="flex items-center gap-2">
+                        <span
+                          className={`h-2.5 w-2.5 shrink-0 rounded-[3px] ${c ? "" : "invisible"} ${c && hidden.has(k) ? "opacity-30" : ""}`}
+                          style={c ? { backgroundColor: c.color } : undefined}
+                          aria-hidden="true"
+                        />
+                        {seriesName(row)}
+                      </span>
                     </td>
-                    <td className="whitespace-nowrap py-2 pr-4 text-ink-2">{row.breakdown_key || "All users"}</td>
+                    <td className="whitespace-nowrap py-2 pr-4 text-ink-2">{segmentOf(row) || "All users"}</td>
                     <td className="tabular py-2 pl-3 text-right font-semibold text-ink">
                       {fmt(row.overall_value)}
                     </td>
@@ -850,7 +757,8 @@ export const InsightsWorkspace: React.FC<Props> = ({
                       </td>
                     ))}
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

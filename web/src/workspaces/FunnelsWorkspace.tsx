@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
-import { api, DroppedSessionSample, FunnelResult, isAbortError } from "../api/client";
+import { api, DroppedSessionSample, FunnelResult, isAbortError, SamplingMode } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { useAccess } from "../auth/access";
 import { typicalOrder } from "../lib/eventOrder";
@@ -24,14 +24,15 @@ import {
   fieldLabel,
   PageHeader,
   Panel,
-  RanIn,
   ReportLayout,
+  SamplingMeta,
   ChartSkeleton,
   SortHeader,
   useSort,
 } from "../components/ui";
-import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
+import { FilterPanel, useTopValues, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
+import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
 
 interface Props {
   projectId: string;
@@ -138,7 +139,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
   const [range, setRange] = useState<RangeSel>("14");
   const reqId = useRef(0);
   const funnelAbortRef = useRef<AbortController | null>(null);
-  const openError = useSavedReport(
+  const { error: openError, saved: savedReport } = useSavedReport(
     projectId,
     (q) => {
       const s = q as { steps?: { event_name: string; filters?: unknown }[]; order_mode?: OrderMode; conversion_window_ms?: number;
@@ -159,6 +160,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
     { query: buildQuery, range },
   );
 
+  const [samplingMode, setSamplingMode] = useState<SamplingMode>("auto");
+
   const runFunnel = useCallback(async () => {
     if (steps.length < 2) {
       setResult(null);
@@ -174,8 +177,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       const main = rangeFor(range);
       const cmp = compareRangeFor(main, compare);
       const [res, prev] = await Promise.all([
-        api.queryFunnel(projectId, { time_range: main, ...buildQuery() }, ctrl.signal),
-        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery() }, ctrl.signal) : Promise.resolve(null),
+        api.queryFunnel(projectId, { time_range: main, ...buildQuery(), sampling: samplingMode }, ctrl.signal),
+        cmp ? api.queryFunnel(projectId, { time_range: cmp, ...buildQuery(), sampling: samplingMode }, ctrl.signal) : Promise.resolve(null),
       ]);
       if (id === reqId.current && !ctrl.signal.aborted) {
         setResult(res);
@@ -186,7 +189,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
     } finally {
       if (id === reqId.current && !ctrl.signal.aborted) setLoading(false);
     }
-  }, [projectId, buildQuery, range, steps.length, compare]);
+  }, [projectId, buildQuery, range, steps.length, compare, samplingMode]);
 
   useEffect(() => {
     void runFunnel();
@@ -235,7 +238,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
         actions={
           <>
             <RangePresets value={range} onChange={setRange} />
-            <SaveToDashboard
+            <SaveToDashboard saved={savedReport}
               projectId={projectId}
               kind="funnel"
               defaultName={reportTitle}
@@ -260,7 +263,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       <Panel title="Steps">
         <ol className="flex flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
           {steps.map((st, idx) => (
-            <li key={idx} className="flex items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
+            <li key={idx} className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 xl:flex-col xl:items-stretch xl:gap-1">
               {idx > 0 && <span className="text-xs text-faint xl:pl-2">then</span>}
               <span className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-field py-1 pl-1.5 pr-1">
               <span
@@ -301,6 +304,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
               </span>
               <StepWhereEditor
                 idx={idx}
+                projectId={projectId}
+                event={st}
                 value={stepWhere[idx] ?? null}
                 props={availableProps}
                 onChange={(w) => {
@@ -370,17 +375,14 @@ export const FunnelsWorkspace: React.FC<Props> = ({
             </select>
           </label>
           <CompareControl main={rangeFor(range)} value={compare} onChange={setCompare} />
-          <label className="flex flex-col gap-1">
-            <span className={fieldLabel}>Split by</span>
-            <select value={breakdownBy} onChange={(e) => setBreakdownBy(e.target.value)} className={field}>
-              <option value="">No split</option>
-              {propOptions.map((p) => (
-                <option key={p} value={p}>
-                  {humanizeEvent(p)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <PropertyPicker
+            label="Split by"
+            value={breakdownBy}
+            onChange={setBreakdownBy}
+            noneLabel="No split"
+            recentKey={`pulse.recent-props.${projectId}`}
+            options={propertyOptions(propOptions)}
+          />
         </div>
       </Panel>
         </>}
@@ -412,7 +414,18 @@ export const FunnelsWorkspace: React.FC<Props> = ({
       )}
 
       {result && first && last && (
-        <Panel title="Conversion" meta={<RanIn us={result.exec_time_us} />}>
+        <Panel
+          title="Conversion"
+          meta={
+            <SamplingMeta
+              sampling={result.sampling}
+              mode={samplingMode}
+              onChangeMode={setSamplingMode}
+              us={result.exec_time_us}
+              loading={loading}
+            />
+          }
+        >
           {first.entered_users === 0 ? (
             <EmptyState
               title={`No one did the first step ${rangePhrase(range)}`}
@@ -567,16 +580,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                     </div>
                   ))}
                 </dl>
-                <div className="flex h-32 items-end gap-1.5" role="img" aria-label="Distribution of time to complete">
-                  {result.time_to_convert.histogram_bins.map(([lo, hi, cnt], i, bins) => {
-                    const maxBin = Math.max(1, ...bins.map((b) => b[2]));
-                    return (
-                      <div key={i} className="flex h-full flex-1 flex-col justify-end" title={`${formatDuration(lo)}–${formatDuration(hi)}: ${formatCount(cnt)} users`}>
-                        <div className="w-full rounded-t bg-info/70" style={{ height: `${Math.max(2, (cnt / maxBin) * 100)}%` }} />
-                      </div>
-                    );
-                  })}
-                </div>
+                <TimeHistogram bins={result.time_to_convert.histogram_bins} />
                 <div className="mt-1 flex justify-between text-xs text-faint tabular">
                   <span>{formatDuration(result.time_to_convert.histogram_bins[0]?.[0] ?? 0)}</span>
                   <span>
@@ -684,13 +688,13 @@ const DropOffDrawer: React.FC<{
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
-      <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-ink/40" tabIndex={-1} />
+      <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-ink/40 motion-safe:animate-fade-in" tabIndex={-1} />
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="dropoff-title"
-        className="relative flex h-full w-full max-w-5xl flex-col border-l border-line bg-canvas shadow-2xl"
+        className="relative flex h-full w-full max-w-5xl flex-col border-l border-line bg-canvas shadow-2xl motion-safe:animate-slide-in-right"
       >
         <div className="flex items-start justify-between gap-4 border-b border-line bg-panel px-5 py-4">
           <div className="min-w-0">
@@ -800,7 +804,45 @@ const DropOffDrawer: React.FC<{
   );
 };
 
-const SEG_COLORS = ["rgb(var(--brand))", "rgb(var(--info))", "rgb(var(--warn))", "rgb(var(--ink-2))"];
+// Shared series palette; never orange, which means drop-offs here.
+/** Time-to-complete bars; hovering one shows its range and count. */
+const TimeHistogram: React.FC<{ bins: [number, number, number][] }> = ({ bins }) => {
+  const [hover, setHover] = useState<number | null>(null);
+  const maxBin = Math.max(1, ...bins.map((b) => b[2]));
+  const text = ([lo, hi, cnt]: [number, number, number]) => `${formatDuration(lo)}–${formatDuration(hi)}: ${formatCount(cnt)} users`;
+  return (
+    <div className="relative">
+      <div
+        className="flex h-32 items-end gap-1.5"
+        role="img"
+        aria-label={`Distribution of time to complete. ${bins.map(text).join("; ")}`}
+        onMouseLeave={() => setHover(null)}
+      >
+        {bins.map((b, i) => (
+          <div key={i} className="flex h-full flex-1 flex-col justify-end" onMouseEnter={() => setHover(i)}>
+            <div
+              className={`w-full rounded-t transition-opacity duration-150 ${hover !== null && hover !== i ? "opacity-50" : ""}`}
+              style={{ height: `${Math.max(2, (b[2] / maxBin) * 100)}%`, background: "rgb(var(--chart-2) / 0.7)" }}
+            />
+          </div>
+        ))}
+      </div>
+      {hover !== null && bins[hover] && (
+        <div
+          className="pointer-events-none absolute -top-2 z-10 -translate-y-full whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop"
+          style={(hover + 0.5) / bins.length > 0.6 ? { right: `${100 - ((hover + 1) / bins.length) * 100}%` } : { left: `${(hover / bins.length) * 100}%` }}
+        >
+          <p className="font-semibold text-ink">
+            {formatDuration(bins[hover][0])}–{formatDuration(bins[hover][1])}
+          </p>
+          <p className="tabular text-ink-2">{formatCount(bins[hover][2])} users</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SEG_COLORS = [1, 2, 3, 4].map((i) => `rgb(var(--chart-${i}))`);
 
 type SegKey = "segment" | "started" | "completed" | "rate";
 
@@ -879,16 +921,21 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
 /** "+ where" on one funnel step: a single property condition, shown inline under the step. */
 const StepWhereEditor: React.FC<{
   idx: number;
+  projectId: string;
+  /** The step's event; value suggestions come from it. */
+  event: string;
   value: StepWhere | null;
   props: string[];
   onChange: (w: StepWhere | null) => void;
-}> = ({ idx, value, props, onChange }) => {
+}> = ({ idx, projectId, event, value, props, onChange }) => {
+  const listId = useId();
+  const suggestions = useTopValues(projectId, value ? event : "", value?.prop ?? "");
   if (!value) {
     return (
       <button
         type="button"
         disabled={props.length === 0}
-        onClick={() => onChange({ prop: props[0] ?? "", op: "eq", value: "" })}
+        onClick={() => onChange({ prop: "", op: "eq", value: "" })}
         className="self-start rounded px-1.5 py-0.5 text-xs text-muted hover:bg-hover hover:text-ink disabled:opacity-50"
         aria-label={`Add a condition to step ${idx + 1}`}
       >
@@ -897,25 +944,21 @@ const StepWhereEditor: React.FC<{
     );
   }
   return (
-    <span className="flex flex-wrap items-center gap-1 pl-1.5 text-xs">
+    <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1 pl-1.5 text-xs">
       <span className="text-faint">where</span>
-      <select
-        aria-label={`Step ${idx + 1} condition property`}
+      <PropertyPicker
+        dense
+        label={`Step ${idx + 1} condition property`}
         value={value.prop}
-        onChange={(e) => onChange({ ...value, prop: e.target.value })}
-        className={`${field} h-7 w-auto py-0 text-xs`}
-      >
-        {Array.from(new Set([value.prop, ...props])).filter(Boolean).map((p) => (
-          <option key={p} value={p}>
-            {humanizeEvent(p)}
-          </option>
-        ))}
-      </select>
+        onChange={(p) => onChange({ ...value, prop: p, value: "" })}
+        recentKey={`pulse.recent-props.${projectId}`}
+        options={propertyOptions(Array.from(new Set([value.prop, ...props])).filter(Boolean))}
+      />
       <select
         aria-label={`Step ${idx + 1} condition operator`}
         value={value.op}
         onChange={(e) => onChange({ ...value, op: e.target.value as StepWhere["op"] })}
-        className={`${field} h-7 w-auto py-0 text-xs`}
+        className={`${field} w-auto py-1 text-xs`}
       >
         <option value="eq">is</option>
         <option value="neq">is not</option>
@@ -926,8 +969,16 @@ const StepWhereEditor: React.FC<{
         value={value.value}
         onChange={(e) => onChange({ ...value, value: e.target.value })}
         placeholder="value"
-        className={`${field} h-7 w-24 py-0 text-xs`}
+        list={suggestions.length ? listId : undefined}
+        className={`${field} w-28 py-1 text-xs`}
       />
+      {suggestions.length > 0 && (
+        <datalist id={listId}>
+          {suggestions.map((v) => (
+            <option key={v} value={v} />
+          ))}
+        </datalist>
+      )}
       <button
         type="button"
         onClick={() => onChange(null)}
