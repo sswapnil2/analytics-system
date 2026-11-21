@@ -26,6 +26,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Flags can be created with your own variants: names, splits, more than two arms, and an optional JSON payload each.
 - Segments hide experiment plumbing, ids and personal-data properties, show no lift for segments with too few users, and name the "no value" segment.
 - Experiments send a webhook (and an audit row) once when a result turns significant, the planned sample is reached, a guardrail gets worse, or a guardrail has no data.
+- Sum and ratio metrics can carry a unit (₹, $, items), shown on every value and difference.
+- Segment pickers say that event properties come from the exposure event, warn when most users have no value, and offer the profile property instead.
+- Full layers can't be picked, and asking for more of a layer than is free is caught before saving.
+- Copied summaries start with a status line (day, planned sample, traffic split, blind guardrails) and a recommendation. Fixed-horizon tests read "too early" until their planned sample, and day counts match everywhere.
 - Experiments can target an audience: keep the flag's, pick a cohort, or build one inline ("hasn't done", "has done", "property is") with a live count of matching users that feeds the duration estimate.
 - Experiment metrics can count only events where a property matches, such as a KYC check with `status = failed`.
 - Every primary metric says whether higher or lower is better (time defaults to lower), and results, verdicts and Ship buttons follow it.

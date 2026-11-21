@@ -326,6 +326,9 @@ pub struct ExperimentMetricSpec {
     /// this metric significantly worse. Needs sequential analysis.
     #[serde(default)]
     pub auto_stop: bool,
+    /// What a `sum` or `ratio` value is in, for display: a currency symbol (`"₹"`) or a word (`"items"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 /// A ratio metric's denominator: a count of `event_name`, or the total of `numeric_prop`.

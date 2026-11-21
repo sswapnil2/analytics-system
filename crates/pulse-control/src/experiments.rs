@@ -461,6 +461,9 @@ pub fn normalized_metric_type(m: &ExperimentMetricSpec) -> &'static str {
 
 /// Checks a metric definition is complete for its type.
 pub fn validate_metric_spec(m: &ExperimentMetricSpec) -> Result<(), String> {
+    if m.unit.as_ref().is_some_and(|u| u.chars().count() > 12) {
+        return Err("unit must be at most 12 characters, such as ₹ or items".into());
+    }
     if !matches!(
         m.metric_type.as_str(),
         "conversion" | "count" | "sum" | "ratio" | "step_through" | "time_between" | "continuous"

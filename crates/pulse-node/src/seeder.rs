@@ -214,6 +214,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             conversion_window_ms: 7 * 86_400_000,
             direction: "decrease_is_bad".to_string(),
             auto_stop: false,
+            unit: None,
         },
         guardrail_metrics: vec![
             ExperimentMetricSpec {
@@ -226,6 +227,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 conversion_window_ms: 7 * 86_400_000,
                 direction: "increase_is_bad".to_string(),
                 auto_stop: true,
+                unit: None,
             },
             ExperimentMetricSpec {
                 name: "Mandate amount per user".to_string(),
@@ -237,6 +239,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 conversion_window_ms: 7 * 86_400_000,
                 direction: "decrease_is_bad".to_string(),
                 auto_stop: false,
+                unit: Some("₹".to_string()),
             },
         ],
         secondary_metrics: vec![
@@ -250,6 +253,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 conversion_window_ms: 7 * 86_400_000,
                 direction: "decrease_is_bad".to_string(),
                 auto_stop: false,
+                unit: None,
             },
             ExperimentMetricSpec {
                 name: "Mandate to disbursal".to_string(),
@@ -264,6 +268,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
                 conversion_window_ms: 7 * 86_400_000,
                 direction: "decrease_is_bad".to_string(),
                 auto_stop: false,
+                unit: None,
             },
         ],
         // Demo users are exposed on their first day, so CUPED has no pre-period to use here.

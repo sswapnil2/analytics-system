@@ -407,6 +407,8 @@ export interface ExperimentMetric {
   direction?: MetricDirection;
   /** Guardrails: roll everyone back to control when a treatment makes this significantly worse. */
   auto_stop?: boolean;
+  /** What a sum or ratio value is in: a currency symbol ("₹") or a word ("items"). */
+  unit?: string | null;
 }
 
 export interface ExperimentAnalysis {
