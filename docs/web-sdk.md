@@ -53,6 +53,7 @@ Ingest routes allow any origin (permissive CORS), so the app can live on a diffe
 | `captureErrors` | `true` | `window` errors and unhandled promise rejections become `$error` events (message and script path, no query string) |
 | `captureNetwork` | same as `enableWireframeReplay` | Every `fetch`/XHR call (method, URL without query string, status, duration) goes on the replay timeline; calls to Pulse itself are skipped |
 | `debug` | `false` | Logs each tracked event and each send result, including events the server rejected |
+| `flagsTtlMs` | 300000 (5 min) | Flags older than this are re-fetched in the background on the next flag read, so a rollback or a guardrail stop reaches open pages. `0` fetches only on first use and `refreshFlags()` |
 
 ## Track and identify
 
@@ -89,6 +90,9 @@ const payload = pulse.getVariantPayload("pricing_test");
 Assignment is deterministic (xxh3 bucketing on the user's routing seed), so the client and the
 server's experiment analysis agree. Record that a user saw a variant with `trackExposure(key, variant)`
 or `getVariant(key, { trackExposure: true })`; repeat exposures of the same variant are deduplicated.
+
+Flags are re-checked in the background once they are older than `flagsTtlMs`; reads never wait for
+that fetch, so a change shows up on the read after it lands.
 
 ## Session replay
 

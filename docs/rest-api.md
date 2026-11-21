@@ -129,7 +129,6 @@ curl -X POST http://127.0.0.1:8080/v1/ingest -H "x-pulse-key: pk_live_…" -H "C
 | POST | `/v1/projects/:id/byok-verify` | Test a stored BYOK configuration |
 | POST | `/v1/projects/:id/export/warehouse` | Trigger an on-demand Parquet export to a configured BYOK S3 bucket |
 | POST | `/v1/projects/:id/ai/copilot` | Run an AI Copilot analytics query using the project's BYOK LLM |
-| PATCH | `/v1/projects/:id/experiments/:exp_id` | Update an existing experiment definition |
 
 ## Operations & health (unauthenticated unless noted)
 
@@ -221,8 +220,15 @@ take simpler arguments.
 |---|---|---|
 | GET, POST | `/v1/projects/:id/flags` | List / create or update a flag |
 | PATCH | `/v1/projects/:id/flags/:flag_id` | Change a flag (enable, rollout, variants) |
-| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag |
-| GET | `/v1/projects/:id/experiments/:exp_id/results` | Lift, p-values (Holm-Bonferroni corrected), Bayesian probability, SRM check |
+| GET, POST | `/v1/projects/:id/experiments` | List / create experiments on a flag. Optional `analysis: { sequential, alpha, planned_users_per_variant, cuped, cuped_pre_window_ms }` (defaults: fixed horizon, `0.05`, 10,000, CUPED off, 14 days). Each metric takes `metric_type` (`conversion`, the default; `count` of events per user; `sum` of `numeric_prop` per user; `ratio` of the metric over `denominator: { event_name, numeric_prop? }`), optional `filters` on the metric event, an optional `direction` (`decrease_is_bad`, the default, or `increase_is_bad`), and for guardrails `auto_stop` (needs `analysis.sequential`). The legacy `continuous` type reads as `sum`. `kind: "bandit"` (default `"ab"`) with optional `bandit: { min_weight_bps, burn_in_users }` (defaults 100 and 100) makes a bandit: the flag must exist with at least two variants, and guardrails aren't allowed. A flag backs one running or paused experiment at a time: creating a second (or resuming a stopped one) on the same flag returns 409 until the other is stopped |
+| PATCH | `/v1/projects/:id/experiments/:exp_id` | Stop, pause or resume (`status`, `end_ts_ms`). Resuming clears `stop_reason` |
+| GET | `/v1/projects/:id/experiments/:exp_id/results` | Lift with absolute and relative intervals, p-values (Holm-Bonferroni corrected; always valid when `sequential`), Bayesian probability, SRM check, and `regressed_variants` per guardrail. Also `metric_type`, `cuped_applied`, `variance_reduction_pct`, `multi_variant_users` (left out of the results), and `timeseries` (cumulative lift by exposure day). `?segment=<prop>` adds `segments` (up to 50 values plus `$other`; exploratory, not corrected across segments). For bandits, `variants` and `guardrails` are empty and `bandit` has each arm's day-stratified mean and interval, `prob_best`, `expected_loss` and current `weight_bps`, plus `weight_history`, `best_variant`, `burn_in_complete` and `ready_to_ship` |
+
+**Guardrail auto-stop.** Every 5 minutes the node checks running sequential experiments with an `auto_stop` guardrail. When a treatment makes one significantly worse, the flag's weights move to 10000 on control (the flag is turned off if it has no control variant), the experiment is concluded with a `stop_reason`, an `experiment.auto_stopped` row goes to the audit log, and `pulse.experiment.auto_stopped` is POSTed to the project's webhook credential URL, signed like alerts. SDKs pick the change up on their next flag refresh (`flagsTtlMs` / `flags_ttl_ms`, 5 minutes by default). Flag and experiment changes made through the API are audited too (`flag.saved`, `flag.updated`, `experiment.created`, `experiment.updated`).
+
+**Bandits.** On the same timer, once a day, in the first hour after midnight in the project's timezone, each running bandit that is past burn-in gets new flag weights from Thompson sampling: every arm keeps `min_weight_bps` and the rest is shared by each arm's chance to be best. The change is recorded in the weight history and audited as `experiment.bandit_reweighted` (actor `system:bandit`). Arm estimates are stratified by exposure day, so traffic moving between arms doesn't bias them, and the SRM check compares users against the weights in effect on each day. `ready_to_ship` is true when the leader's expected loss is under 1% of its value.
+
+The edge flag bundle (`GET /v1/flags/:api_key`) is reused for up to 30 seconds while no flag changes, so polling SDKs don't re-run targeting cohorts on every request.
 
 ## MCP (bearer token)
 

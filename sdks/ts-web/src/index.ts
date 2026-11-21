@@ -125,6 +125,12 @@ export interface PulseWebConfig {
   randomBytes?: (length: number) => Uint8Array;
   /** Optional platform context provider merged into every tracked event. */
   contextProvider?: () => EventProperties;
+  /**
+   * Re-fetch flags in the background when they are older than this (default `300_000`, 5 minutes),
+   * so rollbacks and guardrail stops reach running apps. `0` fetches only on first use and
+   * `refreshFlags()`.
+   */
+  flagsTtlMs?: number;
 }
 
 export interface EdgeFlagRule {
@@ -179,6 +185,7 @@ function visibleAlertBox(message: string): { x: number; y: number; w: number; h:
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 2_000;
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+const DEFAULT_FLAGS_TTL_MS = 300_000;
 const MAX_QUEUED_REPLAY_PACKETS = 64;
 const SNAPSHOT_THROTTLE_MS = 1_000;
 
@@ -440,6 +447,8 @@ export class PulseWebClient {
   private recentClicks: Array<{ ts: number; x: number; y: number }> = [];
   private flagsEtag: string | null = null;
   private flagRules: Map<string, EdgeFlagRule> = new Map();
+  private flagsCheckedAtMs = 0;
+  private flagsRefresh: Promise<void> | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private inFlightFlush: Promise<void> | null = null;
   private consecutiveFailures = 0;
@@ -1269,6 +1278,7 @@ export class PulseWebClient {
   // --- Flags, Experiments & Exposure Tracking (`Gap 13`) ---
 
   public getVariantSync(flagKey: string): string | null {
+    this.refreshFlagsIfStale();
     const rule = this.flagRules.get(flagKey);
     if (!rule) return null;
     return evaluateEdgeFlag(rule, this.getDistinctId());
@@ -1310,7 +1320,22 @@ export class PulseWebClient {
     return variant;
   }
 
-  public async refreshFlags(): Promise<void> {
+  private refreshFlagsIfStale(): void {
+    const ttl = this.cfg.flagsTtlMs ?? DEFAULT_FLAGS_TTL_MS;
+    if (ttl <= 0 || this.flagsCheckedAtMs === 0 || Date.now() - this.flagsCheckedAtMs < ttl) return;
+    void this.refreshFlags();
+  }
+
+  /** Fetches flags now; concurrent calls share one request. */
+  public refreshFlags(): Promise<void> {
+    this.flagsRefresh ??= this.fetchFlags().finally(() => {
+      this.flagsRefresh = null;
+    });
+    return this.flagsRefresh;
+  }
+
+  private async fetchFlags(): Promise<void> {
+    this.flagsCheckedAtMs = Date.now();
     try {
       const headers: Record<string, string> = {};
       if (this.flagsEtag) headers["If-None-Match"] = this.flagsEtag;

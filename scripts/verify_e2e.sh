@@ -289,7 +289,7 @@ python3 - "$EXP_JSON" <<'PY'
 import json, sys
 exp = json.loads(sys.argv[1])
 assert exp["sample_ratio_mismatch"] is False, f"unexpected SRM in balanced synthetic experiment: {exp}"
-assert "not peeking-corrected" in exp["statistical_methodology_note"]
+assert exp["sequential"] is True and "always-valid" in exp["statistical_methodology_note"], exp["statistical_methodology_note"]
 variants = {v["variant_key"]: v for v in exp["variants"]}
 treat = variants["one_tap_sheet"]
 assert treat["relative_lift_pct"] > 5.0, f"expected positive lift, got {treat}"
