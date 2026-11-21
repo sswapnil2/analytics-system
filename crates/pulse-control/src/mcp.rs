@@ -82,7 +82,7 @@ pub async fn handle_mcp_request(
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "pulse-analytics-mcp",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }),
         ),

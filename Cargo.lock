@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "bindings-gen"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "pulse-sdk-core",
  "uniffi",
@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-control"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "async-trait",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-exec"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-identity"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-ingest"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4199,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-node"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-sdk-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chrono",
@@ -4251,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-storage"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "arrow-array",
@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-wire"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "chrono",
