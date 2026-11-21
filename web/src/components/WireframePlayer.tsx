@@ -284,12 +284,12 @@ export const WireframePlayer: React.FC<{ sessionId: string; chunks: ReplayChunk[
                       : isContainer
                         ? "z-[5] overflow-hidden rounded-md"
                         : isErr
-                          ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-[11px] font-medium text-danger"
+                          ? "z-20 flex items-center rounded-lg border border-danger bg-danger-soft px-2 text-2xs font-medium text-danger"
                           : isBtn
                             ? "z-10 flex items-center justify-center rounded-lg text-xs font-semibold"
                             : isMasked
                               ? "z-10 flex items-center rounded-lg border border-line-strong bg-sunken px-2 font-mono text-xs text-muted"
-                              : "z-10 flex items-center px-1 text-[11px] text-ink-2"
+                              : "z-10 flex items-center px-1 text-2xs text-ink-2"
                   }
                 >
                   {isScreen ? (

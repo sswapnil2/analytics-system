@@ -440,19 +440,19 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                   {WINDOWS.find((w) => w.hours === windowHours)?.label ?? `${windowHours} hours`}.
                 </p>
                 {prevEmpty && (
-                  <p className="text-[0.9375rem] text-ink-2">
+                  <p className="text-md text-ink-2">
                     {compareLabel(rangeFor(range), compare)}: no users entered this funnel, so there's nothing to compare.
                   </p>
                 )}
                 {prevLast && prevFirst && (
-                  <p className="text-[0.9375rem] text-ink-2">
+                  <p className="text-md text-ink-2">
                     {compareLabel(rangeFor(range), compare)}:{" "}
                     <span className="tabular">{pct(prevLast.conversion_from_start_pct)}</span> of{" "}
                     {formatCount(prevFirst.entered_users)} users ({delta(last.conversion_from_start_pct - prevLast.conversion_from_start_pct)}).
                   </p>
                 )}
                 {biggestDrop > 0 && (
-                  <p className="text-[0.9375rem] text-ink-2">
+                  <p className="text-md text-ink-2">
                     The biggest drop is between {humanizeEvent(overall[biggestDrop - 1].event_name)} and{" "}
                     {humanizeEvent(overall[biggestDrop].event_name)}:{" "}
                     <span className="tabular">
@@ -487,7 +487,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                             </button>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-2.5 py-0.5 text-[0.8125rem] text-muted sm:ml-[13.5rem]">
+                          <div className="flex items-center gap-2.5 py-0.5 text-compact text-muted sm:ml-[13.5rem]">
                             <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
                             <span className="tabular">
                               {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)})
@@ -534,7 +534,7 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                   );
                 })}
               </ol>
-              <div className="mt-4 flex flex-wrap gap-4 text-[0.8125rem] text-ink-2">
+              <div className="mt-4 flex flex-wrap gap-4 text-compact text-ink-2">
                 <span className="inline-flex items-center gap-1.5">
                   <span className="h-2.5 w-3.5 rounded-sm bg-brand" aria-hidden="true" />
                   Reached this step
@@ -752,7 +752,7 @@ const DropOffDrawer: React.FC<{
                         <span className="flex items-center justify-between gap-2">
                           <span className="truncate text-sm font-medium text-ink tabular">{displayUserId(d.distinct_id)}</span>
                           <span
-                            className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium ${
                               d.has_replay
                                 ? "bg-ok-soft text-ok"
                                 : "bg-sunken text-faint"
@@ -829,7 +829,7 @@ const TimeHistogram: React.FC<{ bins: [number, number, number][] }> = ({ bins })
       </div>
       {hover !== null && bins[hover] && (
         <div
-          className="pointer-events-none absolute -top-2 z-10 -translate-y-full whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop"
+          className="pointer-events-none absolute -top-2 z-10 -translate-y-full whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-compact shadow-pop motion-safe:animate-pop"
           style={(hover + 0.5) / bins.length > 0.6 ? { right: `${100 - ((hover + 1) / bins.length) * 100}%` } : { left: `${(hover / bins.length) * 100}%` }}
         >
           <p className="font-semibold text-ink">
@@ -860,7 +860,7 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
   return (
     <div className="space-y-5">
       <div>
-        <ul className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[0.8125rem] text-ink-2">
+        <ul className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-compact text-ink-2">
           {top.map((g, i) => (
             <li key={g.breakdown_value} className="inline-flex items-center gap-1.5">
               <span className="h-2.5 w-2.5 rounded-sm" style={{ background: SEG_COLORS[i] }} aria-hidden="true" />
@@ -871,7 +871,7 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
         <ol className="space-y-3">
           {stepNames.slice(1).map((name, si) => (
             <li key={name + si}>
-              <p className="mb-1 text-[0.8125rem] font-medium text-ink">
+              <p className="mb-1 text-compact font-medium text-ink">
                 {si + 2}. {name}
               </p>
               <div className="space-y-1">

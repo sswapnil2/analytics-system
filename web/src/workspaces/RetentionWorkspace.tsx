@@ -549,7 +549,7 @@ const RetentionCurve: React.FC<{
       {ticks.map((t) => (
         <g key={t}>
           <line x1={pad.l} x2={W - pad.r} y1={y(t)} y2={y(t)} stroke="rgb(var(--line))" />
-          <text x={pad.l - 6} y={y(t) + 4} textAnchor="end" className="fill-faint text-[11px]">
+          <text x={pad.l - 6} y={y(t) + 4} textAnchor="end" className="fill-faint text-2xs">
             {t}%
           </text>
         </g>
@@ -562,14 +562,14 @@ const RetentionCurve: React.FC<{
         <circle key={d} cx={x(d)} cy={y(v)} r={hover === d ? 5 : 3} fill="rgb(var(--chart-1))" />
       ))}
       {pts.map((_, d) => (
-        <text key={d} x={x(d)} y={H - 6} textAnchor="middle" className="fill-faint text-[11px]">
+        <text key={d} x={x(d)} y={H - 6} textAnchor="middle" className="fill-faint text-2xs">
           {d === 0 ? `${UNIT_WORD[unit]} 0` : d}
         </text>
       ))}
     </svg>
     {hv && (
       <div
-        className="pointer-events-none absolute top-0 z-10 rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop"
+        className="pointer-events-none absolute top-0 z-10 rounded-lg border border-line-strong bg-panel px-3 py-2 text-compact shadow-pop motion-safe:animate-pop"
         style={x(hv[0]) / W > 0.6 ? { right: `${100 - (x(hv[0]) / W) * 100 + 2}%` } : { left: `${(x(hv[0]) / W) * 100 + 2}%` }}
       >
         <p className="font-semibold text-ink">{UNIT_WORD[unit]} {hv[0]}</p>
@@ -582,7 +582,7 @@ const RetentionCurve: React.FC<{
       </div>
     )}
     {compare && (
-      <div className="mt-2 flex flex-wrap gap-4 text-[0.8125rem] text-ink-2">
+      <div className="mt-2 flex flex-wrap gap-4 text-compact text-ink-2">
         <span className="inline-flex items-center gap-1.5">
           <span className="h-0.5 w-4" style={{ background: "rgb(var(--chart-1))" }} aria-hidden="true" /> This range
         </span>

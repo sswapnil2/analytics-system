@@ -129,7 +129,7 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
   const valid = from && to && parseLocal(from) < parseLocal(to);
   return (
     <div className="relative max-w-full" ref={ref}>
-      <div role="group" aria-label="Date range" className="no-scrollbar flex max-w-full overflow-x-auto rounded-lg border border-line bg-panel p-0.5 text-[0.8125rem]">
+      <div role="group" aria-label="Date range" className="no-scrollbar flex max-w-full overflow-x-auto rounded-lg border border-line bg-panel p-0.5 text-compact">
         {PRESETS.map(([k, label]) => (
           <button key={k} type="button" aria-pressed={value === k} onClick={() => onChange(k)} className={seg(value === k)}>
             {label}
@@ -166,7 +166,7 @@ export const RangePresets: React.FC<{ value: RangeSel; onChange: (v: RangeSel) =
               <input type="datetime-local" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} className={field} />
             </label>
           </div>
-          {!valid && <p className="text-[0.8125rem] text-danger">Pick a start before the end.</p>}
+          {!valid && <p className="text-compact text-danger">Pick a start before the end.</p>}
           <div className="flex justify-end gap-2">
             <button type="button" className={btn.ghost} onClick={() => setOpen(false)}>
               Cancel
@@ -306,7 +306,7 @@ const FunnelMini: React.FC<{ data: FunnelResult; splitBy: string | null }> = ({ 
       <Headline value={`${last.conversion_from_start_pct.toFixed(1)}%`}>
         <span className="text-sm text-muted">converted</span>
       </Headline>
-      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3.5rem] items-center gap-x-2.5 gap-y-1.5 text-[0.8125rem]">
+      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3.5rem] items-center gap-x-2.5 gap-y-1.5 text-compact">
         {steps.map((s, i) => {
           const kept = (s.entered_users / first) * 100;
           const prev = i === 0 ? 100 : (steps[i - 1].entered_users / first) * 100;
@@ -325,7 +325,7 @@ const FunnelMini: React.FC<{ data: FunnelResult; splitBy: string | null }> = ({ 
         })}
       </div>
       {worst > 0 && (
-        <p className="text-[0.8125rem] text-danger">
+        <p className="text-compact text-danger">
           Biggest drop: {formatCount(lostBefore(worst))} users between {humanizeEvent(steps[worst - 1].event_name)} and {humanizeEvent(steps[worst].event_name)}.
         </p>
       )}
@@ -349,7 +349,7 @@ const SplitMini: React.FC<{ splitBy: string; groups: FunnelResult["breakdowns"] 
   return (
     <div className="border-t border-line pt-2.5">
       <p className="mb-1.5 text-xs text-muted">By {humanizeEvent(splitBy)}</p>
-      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3.5rem] items-center gap-x-2.5 gap-y-1 text-[0.8125rem]">
+      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3.5rem] items-center gap-x-2.5 gap-y-1 text-compact">
         {rows.map((r) => (
           <React.Fragment key={r.name}>
             <span className="truncate" title={`${r.name}: ${formatCount(r.started)} started`}>
@@ -380,7 +380,7 @@ const FlowsMini: React.FC<{ data: FlowsResult }> = ({ data }) => {
         <span className="text-sm text-muted">users did {humanizeEvent(anchor.event_name)}</span>
       </Headline>
       <p className="text-xs text-muted">{before ? "What they did just before" : "What they did next"}</p>
-      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3rem] items-center gap-x-2.5 gap-y-1 text-[0.8125rem]">
+      <div className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)_3rem] items-center gap-x-2.5 gap-y-1 text-compact">
         {next.map((n) => (
           <React.Fragment key={n.id}>
             <span className="truncate">{name(n.event_name)}</span>
@@ -514,7 +514,7 @@ const RetentionMini: React.FC<{ data: RetentionResult }> = ({ data }) => {
       <Headline value={`${(avg[lastIdx] ?? 0).toFixed(0)}%`}>
         <span className="text-sm text-muted">back on day {lastIdx}</span>
       </Headline>
-      <div className="grid gap-[3px] text-center text-[11px]" style={{ gridTemplateColumns: `repeat(${periods}, minmax(0, 1fr))` }}>
+      <div className="grid gap-[3px] text-center text-2xs" style={{ gridTemplateColumns: `repeat(${periods}, minmax(0, 1fr))` }}>
         {avg.map((v, i) => {
           const a = v === null ? 0 : Math.min(1, v / 100);
           return (
