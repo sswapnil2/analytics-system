@@ -743,7 +743,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before production agent traffic.
 - Validation: `loadgen traces --concurrency 128` holds RSS under the configured bound and returns `429`s instead of growing.
 
-**P0-4. Per-trace limits.** — Done: PR_LINK_P04 (also fixes R-24)
+**P0-4. Per-trace limits.** — Done: [#95](https://github.com/sswapnil2/analytics-system/pull/95) (also fixes R-24)
 - Problem: R-04. Evidence: C2.
 - Solution: cap spans and bytes per trace across batches (for example 10,000 spans and 64 MiB), count rejections in a metric, and avoid re-serialising the whole trace on each append by keeping a running size.
 - Why it matters: one misbehaving agent should not stall a project.
