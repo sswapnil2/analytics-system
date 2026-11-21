@@ -55,7 +55,7 @@ vortex-buffer = "=0.43.0"
 vortex-scalar = "=0.43.0"
 vortex-error = "=0.43.0"
 vortex-io = { version = "=0.43.0", features = ["object_store", "tokio"] }
-arrow = { version = "55.1.0", features = ["prettyprint"] }
+arrow = { version = "60.1.0", features = ["prettyprint"] }
 arrow-array = "55.1.0"
 arrow-buffer = "55.1.0"
 arrow-cast = "55.1.0"
