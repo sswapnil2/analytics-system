@@ -48,6 +48,8 @@ The data stays on your infrastructure. Concretely:
 | Know what's missing | [Limitations](limitations.md) |
 | Contribute | [Contributing](contributing.md) |
 
+**Giving these docs to an AI agent?** Point it at [`llms.txt`](https://sswapnil2.github.io/analytics-system/llms.txt), an index of every page as plain Markdown, or at [`llms-full.txt`](https://sswapnil2.github.io/analytics-system/llms-full.txt), all pages in one file. On the website, every page also has *View as Markdown* and *Copy as Markdown*.
+
 ## Credentials at a glance
 
 | Credential | Looks like | Where it comes from | Use it for |

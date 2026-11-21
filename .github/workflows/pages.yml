@@ -24,8 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
-      # The docs viewer (site/docs/index.html) renders the Markdown in docs/ as-is.
-      - run: mkdir -p site/docs/md && cp -r docs/*.md docs/adr site/docs/md/
+      # Copies docs/ into the viewer (site/docs/md/) and writes site/llms.txt + llms-full.txt.
+      - run: python3 scripts/build_docs_site.py
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site

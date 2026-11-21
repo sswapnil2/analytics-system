@@ -64,14 +64,14 @@ See the [architecture](architecture.md) and [How Pulse works](how-it-works.md) f
 
 ## Working on the docs
 
-The docs are plain Markdown in `docs/`, readable on GitHub and on the website. The website viewer (`site/docs/index.html`) renders the same files in the browser, Mermaid diagrams included. The Pages workflow copies `docs/*.md` and `docs/adr/` into `site/docs/md/` on deploy. To preview locally:
+The docs are plain Markdown in `docs/`, readable on GitHub and on the website. The website viewer (`site/docs/index.html`) renders the same files in the browser, Mermaid diagrams included. On deploy, the Pages workflow runs `scripts/build_docs_site.py`. It copies `docs/*.md` and `docs/adr/` into `site/docs/md/`, and writes `site/llms.txt` (an index for AI agents) and `site/llms-full.txt` (every page in one file). To preview locally:
 
 ```bash
-mkdir -p site/docs/md && cp -r docs/*.md docs/adr site/docs/md/
+python3 scripts/build_docs_site.py
 python3 -m http.server 8000 --directory site    # open http://localhost:8000/docs/
 ```
 
-`site/docs/md/` is git-ignored. Run `python3 scripts/check_docs_links.py` before you push: CI runs it too, and fails on any broken relative link, heading anchor or nav entry. To add a page, write `docs/<name>.md` and add it to the `NAV` list at the top of the script in `site/docs/index.html`. Link between pages with relative `.md` links, as on GitHub. The viewer rewrites them, and sends links outside `docs/` to GitHub.
+The generated files are git-ignored. Run `python3 scripts/check_docs_links.py` before you push: CI runs it too, and fails on any broken relative link, heading anchor or nav entry. To add a page, write `docs/<name>.md` and add it to the `NAV` list at the top of the script in `site/docs/index.html`. Link between pages with relative `.md` links, as on GitHub. The viewer rewrites them, and sends links outside `docs/` to GitHub.
 
 ## Where to start
 

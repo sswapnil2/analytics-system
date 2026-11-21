@@ -7,6 +7,8 @@
 <meta name="description" content="Pulse documentation: getting started, architecture, how Pulse works internally, API reference, SDKs, security and limitations.">
 <meta name="theme-color" content="#09090B">
 <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="text/plain" title="Pulse docs for LLMs (index)" href="../llms.txt">
+<link rel="alternate" type="text/plain" title="Pulse docs for LLMs (all pages)" href="../llms-full.txt">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
@@ -62,6 +64,20 @@ pre.mermaid{background:#0C0C0F;text-align:center;padding:20px}
 hr{border:0;border-top:1px solid var(--line);margin:32px 0}
 .pager{display:flex;justify-content:space-between;gap:12px;margin-top:56px;padding-top:20px;border-top:1px solid var(--line);font-size:14px}
 .pager a{text-decoration:none}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin:-6px 0 22px}
+.tools a,.tools button{display:inline-flex;align-items:center;height:30px;padding:0 11px;border-radius:7px;border:1px solid var(--line2);background:var(--card);color:var(--ink2);font:inherit;font-size:13px;text-decoration:none;cursor:pointer}
+.tools a:hover,.tools button:hover{color:var(--ink);border-color:#52525B}
+pre.mermaid svg{cursor:zoom-in}
+pre.mermaid{position:relative}
+.zoomhint{position:absolute;top:8px;right:10px;font-size:12px;color:var(--ink3);pointer-events:none}
+dialog.zoom{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:0;border:0;background:#0C0C0F;color:var(--ink)}
+dialog.zoom::backdrop{background:rgba(0,0,0,.7)}
+.zbar{position:sticky;top:0;left:0;display:flex;gap:8px;align-items:center;padding:10px 14px;background:rgba(12,12,15,.92);border-bottom:1px solid var(--line);z-index:1}
+.zbar button{height:34px;min-width:34px;padding:0 10px;border-radius:7px;border:1px solid var(--line2);background:var(--card);color:var(--ink);font:inherit;font-size:14px;cursor:pointer}
+.zbar span{color:var(--ink3);font-size:13px;margin-left:auto}
+@media (max-width:600px){.zbar span{display:none}.zbar #zclose{margin-left:auto}.zoomhint{display:none}}
+.zbody{overflow:auto;height:calc(100vh - 55px);padding:24px}
+.zbody svg{display:block;margin:0 auto;max-width:none!important;height:auto}
 .edit{margin-top:28px;font-size:13px;color:var(--ink3)}
 .edit a{color:var(--ink3)}
 @media (max-width:900px){
@@ -83,8 +99,9 @@ hr{border:0;border-top:1px solid var(--line);margin:32px 0}
 </header>
 <div class="layout">
  <nav class="side" id="side" aria-label="Documentation"></nav>
- <main><article id="doc"><p>Loading…</p></article><div class="pager" id="pager"></div><p class="edit" id="edit"></p></main>
+ <main><article id="doc"><h1>Pulse documentation</h1><p>This page renders Markdown in the browser. For plain text, read the Markdown directly: <a href="../llms.txt">llms.txt</a> lists every page with a one-line summary, <a href="../llms-full.txt">llms-full.txt</a> has all of them in one file, and each page is at <code>md/&lt;page&gt;.md</code> (start with <a href="md/README.md">md/README.md</a>).</p></article><div class="pager" id="pager"></div><p class="edit" id="edit"></p></main>
 </div>
+<dialog class="zoom" id="zoom" aria-label="Diagram, zoomed"><div class="zbar"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button><button id="zfit">Fit</button><span>Scroll to pan · Esc to close</span><button id="zclose" aria-label="Close">Close</button></div><div class="zbody" id="zbody"></div></dialog>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
 <script>
@@ -142,14 +159,28 @@ async function load() {
  const doc = document.getElementById("doc");
  const res = await fetch(`md/${page}.md`);
  if (!res.ok) { doc.innerHTML = `<h1>Page not found</h1><p>No page named <code>${page}</code>. <a href="?p=README">Go to the introduction</a>.</p>`; return; }
- doc.innerHTML = marked.parse(await res.text());
+ const raw = await res.text();
+ doc.innerHTML = marked.parse(raw);
  document.title = (doc.querySelector("h1")?.textContent || "Pulse") + " · Pulse Docs";
+ // Plain-Markdown access for people pasting docs into an agent, and for agents themselves.
+ const alt = document.createElement("link"); alt.rel = "alternate"; alt.type = "text/markdown"; alt.href = `md/${page}.md`; document.head.appendChild(alt);
+ const tools = document.createElement("div"); tools.className = "tools";
+ tools.innerHTML = `<a href="md/${page}.md">View as Markdown</a><button type="button">Copy as Markdown</button><a href="../llms-full.txt" title="Every page in one file, for AI agents">All docs as one file</a>`;
+ tools.querySelector("button").onclick = e => navigator.clipboard.writeText(raw).then(() => (e.target.textContent = "Copied"));
+ (doc.querySelector("h1") || doc.firstChild)?.after(tools);
  doc.querySelectorAll("pre:not(.mermaid)").forEach(pre => {
   const b = document.createElement("button"); b.className = "copy"; b.textContent = "Copy";
   b.onclick = () => navigator.clipboard.writeText(pre.innerText.replace(/Copy$/, "")).then(() => (b.textContent = "Copied"));
   pre.appendChild(b);
  });
  await mermaid.run({ querySelector: "pre.mermaid" });
+ doc.querySelectorAll("pre.mermaid").forEach(pre => {
+  const svg = pre.querySelector("svg"); if (!svg) return;
+  pre.insertAdjacentHTML("beforeend", '<span class="zoomhint">Click to zoom</span>');
+  svg.setAttribute("role", "button"); svg.setAttribute("tabindex", "0"); svg.setAttribute("aria-label", "Open diagram full screen");
+  svg.onclick = () => openZoom(svg);
+  svg.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openZoom(svg); } };
+ });
  if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
  const i = FLAT.findIndex(([p]) => p === page);
  const prev = FLAT[i - 1], next = FLAT[i + 1];
@@ -157,6 +188,26 @@ async function load() {
  document.getElementById("edit").innerHTML = `<a href="${REPO}docs/${page}.md">Edit this page on GitHub</a>`;
 }
 load();
+
+// Click-to-zoom: show a copy of the diagram full screen, sized by width; scroll to pan.
+const zoom = document.getElementById("zoom"), zbody = document.getElementById("zbody");
+let zw = 0, fitW = 0;
+function setZoom(w) { zw = Math.max(200, Math.min(w, 8000)); zbody.querySelector("svg").style.width = zw + "px"; }
+function openZoom(svg) {
+ const copy = svg.cloneNode(true);
+ copy.removeAttribute("style"); copy.removeAttribute("role"); copy.removeAttribute("tabindex");
+ zbody.replaceChildren(copy);
+ zoom.showModal();
+ const vb = svg.viewBox.baseVal, cw = zbody.clientWidth - 48, ch = zbody.clientHeight - 48;
+ fitW = vb && vb.width ? Math.min(cw, vb.width * ch / vb.height) : cw;  // whole diagram on screen
+ // Open at natural size, but never smaller than "fit" and at least 900px wide on phones, so labels are readable and you pan.
+ setZoom(Math.max(fitW, Math.min(vb?.width || cw, Math.max(cw, 900))));
+}
+document.getElementById("zin").onclick = () => setZoom(zw * 1.25);
+document.getElementById("zout").onclick = () => setZoom(zw / 1.25);
+document.getElementById("zfit").onclick = () => setZoom(fitW);
+document.getElementById("zclose").onclick = () => zoom.close();
+zoom.addEventListener("click", e => { if (e.target === zoom) zoom.close(); });
 
 // Search: fetch every page once, on first focus, and match lines. ponytail: linear scan; ~20 pages is nothing.
 let index = null;

@@ -18,3 +18,5 @@
 /examples/android-demo/app/src/main/jniLibs/
 /examples/android-demo/app/src/main/java/uniffi/
 site/docs/md/
+site/llms.txt
+site/llms-full.txt
