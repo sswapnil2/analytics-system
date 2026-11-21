@@ -67,7 +67,7 @@ These statements come from reading code; they were not exercised:
 ## Roadmap
 
 1. **Generate an OpenAPI spec** from the Axum routes, and render the API reference from it, so the docs can't drift from the routes.
-2. **Add a docs check to CI.** Build the site, fail on broken internal links and anchors, and run the quickstart `curl`s against a fresh node.
+2. **Extend the docs check in CI.** `scripts/check_docs_links.py` (the `docs-links` job) already fails on broken links, anchors and nav entries. Next: render the Mermaid diagrams, and run the quickstart `curl`s against a fresh node.
 3. **Document React Native**, or mark it experimental, and add it to CI.
 4. **Write a backup-and-restore runbook**, and test it.
 5. **Write a multi-node deployment guide** once a topology is tested (see [ADR-0008](adr/0008-node-roles.md)).

@@ -71,7 +71,7 @@ mkdir -p site/docs/md && cp -r docs/*.md docs/adr site/docs/md/
 python3 -m http.server 8000 --directory site    # open http://localhost:8000/docs/
 ```
 
-`site/docs/md/` is git-ignored. To add a page, write `docs/<name>.md` and add it to the `NAV` list at the top of the script in `site/docs/index.html`. Link between pages with relative `.md` links, as on GitHub. The viewer rewrites them, and sends links outside `docs/` to GitHub.
+`site/docs/md/` is git-ignored. Run `python3 scripts/check_docs_links.py` before you push: CI runs it too, and fails on any broken relative link, heading anchor or nav entry. To add a page, write `docs/<name>.md` and add it to the `NAV` list at the top of the script in `site/docs/index.html`. Link between pages with relative `.md` links, as on GitHub. The viewer rewrites them, and sends links outside `docs/` to GitHub.
 
 ## Where to start
 
