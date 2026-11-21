@@ -758,7 +758,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before a second query node.
 - Validation: a test with two control-plane instances on one DB asserts one webhook.
 
-**P0-6. Correct the README.** — Done: PR_LINK_P06
+**P0-6. Correct the README.** — Done: [#86](https://github.com/sswapnil2/analytics-system/pull/86)
 - Problem: R-06.
 - Solution: say that one ingest node per project is supported, several query nodes are, and link `docs/limitations.md`.
 - Cost: S. Timing: now.
