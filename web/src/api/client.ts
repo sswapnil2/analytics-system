@@ -325,6 +325,24 @@ export interface Experiment {
   /** "ab" (fixed split, p-values) or "bandit" (traffic moves daily to the best variant). */
   kind?: ExperimentKind;
   bandit?: BanditConfig | null;
+  /** Recorded when the experiment was concluded. */
+  decision?: ExperimentDecision | null;
+}
+
+export type DecisionOutcome = "ship" | "keep_control" | "inconclusive";
+/** rollout: everyone gets the variant; rollback: flag off; keep: flag unchanged. */
+export type FlagAction = "rollout" | "rollback" | "keep";
+
+export interface DecisionInput {
+  outcome: DecisionOutcome;
+  variant?: string | null;
+  reason: string;
+  flag_action: FlagAction;
+}
+
+export interface ExperimentDecision extends DecisionInput {
+  decided_by: string;
+  decided_at_ms: number;
 }
 
 export type ExperimentKind = "ab" | "bandit";
@@ -381,6 +399,8 @@ export interface ExperimentAnalysis {
   /** Adjust for each user's pre-exposure value of the metric (CUPED). */
   cuped?: boolean;
   cuped_pre_window_ms?: number;
+  /** Smallest relative lift (%) worth shipping. */
+  target_lift_pct?: number | null;
 }
 
 export interface VariantLiftRow {
@@ -1173,7 +1193,11 @@ export const api = {
     ),
 
   /** Stop (`concluded`), pause or resume an experiment. */
-  patchExperiment: (projectId: string, expId: string, body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number }) =>
+  patchExperiment: (
+    projectId: string,
+    expId: string,
+    body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number; decision?: DecisionInput },
+  ) =>
     fetchJson<Experiment>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}`,
       { method: "PATCH", body: JSON.stringify(body) },
@@ -1192,6 +1216,7 @@ export const api = {
       guardrail_metrics: ExperimentMetric[];
       analysis: ExperimentAnalysis;
       kind?: ExperimentKind;
+      status?: "draft" | "running";
       layer?: { layer_id: string; traffic_pct: number } | null;
       bandit?: BanditConfig;
     },

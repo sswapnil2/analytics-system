@@ -16,6 +16,10 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 
 - Holdouts: keep a share of users off a set of flags, even after shipping, and measure what those flags added up to against them.
 - Layers: experiments in the same layer never share a user, so tests on the same page don't affect each other. Each experiment gets its own slice of the layer's users.
+- Experiments can be saved as drafts and started later, after a review of what starting will do (flag turned on, share of users reached, end date).
+- Concluding an experiment records the decision (ship, keep control or inconclusive), the reason and who made it, and applies it to the flag in the same step.
+- Results open with a plain verdict that checks the lift against the one you planned for, says when it's too early, and calls out guardrails with no data. Shipping with such a guardrail needs an explicit acknowledgement, and guardrails with auto-stop say it can't fire without data.
+- The sample-size estimate counts only users the experiment can reach: rollout, layer slice and holdout.
 
 ### Changed
 - A flag can back only one running or paused experiment at a time; a second one is refused with 409 until the first is stopped.

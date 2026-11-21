@@ -1,3 +1,4 @@
+//! Experiment lifecycle: drafts start later, concluding records a decision and acts on the flag.
 //! Holdouts keep a share of users off every attached flag and measure the flags' combined
 //! effect; layers split users between experiments so no one is in two of them.
 
@@ -363,4 +364,128 @@ async fn layer_experiments_get_disjoint_slices() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+fn draft_or_running(flag: &str, status: &str) -> Value {
+    json!({
+        "name": format!("{flag} {status}"), "flag_key": flag, "hypothesis": "",
+        "status": status, "start_ts_ms": BASE, "end_ts_ms": BASE + 14 * DAY,
+        "primary_metric": {"name": "Purchases", "event_name": "Purchased"},
+    })
+}
+
+#[tokio::test]
+async fn drafts_start_later_and_conclusions_record_a_decision() {
+    let (app, _ctrl, token, _ingest) = setup().await;
+    let exps = "/v1/projects/proj_h/experiments";
+    let flags_uri = "/v1/projects/proj_h/flags";
+    call(
+        &app,
+        &token,
+        "PATCH",
+        "/v1/projects/proj_h/flags/a",
+        json!({"enabled": false}),
+    )
+    .await;
+
+    // A draft leaves the flag alone and doesn't hold it.
+    let (status, draft) = call(&app, &token, "POST", exps, draft_or_running("a", "draft")).await;
+    assert!(status.is_success(), "{draft}");
+    let draft_uri = format!("{exps}/{}", draft["id"].as_str().unwrap());
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], false);
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({"status": "paused"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "drafts can't be paused");
+
+    // A running experiment turns its flag on and blocks starting the draft.
+    let (status, live) = call(&app, &token, "POST", exps, draft_or_running("a", "running")).await;
+    assert!(status.is_success(), "{live}");
+    let live_uri = format!("{exps}/{}", live["id"].as_str().unwrap());
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], true);
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({"status": "running"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Concluding records the decision and rolls the flag back.
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &live_uri,
+        json!({"decision": {"outcome": "inconclusive", "flag_action": "rollback"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a decision needs status concluded"
+    );
+    let (status, done) = call(&app, &token, "PATCH", &live_uri, json!({
+        "status": "concluded",
+        "decision": {"outcome": "inconclusive", "reason": "No difference after 3 weeks", "flag_action": "rollback"},
+    }))
+    .await;
+    assert!(status.is_success(), "{done}");
+    assert_eq!(done["decision"]["outcome"], "inconclusive");
+    assert_eq!(done["decision"]["reason"], "No difference after 3 weeks");
+    assert!(done["decision"]["decided_at_ms"].as_i64().unwrap() > 0);
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], false);
+
+    // Starting the draft moves its clock to now, keeps its length, and turns the flag on.
+    let (status, started) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({"status": "running"}),
+    )
+    .await;
+    assert!(status.is_success(), "{started}");
+    let start = started["start_ts_ms"].as_i64().unwrap();
+    assert!(start > BASE + 100 * DAY, "start moved to now");
+    assert_eq!(started["end_ts_ms"].as_i64().unwrap() - start, 14 * DAY);
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    assert_eq!(flag(&flags, "a")["enabled"], true);
+
+    // Shipping rolls the winner out to everyone.
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({
+            "status": "concluded",
+            "decision": {"outcome": "ship", "variant": "nope", "flag_action": "rollout"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, shipped) = call(&app, &token, "PATCH", &draft_uri, json!({
+        "status": "concluded",
+        "decision": {"outcome": "ship", "variant": "treatment", "reason": "+8 pts", "flag_action": "rollout"},
+    }))
+    .await;
+    assert!(status.is_success(), "{shipped}");
+    let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
+    let a = flag(&flags, "a");
+    assert_eq!(a["rollout_pct"], 100.0);
+    assert_eq!(
+        a["variants"][1],
+        json!({"key": "treatment", "weight_bps": 10000, "payload": null})
+    );
 }

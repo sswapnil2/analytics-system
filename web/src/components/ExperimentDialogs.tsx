@@ -1,0 +1,196 @@
+import React, { useEffect, useRef, useState } from "react";
+import { DecisionInput, DecisionOutcome, FlagAction } from "../api/client";
+import { btn, field, fieldLabel } from "./ui";
+
+/** A native modal <dialog>: focus is trapped, Esc closes, the page behind is inert. */
+const Modal: React.FC<{ title: string; onClose: () => void; children: React.ReactNode }> = ({ title, onClose, children }) => {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const d = ref.current;
+    if (d && !d.open) d.showModal();
+    return () => d?.close();
+  }, []);
+  return (
+    <dialog
+      ref={ref}
+      aria-label={title}
+      onCancel={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+      className="w-[min(34rem,calc(100vw-2rem))] rounded-xl border border-line-strong bg-panel p-0 text-ink shadow-pop backdrop:bg-black/40"
+    >
+      <div className="space-y-4 p-5">
+        <h2 className="text-[0.9375rem] font-semibold text-ink">{title}</h2>
+        {children}
+      </div>
+    </dialog>
+  );
+};
+
+/** The last look before an experiment goes live. */
+export const StartReview: React.FC<{
+  name: string;
+  flagKey: string;
+  flagWasOff: boolean;
+  trafficText: string;
+  endsText: string;
+  busy: boolean;
+  onStart: () => void;
+  onClose: () => void;
+}> = ({ name, flagKey, flagWasOff, trafficText, endsText, busy, onStart, onClose }) => (
+  <Modal title={`Start "${name}"?`} onClose={onClose}>
+    <ul className="list-disc space-y-1.5 pl-5 text-sm text-ink-2">
+      <li>
+        Users start getting variants of <code className="font-mono">{flagKey}</code> now
+        {flagWasOff ? ", so the flag turns on." : "."}
+      </li>
+      <li>{trafficText}</li>
+      <li>It ends {endsText}. You can pause or stop it any time.</li>
+      <li>
+        Results only count users whose app asked for their variant with exposure tracking on. Check that with your engineer
+        before starting.
+      </li>
+    </ul>
+    <div className="flex justify-end gap-2">
+      <button type="button" onClick={onClose} className={btn.ghost}>
+        Back
+      </button>
+      <button type="button" disabled={busy} onClick={onStart} className={btn.primary}>
+        {busy ? "Starting…" : "Start experiment"}
+      </button>
+    </div>
+  </Modal>
+);
+
+const DEFAULT_ACTION: Record<DecisionOutcome, FlagAction> = {
+  ship: "rollout",
+  keep_control: "rollback",
+  inconclusive: "rollback",
+};
+
+/** Ends an experiment with a recorded outcome, reason and what happens to its flag. */
+export const ConcludeDialog: React.FC<{
+  experimentName: string;
+  flagKey: string;
+  treatments: string[];
+  initialVariant?: string;
+  /** Guardrails with no data among exposed users: shipping needs an explicit check. */
+  blindGuardrails: string[];
+  /** Guardrails a variant made significantly worse, by variant. */
+  harmedBy: Record<string, string[]>;
+  busy: boolean;
+  onConclude: (d: DecisionInput) => void;
+  onClose: () => void;
+}> = ({ experimentName, flagKey, treatments, initialVariant, blindGuardrails, harmedBy, busy, onConclude, onClose }) => {
+  const [outcome, setOutcome] = useState<DecisionOutcome>(initialVariant ? "ship" : "inconclusive");
+  const [variant, setVariant] = useState(initialVariant ?? treatments[0] ?? "");
+  const [action, setAction] = useState<FlagAction>(DEFAULT_ACTION[initialVariant ? "ship" : "inconclusive"]);
+  const [reason, setReason] = useState("");
+  const [checked, setChecked] = useState(false);
+  const shipping = outcome === "ship";
+  const needsCheck = shipping && blindGuardrails.length > 0;
+  const harmed = shipping ? harmedBy[variant] ?? [] : [];
+  const ready = reason.trim().length > 0 && (!needsCheck || checked) && (!shipping || !!variant);
+
+  const pickOutcome = (o: DecisionOutcome) => {
+    setOutcome(o);
+    setAction(DEFAULT_ACTION[o]);
+  };
+  const actions: { value: FlagAction; label: string }[] = [
+    ...(shipping ? [{ value: "rollout" as const, label: `Give everyone ${variant}` }] : []),
+    { value: "rollback", label: "Turn the flag off, so everyone gets the default" },
+    { value: "keep", label: "Leave the flag as it is, so the current split keeps serving" },
+  ];
+
+  return (
+    <Modal title={`Conclude "${experimentName}"`} onClose={onClose}>
+      <form
+        noValidate
+        className="space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (ready) onConclude({ outcome, variant: shipping ? variant : null, reason: reason.trim(), flag_action: action });
+        }}
+      >
+        <fieldset className="space-y-1.5">
+          <legend className={fieldLabel}>Decision</legend>
+          {treatments.map((t) => (
+            <label key={t} className="flex items-center gap-2 text-sm text-ink">
+              <input
+                type="radio"
+                name="outcome"
+                checked={shipping && variant === t}
+                onChange={() => {
+                  setVariant(t);
+                  pickOutcome("ship");
+                }}
+              />
+              Ship {t}
+            </label>
+          ))}
+          <label className="flex items-center gap-2 text-sm text-ink">
+            <input type="radio" name="outcome" checked={outcome === "keep_control"} onChange={() => pickOutcome("keep_control")} />
+            Keep control: the change didn't help or did harm
+          </label>
+          <label className="flex items-center gap-2 text-sm text-ink">
+            <input type="radio" name="outcome" checked={outcome === "inconclusive"} onChange={() => pickOutcome("inconclusive")} />
+            Inconclusive: no clear answer
+          </label>
+        </fieldset>
+
+        <label className="flex flex-col gap-1">
+          <span className={fieldLabel}>
+            What happens to <code className="font-mono">{flagKey}</code>
+          </span>
+          <select value={action} onChange={(e) => setAction(e.target.value as FlagAction)} className={field}>
+            {actions.map((a) => (
+              <option key={a.value} value={a.value}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+          {action === "keep" && (
+            <span className="text-xs text-warn">Users keep getting both variants until you change the flag.</span>
+          )}
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className={fieldLabel}>Why</span>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            rows={3}
+            placeholder="e.g. +7.7 pts approval, range +5.5% to +27.5%; guardrails held."
+            className={field}
+          />
+          <span className="text-xs text-muted">Saved with the experiment, so the next person knows what was decided and why.</span>
+        </label>
+
+        {harmed.length > 0 && (
+          <p role="alert" className="rounded-lg border border-danger/40 bg-danger-soft px-3 py-2 text-sm text-ink">
+            {variant} made {harmed.join(", ")} significantly worse.
+          </p>
+        )}
+        {needsCheck && (
+          <label className="flex items-start gap-2 rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm text-ink">
+            <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} className="mt-1" />
+            <span>
+              {blindGuardrails.join(", ")} {blindGuardrails.length > 1 ? "have" : "has"} no data from users in this test, so
+              Pulse can't tell whether {variant} harmed {blindGuardrails.length > 1 ? "them" : "it"}. I've checked another way.
+            </span>
+          </label>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className={btn.ghost}>
+            Cancel
+          </button>
+          <button type="submit" disabled={busy || !ready} className={btn.primary}>
+            {busy ? "Concluding…" : "Conclude"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+};

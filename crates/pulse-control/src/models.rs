@@ -355,6 +355,9 @@ pub struct AnalysisConfig {
     pub cuped: bool,
     #[serde(default = "default_cuped_pre_window_ms")]
     pub cuped_pre_window_ms: i64,
+    /// The smallest relative lift (%) worth shipping, used to judge results against the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_lift_pct: Option<f64>,
 }
 
 fn default_cuped_pre_window_ms() -> i64 {
@@ -369,6 +372,7 @@ impl Default for AnalysisConfig {
             planned_users_per_variant: None,
             cuped: false,
             cuped_pre_window_ms: default_cuped_pre_window_ms(),
+            target_lift_pct: None,
         }
     }
 }
@@ -412,6 +416,27 @@ pub struct Experiment {
     /// Set for bandits; `None` reads as the defaults.
     #[serde(default)]
     pub bandit: Option<BanditConfig>,
+    /// Recorded when the experiment is concluded through the API with a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ExperimentDecision>,
+}
+
+/// Why an experiment ended and what happened to its flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentDecision {
+    /// `"ship"` (a variant won), `"keep_control"` or `"inconclusive"`.
+    pub outcome: String,
+    /// The shipped variant, for `"ship"`.
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+    /// `"rollout"` (everyone gets `variant`), `"rollback"` (flag off) or `"keep"` (unchanged).
+    pub flag_action: String,
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub decided_at_ms: i64,
 }
 
 fn default_experiment_kind() -> String {

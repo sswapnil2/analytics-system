@@ -49,10 +49,11 @@ use crate::models::{
     unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
     BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentMetricSpec, ExperimentResults, FeatureFlag, FlagHoldout, FlagLayer,
-    GroupProfileRecord, LexiconEvent, LexiconProperty, Organization, Project, Role, SavedReport,
-    SystemKeyringRecord, TrafficGroup, UserProfileRecord, VariantAllocation, WeightSnapshot,
-    BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
+    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
+    FlagHoldout, FlagLayer, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization,
+    Project, Role, SavedReport, SystemKeyringRecord, TrafficGroup, UserProfileRecord,
+    VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN, KEY_ROLE_INGEST_AND_FLAGS,
+    REPORT_KINDS,
 };
 
 #[derive(Debug, Clone)]
@@ -3886,6 +3887,7 @@ async fn handle_holdout_results(
         stop_reason: None,
         kind: "holdout".to_string(),
         bandit: None,
+        decision: None,
     };
     let groups = FeatureFlag {
         id: h.id.clone(),
@@ -4106,7 +4108,16 @@ async fn handle_create_experiment(
     }
     // Two live experiments on one flag share users and assignment, so their results conflict
     // (and a bandit rewrites the weights under the other one).
-    if req.status.as_deref() != Some("concluded") {
+    let status = req.status.clone().unwrap_or_else(|| "running".to_string());
+    if !matches!(
+        status.as_str(),
+        "draft" | "running" | "paused" | "concluded"
+    ) {
+        return Err(CtrlError::bad(
+            "status must be one of draft, running, paused, concluded",
+        ));
+    }
+    if is_live(&status) {
         ensure_flag_free(&ctrl, &id, &req.flag_key, None).await?;
     }
     if let Some(lr) = &req.layer {
@@ -4167,7 +4178,7 @@ async fn handle_create_experiment(
             .unwrap_or_else(|| format!("flg_{}_{}", id, req.flag_key)),
         flag_key: req.flag_key,
         hypothesis: req.hypothesis,
-        status: req.status.unwrap_or_else(|| "running".to_string()),
+        status,
         start_ts_ms: req.start_ts_ms.unwrap_or(now - 14 * 86_400_000),
         end_ts_ms: req.end_ts_ms.unwrap_or(now + 14 * 86_400_000),
         primary_metric: req.primary_metric,
@@ -4177,6 +4188,7 @@ async fn handle_create_experiment(
         stop_reason: None,
         bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
         kind,
+        decision: None,
     };
     ctrl.meta
         .upsert_experiment(&exp)
@@ -4191,6 +4203,9 @@ async fn handle_create_experiment(
             .insert_weight_snapshot(&id, &exp.id, &snap)
             .await
             .map_err(CtrlError::meta)?;
+    }
+    if exp.status == "running" {
+        turn_flag_on_for(&ctrl, &exp).await?;
     }
     ctrl.record_enterprise_audit(
         &principal.actor_label(),
@@ -4215,9 +4230,7 @@ async fn ensure_flag_free(
         .await
         .map_err(CtrlError::meta)?
         .into_iter()
-        .find(|e| {
-            e.flag_key == flag_key && e.status != "concluded" && Some(e.id.as_str()) != except_id
-        });
+        .find(|e| e.flag_key == flag_key && is_live(&e.status) && Some(e.id.as_str()) != except_id);
     match other {
         Some(o) => Err(CtrlError::conflict(format!(
             "flag '{flag_key}' is already used by the experiment '{}'. Stop it first, or use another flag",
@@ -4231,6 +4244,112 @@ async fn ensure_flag_free(
 struct PatchExpReq {
     status: Option<String>,
     end_ts_ms: Option<i64>,
+    /// With `status: "concluded"`: what was decided, and what to do with the flag.
+    decision: Option<DecisionReq>,
+}
+
+#[derive(Deserialize)]
+struct DecisionReq {
+    outcome: String,
+    variant: Option<String>,
+    #[serde(default)]
+    reason: String,
+    flag_action: String,
+}
+
+/// Running and paused experiments hold their flag; drafts and concluded ones don't.
+fn is_live(status: &str) -> bool {
+    matches!(status, "running" | "paused")
+}
+
+/// Turns the experiment's flag on, first moving it to a free slice if its layer slice was
+/// taken while it was off.
+async fn turn_flag_on_for(ctrl: &ControlPlaneService, exp: &Experiment) -> Result<(), CtrlError> {
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Ok(());
+    };
+    if flag.enabled {
+        return Ok(());
+    }
+    if let Some(l) = flag.layer.clone() {
+        let taken = layer_slices(ctrl, &exp.project_id, &l.id, &flag.id).await?;
+        if taken
+            .iter()
+            .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+        {
+            let Some((start_bps, end_bps)) = first_free_slice(&taken, l.end_bps - l.start_bps)
+            else {
+                return Err(CtrlError::conflict(format!(
+                    "layer '{}' no longer has a free slice of {}%; stop an experiment in it first",
+                    l.id,
+                    f64::from(l.end_bps - l.start_bps) / 100.0
+                )));
+            };
+            flag.layer = Some(FlagLayer {
+                id: l.id,
+                start_bps,
+                end_bps,
+            });
+        }
+    }
+    flag.enabled = true;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
+}
+
+/// Applies a decision's flag action: everyone gets the winner, the flag goes off, or nothing.
+async fn apply_decision_to_flag(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    d: &DecisionReq,
+) -> Result<(), CtrlError> {
+    if d.flag_action == "keep" {
+        return Ok(());
+    }
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    if d.flag_action == "rollout" {
+        let winner = d.variant.as_deref().unwrap_or_default();
+        if !flag.variants.iter().any(|v| v.key == winner) {
+            return Err(CtrlError::bad(format!(
+                "rollout needs one of the flag's variants, got '{winner}'"
+            )));
+        }
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == winner { 10_000 } else { 0 };
+        }
+        flag.enabled = true;
+        flag.rollout_pct = 100.0;
+        // Leave the layer so the winner reaches everyone, not just this experiment's slice.
+        flag.layer = None;
+    } else {
+        flag.enabled = false;
+    }
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
 }
 
 /// Stop, pause or resume an experiment. Shipping a winner is a flag patch plus `status: "concluded"`.
@@ -4249,19 +4368,66 @@ async fn handle_patch_experiment(
     else {
         return Err(CtrlError::not_found("experiment not found"));
     };
+    if req.decision.is_some() && req.status.as_deref() != Some("concluded") {
+        return Err(CtrlError::bad(
+            "a decision is recorded when concluding: send status \"concluded\"",
+        ));
+    }
     if let Some(status) = req.status {
         if !matches!(status.as_str(), "running" | "paused" | "concluded") {
             return Err(CtrlError::bad(
                 "status must be one of running, paused, concluded",
             ));
         }
-        if exp.status == "concluded" && status != "concluded" {
+        if exp.status == "draft" && status == "paused" {
+            return Err(CtrlError::bad(
+                "a draft can't be paused; start it or conclude it",
+            ));
+        }
+        if is_live(&status) && !is_live(&exp.status) {
             ensure_flag_free(&ctrl, &id, &exp.flag_key, Some(&exp.id)).await?;
+        }
+        if exp.status == "draft" && status == "running" {
+            // Starting a draft: the clock starts now and keeps the planned length.
+            let now = Utc::now().timestamp_millis();
+            let length = (exp.end_ts_ms - exp.start_ts_ms).max(86_400_000);
+            exp.start_ts_ms = now;
+            exp.end_ts_ms = now + length;
+            turn_flag_on_for(&ctrl, &exp).await?;
         }
         if status == "running" {
             exp.stop_reason = None;
         }
         exp.status = status;
+    }
+    if let Some(d) = req.decision {
+        if !matches!(d.outcome.as_str(), "ship" | "keep_control" | "inconclusive") {
+            return Err(CtrlError::bad(
+                "decision.outcome must be ship, keep_control or inconclusive",
+            ));
+        }
+        if !matches!(d.flag_action.as_str(), "rollout" | "rollback" | "keep") {
+            return Err(CtrlError::bad(
+                "decision.flag_action must be rollout, rollback or keep",
+            ));
+        }
+        if d.reason.chars().count() > 2_000 {
+            return Err(CtrlError::bad(
+                "decision.reason must be at most 2000 characters",
+            ));
+        }
+        apply_decision_to_flag(&ctrl, &exp, &d).await?;
+        let now = Utc::now().timestamp_millis();
+        exp.end_ts_ms = exp.end_ts_ms.min(now);
+        let decided_by = ctrl.principal_label(&principal).await?;
+        exp.decision = Some(ExperimentDecision {
+            outcome: d.outcome,
+            variant: d.variant,
+            reason: d.reason.trim().to_string(),
+            flag_action: d.flag_action,
+            decided_by,
+            decided_at_ms: now,
+        });
     }
     if let Some(end) = req.end_ts_ms {
         exp.end_ts_ms = end;
@@ -4274,7 +4440,7 @@ async fn handle_patch_experiment(
         &principal.actor_label(),
         "experiment.updated",
         &format!("project:{id}"),
-        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms }),
+        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms, "decision": exp.decision }),
     )
     .await;
     Ok(Json(exp))

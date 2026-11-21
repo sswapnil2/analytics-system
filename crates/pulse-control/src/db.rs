@@ -874,10 +874,14 @@ impl MetaStore {
             .bandit
             .as_ref()
             .and_then(|b| serde_json::to_string(b).ok());
+        let djson = exp
+            .decision
+            .as_ref()
+            .and_then(|d| serde_json::to_string(d).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -891,7 +895,8 @@ impl MetaStore {
                 analysis_json = excluded.analysis_json,
                 stop_reason = excluded.stop_reason,
                 kind = excluded.kind,
-                bandit_json = excluded.bandit_json
+                bandit_json = excluded.bandit_json,
+                decision_json = excluded.decision_json
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -909,6 +914,7 @@ impl MetaStore {
             &exp.stop_reason,
             &exp.kind,
             &bjson,
+            &djson,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -922,7 +928,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -951,6 +957,9 @@ impl MetaStore {
                     bandit: r
                         .get::<Option<String>, _>("bandit_json")
                         .and_then(|b| serde_json::from_str(&b).ok()),
+                    decision: r
+                        .get::<Option<String>, _>("decision_json")
+                        .and_then(|d| serde_json::from_str(&d).ok()),
                 })
             },
             project_id,
@@ -966,7 +975,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -995,6 +1004,9 @@ impl MetaStore {
                     bandit: r
                         .get::<Option<String>, _>("bandit_json")
                         .and_then(|b| serde_json::from_str(&b).ok()),
+                    decision: r
+                        .get::<Option<String>, _>("decision_json")
+                        .and_then(|d| serde_json::from_str(&d).ok()),
                 })
             },
             exp_id,
