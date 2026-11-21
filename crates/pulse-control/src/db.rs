@@ -859,10 +859,11 @@ impl MetaStore {
     pub async fn upsert_experiment(&self, exp: &Experiment) -> Result<(), MetaError> {
         let pjson = serde_json::to_string(&exp.primary_metric).unwrap_or_else(|_| "{}".into());
         let gjson = serde_json::to_string(&exp.guardrail_metrics).unwrap_or_else(|_| "[]".into());
+        let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -872,7 +873,8 @@ impl MetaStore {
                 start_ts_ms = excluded.start_ts_ms,
                 end_ts_ms = excluded.end_ts_ms,
                 primary_metric_json = excluded.primary_metric_json,
-                guardrail_metrics_json = excluded.guardrail_metrics_json
+                guardrail_metrics_json = excluded.guardrail_metrics_json,
+                analysis_json = excluded.analysis_json
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -885,6 +887,7 @@ impl MetaStore {
             exp.end_ts_ms,
             &pjson,
             &gjson,
+            &ajson,
             exp.created_at_ms,
         );
         if affected == 0 {
@@ -899,7 +902,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -916,6 +919,10 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    analysis: r
+                        .get::<Option<String>, _>("analysis_json")
+                        .and_then(|a| serde_json::from_str(&a).ok())
+                        .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
                 })
             },
@@ -932,7 +939,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -949,6 +956,10 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    analysis: r
+                        .get::<Option<String>, _>("analysis_json")
+                        .and_then(|a| serde_json::from_str(&a).ok())
+                        .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
                 })
             },

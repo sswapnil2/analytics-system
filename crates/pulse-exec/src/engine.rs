@@ -250,6 +250,37 @@ impl QueryEngine {
         .await
     }
 
+    /// Per-variant moments of a per-user experiment metric, anchored on each user's first exposure.
+    pub async fn query_experiment_metric(
+        &self,
+        project_id: &str,
+        query: &crate::experiment::ExperimentMetricQuery,
+    ) -> Result<crate::experiment::ExperimentMetricResult> {
+        self.with_deadline(project_id, async {
+            let ps = self.storage.get_or_open_project(project_id).await?;
+            let snap = ps.snapshot();
+            let id_graph = self
+                .storage
+                .identity_router()
+                .get_or_open(project_id)
+                .await?;
+            let id_snap = id_graph.snapshot();
+            let cat = self.catalogs.for_project(project_id);
+            let res = crate::experiment::ExperimentEngine::execute(
+                query,
+                &ps,
+                &snap,
+                &id_snap,
+                &self.cache,
+                &cat,
+            )
+            .await?;
+            self.record_latency(res.exec_time_us);
+            Ok(res)
+        })
+        .await
+    }
+
     /// Every user who reached step `step - 1` of the funnel but not step `step` (1-based steps
     /// after the first), as distinct ids. Same rules as the funnel counts.
     pub async fn query_funnel_dropped_users(
