@@ -13,7 +13,7 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
-    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedMetric, SavedReport,
     SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
 };
 
@@ -70,7 +70,7 @@ pub enum MetaStore {
 }
 
 /// Converts `?` placeholders (outside single-quoted SQL string literals) into PostgreSQL `$1, $2, ...`.
-fn pg_rewrite(sql: &str) -> String {
+pub(crate) fn pg_rewrite(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 16);
     let mut idx = 0usize;
     let mut in_quotes = false;
@@ -137,7 +137,7 @@ macro_rules! profile_from_row {
 }
 
 /// Escapes `LIKE` wildcards so user search text matches literally (paired with `ESCAPE '\\'`).
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '%' | '_' | '\\') {
@@ -1197,6 +1197,55 @@ impl MetaStore {
             end_ms,
         );
         Ok(rows)
+    }
+
+    pub async fn insert_saved_metric(&self, m: &SavedMetric) -> Result<(), MetaError> {
+        let spec = serde_json::to_string(&m.spec).unwrap_or_default();
+        db_exec!(
+            self,
+            "INSERT INTO saved_metrics (id, project_id, name, spec_json, created_by, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            m.id.as_str(),
+            m.project_id.as_str(),
+            m.name.as_str(),
+            spec.as_str(),
+            m.created_by.as_str(),
+            m.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// A project's saved metrics by name; rows whose spec no longer parses are skipped.
+    pub async fn list_saved_metrics(&self, project_id: &str) -> Result<Vec<SavedMetric>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, name, spec_json, created_by, created_at_ms FROM saved_metrics
+             WHERE project_id = ? ORDER BY name ASC",
+            |r| {
+                serde_json::from_str(&r.get::<String, _>("spec_json"))
+                    .ok()
+                    .map(|spec| SavedMetric {
+                        id: r.get("id"),
+                        project_id: r.get("project_id"),
+                        name: r.get("name"),
+                        spec,
+                        created_by: r.get("created_by"),
+                        created_at_ms: r.get("created_at_ms"),
+                    })
+            },
+            project_id,
+        );
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    pub async fn delete_saved_metric(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM saved_metrics WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
     }
 
     pub async fn insert_traffic_group(&self, g: &TrafficGroup) -> Result<(), MetaError> {

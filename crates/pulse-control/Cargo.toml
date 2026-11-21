@@ -15,6 +15,7 @@ pulse-identity.workspace = true
 pulse-storage.workspace = true
 pulse-ingest.workspace = true
 pulse-exec.workspace = true
+pulse-agent.workspace = true
 
 argon2.workspace = true
 async-trait.workspace = true
@@ -38,11 +39,14 @@ sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+prost.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
