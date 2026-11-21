@@ -416,6 +416,15 @@ pub struct Experiment {
     /// Who created it: an email for Studio users, otherwise `"admin token"`.
     #[serde(default)]
     pub created_by: String,
+    /// The problem this tests a fix for, in the PM's words.
+    #[serde(default)]
+    pub problem: String,
+    /// Who answers for it; empty reads as `created_by`.
+    #[serde(default)]
+    pub owner: String,
+    /// Send this experiment's milestones to the project webhook.
+    #[serde(default = "default_true")]
+    pub notify: bool,
     /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -449,6 +458,10 @@ pub struct ExperimentDecision {
     pub decided_by: String,
     #[serde(default)]
     pub decided_at_ms: i64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_experiment_kind() -> String {

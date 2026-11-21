@@ -325,6 +325,12 @@ export interface Experiment {
   secondary_metrics?: ExperimentMetric[];
   /** Email of whoever created it (or "admin token"). */
   created_by?: string;
+  /** The problem it tests a fix for. */
+  problem?: string;
+  /** Who answers for it; empty means `created_by`. */
+  owner?: string;
+  /** Whether milestones go to the project webhook. */
+  notify?: boolean;
   analysis?: ExperimentAnalysis;
   /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
   stop_reason?: string | null;
@@ -395,7 +401,9 @@ export interface ExperimentMetric {
   /** Required for `ratio`: a count of `event_name`, or the total of `numeric_prop`. */
   denominator?: { event_name: string; numeric_prop?: string | null } | null;
   conversion_window_ms: number;
-  /** Which way is bad, for guardrails. */
+  /** Only `event_name` events matching every condition count. */
+  filters?: { prop_name: string; filter: { op: string; val?: unknown } }[];
+  /** Which way is bad: guardrails flag a move this way, and for the primary it decides what "better" means. */
   direction?: MetricDirection;
   /** Guardrails: roll everyone back to control when a treatment makes this significantly worse. */
   auto_stop?: boolean;
@@ -1211,7 +1219,14 @@ export const api = {
   patchExperiment: (
     projectId: string,
     expId: string,
-    body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number; decision?: DecisionInput },
+    body: {
+      status?: "running" | "paused" | "concluded";
+      end_ts_ms?: number;
+      decision?: DecisionInput;
+      problem?: string;
+      owner?: string;
+      notify?: boolean;
+    },
   ) =>
     fetchJson<Experiment>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}`,
@@ -1235,6 +1250,8 @@ export const api = {
       status?: "draft" | "running";
       layer?: { layer_id: string; traffic_pct: number } | null;
       bandit?: BanditConfig;
+      problem?: string;
+      owner?: string;
     },
   ) =>
     fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {

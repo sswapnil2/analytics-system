@@ -6,9 +6,12 @@ import { ConcludeDialog, StartReview } from "../components/ExperimentDialogs";
 import { ExperimentIndex } from "../components/ExperimentIndex";
 import { defaultVariants, toAllocations, VariantDraft, VariantsEditor, variantsProblem } from "../components/VariantsEditor";
 import { isTwoStep, MetricRow, metricRowProblem, MetricRows } from "../components/MetricRows";
+import { StepWhere, StepWhereEditor, stepWhereToFilters } from "../components/StepWhere";
+import { AudiencePicker, EVERYONE, KEEP, NEW } from "../components/AudiencePicker";
+import { Cond, cohortDefinition } from "../lib/cohort";
 import { BanditResultsView } from "../components/BanditResults";
 import { LiftChart } from "../components/LiftChart";
-import { useCohortNames } from "../components/FilterPanel";
+import { clearFilterCaches, useCohortNames } from "../components/FilterPanel";
 import { EmptyState, ErrorNotice, PageHeader, Panel, RanIn, btn, field, fieldLabel, ListSkeleton, ChartSkeleton } from "../components/ui";
 import { useAccess } from "../auth/access";
 import { PropertyPicker } from "../components/PropertyPicker";
@@ -85,6 +88,11 @@ const METRIC_TYPE_LABEL: Record<MetricType, string> = {
   time_between: "time between",
 };
 
+/** True when the primary metric is better low (time, errors): its direction says going up is bad. */
+const lowerIsBetter = (exp: Experiment | null | undefined) => exp?.primary_metric.direction === "increase_is_bad";
+/** A lift turned so that positive means better than control. */
+const gain = (exp: Experiment | null | undefined, liftPct: number) => (lowerIsBetter(exp) ? -liftPct : liftPct);
+
 function describeMetric(m: Experiment["primary_metric"]): string {
   const raw = m.metric_type ?? "conversion";
   const type: MetricType = raw === "continuous" ? (m.numeric_prop ? "sum" : "count") : raw;
@@ -95,7 +103,10 @@ function describeMetric(m: Experiment["primary_metric"]): string {
     const lead = m.name.startsWith(pair) ? "" : `${pair} · `;
     return `${lead}${METRIC_TYPE_LABEL[type]} · within ${Math.round(m.conversion_window_ms / DAY_MS)}d of exposure`;
   }
-  const event = humanizeEvent(m.event_name);
+  const where = (m.filters ?? [])
+    .map((f) => ` where ${f.prop_name} ${f.filter.op === "neq" ? "is not" : f.filter.op === "contains" ? "contains" : "="} ${String(f.filter.val ?? "")}`)
+    .join(",");
+  const event = humanizeEvent(m.event_name) + where;
   const head = event === m.name && !of && !per ? "" : `${event}${of}${per} · `;
   return `${head}${METRIC_TYPE_LABEL[type]} · within ${Math.round(m.conversion_window_ms / DAY_MS)}d of exposure`;
 }
@@ -140,13 +151,14 @@ function verdict(
     lines = ["Don't decide on this yet: the traffic split is off, so the comparison isn't fair."];
   } else {
     lines = treatments.map((v) => {
-      if (v.statistically_significant && v.relative_lift_pct > 0) {
-        if (target === null || v.ci95_low_pct >= target) {
+      const better = lowerIsBetter(exp) ? "lower" : "higher";
+      if (v.statistically_significant && gain(exp, v.relative_lift_pct) > 0) {
+        if (target === null || Math.min(gain(exp, v.ci95_low_pct), gain(exp, v.ci95_high_pct)) >= target) {
           tone = tone === "danger" ? tone : "ok";
-          return `${v.variant_key} beats control${target !== null ? ` by at least the +${target}% you planned for` : ""}: ${pct(v.relative_lift_pct)} (likely ${range(v)}).`;
+          return `${v.variant_key} beats control${target !== null ? ` by at least the ${target}% you planned for` : ""}: ${pct(v.relative_lift_pct)} (likely ${range(v)}, ${better} is better).`;
         }
         if (tone === "muted") tone = "warn";
-        return `${v.variant_key} beats control, but not clearly by the +${target}% you planned for: ${pct(v.relative_lift_pct)} (likely ${range(v)}). Decide whether a gain this size is worth shipping.`;
+        return `${v.variant_key} beats control, but not clearly by the ${target}% you planned for: ${pct(v.relative_lift_pct)} (likely ${range(v)}, ${better} is better). Decide whether a gain this size is worth shipping.`;
       }
       if (v.statistically_significant) {
         tone = "danger";
@@ -159,7 +171,7 @@ function verdict(
       return `No clear difference for ${v.variant_key} at the planned sample (likely ${range(v)}). If a change this size would matter, it didn't show up: treat as inconclusive.`;
     });
   }
-  if (target === null && treatments.some((v) => v.statistically_significant && v.relative_lift_pct > 0)) {
+  if (target === null && treatments.some((v) => v.statistically_significant && gain(exp, v.relative_lift_pct) > 0)) {
     lines.push("No target lift was set, so Pulse can't say whether this gain is big enough to be worth shipping.");
   }
   if (blindGuardrails.length) {
@@ -322,14 +334,24 @@ const ExperimentSetup: React.FC<{
   flag: FeatureFlag | undefined;
   cohortName: (id: string) => string;
   usersPerVariantNow: number;
-}> = ({ exp, flag, cohortName, usersPerVariantNow }) => {
+  /** Whether the project has a webhook; null when unknown (no permission to look). */
+  hasWebhook: boolean | null;
+  /** Turns this experiment's webhook notifications on or off; absent for viewers. */
+  onNotify?: (on: boolean) => void;
+}> = ({ exp, flag, cohortName, usersPerVariantNow, hasWebhook, onNotify }) => {
   const planned = exp.analysis?.planned_users_per_variant ?? null;
   const elapsed = Math.max(0, Math.min(Date.now(), exp.end_ts_ms) - exp.start_ts_ms);
   const total = Math.max(1, exp.end_ts_ms - exp.start_ts_ms);
   const bandit = exp.kind === "bandit";
-  const rows: [string, React.ReactNode][] = [
-    ["Primary metric", <><span className="font-medium text-ink">{exp.primary_metric.name}</span> · {describeMetric(exp.primary_metric)}</>],
-  ];
+  const rows: [string, React.ReactNode][] = [];
+  if (exp.problem) rows.push(["Problem", <span className="whitespace-pre-wrap">{exp.problem}</span>]);
+  rows.push([
+    "Primary metric",
+    <>
+      <span className="font-medium text-ink">{exp.primary_metric.name}</span> · {describeMetric(exp.primary_metric)} ·{" "}
+      {lowerIsBetter(exp) ? "lower is better" : "higher is better"}
+    </>,
+  ]);
   if (!bandit) {
     rows.push([
       "Guardrails",
@@ -372,7 +394,34 @@ const ExperimentSetup: React.FC<{
       <code className="font-mono">{exp.flag_key}</code>
     ),
   ]);
-  if (exp.created_by) rows.push(["Owner", exp.created_by]);
+  if (exp.owner || exp.created_by)
+    rows.push(["Owner", exp.owner && exp.created_by && exp.owner !== exp.created_by ? `${exp.owner} (created by ${exp.created_by})` : exp.owner || exp.created_by]);
+  if (!bandit)
+    rows.push([
+      "Notifications",
+      <>
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={exp.notify !== false}
+            disabled={!onNotify}
+            onChange={(e) => onNotify?.(e.target.checked)}
+            className="mt-1"
+          />
+          <span>
+            Send a webhook when the result turns significant, the planned sample is reached, a guardrail gets worse or has
+            no data, or auto-stop fires.
+          </span>
+        </label>
+        <span className={`block text-xs ${hasWebhook === false ? "text-warn" : "text-muted"}`}>
+          {hasWebhook === false
+            ? "This project has no webhook yet, so nothing is sent. An admin can add one under Security and integrations → Provider credentials (Alert webhook)."
+            : hasWebhook
+              ? "Sent to the project's webhook. Every milestone is also in the audit log."
+              : "Sent to the project's webhook, if an admin has set one up. Every milestone is also in the audit log."}
+        </span>
+      </>,
+    ]);
   if (exp.decision) {
     const d = exp.decision;
     const what = d.outcome === "ship" ? `Shipped ${d.variant}` : d.outcome === "keep_control" ? "Kept control" : "Inconclusive";
@@ -515,6 +564,24 @@ function sampleCaveat(exp: Experiment, results: ExperimentResults | null, bandit
   return null;
 }
 
+/** Users per variant for the target lift, daily users who can be in it, and the days that takes. */
+function plan(
+  baseline: { rate: number; dailyUsers: number },
+  mde: number,
+  flag: FeatureFlag | undefined,
+  sequential: boolean,
+  layerPct: number | null,
+  eligible: number | null,
+) {
+  const variants = Math.max(2, flag?.variants.length ?? 2);
+  const n = usersPerVariant(baseline.rate, mde, { variants, sequential });
+  // ponytail: the audience's share of the last 14 days' active users scales daily traffic; its own
+  // conversion rate may differ from everyone's, so the estimate stays approximate.
+  const audienceShare = eligible === null ? 1 : Math.min(1, eligible / Math.max(1, baseline.dailyUsers * 14));
+  const perDay = baseline.dailyUsers * trafficShare(flag, layerPct) * audienceShare;
+  return { n, perDay, need: Math.ceil((n * variants) / Math.max(perDay, 1e-9)), audienceShare };
+}
+
 /** Longest an experiment can be planned to run from the form. */
 const MAX_DAYS = 120;
 
@@ -527,20 +594,20 @@ const SampleEstimate: React.FC<{
   sequential: boolean;
   layerPct: number | null;
   onUseDays: (days: number) => void;
-}> = ({ baseline, mde, flag, days, event, sequential, layerPct, onUseDays }) => {
+  /** Users in the chosen audience now; null for everyone. */
+  eligible: number | null;
+}> = ({ baseline, mde, flag, days, event, sequential, layerPct, onUseDays, eligible }) => {
   if (!baseline) return null;
   const name = humanizeEvent(event);
-  const variants = Math.max(2, flag?.variants.length ?? 2);
-  const n = usersPerVariant(baseline.rate, mde, { variants, sequential });
-  const perDay = baseline.dailyUsers * trafficShare(flag, layerPct);
-  const need = Math.ceil((n * variants) / Math.max(perDay, 1e-9));
+  const { n, perDay, need, audienceShare } = plan(baseline, mde, flag, sequential, layerPct, eligible);
   const short = need > days;
   return (
     <p className={`rounded-lg border px-3.5 py-2.5 text-sm ${short ? "border-warn/40 bg-warn-soft text-ink" : "border-line bg-sunken text-ink-2"}`}>
       {Number.isFinite(n) ? (
         <>
           About <span className="font-semibold text-ink">{formatCount(n)} users per variant</span> to spot a {Math.round(mde * 100)}% change
-          on today's {formatPercent(baseline.rate, 1)} conversion. {trafficSentence(flag, layerPct)} At ~
+          on today's {formatPercent(baseline.rate, 1)} conversion. {trafficSentence(flag, layerPct)}
+          {eligible !== null && ` Your audience is about ${formatPercent(audienceShare, 0)} of active users.`} At ~
           {formatCount(Math.round(perDay))} users a day, that's about{" "}
           <span className="font-semibold text-ink">{need} days</span>
           {short ? `, longer than the ${days} days you picked.` : "."}
@@ -597,7 +664,8 @@ const ExposureSnippets: React.FC<{ flagKey: string }> = ({ flagKey }) => {
 
 export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availableEvents, availableProps, refreshToken }) => {
   const { canEdit } = useAccess();
-  const cohorts = useCohortNames(projectId);
+  const [cohortsVersion, setCohortsVersion] = useState(0);
+  const cohorts = useCohortNames(projectId, cohortsVersion);
   const [mde, setMde] = useState(10);
   const [actionError, setActionError] = useState<string | null>(null);
   const [acting, setActing] = useState(false);
@@ -625,14 +693,34 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
   const [expName, setExpName] = useState("");
   const [expFlagId, setExpFlagId] = useState("");
   const [expHypothesis, setExpHypothesis] = useState("");
+  const [expProblem, setExpProblem] = useState("");
+  const [expAudience, setExpAudience] = useState(KEEP);
+  const [expAudienceConds, setExpAudienceConds] = useState<Cond[]>([]);
+  /** Users matching the chosen audience now; null for everyone. */
+  const [expEligible, setExpEligible] = useState<number | null>(null);
+  const [expOwner, setExpOwner] = useState("");
+  /** Whether the project has a webhook for notifications; null until known or when we can't look. */
+  const [hasWebhook, setHasWebhook] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setHasWebhook(null);
+    api
+      .listByokCredentials(projectId)
+      .then((creds) => alive && setHasWebhook(creds.some((c) => c.category === "webhook")))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [projectId]);
   // No default: the busiest event is usually one everyone does, which a test can't move.
   const [expMetric, setExpMetric] = useState("");
+  const [expWhere, setExpWhere] = useState<StepWhere | null>(null);
   const eventOptions = availableEvents.map((ev) => ({ value: ev, label: humanizeEvent(ev), group: "Events" }));
   const [expMetricType, setExpMetricType] = useState<MetricType>("conversion");
   const [expProp, setExpProp] = useState("");
   const [expDenominator, setExpDenominator] = useState("");
   const [expCuped, setExpCuped] = useState(true);
-  const propOptions = propertyOptions(availableProps.filter((p) => !p.startsWith("user.")));
+  const propOptions = propertyOptions(availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$")));
   const [segment, setSegment] = useState("");
   /** Properties marked as personal data in the lexicon; never offered as segments. */
   const [piiProps, setPiiProps] = useState<Set<string>>(new Set());
@@ -741,6 +829,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           setExpDenominator(from);
           setExpMetric(to);
           setExpHypothesis(`If we fix what stops people after ${humanizeEvent(from)}, more of them will reach ${humanizeEvent(to)}.`);
+          setExpProblem(`Users drop off between ${humanizeEvent(from)} and ${humanizeEvent(to)}.`);
         }
         for (const k of ["new", "from", "to"]) params.delete(k);
         window.history.replaceState(null, "", `#${path}?${params.toString()}`);
@@ -843,7 +932,12 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     setExpName("");
     setExpFlagId("");
     setExpHypothesis("");
+    setExpProblem("");
+    setExpOwner("");
+    setExpAudience(KEEP);
+    setExpAudienceConds([]);
     setExpMetric("");
+    setExpWhere(null);
     setExpMetricType("conversion");
     setExpProp("");
     setExpDenominator("");
@@ -869,6 +963,11 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       }
     }
     if (expKind === "bandit" && flag.variants.length < 2) return "A bandit needs a flag with at least two variants.";
+    if (expAudience === NEW && !cohortDefinition(expAudienceConds, "and"))
+      return "Finish the new audience: every line needs an event, or a property and a value.";
+    const busy = experiments.find((e) => e.flag_key === flag.key && (e.status === "running" || e.status === "paused"));
+    if (busy && expAudience !== KEEP)
+      return `"${busy.name}" is live on ${flag.key}, so its audience can't change now. Keep the flag's audience or pick another flag.`;
     return null;
   };
 
@@ -891,17 +990,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
     });
     const bandit = expKind === "bandit";
     const primary = {
-      ...metric(expMetric, bandit && expLowerIsBetter ? "increase_is_bad" : "decrease_is_bad"),
+      ...metric(expMetric, expLowerIsBetter ? "increase_is_bad" : "decrease_is_bad"),
       ...(isTwoStep(expMetricType) ? { name: `${humanizeEvent(expDenominator)} → ${humanizeEvent(expMetric)}` } : {}),
       metric_type: expMetricType,
       numeric_prop: expMetricType === "sum" || expMetricType === "ratio" ? expProp || null : null,
       denominator: expMetricType === "ratio" || isTwoStep(expMetricType) ? { event_name: expDenominator } : null,
+      filters: stepWhereToFilters(expWhere),
     };
     const fromRow = (r: MetricRow, guardrail: boolean): ExperimentMetric => ({
       name: isTwoStep(r.type)
         ? `${humanizeEvent(r.from)} → ${humanizeEvent(r.event)}${r.type === "time_between" ? " (time)" : ""}`
         : humanizeEvent(r.event),
       event_name: r.event,
+      filters: stepWhereToFilters(r.where),
       metric_type: r.type,
       denominator: isTwoStep(r.type) ? { event_name: r.from } : null,
       conversion_window_ms: expWindowDays * DAY_MS,
@@ -913,11 +1014,33 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
       ? usersPerVariant(baseline.rate, mde / 100, { variants: Math.max(2, flag.variants.length), sequential: expSequential })
       : Infinity;
     try {
+      // The audience lives on the flag, so set it first; the experiment then reports on that audience.
+      let cohortId: string | null = null;
+      if (expAudience === EVERYONE) cohortId = "";
+      else if (expAudience === NEW) {
+        const def = cohortDefinition(expAudienceConds, "and");
+        const cohort = (await api.createCohort(projectId, {
+          name: `${expName.trim()} audience`,
+          description: `Made for the experiment "${expName.trim()}".`,
+          definition: def,
+        })) as { id: string };
+        cohortId = cohort.id;
+        clearFilterCaches(projectId);
+        setCohortsVersion((v) => v + 1);
+        // If anything below fails, a retry reuses this cohort instead of making another.
+        setExpAudience(cohort.id);
+      } else if (expAudience) cohortId = expAudience;
+      if (cohortId !== null && cohortId !== (flag.targeting_cohort_id ?? "")) {
+        const updated = await api.patchFlag(projectId, flag.id, { targeting_cohort_id: cohortId });
+        setFlags((prev) => prev.map((f) => (f.id === updated.id ? updated : f)));
+      }
       const created = await api.createExperiment(projectId, {
         name: expName.trim(),
         flag_key: flag.key,
         flag_id: flag.id,
         hypothesis: expHypothesis.trim(),
+        problem: expProblem.trim(),
+        owner: expOwner.trim(),
         start_ts_ms: now,
         end_ts_ms: now + expDays * DAY_MS,
         primary_metric: primary,
@@ -1111,6 +1234,27 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </select>
               </label>
               <label className="flex flex-col gap-1 sm:col-span-2">
+                <span className={fieldLabel}>Problem</span>
+                <textarea
+                  value={expProblem}
+                  onChange={(e) => setExpProblem(e.target.value)}
+                  rows={2}
+                  maxLength={2000}
+                  placeholder="e.g. 17% of users quit after the PAN step"
+                  className={field}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className={fieldLabel}>Owner</span>
+                <input
+                  value={expOwner}
+                  onChange={(e) => setExpOwner(e.target.value)}
+                  maxLength={200}
+                  placeholder="You, unless someone else answers for it"
+                  className={field}
+                />
+              </label>
+              <label className="flex flex-col gap-1 sm:col-span-2">
                 <span className={fieldLabel}>Hypothesis</span>
                 <input
                   value={expHypothesis}
@@ -1123,7 +1267,12 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 <span className={fieldLabel}>Metric</span>
                 <select
                   value={expMetricType}
-                  onChange={(e) => setExpMetricType(e.target.value as MetricType)}
+                  onChange={(e) => {
+                    const t = e.target.value as MetricType;
+                    setExpMetricType(t);
+                    // Shorter is better for time; the PM can still flip it.
+                    setExpLowerIsBetter(t === "time_between");
+                  }}
                   className={field}
                 >
                   {METRIC_TYPES.map((t) => (
@@ -1150,6 +1299,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   options={eventOptions}
                 />
               )}
+              {expMetric && (
+                <div className="sm:col-span-2">
+                  <StepWhereEditor
+                    idx={0}
+                    name="the metric's event"
+                    projectId={projectId}
+                    event={expMetric}
+                    value={expWhere}
+                    props={availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$"))}
+                    onChange={setExpWhere}
+                  />
+                </div>
+              )}
               {(expMetricType === "sum" || expMetricType === "ratio") && (
                 <PropertyPicker
                   label={expMetricType === "sum" ? "Property to add up" : "Numerator property (optional)"}
@@ -1170,7 +1332,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                   options={eventOptions}
                 />
               )}
-              {expKind === "bandit" && (
+              {(
                 <label className="flex flex-col gap-1">
                   <span className={fieldLabel}>Better when it</span>
                   <select
@@ -1209,6 +1371,19 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 </span>
               </label>
               )}
+              <AudiencePicker
+                projectId={projectId}
+                flag={flags.find((f) => f.id === expFlagId)}
+                value={expAudience}
+                conds={expAudienceConds}
+                onChange={(v, c) => {
+                  setExpAudience(v);
+                  setExpAudienceConds(c);
+                }}
+                onEligible={setExpEligible}
+                events={eventOptions}
+                props={availableProps}
+              />
               {layers.length > 0 && (
                 <div className="flex flex-col gap-1 sm:col-span-2">
                   <span className={fieldLabel}>Layer</span>
@@ -1267,6 +1442,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     sequential={expSequential}
                     events={eventOptions}
                     recentKey={`pulse.recent-events.${projectId}`}
+                    projectId={projectId}
+                    props={availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$"))}
                   />
                   <MetricRows
                     title="Secondary metrics"
@@ -1277,6 +1454,8 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                     sequential={expSequential}
                     events={eventOptions}
                     recentKey={`pulse.recent-events.${projectId}`}
+                    projectId={projectId}
+                    props={availableProps.filter((p) => !p.startsWith("user.") && !p.startsWith("$"))}
                   />
                 </>
               )}
@@ -1318,6 +1497,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
               sequential={expSequential}
               layerPct={expLayerId ? expLayerPct : null}
               onUseDays={setExpDays}
+              eligible={expEligible}
             />
             )}
             </>
@@ -1519,7 +1699,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                       </button>
                     )}
                     {expResults.variants
-                      .filter((v) => !v.is_control && v.statistically_significant && v.relative_lift_pct > 0)
+                      .filter((v) => !v.is_control && v.statistically_significant && gain(selectedExp, v.relative_lift_pct) > 0)
                       .map((v) => (
                         <button
                           key={v.variant_key}
@@ -1584,6 +1764,16 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                 exp={selectedExp}
                 flag={selectedFlag}
                 cohortName={(id) => cohorts.find((c) => c.id === id)?.name ?? id}
+                hasWebhook={hasWebhook}
+                onNotify={
+                  canEdit
+                    ? (on) =>
+                        void api
+                          .patchExperiment(projectId, selectedExp.id, { notify: on })
+                          .then((u) => setExperiments((prev) => prev.map((e) => (e.id === u.id ? u : e))))
+                          .catch((err) => setActionError(`Couldn't change notifications: ${errorMessage(err)}`))
+                    : undefined
+                }
                 usersPerVariantNow={
                   expResults.variants.length ? Math.min(...expResults.variants.map((v) => v.sample_size)) : 0
                 }
@@ -1664,7 +1854,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                         </td>
                         <td
                           className={`tabular py-3 text-right font-semibold ${
-                            v.is_control ? "text-faint" : v.relative_lift_pct >= 0 ? "text-ok" : "text-danger"
+                            v.is_control ? "text-faint" : gain(selectedExp, v.relative_lift_pct) >= 0 ? "text-ok" : "text-danger"
                           }`}
                         >
                           {v.is_control ? "–" : formatLift(v.relative_lift_pct)}
@@ -1682,7 +1872,7 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                                 <div
                                   style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                                   className={`absolute bottom-0.5 top-0.5 rounded-full ${
-                                    v.ci95_low_pct > 0 ? "bg-ok" : "bg-warn"
+                                    Math.min(gain(selectedExp, v.ci95_low_pct), gain(selectedExp, v.ci95_high_pct)) > 0 ? "bg-ok" : "bg-warn"
                                   }`}
                                 />
                               </div>
@@ -1696,7 +1886,9 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
                           {v.is_control ? "–" : formatPValue(v.p_value)}
                         </td>
                         <td className="tabular py-3 text-right font-semibold text-ink">
-                          {v.is_control ? "–" : formatProbability(v.bayesian_prob_to_beat_control)}
+                          {v.is_control
+                            ? "–"
+                            : formatProbability(lowerIsBetter(selectedExp) ? 1 - v.bayesian_prob_to_beat_control : v.bayesian_prob_to_beat_control)}
                         </td>
                         <td className="py-3 pl-4">
                           {v.is_control ? (
@@ -2077,6 +2269,43 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
             flagWasOff={!flag?.enabled}
             trafficText={trafficSentence(flag, expLayerId ? expLayerPct : null)}
             endsText={`on ${new Date(Date.now() + expDays * DAY_MS).toLocaleDateString()}`}
+            recap={[
+              `Primary: ${isTwoStep(expMetricType) ? `${humanizeEvent(expDenominator)} → ` : ""}${humanizeEvent(expMetric)}${
+                expWhere?.prop && expWhere.value.trim() ? ` where ${expWhere.prop} ${expWhere.op === "eq" ? "=" : expWhere.op === "neq" ? "is not" : "contains"} ${expWhere.value.trim()}` : ""
+              } (${METRIC_TYPE_LABEL[expMetricType]}, within ${expWindowDays}d), ${expLowerIsBetter ? "lower" : "higher"} is better${
+                expKind === "ab" ? `, worth shipping at ${mde}% or more` : ""
+              }.`,
+              ...(expKind === "ab"
+                ? [
+                    expGuardrails.length
+                      ? `Guardrails: ${expGuardrails
+                          .map(
+                            (g) =>
+                              `${humanizeEvent(g.event)}${g.where?.prop && g.where.value.trim() ? ` where ${g.where.prop} ${g.where.op === "eq" ? "=" : g.where.op === "neq" ? "is not" : "contains"} ${g.where.value.trim()}` : ""}${g.autoStop && expSequential ? " (auto-stops)" : ""}`,
+                          )
+                          .join(", ")}.`
+                      : "No guardrails: nothing will flag harm.",
+                    ...(expSecondaries.length ? [`Secondary: ${expSecondaries.map((g) => humanizeEvent(g.event)).join(", ")}.`] : []),
+                  ]
+                : []),
+              `Variants: ${flag?.variants.map((v) => `${v.key} ${formatPercent(v.weight_bps / 10_000, 0)}`).join(" / ") || "on"}.`,
+              `Audience: ${
+                expAudience === KEEP
+                  ? flag?.targeting_cohort_id ? `the flag's cohort (${cohorts.find((c) => c.id === flag.targeting_cohort_id)?.name ?? "cohort"})` : "everyone"
+                  : expAudience === EVERYONE
+                    ? "everyone"
+                    : expAudience === NEW
+                      ? "the new audience you built"
+                      : cohorts.find((c) => c.id === expAudience)?.name ?? "a cohort"
+              }${expEligible !== null ? `, about ${formatCount(expEligible)} users today` : ""}.`,
+            ]}
+            warning={(() => {
+              if (!baseline || expMetricType !== "conversion" || expKind !== "ab") return null;
+              const { need } = plan(baseline, mde / 100, flag, expSequential, expLayerId ? expLayerPct : null, expEligible);
+              return Number.isFinite(need) && need > expDays
+                ? `Underpowered: the plan needs about ${need} days and you picked ${expDays}. You may not be able to tell a ${mde}% change from noise.`
+                : null;
+            })()}
             busy={expCreating}
             onStart={() => void createExperiment("running")}
             onClose={() => setReview(null)}
@@ -2090,6 +2319,14 @@ export const ExperimentsFlagsWorkspace: React.FC<Props> = ({ projectId, availabl
           flagWasOff={!selectedFlag?.enabled}
           trafficText={trafficSentence(selectedFlag, null)}
           endsText={`on ${new Date(Date.now() + Math.max(DAY_MS, selectedExp.end_ts_ms - selectedExp.start_ts_ms)).toLocaleDateString()}`}
+          recap={[
+            `Primary: ${selectedExp.primary_metric.name} (${describeMetric(selectedExp.primary_metric)}), ${lowerIsBetter(selectedExp) ? "lower" : "higher"} is better.`,
+            selectedExp.guardrail_metrics.length
+              ? `Guardrails: ${selectedExp.guardrail_metrics.map((g) => `${g.name}${g.auto_stop ? " (auto-stops)" : ""}`).join(", ")}.`
+              : "No guardrails: nothing will flag harm.",
+            `Variants: ${selectedFlag?.variants.map((v) => `${v.key} ${formatPercent(v.weight_bps / 10_000, 0)}`).join(" / ") || "on"}.`,
+          ]}
+          warning={null}
           busy={acting}
           onStart={() => void startDraft(selectedExp)}
           onClose={() => setReview(null)}

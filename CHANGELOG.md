@@ -26,6 +26,12 @@ All notable changes to Pulse are listed here. Versions follow [Semantic Versioni
 - Flags can be created with your own variants: names, splits, more than two arms, and an optional JSON payload each.
 - Segments hide experiment plumbing, ids and personal-data properties, show no lift for segments with too few users, and name the "no value" segment.
 - Experiments send a webhook (and an audit row) once when a result turns significant, the planned sample is reached, a guardrail gets worse, or a guardrail has no data.
+- Experiments can target an audience: keep the flag's, pick a cohort, or build one inline ("hasn't done", "has done", "property is") with a live count of matching users that feeds the duration estimate.
+- Experiment metrics can count only events where a property matches, such as a KYC check with `status = failed`.
+- Every primary metric says whether higher or lower is better (time defaults to lower), and results, verdicts and Ship buttons follow it.
+- Experiments record the problem they address and an owner; "Test a fix" fills in the problem.
+- The start dialog recaps the metrics, guardrails, variants and audience, and warns when the test is too short to detect the target.
+- Each experiment shows whether its milestones are sent to the project webhook, and can turn them off.
 - Shipping before the planned sample, with no users, or with a guardrail that has no data needs a tick for each caveat, and the accepted caveats are saved with the decision.
 - Experiments can run for any number of days up to 120, and the sample-size warning offers to use the length the plan needs.
 - Guardrails with no data say why: the event never fired since the test started, or it fired but not from users in the test.

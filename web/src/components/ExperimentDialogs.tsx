@@ -35,11 +35,20 @@ export const StartReview: React.FC<{
   flagWasOff: boolean;
   trafficText: string;
   endsText: string;
+  /** What will be measured, on whom: one line each, so a wrong metric or audience shows before launch. */
+  recap: string[];
+  /** Shown above the buttons when the plan can't detect the target in time. */
+  warning: string | null;
   busy: boolean;
   onStart: () => void;
   onClose: () => void;
-}> = ({ name, flagKey, flagWasOff, trafficText, endsText, busy, onStart, onClose }) => (
+}> = ({ name, flagKey, flagWasOff, trafficText, endsText, recap, warning, busy, onStart, onClose }) => (
   <Modal title={`Start "${name}"?`} onClose={onClose}>
+    <ul className="space-y-1 rounded-lg border border-line bg-sunken px-3 py-2 text-sm text-ink">
+      {recap.map((r) => (
+        <li key={r}>{r}</li>
+      ))}
+    </ul>
     <ul className="list-disc space-y-1.5 pl-5 text-sm text-ink-2">
       <li>
         Users start getting variants of <code className="font-mono">{flagKey}</code> now
@@ -52,6 +61,11 @@ export const StartReview: React.FC<{
         before starting.
       </li>
     </ul>
+    {warning && (
+      <p role="alert" className="rounded-lg border border-warn/40 bg-warn-soft px-3 py-2 text-sm text-ink">
+        {warning}
+      </p>
+    )}
     <div className="flex justify-end gap-2">
       <button type="button" onClick={onClose} className={btn.ghost}>
         Back

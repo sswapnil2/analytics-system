@@ -881,8 +881,8 @@ impl MetaStore {
             .and_then(|d| serde_json::to_string(d).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -898,7 +898,10 @@ impl MetaStore {
                 kind = excluded.kind,
                 bandit_json = excluded.bandit_json,
                 decision_json = excluded.decision_json,
-                secondary_metrics_json = excluded.secondary_metrics_json
+                secondary_metrics_json = excluded.secondary_metrics_json,
+                problem = excluded.problem,
+                owner = excluded.owner,
+                notify = excluded.notify
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -919,6 +922,9 @@ impl MetaStore {
             &djson,
             &sjson,
             &exp.created_by,
+            &exp.problem,
+            &exp.owner,
+            i32::from(exp.notify),
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -932,7 +938,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -956,6 +962,9 @@ impl MetaStore {
                     created_by: r
                         .get::<Option<String>, _>("created_by")
                         .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())
@@ -986,7 +995,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -1010,6 +1019,9 @@ impl MetaStore {
                     created_by: r
                         .get::<Option<String>, _>("created_by")
                         .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
                     analysis: r
                         .get::<Option<String>, _>("analysis_json")
                         .and_then(|a| serde_json::from_str(&a).ok())

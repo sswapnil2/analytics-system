@@ -402,6 +402,32 @@ async fn drafts_start_later_and_conclusions_record_a_decision() {
     let (status, draft) = call(&app, &token, "POST", exps, draft_or_running("a", "draft")).await;
     assert!(status.is_success(), "{draft}");
     let draft_uri = format!("{exps}/{}", draft["id"].as_str().unwrap());
+    // Problem and owner default empty, notifications on; all three can be changed later.
+    assert_eq!(draft["problem"], "");
+    assert_eq!(draft["notify"], true);
+    let (status, edited) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({
+            "problem": "  Users quit at PAN entry  ", "owner": "Asha (growth)", "notify": false,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{edited}");
+    assert_eq!(edited["problem"], "Users quit at PAN entry");
+    assert_eq!(edited["owner"], "Asha (growth)");
+    assert_eq!(edited["notify"], false);
+    let (status, _) = call(
+        &app,
+        &token,
+        "PATCH",
+        &draft_uri,
+        json!({"owner": "x".repeat(201)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (_, flags) = call(&app, &token, "GET", flags_uri, json!(null)).await;
     assert_eq!(flag(&flags, "a")["enabled"], false);
     let (status, _) = call(

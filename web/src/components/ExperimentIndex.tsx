@@ -39,7 +39,7 @@ export const ExperimentIndex: React.FC<{
   const rows = experiments.filter(
     (e) =>
       match(e.status) &&
-      (!needle || [e.name, e.flag_key, e.created_by ?? ""].some((t) => t.toLowerCase().includes(needle))),
+      (!needle || [e.name, e.flag_key, e.owner || e.created_by || ""].some((t) => t.toLowerCase().includes(needle))),
   );
   return (
     <div className="space-y-2">
@@ -85,7 +85,7 @@ export const ExperimentIndex: React.FC<{
                 </td>
                 <td className="py-2 text-ink-2">{statusText(e)}</td>
                 <td className="py-2 font-mono text-xs text-ink-2">{e.flag_key}</td>
-                <td className="py-2 text-muted">{e.created_by || "–"}</td>
+                <td className="py-2 text-muted">{e.owner || e.created_by || "–"}</td>
               </tr>
             ))}
             {rows.length === 0 && (

@@ -2,6 +2,7 @@ import React from "react";
 import { Plus, X } from "lucide-react";
 import { MetricDirection, MetricType } from "../api/client";
 import { PickerOption, PropertyPicker } from "./PropertyPicker";
+import { StepWhere, StepWhereEditor } from "./StepWhere";
 import { btn, field, fieldLabel } from "./ui";
 
 /** One guardrail or secondary metric in the experiment form. */
@@ -12,6 +13,8 @@ export interface MetricRow {
   from: string;
   direction: MetricDirection;
   autoStop: boolean;
+  /** Only events matching this condition count (e.g. status = failed). */
+  where: StepWhere | null;
 }
 
 export const newMetricRow = (guardrail: boolean): MetricRow => ({
@@ -20,6 +23,7 @@ export const newMetricRow = (guardrail: boolean): MetricRow => ({
   from: "",
   direction: guardrail ? "increase_is_bad" : "decrease_is_bad",
   autoStop: guardrail,
+  where: null,
 });
 
 export const isTwoStep = (t: MetricType | "continuous" | undefined) => t === "step_through" || t === "time_between";
@@ -48,7 +52,10 @@ export const MetricRows: React.FC<{
   sequential: boolean;
   events: PickerOption[];
   recentKey: string;
-}> = ({ title, hint, rows, onChange, guardrail, sequential, events, recentKey }) => {
+  projectId: string;
+  /** Event properties offered for a "where" condition. */
+  props: string[];
+}> = ({ title, hint, rows, onChange, guardrail, sequential, events, recentKey, projectId, props }) => {
   const set = (i: number, patch: Partial<MetricRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   return (
     <fieldset className="space-y-2 sm:col-span-2">
@@ -92,6 +99,19 @@ export const MetricRows: React.FC<{
             recentKey={recentKey}
             options={events}
           />
+          {r.event && (
+            <div className="sm:col-span-2">
+              <StepWhereEditor
+                idx={i}
+                name={`${title.toLowerCase()} ${i + 1}`}
+                projectId={projectId}
+                event={r.event}
+                value={r.where}
+                props={props}
+                onChange={(w) => set(i, { where: w })}
+              />
+            </div>
+          )}
           {guardrail && (
             <label className="flex flex-col gap-1">
               <span className={fieldLabel}>Bad when it</span>
