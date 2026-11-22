@@ -562,8 +562,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     let id_graph = ctrl
         .qengine()
         .storage()
-        .identity_router()
-        .get_or_open(project_id)
+        .identity_graph(project_id, true)
         .await?;
     let num_buckets = ctrl.qengine().storage().config().num_buckets;
 
@@ -1048,8 +1047,7 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     let pstore = ctrl
         .qengine()
         .storage()
-        .profile_router()
-        .get_or_open(project_id)
+        .profile_store(project_id, true)
         .await?;
     let mut seeded_profiles = Vec::with_capacity(profile_indices.len());
     for u in profile_indices {

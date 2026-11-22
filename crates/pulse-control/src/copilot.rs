@@ -430,11 +430,7 @@ pub async fn run_byok_copilot(
         || prompt_lower.contains("ltv")
         || prompt_lower.contains("pay")
     {
-        let (_, paying, total_rev) = match qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
+        let (_, paying, total_rev) = match qengine.storage().profile_store(project_id, false).await
         {
             Ok(ps) => ps.revenue_summary().await.unwrap_or((0, 0, 0.0)),
             Err(_) => (0, 0, 0.0),

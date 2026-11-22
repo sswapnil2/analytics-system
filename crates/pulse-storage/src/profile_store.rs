@@ -693,7 +693,17 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if let Some(db) = guard.take() {
-            db.close().await.map_err(slatedb_err)?;
+            // SlateDB 0.6 panics in `close` when another writer fenced this handle; run it on its
+            // own task so that becomes an error instead of taking down shutdown.
+            match tokio::spawn(async move { db.close().await }).await {
+                Ok(res) => res.map_err(slatedb_err)?,
+                Err(e) => {
+                    return Err(StorageError::Corrupted(format!(
+                        "closing profile store for '{}' panicked (fenced by another writer?): {e}",
+                        self.project_id
+                    )))
+                }
+            }
         }
         Ok(())
     }
@@ -733,6 +743,11 @@ impl ProfileRouter {
         self.read_only
     }
 
+    /// A read-only store for a project this node does not write. Never fences the writer.
+    pub fn open_reader(&self, project_id: &str) -> Arc<ProjectProfileStore> {
+        ProjectProfileStore::open_read_only(project_id.to_string(), self.object_store.clone())
+    }
+
     pub async fn get_or_open(&self, project_id: &str) -> Result<Arc<ProjectProfileStore>> {
         if let Some(s) = self.stores.get(project_id) {
             return Ok(s.clone());
@@ -758,11 +773,15 @@ impl ProfileRouter {
     pub async fn close_all(&self) -> Result<()> {
         let stores: Vec<Arc<ProjectProfileStore>> =
             self.stores.iter().map(|e| e.value().clone()).collect();
+        // Close every store even if one fails, and report the first failure.
+        let mut first_err = None;
         for s in stores {
-            s.close().await?;
+            if let Err(e) = s.close().await {
+                first_err.get_or_insert(e);
+            }
         }
         self.stores.clear();
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 }
 

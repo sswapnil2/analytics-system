@@ -792,8 +792,7 @@ impl ControlPlaneService {
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let started_ms = Utc::now().timestamp_millis();
@@ -855,8 +854,7 @@ impl ControlPlaneService {
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, true)
             .await
             .map_err(|e| e.to_string())?;
         let rows: Vec<UserProfileRecord> = pstore
@@ -949,16 +947,14 @@ impl ControlPlaneService {
         let id_graph = self
             .qengine
             .storage()
-            .identity_router()
-            .get_or_open(project_id)
+            .identity_graph(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
 
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
         let existing_prof = pstore
@@ -1162,13 +1158,7 @@ impl GovernanceProvider for ControlPlaneService {
         canonical_uid: u32,
         ops: &Value,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store");
@@ -1221,13 +1211,7 @@ impl GovernanceProvider for ControlPlaneService {
         user_id: &str,
         canonical_uid: u32,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store on identify");
@@ -1785,8 +1769,7 @@ async fn handle_status(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&pid)
+        .identity_graph(&pid, false)
         .await
         .map_err(CtrlError::internal)?;
 
@@ -3954,8 +3937,7 @@ async fn handle_list_user_profiles(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profiles = pstore
@@ -3997,16 +3979,14 @@ async fn handle_get_user_detail(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&id)
+        .identity_graph(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profile = pstore
@@ -4379,8 +4359,7 @@ async fn handle_export_cohort(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let mut by_uid: HashMap<u32, UserProfileRecord> = HashMap::with_capacity(members.len());
@@ -4471,8 +4450,7 @@ async fn handle_get_revenue_summary(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let (total_profiles, paying_users, total_revenue) = pstore
