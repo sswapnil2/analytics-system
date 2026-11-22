@@ -170,6 +170,14 @@ The owner's target (stated after revision 1):
 - Compute nodes read S3 only and see data one interval late.
 - One machine runs the same pipeline in one process.
 
+Decided by the owner so far:
+
+- **Queries run on storage nodes.** A storage node is mostly I/O and has CPU and memory to spare, so it answers queries over its own fresh data and S3. A dashboard query across machines fans out to the owning storage nodes and merges. Compute nodes that read S3 only are a later option.
+- **The event writer is asynchronous.** Its goal is fast ingestion: it accepts events and returns without any result of processing. Dedup counts, identity conflicts and schema-cap errors are no longer returned on the event path; they become metrics and dead-lettered records. This changes the ingest response and the SDKs, and the end-to-end gate that checks the dedup count.
+- **Profiles have their own synchronous endpoint** that creates the profile on the owning storage node and returns its id. Events carry the external id only; the storage node links each event to its profile when it processes the event, so writers hold no identity state.
+
+Open on the writer: whether "accepted" is returned after the event is on the writer's disk (a process crash then loses nothing) or before (faster, a crash loses what was buffered).
+
 This note is the storage-node half and does not change under that target. Still to design: the writer log and forwarding, the ring and ownership unit, moving ownership (publish, stop, restore under the lease), and fresh reads. Section 15 of the review assumed a shared log in the object store; the owner's target uses writer-local logs and forwarding, so that section will be revised, not reused.
 
 ## 7. Order of work and exit criteria
