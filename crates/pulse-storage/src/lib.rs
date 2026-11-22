@@ -22,7 +22,7 @@ pub use encrypted_store::{
 };
 pub use engine::{
     event_uuid_fingerprint, route_bucket, MaintenanceErrors, MaintenanceKind, ProjectStorage,
-    StorageConfig, StorageEngine, WriterLeases, DEFAULT_NUM_BUCKETS,
+    StorageConfig, StorageEngine, WriterLeases, DEAD_LETTERED_EVENTS, DEFAULT_NUM_BUCKETS,
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};

@@ -43,6 +43,7 @@
 | `PULSE_OBJECT_STORE_URL` | `<data_dir>/object_store` (fsynced local files) | `s3://bucket`, `file:///path` or `memory://` |
 | `AWS_REGION`, `AWS_ENDPOINT` (+ standard `AWS_*` credentials) | region `ap-south-1` | S3-compatible region and endpoint (R2, MinIO, …) |
 | `PULSE_NUM_BUCKETS` | `16` (1–256) | Storage buckets per day partition. Choose before you ingest real data |
+| `PULSE_L0_PROJECT_MAX_MB` / `PULSE_L0_MAX_MB` | `512` / `1024` | Estimated bytes of in-memory rows, per project and per node, before ingest returns `429` (`l0_backpressure`). A bucket is flushed when it reaches the project limit ÷ (2 × buckets) |
 | `PULSE_L0_MAX_ROWS_PER_BUCKET` | `1,000,000` (4 × the 250k flush threshold) | In-memory rows per bucket before ingest returns `429` |
 
 ## Ingest
