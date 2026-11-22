@@ -485,6 +485,16 @@ pub async fn with_hot_store(
                     segments,
                 }))
             } else {
+                if let Some((_, loc)) = first_object_under(&segments, &["published"]).await? {
+                    return Err(config_error(format!(
+                        "hot-store mode is `local` and data directory `{}` is uninitialized \
+                         (missing `{}`), while published state exists in the object store ({loc}); \
+                         refusing to start to prevent silent UID reuse \
+                         (recover with `pulse-node restore --from-published`)",
+                        data_dir.display(),
+                        HOT_STORE_MODE_FILE,
+                    )));
+                }
                 init_local_hot_dirs(data_dir, &wal_dir, &hot_dir).await?;
                 write_mode_marker(data_dir, &marker_path, HotStoreMode::Local).await?;
                 let wal_store: Arc<dyn ObjectStore> =
@@ -499,6 +509,52 @@ pub async fn with_hot_store(
             }
         }
     }
+}
+
+/// Opens a `local`-mode [`HotRouted`] store for `pulse-node restore --from-published` without
+/// triggering the uninitialized-`<data_dir>` `published/` refusal, and without writing the
+/// `<data_dir>/hot_store_mode` marker until restore completes (see [`finalize_local_hot_store_marker`]).
+pub async fn open_hot_store_for_restore(
+    segments: Arc<dyn ObjectStore>,
+    data_dir: &Path,
+) -> Result<Arc<dyn ObjectStore>> {
+    let desired = parse_hot_store_env()?;
+    if desired != HotStoreMode::Local {
+        return Err(config_error(
+            "restore --from-published requires PULSE_HOT_STORE=local (or unset)".to_string(),
+        ));
+    }
+    let marker_path = data_dir.join(HOT_STORE_MODE_FILE);
+    if let Some(HotStoreMode::Object) = read_mode_marker(&marker_path).await? {
+        return Err(config_error(format!(
+            "hot-store mode mismatch: data directory `{}` is initialized for PULSE_HOT_STORE=object",
+            data_dir.display()
+        )));
+    }
+    refuse_opposite_tier_objects(&segments, "the object store", "object", "local").await?;
+
+    let wal_dir = data_dir.join("wal");
+    let hot_dir = data_dir.join("hot");
+    init_local_hot_dirs(data_dir, &wal_dir, &hot_dir).await?;
+    let wal_store: Arc<dyn ObjectStore> = Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
+    let hot_store: Arc<dyn ObjectStore> = Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?);
+    Ok(Arc::new(HotRouted {
+        wal: wal_store,
+        hot: hot_store,
+        segments,
+    }))
+}
+
+/// Writes `<data_dir>/hot_store_mode = "local\n"` after `restore --from-published` completes.
+pub async fn finalize_local_hot_store_marker(data_dir: &Path) -> Result<()> {
+    let desired = parse_hot_store_env()?;
+    if desired != HotStoreMode::Local {
+        return Err(config_error(
+            "finalize_local_hot_store_marker requires PULSE_HOT_STORE=local".to_string(),
+        ));
+    }
+    let marker_path = data_dir.join(HOT_STORE_MODE_FILE);
+    write_mode_marker(data_dir, &marker_path, HotStoreMode::Local).await
 }
 
 /// A startup refusal or bad setting: not data corruption.
@@ -1442,6 +1498,45 @@ mod hot_store_and_multipart_tests {
                 err.to_string().contains("restore --from-published"),
                 "{err}"
             );
+        }
+
+        // 5b. Uninitialized / wiped <data_dir> (no marker) with S3 published/ -> refused,
+        //     and leaves <data_dir> untouched (no marker or hot/ created).
+        {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            seg.put(
+                &ObjectPath::from("published/p1/pub_000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+            assert!(!tmp.path().join("hot_store_mode").exists());
+            assert!(!tmp.path().join("hot").exists());
+            assert!(!tmp.path().join("wal").exists());
+
+            // Restore helpers open without refusal and finalize marker afterwards.
+            let restore_store = open_hot_store_for_restore(seg.clone(), tmp.path())
+                .await
+                .unwrap();
+            restore_store
+                .put(
+                    &ObjectPath::from("identity/p1/manifest/00000000000000000001.manifest"),
+                    PutPayload::from_static(b"m"),
+                )
+                .await
+                .unwrap();
+            finalize_local_hot_store_marker(tmp.path()).await.unwrap();
+            let _ = with_hot_store(seg, tmp.path()).await.unwrap();
         }
 
         // 6. Opposite-tier leftover checks (every WAL/HOT prefix in segments refused by local;

@@ -1,6 +1,6 @@
 # Design note: local hot tier, S3 for compacted data only (proposed)
 
-Status: ready for implementation (revision 5, after three independent reviews and owner decisions on all open questions except the T1 snapshot benchmark). No code. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (`PULSE_HOT_STORE=local`, WAL half already in PR #114). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc` unless noted.
+Status: T1 snapshot benchmark complete (Candidate B logical export selected); T0a/T0b implemented and T1 publish/snapshot pipeline active. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (`PULSE_HOT_STORE=local`, WAL half already in PR #114). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc` unless noted.
 
 Sections 1 to 5 cover the storage half: one node, its volume, and what it sends to S3. Section 6 covers the other half of the owner's target: stateless writers that forward to storage nodes which own projects. Both halves were reviewed against the code (section 9).
 
@@ -107,6 +107,32 @@ Cost caveat: SlateDB writes one WAL table per flush with pending changes, so a c
 
 Exit test either way: restore from S3 into an empty directory and resolve every user id in every published segment and profile row.
 
+#### T1 Snapshot Benchmark Results (measured)
+
+Run via `cargo test -p pulse-node --test t1_snapshot_bench --locked -- --nocapture` with `PULSE_HOT_STORE=local` and `PULSE_BYOK_MASTER_KEY` (`PLSEAGM2` path-bound encryption) over `Counting` (`InMemory`) across an identical 5-cycle workload (Cycles 1–3 active: 500 new users, 50 `alias_durable` merges, 100 `upsert` profile updates each; Cycle 4 idle: 200 events for existing users with 0 identity/profile mutations; Cycle 5 heavy: 200 new users, 100 merges, 300 profile updates; 1,900 total events, 500 total profiles):
+
+| Metric | Candidate A (Checkpoint Copy) | Candidate B (Logical Export) | Winner Ratio |
+|---|---|---|---|
+| Cycle 1 (active) snapshot PUTs / bytes | 155 / 93,483 B | 2 / 2,436 B | **77.5x fewer PUTs / 38.4x smaller** |
+| Cycle 2 (active) snapshot PUTs / bytes | 153 / 93,388 B | 2 / 5,097 B | **76.5x fewer PUTs / 18.3x smaller** |
+| Cycle 3 (active) snapshot PUTs / bytes | 153 / 93,533 B | 2 / 7,840 B | **76.5x fewer PUTs / 11.9x smaller** |
+| Cycle 4 (idle) snapshot PUTs / bytes | 0 / 0 B | 0 / 0 B | Tied (`0` PUTs via dirty tracking) |
+| Cycle 5 (heavy) snapshot PUTs / bytes | 403 / 241,645 B | 2 / 9,669 B | **201.5x fewer PUTs / 25.0x smaller** |
+| **Total 5-cycle snapshot PUTs / bytes** | **864 / 522,049 B** | **8 / 25,042 B** | **108.0x fewer PUTs / 20.8x smaller** |
+| **Total S3 PUTs (all prefixes)** | 879 (606,822 B) | 23 (109,977 B) | **38.2x fewer total PUTs** |
+| **Snapshot LISTs / DELETEs** | 0 / 6 | 0 / 6 | Tied (`0` S3 `LIST`s) |
+| **Active avg snapshot PUTs / cycle** | 216.00 | **2.00** | **108.0x lower** |
+| **Extrapolated T2 (12 cycles/hr)** | 2,592.0 PUTs/hr | **24.0 PUTs/hr** | **108.0x lower** |
+| **Extrapolated T1 (20 flushes/hr)** | 4,320.0 PUTs/hr | **40.0 PUTs/hr** | **108.0x lower** |
+| **End-of-run S3 snapshot objects** | 858 | **2** | **429.0x fewer objects** |
+| **Snapshot latency (active cycle)** | 40.67–63.32 ms | **20.37–24.32 ms** | **~2.2x faster** |
+| **Empty-dir BYOK restore latency** | 5,033.83 ms | **81.87 ms** | **61.5x faster restore** |
+
+**Winner selection & rationale: Candidate B (Logical Export).**
+1. Because SlateDB writes a separate `wal/{id:020}.sst` file on every `Db::flush()` / `upsert()` / `alias_durable()` until `l0_sst_size_bytes` (64 MiB) fills, Candidate A's checkpoint copy still uploads `O(flushes)` individual WAL SSTs per cycle (216 PUTs/cycle avg -> 2,592 PUTs/hr at T2, and 858 S3 objects) and takes >5 seconds to re-seal and replay those 858 SSTs on empty-dir BYOK restore. Furthermore, calling `Db::delete_checkpoint` out-of-band while the writer `Db` is open advances SlateDB's manifest and fences the active writer (`Detected newer DB client`), requiring checkpoint expiry lifetimes instead.
+2. Candidate B emits at most **2 S3 PUTs per dirty cycle** (1 `PZST` `bincode` `IdentityCheckpoint` with `next_chunk_seq = 1`, 1 `PZST` zstd JSON profile snapshot) and **0 PUTs when unchanged**, cuts snapshot bytes by 20.8x, keeps S3 snapshot objects constant at `2`, and restores in **81.87 ms** with full `PLSEAGM2` BYOK verification across all 1,900 event rows and 500 profiles.
+3. Future scale note: for very large projects (hundreds of thousands+ profiles), Candidate B's logical export can be partitioned into bounded zstd chunks or paired with periodic delta/base snapshots without changing `PublishedManifest` or `T_id >= T_prof >= T_freeze` semantics.
+
 ### 3.5 Restore after losing the volume
 
 P0-7 makes a node refuse to start when the marker says `local` and the local stores are missing. That guard is what makes losing the volume an outage, not silent reuse of user ids. This design adds an explicit command:
@@ -164,7 +190,7 @@ The storage tiering changes no API response. The asynchronous writer in section 
 
 ## 5. Cost after the change
 
-**Estimate**, per busy project, 16 buckets active, one current date, 5-minute interval: 16 segment PUTs and 1 published manifest per cycle, about 200 per hour, plus the identity and profile snapshots. The snapshot cost is unknown until T1 is measured: with a checkpoint copy it could approach one PUT per identity flush, which is what the system pays today.
+**Estimate**, per busy project, 16 buckets active, one current date, 5-minute interval: 16 segment PUTs and 1 published manifest per cycle, about 200 per hour, plus **2** logical-export snapshot PUTs per dirty cycle (**24 PUTs/hour** at 12 cycles/hour; **0 PUTs/hour** when identity and profiles are unchanged, **measured** in `t1_snapshot_bench`).
 
 An idle project must make no calls. That requires tracking uploads locally, not by listing S3.
 
@@ -308,9 +334,9 @@ An interval of zero means "upload eagerly", not a return to today's layout: the 
 
 ## 8. Decisions and remaining open question
 
-Only one question remains open (decided empirically by the T1 benchmark):
+All open design questions are now decided:
 
-1. **Checkpoint copy or logical export for identity and profiles (3.4)?** Decided by the T1 counting-store measurement.
+1. **Checkpoint copy or logical export for identity and profiles (3.4)?** **Decided: Candidate B (Logical Export)**, based on the empirical T1 `Counting` store benchmark (`t1_snapshot_bench.rs`: 8 vs 864 snapshot PUTs across 5 cycles, 24 vs 2,592 PUTs/hr at T2, 25.0 KiB vs 522.0 KiB, 2 vs 858 S3 objects, and 81.87 ms vs 5,033.83 ms empty-dir BYOK restore).
 
 All other design questions are now decided:
 

@@ -162,9 +162,36 @@ async fn a_clean_shutdown_leaves_the_local_wal_empty_and_the_object_store_comple
         "local WAL after shutdown"
     );
 
-    // Everything is in the object store: a node on a fresh disk sees all 20.
+    // All 20 rows and a published manifest are in the object store.
+    let enc: Arc<dyn ObjectStore> =
+        Arc::new(pulse_storage::EncryptedObjectStore::new(store.clone()));
+    assert_eq!(
+        pulse_storage::ManifestStore::new(PID, enc.clone())
+            .load_latest()
+            .await
+            .unwrap()
+            .total_l1_rows(),
+        20
+    );
+    assert!(pulse_storage::PublishedManifestStore::new(PID, enc)
+        .load_latest()
+        .await
+        .unwrap()
+        .is_some());
+
+    // Starting on a fresh/wiped <data_dir> while S3 `published/` exists must refuse startup.
     let fresh = tempfile::tempdir().unwrap();
-    let (node, _) = start(fresh.path(), &store).await;
+    let err = start_pulse_node_with_store(config(fresh.path()), store.clone())
+        .await
+        .err()
+        .expect("fresh data_dir with S3 published/ must refuse startup");
+    assert!(
+        err.to_string().contains("restore --from-published"),
+        "{err}"
+    );
+
+    // Restarting on the original `tmp.path()` sees all 20 rows.
+    let (node, _) = start(tmp.path(), &store).await;
     assert_eq!(rows(&node).await, 20);
     node.shutdown().await;
 }

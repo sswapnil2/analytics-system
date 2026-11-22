@@ -35,6 +35,13 @@ pub enum StorageError {
     #[error("mvcc manifest conflict after retries")]
     ManifestConflict,
 
+    #[error("identity high-water mark violation for project '{project_id}': identity user count {identity_user_count} < manifest high_water_mark {high_water_mark}")]
+    HighWaterMarkViolation {
+        project_id: String,
+        identity_user_count: u64,
+        high_water_mark: u64,
+    },
+
     /// Rows held in memory and not yet in a segment reached their byte limit.
     #[error("l0 backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
     Backpressure {

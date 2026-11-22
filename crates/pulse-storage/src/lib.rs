@@ -9,6 +9,7 @@ pub mod mem_bucket;
 pub mod profile_store;
 pub mod replay_store;
 pub mod segment;
+pub mod snapshot;
 pub mod store_factory;
 pub mod wal;
 
@@ -27,7 +28,11 @@ pub use engine::{
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
 pub use hll::{CompactHll, HllSketch};
-pub use manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
+pub use manifest::{
+    install_restored_manifest, IdentitySnapshotRef, Manifest, ManifestStore, PartitionEntry,
+    ProfileSnapshotRef, PublishedManifest, PublishedManifestStore, ReaderPinTracker, SnapshotRef,
+    StorageSnapshot,
+};
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
@@ -39,10 +44,15 @@ pub use segment::{
     SessionHeader, TierBColumnEntry, VortexSegmentReader, MAX_INVERTED_INDEX_CARDINALITY,
     MAX_TIER_B_KEYS,
 };
+pub use snapshot::{
+    restore_identity_from_snapshot, restore_profiles_from_snapshot, restore_project_from_published,
+    CandidateACheckpointFiles, RestoredProjectSnapshot, SlateDbCheckpointSyncState,
+};
 pub use store_factory::{
     allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
-    check_resolved_addrs, is_forbidden_ssrf_ip, validate_object_store_connection,
-    validate_outbound_url_ssrf, with_hot_store, DurableLocalObjectStore,
+    check_resolved_addrs, finalize_local_hot_store_marker, is_forbidden_ssrf_ip,
+    open_hot_store_for_restore, validate_object_store_connection, validate_outbound_url_ssrf,
+    with_hot_store, DurableLocalObjectStore,
 };
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 

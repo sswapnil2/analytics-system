@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as OsError, ObjectMeta, ObjectStore, PutMode, PutOptions, PutPayload};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::dictionary::ProjectDictSnapshot;
@@ -15,11 +16,11 @@ use crate::error::{Result, StorageError};
 use crate::mem_bucket::StoredRow;
 use crate::segment::SegmentMeta;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PartitionEntry {
-    date: NaiveDate,
-    bucket_id: u8,
-    segments: Vec<SegmentMeta>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionEntry {
+    pub date: NaiveDate,
+    pub bucket_id: u8,
+    pub segments: Vec<SegmentMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ struct ManifestWire {
     fenced_wal_epoch: u64,
     #[serde(default)]
     writer_generation: u64,
+    #[serde(default)]
+    last_published_seq: Option<u64>,
     partitions: Vec<PartitionEntry>,
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
@@ -43,6 +46,8 @@ pub struct Manifest {
     /// Generation of the writer lease held by the node that last opened this project for
     /// writing (0 = never leased). A writer whose own generation is older must stop committing.
     pub writer_generation: u64,
+    /// Dense `publish_seq` of the newest `PublishedManifest` emitted for this project (if any).
+    pub last_published_seq: Option<u64>,
     pub active_segments: HashMap<(NaiveDate, u8), Vec<SegmentMeta>>,
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
@@ -73,7 +78,7 @@ impl Manifest {
         out
     }
 
-    fn to_wire(&self) -> ManifestWire {
+    pub fn to_sorted_partitions(&self) -> Vec<PartitionEntry> {
         let mut partitions: Vec<PartitionEntry> = self
             .active_segments
             .iter()
@@ -85,11 +90,16 @@ impl Manifest {
             })
             .collect();
         partitions.sort_by_key(|p| (p.date, p.bucket_id));
+        partitions
+    }
+
+    fn to_wire(&self) -> ManifestWire {
         ManifestWire {
             epoch: self.epoch,
             fenced_wal_epoch: self.fenced_wal_epoch,
             writer_generation: self.writer_generation,
-            partitions,
+            last_published_seq: self.last_published_seq,
+            partitions: self.to_sorted_partitions(),
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
             dict_snapshot: self.dict_snapshot.clone(),
@@ -105,6 +115,7 @@ impl Manifest {
             epoch: w.epoch,
             fenced_wal_epoch: w.fenced_wal_epoch,
             writer_generation: w.writer_generation,
+            last_published_seq: w.last_published_seq,
             active_segments,
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,
@@ -245,8 +256,8 @@ impl ManifestStore {
 
 const MANIFEST_ZSTD_MAGIC: &[u8; 4] = b"PZST";
 
-fn encode_manifest_payload(wire: &ManifestWire) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(wire)?;
+fn encode_json_zstd<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(value)?;
     let compressed = zstd::stream::encode_all(json.as_slice(), 3)
         .map_err(|e| StorageError::Corrupted(format!("manifest zstd compress: {e}")))?;
     let mut out = Vec::with_capacity(MANIFEST_ZSTD_MAGIC.len() + compressed.len());
@@ -255,7 +266,7 @@ fn encode_manifest_payload(wire: &ManifestWire) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_manifest_payload(bytes: &[u8]) -> Result<ManifestWire> {
+fn decode_json_zstd<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if let Some(rest) = bytes.strip_prefix(MANIFEST_ZSTD_MAGIC) {
         let json = zstd::stream::decode_all(rest)
             .map_err(|e| StorageError::Corrupted(format!("manifest zstd decompress: {e}")))?;
@@ -265,10 +276,216 @@ fn decode_manifest_payload(bytes: &[u8]) -> Result<ManifestWire> {
     }
 }
 
+fn encode_manifest_payload(wire: &ManifestWire) -> Result<Vec<u8>> {
+    encode_json_zstd(wire)
+}
+
+fn decode_manifest_payload(bytes: &[u8]) -> Result<ManifestWire> {
+    decode_json_zstd(bytes)
+}
+
 fn parse_epoch_from_path(path: &str) -> Option<u64> {
     let fname = path.rsplit('/').next()?;
     let body = fname.strip_prefix("epoch_")?.strip_suffix(".json")?;
     body.parse::<u64>().ok()
+}
+
+/// Reference to a project's S3 identity snapshot under `published/{project_id}/snapshots/...`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentitySnapshotRef {
+    pub object_path: String,
+    pub user_count: u64,
+    pub mutation_epoch: u64,
+}
+
+/// Reference to a project's S3 profile snapshot under `published/{project_id}/snapshots/...`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileSnapshotRef {
+    pub object_path: String,
+    pub dirty_seq: u64,
+}
+
+/// Snapshot pointers bundled in a [`PublishedManifest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRef {
+    pub identity: IdentitySnapshotRef,
+    #[serde(default)]
+    pub profiles: Option<ProfileSnapshotRef>,
+}
+
+/// Dense-sequence published S3 manifest (`published/{project_id}/pub_{publish_seq:012}.json`).
+///
+/// Written create-only after `T_id >= T_prof >= T_freeze` snapshots complete, carrying the
+/// identity `high_water_mark` and fencing metadata (`publish_seq`, `writer_generation`,
+/// `source_local_epoch`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedManifest {
+    pub publish_seq: u64,
+    pub writer_generation: u64,
+    pub source_local_epoch: u64,
+    pub high_water_mark: u64,
+    pub published_at_ms: i64,
+    pub partitions: Vec<PartitionEntry>,
+    pub dict_snapshot: ProjectDictSnapshot,
+    pub committed_wal_seq: BTreeMap<u8, u64>,
+    pub committed_l0_seq: BTreeMap<u8, u64>,
+    pub snapshot_ref: SnapshotRef,
+}
+
+impl PublishedManifest {
+    /// Materializes a local [`Manifest`] at `target_epoch` for `restore --from-published`.
+    pub fn to_local_manifest(&self, target_epoch: u64) -> Manifest {
+        let mut active_segments = HashMap::with_capacity(self.partitions.len());
+        for p in &self.partitions {
+            active_segments.insert((p.date, p.bucket_id), p.segments.clone());
+        }
+        Manifest {
+            epoch: target_epoch,
+            fenced_wal_epoch: target_epoch,
+            writer_generation: self.writer_generation,
+            last_published_seq: Some(self.publish_seq),
+            active_segments,
+            committed_wal_seq: self.committed_wal_seq.clone(),
+            committed_l0_seq: self.committed_l0_seq.clone(),
+            dict_snapshot: self.dict_snapshot.clone(),
+        }
+    }
+}
+
+/// Conditional-create store for `published/{project_id}/pub_{publish_seq:012}.json`.
+pub struct PublishedManifestStore {
+    project_id: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl PublishedManifestStore {
+    pub fn new(project_id: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            object_store,
+        }
+    }
+
+    fn prefix(&self) -> ObjectPath {
+        ObjectPath::from(format!("published/{}", self.project_id))
+    }
+
+    pub fn pub_path(&self, publish_seq: u64) -> ObjectPath {
+        ObjectPath::from(format!(
+            "published/{}/pub_{:012}.json",
+            self.project_id, publish_seq
+        ))
+    }
+
+    async fn list_pub_seqs(&self) -> Result<Vec<(u64, ObjectMeta)>> {
+        let prefix = self.prefix();
+        let res = self.object_store.list_with_delimiter(Some(&prefix)).await?;
+        let expected_dir = format!("published/{}/", self.project_id);
+        let mut out: Vec<(u64, ObjectMeta)> = res
+            .objects
+            .into_iter()
+            .filter_map(|m| {
+                let rel = m.location.as_ref().strip_prefix(&expected_dir)?;
+                if rel.contains('/') {
+                    return None;
+                }
+                parse_pub_seq_from_filename(rel).map(|seq| (seq, m))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(seq, _)| *seq);
+        Ok(out)
+    }
+
+    pub async fn load_latest(&self) -> Result<Option<PublishedManifest>> {
+        let Some((_, meta)) = self.list_pub_seqs().await?.pop() else {
+            return Ok(None);
+        };
+        let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
+        let decoded: PublishedManifest = decode_json_zstd(&bytes)?;
+        Ok(Some(decoded))
+    }
+
+    pub async fn load_seq(&self, publish_seq: u64) -> Result<PublishedManifest> {
+        let path = self.pub_path(publish_seq);
+        let bytes = self.object_store.get(&path).await?.bytes().await?;
+        decode_json_zstd(&bytes)
+    }
+
+    /// Writes `pub_manifest` create-only at `pub_{publish_seq:012}.json`, verifying
+    /// `head(publish_seq - 1)` when `publish_seq > 0` so a stale writer behind GC cannot slip past.
+    pub async fn publish_next(&self, pub_manifest: PublishedManifest) -> Result<PublishedManifest> {
+        let seq = pub_manifest.publish_seq;
+        let path = self.pub_path(seq);
+        let payload = encode_json_zstd(&pub_manifest)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from_bytes(Bytes::from(payload)), opts)
+            .await
+        {
+            Ok(_) => {
+                if seq > 0 {
+                    if let Err(OsError::NotFound { .. }) =
+                        self.object_store.head(&self.pub_path(seq - 1)).await
+                    {
+                        let _ = self.object_store.delete(&path).await;
+                        return Err(StorageError::ManifestConflict);
+                    }
+                }
+                Ok(pub_manifest)
+            }
+            Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
+                Err(StorageError::ManifestConflict)
+            }
+            Err(other) => Err(StorageError::ObjectStore(other)),
+        }
+    }
+}
+
+fn parse_pub_seq_from_filename(fname: &str) -> Option<u64> {
+    let body = fname.strip_prefix("pub_")?.strip_suffix(".json")?;
+    body.parse::<u64>().ok()
+}
+
+/// Installs `pub_m` into `manifests/{project_id}/` for `restore --from-published`.
+///
+/// When `manifests/{project_id}/` already contains epochs (e.g., T1 with S3 `manifests/`), commits
+/// at `latest.epoch + 1` via CAS; when empty (e.g., T2 after local volume loss), writes
+/// `pub_m.source_local_epoch.max(1)` create-only so subsequent commits maintain monotonic epochs.
+pub async fn install_restored_manifest(
+    project_id: &str,
+    store: Arc<dyn ObjectStore>,
+    pub_m: &PublishedManifest,
+) -> Result<Manifest> {
+    let ms = ManifestStore::new(project_id, store.clone());
+    let latest = ms.load_latest().await?;
+    if latest.epoch > 0 {
+        let next = pub_m.to_local_manifest(latest.epoch);
+        return ms.commit_next(next).await;
+    }
+
+    let target_epoch = pub_m.source_local_epoch.max(1);
+    let restored = pub_m.to_local_manifest(target_epoch);
+    let path = ms.epoch_path(target_epoch);
+    let payload = encode_manifest_payload(&restored.to_wire())?;
+    let opts = PutOptions {
+        mode: PutMode::Create,
+        ..PutOptions::default()
+    };
+    match store
+        .put_opts(&path, PutPayload::from_bytes(Bytes::from(payload)), opts)
+        .await
+    {
+        Ok(_) => Ok(restored),
+        Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
+            let latest = ms.load_latest().await?;
+            ms.commit_next(pub_m.to_local_manifest(latest.epoch)).await
+        }
+        Err(other) => Err(StorageError::ObjectStore(other)),
+    }
 }
 
 /// Pin tracker ensuring compacted/superseded L1 segments are deleted ONLY once all active readers finish.
@@ -517,5 +734,102 @@ mod tests {
         assert_eq!(reloaded.epoch, 2);
         assert_eq!(reloaded.active_segments.len(), 256);
         assert_eq!(reloaded.total_l1_rows(), 512 * 10_000);
+    }
+
+    #[tokio::test]
+    async fn published_manifest_dense_seq_conflict_and_gc_guard() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let pms = PublishedManifestStore::new("p", store.clone());
+        assert!(pms.load_latest().await.unwrap().is_none());
+
+        // Snapshot objects under published/p/snapshots/ must not confuse load_latest.
+        store
+            .put(
+                &ObjectPath::from("published/p/snapshots/identity_000000000000.pzst"),
+                PutPayload::from_static(b"snap"),
+            )
+            .await
+            .unwrap();
+        assert!(pms.load_latest().await.unwrap().is_none());
+
+        let make_pub = |seq: u64, gen: u64, epoch: u64, hwm: u64| PublishedManifest {
+            publish_seq: seq,
+            writer_generation: gen,
+            source_local_epoch: epoch,
+            high_water_mark: hwm,
+            published_at_ms: 1_790_000_000_000 + seq as i64,
+            partitions: vec![],
+            dict_snapshot: ProjectDictSnapshot::default(),
+            committed_wal_seq: BTreeMap::from([(0, seq + 1)]),
+            committed_l0_seq: BTreeMap::from([(0, seq + 1)]),
+            snapshot_ref: SnapshotRef {
+                identity: IdentitySnapshotRef {
+                    object_path: format!("published/p/snapshots/identity_{seq:012}.pzst"),
+                    user_count: hwm,
+                    mutation_epoch: seq,
+                },
+                profiles: None,
+            },
+        };
+
+        // Publish seq 0 and 1.
+        let p0 = pms.publish_next(make_pub(0, 1, 1, 10)).await.unwrap();
+        assert_eq!(p0.publish_seq, 0);
+        let p1 = pms.publish_next(make_pub(1, 1, 2, 25)).await.unwrap();
+        assert_eq!(p1.publish_seq, 1);
+
+        // Duplicate PutMode::Create at seq 1 conflicts.
+        assert!(matches!(
+            pms.publish_next(make_pub(1, 2, 3, 30)).await,
+            Err(StorageError::ManifestConflict)
+        ));
+
+        // Verify PZST compression and load_latest.
+        let raw_p1 = store
+            .get(&pms.pub_path(1))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(raw_p1.starts_with(MANIFEST_ZSTD_MAGIC));
+        let latest = pms.load_latest().await.unwrap().unwrap();
+        assert_eq!(latest.publish_seq, 1);
+        assert_eq!(latest.high_water_mark, 25);
+
+        // GC guard: if predecessor (seq 1) is missing, publish_next(2) deletes seq 2 and returns Conflict.
+        store.delete(&pms.pub_path(1)).await.unwrap();
+        assert!(matches!(
+            pms.publish_next(make_pub(2, 1, 3, 40)).await,
+            Err(StorageError::ManifestConflict)
+        ));
+        assert!(store.head(&pms.pub_path(2)).await.is_err());
+
+        // Plain-JSON fallback on PublishedManifestStore + install_restored_manifest (empty & non-empty).
+        let p2_plain = make_pub(2, 2, 5, 42);
+        store
+            .put(
+                &pms.pub_path(2),
+                PutPayload::from(serde_json::to_vec(&p2_plain).unwrap()),
+            )
+            .await
+            .unwrap();
+        let loaded_p2 = pms.load_latest().await.unwrap().unwrap();
+        assert_eq!(loaded_p2.publish_seq, 2);
+
+        // Install into empty manifests/ -> epoch = source_local_epoch (5).
+        let installed1 = install_restored_manifest("p", store.clone(), &loaded_p2)
+            .await
+            .unwrap();
+        assert_eq!(installed1.epoch, 5);
+        assert_eq!(installed1.last_published_seq, Some(2));
+        assert_eq!(installed1.writer_generation, 2);
+
+        // Install again when manifests/ already has epoch 5 -> commits epoch 6.
+        let installed2 = install_restored_manifest("p", store.clone(), &loaded_p2)
+            .await
+            .unwrap();
+        assert_eq!(installed2.epoch, 6);
+        assert_eq!(installed2.last_published_seq, Some(2));
     }
 }

@@ -11,10 +11,12 @@
 //! - `u/<updated_ms:016x>/<distinct_id>`            -> forward-timestamp index for incremental sync since `since_ms`
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
@@ -164,6 +166,52 @@ async fn scan_reader_keys(
         .map_err(|_| StorageError::Corrupted("profile reader scan worker dropped".into()))?
 }
 
+async fn scan_db_records(db: Arc<Db>) -> Result<Vec<StoredUserProfile>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    profile_io_runtime().spawn_blocking(move || {
+        let res = profile_io_runtime().block_on(async move {
+            let mut iter = db
+                .scan(b"r/".to_vec()..b"r0".to_vec())
+                .await
+                .map_err(slatedb_err)?;
+            let mut profiles = Vec::new();
+            while let Some(kv) = iter.next().await.map_err(slatedb_err)? {
+                profiles.push(decode_profile(&kv.value)?);
+            }
+            Ok(profiles)
+        });
+        let _ = tx.send(res);
+    });
+    rx.await
+        .map_err(|_| StorageError::Corrupted("profile export scan worker dropped".into()))?
+}
+
+fn encode_profile_snapshot(profiles: &[StoredUserProfile]) -> Result<Vec<u8>> {
+    let raw = serde_json::to_vec(profiles).map_err(|e| {
+        StorageError::Corrupted(format!("failed to serialize profile snapshot: {e}"))
+    })?;
+    let compressed = zstd::bulk::compress(&raw, 3).map_err(|e| {
+        StorageError::Corrupted(format!("failed to compress profile snapshot: {e}"))
+    })?;
+    let mut out = Vec::with_capacity(PROFILE_ZSTD_MAGIC.len() + compressed.len());
+    out.extend_from_slice(PROFILE_ZSTD_MAGIC);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn decode_profile_snapshot(bytes: &[u8]) -> Result<Vec<StoredUserProfile>> {
+    if let Some(payload) = bytes.strip_prefix(PROFILE_ZSTD_MAGIC) {
+        let decompressed = zstd::stream::decode_all(payload).map_err(|e| {
+            StorageError::Corrupted(format!("corrupted compressed profile snapshot: {e}"))
+        })?;
+        serde_json::from_slice(&decompressed)
+            .map_err(|e| StorageError::Corrupted(format!("corrupted profile snapshot json: {e}")))
+    } else {
+        serde_json::from_slice(bytes)
+            .map_err(|e| StorageError::Corrupted(format!("corrupted profile snapshot json: {e}")))
+    }
+}
+
 async fn open_profile_db(project_id: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
     let db_path = ObjectPath::from(format!("profiles/{project_id}"));
     for attempt in 0..8 {
@@ -231,6 +279,7 @@ pub struct ProjectProfileStore {
     project_id: String,
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
+    dirty_seq: AtomicU64,
     db: tokio::sync::Mutex<Option<Arc<Db>>>,
     /// Read-only stores keep one reader: it follows the writer by polling, and opening one per
     /// read wrote (then deleted) a SlateDB checkpoint each time, two PUTs per read.
@@ -261,6 +310,7 @@ impl ProjectProfileStore {
             project_id,
             object_store,
             read_only: false,
+            dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(Some(Arc::new(db))),
             reader: tokio::sync::Mutex::new(None),
         }))
@@ -274,9 +324,15 @@ impl ProjectProfileStore {
             project_id: project_id.into(),
             object_store,
             read_only: true,
+            dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(None),
             reader: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Monotonic counter incremented after every flushed write or delete (used to skip idle snapshots).
+    pub fn dirty_seq(&self) -> u64 {
+        self.dirty_seq.load(Ordering::Acquire)
     }
 
     /// This read-only store's reader, opened on first use. `None` while the store does not exist.
@@ -359,6 +415,7 @@ impl ProjectProfileStore {
             let _ = guard.take();
             return Err(slatedb_err(e));
         }
+        self.dirty_seq.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -498,6 +555,7 @@ impl ProjectProfileStore {
                 let _ = guard.take();
                 return Err(slatedb_err(e));
             }
+            self.dirty_seq.fetch_add(1, Ordering::AcqRel);
         }
         Ok(deleted)
     }
@@ -694,6 +752,91 @@ impl ProjectProfileStore {
         Ok(keys.len() as u64)
     }
 
+    /// Exports all profile records (`r/`..`r0`) as `PZST`-compressed JSON for T1 logical snapshot.
+    pub async fn export_snapshot_bytes(&self) -> Result<Vec<u8>> {
+        if self.read_only {
+            return Err(StorageError::Corrupted(
+                "cannot export logical snapshot from read-only profile store".into(),
+            ));
+        }
+        let mut guard = self.db.lock().await;
+        if guard.is_none() {
+            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            *guard = Some(Arc::new(reopened));
+        }
+        let db = guard
+            .as_ref()
+            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
+            .clone();
+        let profiles = scan_db_records(db).await?;
+        tokio::task::spawn_blocking(move || encode_profile_snapshot(&profiles))
+            .await
+            .map_err(|_| {
+                StorageError::Corrupted("profile export compression task panicked".into())
+            })?
+    }
+
+    /// Restores `profiles/{project_id}` from a logical export produced by [`Self::export_snapshot_bytes`],
+    /// rebuilding all secondary indexes deterministically and returning the open writable store.
+    pub async fn restore_from_export(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        export_bytes: &[u8],
+    ) -> Result<Arc<Self>> {
+        let project_id = project_id.into();
+        let profiles = decode_profile_snapshot(export_bytes)?;
+
+        // Clear any existing profile SlateDB files under `profiles/{project_id}/`.
+        let prefix = ObjectPath::from(format!("profiles/{project_id}"));
+        let existing: Vec<_> = object_store.list(Some(&prefix)).try_collect().await?;
+        for meta in existing {
+            object_store.delete(&meta.location).await?;
+        }
+
+        let store = Self::open(project_id, object_store).await?;
+        for chunk in profiles.chunks(10_000) {
+            store.upsert_batch(chunk).await?;
+        }
+        Ok(store)
+    }
+
+    /// Creates a SlateDB checkpoint for Candidate A snapshot benchmarking/sync.
+    pub async fn create_slatedb_checkpoint(&self) -> Result<slatedb::CheckpointCreateResult> {
+        if self.read_only {
+            return Err(StorageError::Corrupted(
+                "cannot checkpoint read-only profile store".into(),
+            ));
+        }
+        let mut guard = self.db.lock().await;
+        if guard.is_none() {
+            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            *guard = Some(Arc::new(reopened));
+        }
+        let db = guard
+            .as_ref()
+            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?;
+        db.create_checkpoint(
+            slatedb::config::CheckpointScope::all_with_force_flush(true),
+            &slatedb::config::CheckpointOptions {
+                lifetime: Some(Duration::from_secs(300)),
+                source: None,
+            },
+        )
+        .await
+        .map_err(slatedb_err)
+    }
+
+    /// Deletes a SlateDB checkpoint created by [`Self::create_slatedb_checkpoint`].
+    pub async fn delete_slatedb_checkpoint(
+        &self,
+        checkpoint: &slatedb::CheckpointCreateResult,
+    ) -> Result<()> {
+        let db_path = ObjectPath::from(format!("profiles/{}", self.project_id));
+        Db::delete_checkpoint(&db_path, self.object_store.clone(), checkpoint.id)
+            .await
+            .map_err(slatedb_err)
+    }
+
     pub async fn close(&self) -> Result<()> {
         if self.read_only {
             // Releases the reader's checkpoint now instead of letting it expire.
@@ -755,6 +898,11 @@ impl ProfileRouter {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Returns the project's profile store only if it has already been opened in this process.
+    pub fn get_if_open(&self, project_id: &str) -> Option<Arc<ProjectProfileStore>> {
+        self.stores.get(project_id).map(|s| s.clone())
     }
 
     /// A read-only store for a project this node does not write, cached. Never fences the writer.
@@ -894,5 +1042,56 @@ mod tests {
         assert!(ps.list_for_canonical(10).await.unwrap().is_empty());
 
         ps.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dirty_seq_and_logical_export_restore_rebuild_secondary_indexes() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let store1: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir1.path()).unwrap());
+        let ps = ProjectProfileStore::open("proj_p2", store1).await.unwrap();
+        assert_eq!(ps.dirty_seq(), 0);
+
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_p2".into(),
+            distinct_id: "u_a".into(),
+            canonical_uid: 5,
+            props: BTreeMap::from([("tier".into(), json!("gold"))]),
+            total_revenue: 100.0,
+            updated_at_ms: 1000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(ps.dirty_seq(), 1);
+
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_p2".into(),
+            distinct_id: "u_b".into(),
+            canonical_uid: 5,
+            props: BTreeMap::from([("tier".into(), json!("silver"))]),
+            total_revenue: 50.0,
+            updated_at_ms: 2000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(ps.dirty_seq(), 2);
+
+        let exported = ps.export_snapshot_bytes().await.unwrap();
+        assert!(exported.starts_with(PROFILE_ZSTD_MAGIC));
+        ps.close().await.unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir2.path()).unwrap());
+        let restored = ProjectProfileStore::restore_from_export("proj_p2", store2, &exported)
+            .await
+            .unwrap();
+        assert_eq!(restored.count().await.unwrap(), 2);
+        assert_eq!(restored.list_for_canonical(5).await.unwrap().len(), 2);
+        let page = restored.list_paginated(None, 10, 0).await.unwrap();
+        assert_eq!(page[0].distinct_id, "u_b");
+        assert_eq!(page[1].distinct_id, "u_a");
+        assert_eq!(restored.list_updated_since(1500).await.unwrap().len(), 1);
+        restored.close().await.unwrap();
     }
 }

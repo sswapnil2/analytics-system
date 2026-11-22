@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const ADMIN: &str = "sk_root_storecallstest0000000000000000000000000000";
@@ -157,8 +157,13 @@ fn config(dir: &Path, role: NodeRole) -> NodeConfig {
     }
 }
 
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 async fn post(node: &RunningNode, path: &str, key: &str, body: Value) -> u16 {
-    reqwest::Client::new()
+    http_client()
         .post(format!("http://{}{path}", node.http_addr))
         .header("x-pulse-key", key)
         .json(&body)
@@ -170,7 +175,7 @@ async fn post(node: &RunningNode, path: &str, key: &str, body: Value) -> u16 {
 }
 
 async fn admin(node: &RunningNode, method: reqwest::Method, path: &str) -> u16 {
-    reqwest::Client::new()
+    http_client()
         .request(method, format!("http://{}{path}", node.http_addr))
         .bearer_auth(ADMIN)
         .send()

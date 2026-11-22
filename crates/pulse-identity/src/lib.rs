@@ -590,6 +590,14 @@ const CHECKPOINT_MIN_MUTATIONS: u64 = 250_000;
 /// Hard cap on uncompacted log chunks so recovery never replays thousands of tiny flushes.
 const CHECKPOINT_MAX_CHUNKS: u64 = 512;
 
+/// Exported point-in-time logical snapshot of a project's identity graph (`PZST` + `bincode`).
+#[derive(Debug, Clone)]
+pub struct IdentityExport {
+    pub payload: Vec<u8>,
+    pub user_count: u64,
+    pub mutation_epoch: u64,
+}
+
 /// Durable per-project `distinct_id <-> u32` dictionary and zero-rewrite Union-Find alias graph.
 pub struct ProjectIdentityGraph {
     project_id: String,
@@ -604,6 +612,7 @@ pub struct ProjectIdentityGraph {
     mutations_since_checkpoint: AtomicU64,
     mutation_epoch: AtomicU64,
     flushed_epoch: AtomicU64,
+    flushed_user_count: AtomicU64,
     pending_mutations: Mutex<Vec<MutationEntry>>,
     db: tokio::sync::Mutex<Option<Db>>,
 }
@@ -788,6 +797,7 @@ impl ProjectIdentityGraph {
             apply_mutation_entries(&mut state, &fast_lookup, entries)?;
         }
 
+        let initial_user_count = state.u32_to_external.len() as u64;
         let initial_snap = state.compress_all_and_build_snapshot();
 
         Ok(Arc::new(Self {
@@ -803,6 +813,7 @@ impl ProjectIdentityGraph {
             mutations_since_checkpoint: AtomicU64::new(replayed_mutations),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
+            flushed_user_count: AtomicU64::new(initial_user_count),
             pending_mutations: Mutex::new(Vec::new()),
             db: tokio::sync::Mutex::new(Some(db)),
         }))
@@ -828,6 +839,7 @@ impl ProjectIdentityGraph {
             mutations_since_checkpoint: AtomicU64::new(0),
             mutation_epoch: AtomicU64::new(0),
             flushed_epoch: AtomicU64::new(0),
+            flushed_user_count: AtomicU64::new(0),
             pending_mutations: Mutex::new(Vec::new()),
             db: tokio::sync::Mutex::new(None),
         });
@@ -931,6 +943,8 @@ impl ProjectIdentityGraph {
                 for entries in decoded_chunks {
                     apply_mutation_entries(&mut state, &self.fast_lookup, entries)?;
                 }
+                self.flushed_user_count
+                    .store(state.u32_to_external.len() as u64, Ordering::Release);
             }
             self.next_chunk_seq.store(chunk_count, Ordering::Release);
             self.snapshot_dirty.store(true, Ordering::Release);
@@ -946,8 +960,25 @@ impl ProjectIdentityGraph {
         &self.project_id
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn user_count(&self) -> usize {
         self.state.read().u32_to_external.len()
+    }
+
+    /// Number of users guaranteed durable in the most recently completed `flush()` (updated under `self.db`).
+    pub fn flushed_user_count(&self) -> u64 {
+        self.flushed_user_count.load(Ordering::Acquire)
+    }
+
+    pub fn flushed_mutation_epoch(&self) -> u64 {
+        self.flushed_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
     }
 
     pub fn has_pending_mutations(&self) -> bool {
@@ -1181,64 +1212,87 @@ impl ProjectIdentityGraph {
         }
         let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
 
-        let (batch, new_seq, flushed_len, batch_epoch, wrote_checkpoint) = if should_checkpoint {
-            // Acquire `state.read()` BEFORE `pending_mutations.lock()` (same lock order as writers,
-            // deadlock-free, and never blocks concurrent readers or fast_lookup hits).
-            let (cp_snap, flushed_len, batch_epoch) = {
-                let st = self.state.read();
-                let guard = self.pending_mutations.lock();
-                if guard.is_empty() {
-                    let ep = self.mutation_epoch.load(Ordering::Acquire);
-                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-                    return Ok(());
+        let (batch, new_seq, flushed_len, batch_epoch, wrote_checkpoint, flushed_users_hint) =
+            if should_checkpoint {
+                // Acquire `state.read()` BEFORE `pending_mutations.lock()` (same lock order as writers,
+                // deadlock-free, and never blocks concurrent readers or fast_lookup hits).
+                let (cp_snap, flushed_len, batch_epoch) = {
+                    let st = self.state.read();
+                    let guard = self.pending_mutations.lock();
+                    if guard.is_empty() {
+                        let ep = self.mutation_epoch.load(Ordering::Acquire);
+                        self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                    (
+                        st.snapshot_for_checkpoint(),
+                        guard.len(),
+                        self.mutation_epoch.load(Ordering::Acquire),
+                    )
+                };
+
+                let cp_total_users = cp_snap.total_users as u64;
+                let new_seq = base_seq + 1;
+                let cp_bytes = tokio::task::spawn_blocking(move || cp_snap.encode(new_seq))
+                    .await
+                    .map_err(|_| {
+                        IdentityError::CorruptedRecord("checkpoint serialization task panicked")
+                    })??;
+
+                let mut batch = WriteBatch::new();
+                batch.put(META_CHECKPOINT_KEY, &cp_bytes);
+                batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
+                for old_seq in prev_cp..base_seq {
+                    let old_key = format!("log/chunk_{old_seq:012}");
+                    batch.delete(old_key.as_bytes());
                 }
                 (
-                    st.snapshot_for_checkpoint(),
-                    guard.len(),
-                    self.mutation_epoch.load(Ordering::Acquire),
+                    batch,
+                    new_seq,
+                    flushed_len,
+                    batch_epoch,
+                    true,
+                    Some(cp_total_users),
+                )
+            } else {
+                let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
+                    let guard = self.pending_mutations.lock();
+                    if guard.is_empty() {
+                        let ep = self.mutation_epoch.load(Ordering::Acquire);
+                        self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                    (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
+                };
+                let flushed_len = staged.len();
+                let max_intern_users = staged
+                    .iter()
+                    .filter_map(|e| match e {
+                        MutationEntry::Intern { uid, .. } => Some(*uid as u64 + 1),
+                        _ => None,
+                    })
+                    .max();
+
+                const CHUNK_SIZE: usize = 32_768;
+                let mut new_seq = base_seq;
+                let mut batch = WriteBatch::new();
+
+                for slice in staged.chunks(CHUNK_SIZE) {
+                    let chunk_key = format!("log/chunk_{new_seq:012}");
+                    let chunk_bytes = encode_mutation_chunk(slice);
+                    batch.put(chunk_key.as_bytes(), &chunk_bytes);
+                    new_seq += 1;
+                }
+                batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
+                (
+                    batch,
+                    new_seq,
+                    flushed_len,
+                    batch_epoch,
+                    false,
+                    max_intern_users,
                 )
             };
-
-            let new_seq = base_seq + 1;
-            let cp_bytes = tokio::task::spawn_blocking(move || cp_snap.encode(new_seq))
-                .await
-                .map_err(|_| {
-                    IdentityError::CorruptedRecord("checkpoint serialization task panicked")
-                })??;
-
-            let mut batch = WriteBatch::new();
-            batch.put(META_CHECKPOINT_KEY, &cp_bytes);
-            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
-            for old_seq in prev_cp..base_seq {
-                let old_key = format!("log/chunk_{old_seq:012}");
-                batch.delete(old_key.as_bytes());
-            }
-            (batch, new_seq, flushed_len, batch_epoch, true)
-        } else {
-            let (staged, batch_epoch): (Vec<MutationEntry>, u64) = {
-                let guard = self.pending_mutations.lock();
-                if guard.is_empty() {
-                    let ep = self.mutation_epoch.load(Ordering::Acquire);
-                    self.flushed_epoch.fetch_max(ep, Ordering::AcqRel);
-                    return Ok(());
-                }
-                (guard.clone(), self.mutation_epoch.load(Ordering::Acquire))
-            };
-            let flushed_len = staged.len();
-
-            const CHUNK_SIZE: usize = 32_768;
-            let mut new_seq = base_seq;
-            let mut batch = WriteBatch::new();
-
-            for slice in staged.chunks(CHUNK_SIZE) {
-                let chunk_key = format!("log/chunk_{new_seq:012}");
-                let chunk_bytes = encode_mutation_chunk(slice);
-                batch.put(chunk_key.as_bytes(), &chunk_bytes);
-                new_seq += 1;
-            }
-            batch.put(META_CHUNK_COUNT_KEY, new_seq.to_le_bytes());
-            (batch, new_seq, flushed_len, batch_epoch, false)
-        };
 
         let write_opts = WriteOptions {
             await_durable: false,
@@ -1258,12 +1312,120 @@ impl ProjectIdentityGraph {
         if wrote_checkpoint {
             self.last_checkpoint_seq.store(new_seq, Ordering::Release);
             self.mutations_since_checkpoint.store(0, Ordering::Release);
+            if let Some(n) = flushed_users_hint {
+                self.flushed_user_count.fetch_max(n, Ordering::AcqRel);
+            }
         } else {
             self.mutations_since_checkpoint
                 .fetch_add(flushed_len as u64, Ordering::AcqRel);
+            if let Some(n) = flushed_users_hint {
+                self.flushed_user_count.fetch_max(n, Ordering::AcqRel);
+            }
         }
         self.pending_mutations.lock().drain(..flushed_len);
         self.flushed_epoch.fetch_max(batch_epoch, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Exports a self-contained logical snapshot (`PZST` + `bincode` `IdentityCheckpoint` with
+    /// `next_chunk_seq = 1`) after flushing pending mutations to local SlateDB.
+    pub async fn export_snapshot(&self) -> Result<IdentityExport> {
+        if !self.read_only {
+            self.flush().await?;
+        }
+        let (cp_snap, snap_epoch) = {
+            let st = self.state.read();
+            let ep = self.mutation_epoch.load(Ordering::Acquire);
+            (st.snapshot_for_checkpoint(), ep)
+        };
+        let user_count = cp_snap.total_users as u64;
+        let payload = tokio::task::spawn_blocking(move || cp_snap.encode(1))
+            .await
+            .map_err(|_| IdentityError::CorruptedRecord("identity export task panicked"))??;
+        Ok(IdentityExport {
+            payload,
+            user_count,
+            mutation_epoch: snap_epoch,
+        })
+    }
+
+    /// Restores a project's identity graph into `object_store` from a logical export created by
+    /// [`Self::export_snapshot`] and returns an open writable handle.
+    pub async fn restore_from_export(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        export_bytes: &[u8],
+    ) -> Result<Arc<Self>> {
+        let project_id = project_id.into();
+        let cp = decode_checkpoint(export_bytes)?;
+        let chunk_count = cp.next_chunk_seq.max(1);
+
+        let fast_lookup: DashMap<String, (u32, u8)> = DashMap::new();
+        let mut state = GraphState::new();
+        let start_seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
+        let initial_user_count = state.u32_to_external.len() as u64;
+        let initial_snap = state.compress_all_and_build_snapshot();
+
+        let db = open_slatedb_handle(&project_id, &object_store).await?;
+        let mut batch = WriteBatch::new();
+        batch.put(META_CHECKPOINT_KEY, export_bytes);
+        batch.put(META_CHUNK_COUNT_KEY, chunk_count.to_le_bytes());
+        let write_opts = WriteOptions {
+            await_durable: false,
+        };
+        db.write_with_options(batch, &write_opts).await?;
+        db.flush().await?;
+
+        Ok(Arc::new(Self {
+            project_id,
+            object_store,
+            read_only: false,
+            fast_lookup,
+            state: RwLock::new(state),
+            snapshot_cache: RwLock::new(Some(initial_snap)),
+            snapshot_dirty: AtomicBool::new(false),
+            next_chunk_seq: AtomicU64::new(chunk_count),
+            last_checkpoint_seq: AtomicU64::new(start_seq),
+            mutations_since_checkpoint: AtomicU64::new(0),
+            mutation_epoch: AtomicU64::new(0),
+            flushed_epoch: AtomicU64::new(0),
+            flushed_user_count: AtomicU64::new(initial_user_count),
+            pending_mutations: Mutex::new(Vec::new()),
+            db: tokio::sync::Mutex::new(Some(db)),
+        }))
+    }
+
+    /// Flushes and creates a SlateDB checkpoint for Candidate A snapshot benchmarking/sync.
+    pub async fn create_slatedb_checkpoint(&self) -> Result<slatedb::CheckpointCreateResult> {
+        if self.read_only {
+            return Err(IdentityError::SlateDb(SlateDBError::InvalidDBState));
+        }
+        self.flush().await?;
+        let mut db_guard = self.db.lock().await;
+        if db_guard.is_none() {
+            let reopened = open_slatedb_handle(&self.project_id, &self.object_store).await?;
+            *db_guard = Some(reopened);
+        }
+        let db = db_guard.as_ref().ok_or(IdentityError::Closed)?;
+        let res = db
+            .create_checkpoint(
+                slatedb::config::CheckpointScope::all_with_force_flush(true),
+                &slatedb::config::CheckpointOptions {
+                    lifetime: Some(Duration::from_secs(300)),
+                    source: None,
+                },
+            )
+            .await?;
+        Ok(res)
+    }
+
+    /// Deletes a SlateDB checkpoint created by [`Self::create_slatedb_checkpoint`].
+    pub async fn delete_slatedb_checkpoint(
+        &self,
+        checkpoint: &slatedb::CheckpointCreateResult,
+    ) -> Result<()> {
+        let db_path = ObjectPath::from(format!("identity/{}", self.project_id));
+        Db::delete_checkpoint(&db_path, self.object_store.clone(), checkpoint.id).await?;
         Ok(())
     }
 
@@ -1573,5 +1735,69 @@ mod tests {
         assert!(!IdentityError::IdentifiedMergeConflict.is_store_unavailable());
         assert!(!IdentityError::CorruptedRecord("bad").is_store_unavailable());
         assert!(!IdentityError::Closed.is_store_unavailable());
+    }
+
+    #[tokio::test]
+    async fn flushed_user_count_and_logical_export_restore_preserve_aliases_and_hwm() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let store1: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir1.path()).unwrap());
+        let g = ProjectIdentityGraph::open("proj_exp", store1)
+            .await
+            .unwrap();
+        assert_eq!(g.flushed_user_count(), 0);
+
+        let u0 = g.get_or_intern("anon_0", 0);
+        let u1 = g.get_or_intern("user_0", 1);
+        // Not flushed yet: flushed_user_count stays 0 while user_count is 2.
+        assert_eq!(g.user_count(), 2);
+        assert_eq!(g.flushed_user_count(), 0);
+
+        g.flush().await.unwrap();
+        assert_eq!(g.flushed_user_count(), 2);
+
+        let canon = g.alias_durable("anon_0", "user_0", 0, 1).await.unwrap();
+        assert_eq!(g.flushed_user_count(), 2);
+
+        // Intern one more user without flushing, then export (export flushes first).
+        let u2 = g.get_or_intern("user_1", 2);
+        assert_eq!(u2, 2);
+        let export = g.export_snapshot().await.unwrap();
+        assert_eq!(export.user_count, 3);
+        assert_eq!(g.flushed_user_count(), 3);
+        g.close().await.unwrap();
+
+        // Restore into a completely fresh empty directory.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir2.path()).unwrap());
+        let restored =
+            ProjectIdentityGraph::restore_from_export("proj_exp", store2.clone(), &export.payload)
+                .await
+                .unwrap();
+        assert_eq!(restored.user_count(), 3);
+        assert_eq!(restored.flushed_user_count(), 3);
+        let snap = restored.snapshot();
+        assert_eq!(snap.resolve(u0), canon);
+        assert_eq!(snap.resolve(u1), canon);
+        assert_eq!(snap.resolve(u2), u2);
+        assert_eq!(restored.external_id(u0).as_deref(), Some("anon_0"));
+        assert_eq!(restored.external_id(u1).as_deref(), Some("user_0"));
+        assert_eq!(restored.external_id(u2).as_deref(), Some("user_1"));
+        assert!(snap.is_cross_bucket(canon));
+
+        // New user gets uid >= high_water_mark (3), never colliding with restored UIDs.
+        let u3 = restored.get_or_intern("post_restore", 0);
+        assert_eq!(u3, 3);
+        restored.close().await.unwrap();
+
+        // Reopening with ProjectIdentityGraph::open recovers everything cleanly.
+        let reopened = ProjectIdentityGraph::open("proj_exp", store2)
+            .await
+            .unwrap();
+        assert_eq!(reopened.user_count(), 4);
+        assert_eq!(reopened.lookup_canonical("anon_0"), Some(canon));
+        assert_eq!(reopened.lookup_raw("post_restore"), Some(3));
+        reopened.close().await.unwrap();
     }
 }

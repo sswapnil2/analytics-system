@@ -22,10 +22,14 @@ use crate::dictionary::ProjectDictionary;
 use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
 use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
-use crate::manifest::{Manifest, ManifestStore, ReaderPinTracker, StorageSnapshot};
+use crate::manifest::{
+    IdentitySnapshotRef, Manifest, ManifestStore, ProfileSnapshotRef, PublishedManifest,
+    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot,
+};
 use crate::mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
+use crate::profile_store::ProfileRouter;
 use crate::replay_store::{ReplayAppendResult, ReplayStore};
 use crate::segment::{write_vortex_segment, SegmentMeta, VortexSegmentReader};
 use crate::wal::BucketWal;
@@ -125,17 +129,30 @@ struct WriterFence {
     fenced: AtomicBool,
 }
 
+#[derive(Default)]
+struct LastSnapshotState {
+    last_snapshot_ref: Option<SnapshotRef>,
+    exported_id_epoch: Option<u64>,
+    exported_prof_dirty_seq: Option<u64>,
+}
+
 /// Per-project storage state managing WALs, L0 `MemBucket`s, MVCC `Manifest`, and Compaction.
 pub struct ProjectStorage {
     project_id: String,
     config: StorageConfig,
     object_store: Arc<dyn ObjectStore>,
     id_graph: Arc<ProjectIdentityGraph>,
+    profile_router: Arc<ProfileRouter>,
     /// `None` when no lease is configured (embedded use, tests) or the project is read-only here.
     writer: Option<WriterFence>,
     manifest_store: ManifestStore,
+    published_store: PublishedManifestStore,
     manifest: RwLock<Arc<Manifest>>,
     manifest_commit_lock: AsyncMutex<()>,
+    publish_lock: AsyncMutex<()>,
+    publish_enabled: AtomicBool,
+    last_published_seq: Mutex<Option<u64>>,
+    last_snapshot_state: Mutex<LastSnapshotState>,
     dictionary: Arc<ProjectDictionary>,
     wals: Vec<BucketWal>,
     mem_buckets: Vec<MemBucket>,
@@ -195,11 +212,16 @@ impl ProjectStorage {
         object_store: Arc<dyn ObjectStore>,
         identity_router: &IdentityRouter,
     ) -> Result<Arc<Self>> {
+        let profile_router = Arc::new(ProfileRouter::new(
+            object_store.clone(),
+            identity_router.is_read_only(),
+        ));
         Self::open_inner(
             project_id.into(),
             config,
             object_store,
             identity_router,
+            profile_router,
             None,
             NodeLoad::from_env(),
         )
@@ -211,11 +233,25 @@ impl ProjectStorage {
         config: StorageConfig,
         object_store: Arc<dyn ObjectStore>,
         identity_router: &IdentityRouter,
+        profile_router: Arc<ProfileRouter>,
         lease: Option<(u64, Instant)>,
         node_load: Arc<NodeLoad>,
     ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
+        let published_store = PublishedManifestStore::new(&project_id, object_store.clone());
+        let latest_published = published_store.load_latest().await?;
         let mut manifest = manifest_store.load_latest().await?;
+
+        if !identity_router.is_read_only() {
+            if let Some(ref pub_m) = latest_published {
+                if let Some((generation, _)) = lease {
+                    if pub_m.writer_generation > generation {
+                        return Err(StorageError::NotWriter { project_id });
+                    }
+                }
+            }
+        }
+
         if let Some((generation, _)) = lease {
             // Publish our generation BEFORE replaying the WAL: from this commit on, the previous
             // holder's manifest commits (and so its WAL purges) abort, so nothing we are about
@@ -233,6 +269,14 @@ impl ProjectStorage {
                 };
             }
         }
+
+        let initial_last_published_seq = latest_published
+            .as_ref()
+            .map(|p| p.publish_seq)
+            .max(manifest.last_published_seq);
+        manifest.last_published_seq = initial_last_published_seq;
+        let last_snapshot_ref = latest_published.map(|p| p.snapshot_ref);
+
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
         ));
@@ -284,14 +328,24 @@ impl ProjectStorage {
             config: config.clone(),
             object_store: object_store.clone(),
             id_graph,
+            profile_router,
             writer: lease.map(|(generation, valid_until)| WriterFence {
                 generation,
                 valid_until: Mutex::new(valid_until),
                 fenced: AtomicBool::new(false),
             }),
             manifest_store,
+            published_store,
             manifest: RwLock::new(Arc::new(manifest)),
             manifest_commit_lock: AsyncMutex::new(()),
+            publish_lock: AsyncMutex::new(()),
+            publish_enabled: AtomicBool::new(true),
+            last_published_seq: Mutex::new(initial_last_published_seq),
+            last_snapshot_state: Mutex::new(LastSnapshotState {
+                last_snapshot_ref,
+                exported_id_epoch: None,
+                exported_prof_dirty_seq: None,
+            }),
             dictionary,
             wals,
             mem_buckets,
@@ -778,37 +832,275 @@ impl ProjectStorage {
         }
 
         // Atomically commit new MVCC Manifest epoch (with CAS reload-and-merge retries) BEFORE evicting from L0 MemBucket!
-        if let Some(committed) = self
-            .commit_manifest_cas(|next_manifest| {
-                for meta in &written_segments {
-                    next_manifest
-                        .active_segments
-                        .entry((meta.date, bucket_id))
-                        .or_default()
-                        .push(meta.clone());
-                }
-                next_manifest
-                    .committed_l0_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_l0))
-                    .or_insert(max_l0);
-                next_manifest
-                    .committed_wal_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_wal))
-                    .or_insert(max_wal);
-                next_manifest.dict_snapshot = self.dictionary.snapshot();
-                true
-            })
-            .await?
         {
-            self.wals[b_idx].advance_epoch(committed.epoch);
+            let _publish_guard = self.publish_lock.lock().await;
+            if let Some(committed) = self
+                .commit_manifest_cas(|next_manifest| {
+                    for meta in &written_segments {
+                        next_manifest
+                            .active_segments
+                            .entry((meta.date, bucket_id))
+                            .or_default()
+                            .push(meta.clone());
+                    }
+                    next_manifest
+                        .committed_l0_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_l0))
+                        .or_insert(max_l0);
+                    next_manifest
+                        .committed_wal_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_wal))
+                        .or_insert(max_wal);
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                })
+                .await?
+            {
+                self.wals[b_idx].advance_epoch(committed.epoch);
+                if !self.id_graph.is_read_only() && self.publish_enabled.load(Ordering::Acquire) {
+                    self.publish_committed_state(&committed).await?;
+                }
+            }
         }
 
         self.mem_buckets[b_idx].complete_flush(max_l0);
         let _ = self.wals[b_idx].purge_up_to(max_wal).await;
 
         Ok(written_segments)
+    }
+
+    #[doc(hidden)]
+    pub fn set_publish_enabled(&self, enabled: bool) {
+        self.publish_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn last_published_seq(&self) -> Option<u64> {
+        *self.last_published_seq.lock()
+    }
+
+    pub async fn latest_published_manifest(&self) -> Result<Option<PublishedManifest>> {
+        self.published_store.load_latest().await
+    }
+
+    /// Publishes snapshots in strict `T_id >= T_prof >= T_freeze` order and writes a create-only
+    /// [`PublishedManifest`] with dense `publish_seq`. Caller MUST hold `self.publish_lock`.
+    async fn publish_committed_state(&self, committed: &Manifest) -> Result<PublishedManifest> {
+        self.check_writer()?;
+        let publish_seq = self
+            .last_published_seq
+            .lock()
+            .map_or(0, |seq| seq.saturating_add(1));
+
+        // 1. T_prof >= T_freeze: snapshot profiles if open or already present in object_store.
+        let prof_store = if let Some(ps) = self.profile_router.get_if_open(&self.project_id) {
+            Some(ps)
+        } else {
+            let prof_prefix = ObjectPath::from(format!("profiles/{}", self.project_id));
+            let mut list = self.object_store.list(Some(&prof_prefix));
+            if futures::StreamExt::next(&mut list)
+                .await
+                .transpose()?
+                .is_some()
+            {
+                Some(self.profile_router.get_or_open(&self.project_id).await?)
+            } else {
+                None
+            }
+        };
+
+        let (prev_snapshot_ref, prev_id_epoch, prev_prof_dirty) = {
+            let st = self.last_snapshot_state.lock();
+            (
+                st.last_snapshot_ref.clone(),
+                st.exported_id_epoch,
+                st.exported_prof_dirty_seq,
+            )
+        };
+
+        let (prof_ref, new_prof_dirty, prof_uploaded_path) = match prof_store {
+            Some(ps) => {
+                let cur_dirty = ps.dirty_seq();
+                let reuse = if prev_prof_dirty == Some(cur_dirty) {
+                    prev_snapshot_ref.as_ref().and_then(|s| s.profiles.clone())
+                } else {
+                    None
+                };
+                if let Some(prev_prof) = reuse {
+                    (Some(prev_prof), Some(cur_dirty), None)
+                } else {
+                    let bytes = ps.export_snapshot_bytes().await?;
+                    let path_str = format!(
+                        "published/{}/snapshots/profiles_{:012}_{}.pzst",
+                        self.project_id,
+                        publish_seq,
+                        Uuid::new_v4().simple()
+                    );
+                    self.object_store
+                        .put_opts(
+                            &ObjectPath::from(path_str.as_str()),
+                            PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+                            PutOptions {
+                                mode: PutMode::Create,
+                                ..PutOptions::default()
+                            },
+                        )
+                        .await?;
+                    (
+                        Some(ProfileSnapshotRef {
+                            object_path: path_str.clone(),
+                            dirty_seq: cur_dirty,
+                        }),
+                        Some(cur_dirty),
+                        Some(path_str),
+                    )
+                }
+            }
+            None => (None, None, None),
+        };
+
+        // 2. T_id >= T_prof >= T_freeze: flush & snapshot identity, asserting HWM.
+        self.id_graph.flush().await?;
+        let flushed_hwm = self.id_graph.flushed_user_count();
+        let cur_id_epoch = self.id_graph.mutation_epoch();
+        let cur_flushed_epoch = self.id_graph.flushed_mutation_epoch();
+
+        let reuse_id = if prev_id_epoch == Some(cur_id_epoch) && cur_flushed_epoch == cur_id_epoch {
+            prev_snapshot_ref.as_ref().map(|s| s.identity.clone())
+        } else {
+            None
+        };
+
+        let (id_ref, new_id_epoch, id_uploaded_path) = if let Some(prev_id) = reuse_id {
+            if prev_id.user_count < flushed_hwm {
+                return Err(StorageError::HighWaterMarkViolation {
+                    project_id: self.project_id.clone(),
+                    identity_user_count: prev_id.user_count,
+                    high_water_mark: flushed_hwm,
+                });
+            }
+            (prev_id, cur_id_epoch, None)
+        } else {
+            let exp = self.id_graph.export_snapshot().await?;
+            if exp.user_count < flushed_hwm {
+                return Err(StorageError::HighWaterMarkViolation {
+                    project_id: self.project_id.clone(),
+                    identity_user_count: exp.user_count,
+                    high_water_mark: flushed_hwm,
+                });
+            }
+            let path_str = format!(
+                "published/{}/snapshots/identity_{:012}_{}.pzst",
+                self.project_id,
+                publish_seq,
+                Uuid::new_v4().simple()
+            );
+            self.object_store
+                .put_opts(
+                    &ObjectPath::from(path_str.as_str()),
+                    PutPayload::from_bytes(bytes::Bytes::from(exp.payload)),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..PutOptions::default()
+                    },
+                )
+                .await?;
+            (
+                IdentitySnapshotRef {
+                    object_path: path_str.clone(),
+                    user_count: exp.user_count,
+                    mutation_epoch: exp.mutation_epoch,
+                },
+                exp.mutation_epoch,
+                Some(path_str),
+            )
+        };
+
+        let high_water_mark = id_ref.user_count;
+        let snapshot_ref = SnapshotRef {
+            identity: id_ref,
+            profiles: prof_ref,
+        };
+        let pub_manifest = PublishedManifest {
+            publish_seq,
+            writer_generation: committed.writer_generation,
+            source_local_epoch: committed.epoch,
+            high_water_mark,
+            published_at_ms: Utc::now().timestamp_millis(),
+            partitions: committed.to_sorted_partitions(),
+            dict_snapshot: committed.dict_snapshot.clone(),
+            committed_wal_seq: committed.committed_wal_seq.clone(),
+            committed_l0_seq: committed.committed_l0_seq.clone(),
+            snapshot_ref: snapshot_ref.clone(),
+        };
+
+        let published = match self.published_store.publish_next(pub_manifest).await {
+            Ok(p) => p,
+            Err(StorageError::ManifestConflict) => {
+                if let Some(p) = &id_uploaded_path {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(p.as_str()))
+                        .await;
+                }
+                if let Some(p) = &prof_uploaded_path {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(p.as_str()))
+                        .await;
+                }
+                if self.writer.is_some() {
+                    self.fence();
+                    return Err(self.not_writer());
+                }
+                return Err(StorageError::ManifestConflict);
+            }
+            Err(e) => return Err(e),
+        };
+
+        *self.last_published_seq.lock() = Some(publish_seq);
+        {
+            let mut mf_guard = self.manifest.write();
+            let mut updated = (**mf_guard).clone();
+            updated.last_published_seq = Some(publish_seq);
+            *mf_guard = Arc::new(updated);
+        }
+        {
+            let mut st = self.last_snapshot_state.lock();
+            st.last_snapshot_ref = Some(snapshot_ref);
+            st.exported_id_epoch = Some(new_id_epoch);
+            st.exported_prof_dirty_seq = new_prof_dirty;
+        }
+
+        // Delete superseded snapshot blobs ONLY after PublishedManifest is durable in S3.
+        if let Some(prev) = prev_snapshot_ref {
+            if id_uploaded_path.is_some()
+                && prev.identity.object_path != published.snapshot_ref.identity.object_path
+            {
+                let _ = self
+                    .object_store
+                    .delete(&ObjectPath::from(prev.identity.object_path.as_str()))
+                    .await;
+            }
+            if prof_uploaded_path.is_some() {
+                if let Some(prev_prof) = prev.profiles {
+                    if published
+                        .snapshot_ref
+                        .profiles
+                        .as_ref()
+                        .is_none_or(|cur| cur.object_path != prev_prof.object_path)
+                    {
+                        let _ = self
+                            .object_store
+                            .delete(&ObjectPath::from(prev_prof.object_path.as_str()))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        Ok(published)
     }
 
     async fn commit_manifest_cas<F>(&self, mut apply: F) -> Result<Option<Arc<Manifest>>>
@@ -843,7 +1135,9 @@ impl ProjectStorage {
                     return Ok(Some(arc));
                 }
                 Err(StorageError::ManifestConflict) if attempt < 7 => {
-                    let latest = self.manifest_store.load_latest().await?;
+                    let mut latest = self.manifest_store.load_latest().await?;
+                    let mem_pub_seq = *self.last_published_seq.lock();
+                    latest.last_published_seq = latest.last_published_seq.max(mem_pub_seq);
                     self.dictionary.merge_snapshot(&latest.dict_snapshot);
                     *self.manifest.write() = Arc::new(latest);
                 }
@@ -936,34 +1230,40 @@ impl ProjectStorage {
             }
         }
 
-        if let Some(committed) = self
-            .commit_manifest_cas(|next_manifest| {
-                for meta in &written_segments {
-                    next_manifest
-                        .active_segments
-                        .entry((meta.date, meta.bucket_id))
-                        .or_default()
-                        .push(meta.clone());
-                }
-                for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
-                    next_manifest
-                        .committed_l0_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_l0))
-                        .or_insert(max_l0);
-                    next_manifest
-                        .committed_wal_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_wal))
-                        .or_insert(max_wal);
-                }
-                next_manifest.dict_snapshot = self.dictionary.snapshot();
-                true
-            })
-            .await?
         {
-            for &(_, b_idx, _, _) in &bucket_watermarks {
-                self.wals[b_idx].advance_epoch(committed.epoch);
+            let _publish_guard = self.publish_lock.lock().await;
+            if let Some(committed) = self
+                .commit_manifest_cas(|next_manifest| {
+                    for meta in &written_segments {
+                        next_manifest
+                            .active_segments
+                            .entry((meta.date, meta.bucket_id))
+                            .or_default()
+                            .push(meta.clone());
+                    }
+                    for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
+                        next_manifest
+                            .committed_l0_seq
+                            .entry(bucket_id)
+                            .and_modify(|v| *v = (*v).max(max_l0))
+                            .or_insert(max_l0);
+                        next_manifest
+                            .committed_wal_seq
+                            .entry(bucket_id)
+                            .and_modify(|v| *v = (*v).max(max_wal))
+                            .or_insert(max_wal);
+                    }
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                })
+                .await?
+            {
+                for &(_, b_idx, _, _) in &bucket_watermarks {
+                    self.wals[b_idx].advance_epoch(committed.epoch);
+                }
+                if !self.id_graph.is_read_only() && self.publish_enabled.load(Ordering::Acquire) {
+                    self.publish_committed_state(&committed).await?;
+                }
             }
         }
 
@@ -1122,40 +1422,48 @@ impl ProjectStorage {
 
             if !prepared.is_empty() {
                 let mut accepted_flags = vec![false; prepared.len()];
-                let committed_ok = self
-                    .commit_manifest_cas(|next_manifest| {
-                        let mut any_accepted = false;
-                        for (idx, item) in prepared.iter().enumerate() {
-                            let entry = next_manifest
-                                .active_segments
-                                .entry((item.date, item.bucket_id))
-                                .or_default();
-                            // Verify ALL `source_ids` for this partition are still active before replacing them.
-                            let active_ids: HashSet<&str> =
-                                entry.iter().map(|s| s.segment_id.as_str()).collect();
-                            if item
-                                .source_ids
-                                .iter()
-                                .all(|sid| active_ids.contains(sid.as_str()))
-                            {
-                                entry.retain(|s| !item.source_ids.contains(&s.segment_id));
-                                entry.push(item.new_meta.clone());
-                                accepted_flags[idx] = true;
-                                any_accepted = true;
-                            } else {
-                                accepted_flags[idx] = false;
+                let committed = {
+                    let _publish_guard = self.publish_lock.lock().await;
+                    let committed_opt = self
+                        .commit_manifest_cas(|next_manifest| {
+                            let mut any_accepted = false;
+                            for (idx, item) in prepared.iter().enumerate() {
+                                let entry = next_manifest
+                                    .active_segments
+                                    .entry((item.date, item.bucket_id))
+                                    .or_default();
+                                // Verify ALL `source_ids` for this partition are still active before replacing them.
+                                let active_ids: HashSet<&str> =
+                                    entry.iter().map(|s| s.segment_id.as_str()).collect();
+                                if item
+                                    .source_ids
+                                    .iter()
+                                    .all(|sid| active_ids.contains(sid.as_str()))
+                                {
+                                    entry.retain(|s| !item.source_ids.contains(&s.segment_id));
+                                    entry.push(item.new_meta.clone());
+                                    accepted_flags[idx] = true;
+                                    any_accepted = true;
+                                } else {
+                                    accepted_flags[idx] = false;
+                                }
                             }
+                            if !any_accepted {
+                                return false;
+                            }
+                            next_manifest.dict_snapshot = self.dictionary.snapshot();
+                            true
+                        })
+                        .await?;
+                    if let Some(ref c) = committed_opt {
+                        if !self.id_graph.is_read_only() {
+                            self.publish_committed_state(c).await?;
                         }
-                        if !any_accepted {
-                            return false;
-                        }
-                        next_manifest.dict_snapshot = self.dictionary.snapshot();
-                        true
-                    })
-                    .await?
-                    .is_some();
+                    }
+                    committed_opt
+                };
 
-                if committed_ok {
+                if committed.is_some() {
                     let mut gc_batch = Vec::new();
                     for (item, accepted) in prepared.into_iter().zip(accepted_flags) {
                         if accepted {
@@ -1189,6 +1497,20 @@ impl ProjectStorage {
 
     /// Deletes superseded segment files whose active reader pin count is 0, re-checked under `manifest.read()`.
     pub async fn run_gc(&self) -> Result<usize> {
+        let published_protected: HashSet<String> = if self.id_graph.is_read_only() {
+            match self.published_store.load_latest().await {
+                Ok(Some(pub_m)) => pub_m
+                    .partitions
+                    .into_iter()
+                    .flat_map(|p| p.segments.into_iter().map(|s| s.object_path))
+                    .collect(),
+                Ok(None) => HashSet::new(),
+                Err(_) => return Ok(0),
+            }
+        } else {
+            HashSet::new()
+        };
+
         let candidates = {
             let mf_guard = self.manifest.read();
             let mut guard = self.pending_gc.lock();
@@ -1203,7 +1525,10 @@ impl ProjectStorage {
             let mut ready = Vec::new();
             let mut still_pinned = Vec::new();
             for path in guard.drain(..) {
-                if active_paths.contains(path.as_str()) || self.pin_tracker.is_pinned(&path) {
+                if active_paths.contains(path.as_str())
+                    || self.pin_tracker.is_pinned(&path)
+                    || published_protected.contains(&path)
+                {
                     still_pinned.push(path);
                 } else {
                     ready.push(path);
@@ -1474,6 +1799,7 @@ impl StorageEngine {
             self.config.clone(),
             self.object_store.clone(),
             &self.identity_router,
+            self.profile_router.clone(),
             lease,
             self.node_load.clone(),
         )
@@ -2061,5 +2387,146 @@ mod manifest_retention_tests {
             .active_segments
             .values()
             .all(|segs| segs.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn publish_sequence_compaction_before_gc_and_step6_recovery() {
+        use crate::snapshot::restore_project_from_published;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 2,
+                l0_flush_row_threshold: 100,
+                l0_flush_max_age: Duration::ZERO,
+                compaction_min_segments: 2,
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store.clone())),
+        );
+        let ps = engine.get_or_open_project("p_pub").await.unwrap();
+        let id_graph = engine.identity_graph("p_pub", true).await.unwrap();
+        let pstore = engine.profile_store("p_pub", true).await.unwrap();
+
+        let make_ev = |did: &str, i: i64| {
+            let ts = 1_790_000_000_000 + i * 1_000;
+            WireEvent {
+                event_uuid: WireEvent::deterministic_uuid(did, "s", "click", ts, i as u64),
+                routing_seed: did.into(),
+                distinct_id: did.into(),
+                session_id: "s".into(),
+                event_name: "click".into(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: 0,
+                props: vec![],
+                replay_offset_kb: 0,
+            }
+        };
+
+        // Flush 1: 2 users, 1 profile -> pub_0
+        let u0 = id_graph.get_or_intern("u0", 0);
+        let u1 = id_graph.get_or_intern("u1", 0);
+        pstore
+            .upsert(&crate::StoredUserProfile {
+                project_id: "p_pub".into(),
+                distinct_id: "u0".into(),
+                canonical_uid: u0,
+                props: BTreeMap::from([("plan".into(), serde_json::json!("pro"))]),
+                total_revenue: 10.0,
+                updated_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+        ps.append_bucket_events(0, vec![(make_ev("u0", 1), u0), (make_ev("u1", 2), u1)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+        assert_eq!(ps.last_published_seq(), Some(0));
+
+        let pub0 = ps.latest_published_manifest().await.unwrap().unwrap();
+        assert_eq!(pub0.publish_seq, 0);
+        assert_eq!(pub0.high_water_mark, 2);
+        assert!(pub0.snapshot_ref.profiles.is_some());
+
+        // Flush 2: 1 more user -> pub_1
+        let u2 = id_graph.get_or_intern("u2", 0);
+        ps.append_bucket_events(0, vec![(make_ev("u2", 3), u2)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+        assert_eq!(ps.last_published_seq(), Some(1));
+
+        // Compaction merges the 2 segments in bucket 0 -> publishes pub_2 BEFORE run_gc() deletes old segments.
+        let compacted = ps
+            .compact_min_segments(engine.segment_reader(), 2)
+            .await
+            .unwrap();
+        assert_eq!(compacted, 1);
+        assert_eq!(ps.last_published_seq(), Some(2));
+        let pub2 = ps.latest_published_manifest().await.unwrap().unwrap();
+        assert_eq!(pub2.publish_seq, 2);
+        assert_eq!(pub2.high_water_mark, 3);
+        assert_eq!(pub2.partitions.len(), 1);
+        assert_eq!(pub2.partitions[0].segments.len(), 1);
+        let compacted_seg_path = pub2.partitions[0].segments[0].object_path.clone();
+        assert!(store
+            .head(&ObjectPath::from(compacted_seg_path.as_str()))
+            .await
+            .is_ok());
+
+        // Simulate step-6 crash: pub_3 exists in S3 while local manifest has last_published_seq = Some(2).
+        let mut crashed_pub3 = pub2.clone();
+        crashed_pub3.publish_seq = 3;
+        PublishedManifestStore::new("p_pub", store.clone())
+            .publish_next(crashed_pub3)
+            .await
+            .unwrap();
+        drop(ps);
+        drop(engine);
+
+        // Reopen: open_inner reconciles last_published_seq to Some(3), so next flush writes pub_4.
+        let engine2 = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 2,
+                l0_flush_row_threshold: 100,
+                l0_flush_max_age: Duration::ZERO,
+                compaction_min_segments: 2,
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store.clone())),
+        );
+        let ps2 = engine2.get_or_open_project("p_pub").await.unwrap();
+        assert_eq!(ps2.last_published_seq(), Some(3));
+        let id2 = engine2.identity_graph("p_pub", true).await.unwrap();
+        let u3 = id2.get_or_intern("u3", 0);
+        ps2.append_bucket_events(0, vec![(make_ev("u3", 4), u3)])
+            .await
+            .unwrap();
+        ps2.flush_bucket(0).await.unwrap();
+        assert_eq!(ps2.last_published_seq(), Some(4));
+
+        // Verify HWM violation error on restore if published HWM > identity_user_count.
+        let latest_pub = ps2.latest_published_manifest().await.unwrap().unwrap();
+        let mut bad_pub = latest_pub.clone();
+        bad_pub.high_water_mark = 999;
+        let restore_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Copy published/ into restore_store.
+        {
+            use futures::TryStreamExt;
+            let metas: Vec<_> = store
+                .list(Some(&ObjectPath::from("published/p_pub")))
+                .try_collect()
+                .await
+                .unwrap();
+            for m in metas {
+                let b = store.get(&m.location).await.unwrap().bytes().await.unwrap();
+                restore_store.put(&m.location, b.into()).await.unwrap();
+            }
+        }
+        let err = restore_project_from_published("p_pub", &bad_pub, restore_store)
+            .await
+            .err()
+            .expect("must fail on HighWaterMarkViolation");
+        assert!(matches!(err, StorageError::HighWaterMarkViolation { .. }));
     }
 }

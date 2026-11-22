@@ -936,6 +936,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
         epoch: 0,
         fenced_wal_epoch: 0,
         writer_generation: 0,
+        last_published_seq: None,
         active_segments: std::collections::HashMap::new(),
         committed_wal_seq: std::collections::BTreeMap::new(),
         committed_l0_seq: std::collections::BTreeMap::new(),

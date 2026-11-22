@@ -309,3 +309,45 @@ fn local_mode_refuses_to_start_over_leftover_object_store_identity_or_profiles()
         }
     });
 }
+
+#[test]
+fn local_mode_refuses_to_start_when_entire_data_dir_is_wiped_and_published_exists() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemory::new());
+        let node = start("local", tmp.path(), &store).await.unwrap();
+        ingest(&node, 10, 0).await;
+        node.shutdown().await;
+
+        // Wipe the entire `<data_dir>` (including `hot_store_mode` marker and `hot/`).
+        let node_dir = tmp.path().join("node");
+        std::fs::remove_dir_all(&node_dir).unwrap();
+        assert!(!node_dir.exists());
+
+        let err = start("local", tmp.path(), &store)
+            .await
+            .err()
+            .expect("wiped <data_dir> with S3 published/ must refuse startup");
+        assert!(
+            err.to_string().contains("restore --from-published"),
+            "{err}"
+        );
+        assert!(
+            !node_dir.join("hot_store_mode").exists(),
+            "refusal must not write hot_store_mode marker"
+        );
+        assert!(
+            !node_dir.join("hot").exists(),
+            "refusal must not initialize hot/ directories"
+        );
+
+        // Fresh directory without any `published/` starts cleanly.
+        let clean_tmp = tempfile::tempdir().unwrap();
+        let clean_store = Arc::new(InMemory::new());
+        let clean_node = start("local", clean_tmp.path(), &clean_store)
+            .await
+            .expect("clean fresh init without published/ must succeed");
+        clean_node.shutdown().await;
+    });
+}
