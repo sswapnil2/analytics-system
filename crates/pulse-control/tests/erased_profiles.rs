@@ -794,3 +794,228 @@ async fn export_cohort_preserves_post_erasure_event_only_resignup_and_filters_st
         assert_eq!(uids, vec![never_uid as u64], "{cid}: {j}");
     }
 }
+
+#[tokio::test]
+async fn preview_cohort_and_mcp_list_cohorts_sync_and_expand_erased_uids_before_catalog_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let t_ev = now_ms - 30_000;
+    let t_erase = now_ms - 10_000;
+
+    // Create merged user `anon_a` -> `user_a` and surviving user `user_b`.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Checkout", "distinct_id": "anon_a", "timestamp": t_ev },
+                { "event": "Checkout", "distinct_id": "user_b", "timestamp": t_ev }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({ "anon_id": "anon_a", "user_id": "user_a" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let id_graph = qengine
+        .storage()
+        .identity_graph("proj_erased", false)
+        .await
+        .unwrap();
+    let raw_anon_a = id_graph.lookup_raw("anon_a").unwrap();
+    let canon_a = id_graph.lookup_canonical("user_a").unwrap();
+    let canon_b = id_graph.lookup_canonical("user_b").unwrap();
+
+    // Save both an event-based cohort and a static `Users` cohort.
+    let ev_def = json!({ "kind": "performed_event", "event_name": "Checkout", "min_count": 1 });
+    let users_def = json!({ "kind": "users", "canonical_uids": [canon_a, canon_b] });
+
+    let (s, c_ev) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({ "name": "Buyers", "definition": ev_def })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let ev_cid = serde_json::from_slice::<Value>(&c_ev).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (s, c_users) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({ "name": "Static Buyers", "definition": users_def })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let users_cid = serde_json::from_slice::<Value>(&c_users).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Refresh catalog once BEFORE erasure (simulates node state prior to a cross-node erasure).
+    ctrl.refresh_project_virtual_catalog("proj_erased")
+        .await
+        .unwrap();
+
+    // Pre-erasure baseline: all endpoints agree on count = 2.
+    for def in [&ev_def, &users_def] {
+        let (s, prev) = send_admin(
+            &admin_app,
+            "POST",
+            "/v1/projects/proj_erased/cohorts/preview",
+            Some(json!({ "definition": def })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let prev_json: Value = serde_json::from_slice(&prev).unwrap();
+        assert_eq!(prev_json["user_count"].as_u64(), Some(2), "{prev_json}");
+    }
+
+    // Insert ONLY the raw alias UID directly into MetaStore (cross-node erasure, no
+    // `erase_user_dpdp` and NO `refresh_project_virtual_catalog` on this node).
+    meta.insert_erased_uids("proj_erased", &[raw_anon_a], t_erase)
+        .await
+        .unwrap();
+
+    // 1. POST /cohorts/preview must sync & expand `erased_uids` and report 1 (not 2).
+    for def in [&ev_def, &users_def] {
+        let (s, prev) = send_admin(
+            &admin_app,
+            "POST",
+            "/v1/projects/proj_erased/cohorts/preview",
+            Some(json!({ "definition": def })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let prev_json: Value = serde_json::from_slice(&prev).unwrap();
+        assert_eq!(
+            prev_json["user_count"].as_u64(),
+            Some(1),
+            "preview_cohort leaked erased user: {prev_json}"
+        );
+    }
+
+    // 2. handle_mcp_request "list_cohorts" must agree on count = 1.
+    let mcp_resp = handle_mcp_request(
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(10),
+            method: "tools/call".into(),
+            params: json!({ "name": "list_cohorts", "arguments": {} }),
+        },
+        "proj_erased",
+        &meta,
+        &qengine,
+    )
+    .await;
+    let cohorts = mcp_resp.result.unwrap()["structuredContent"]["cohorts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(cohorts.len(), 2, "{cohorts:?}");
+    for c in &cohorts {
+        assert_eq!(
+            c["users"].as_u64(),
+            Some(1),
+            "mcp list_cohorts leaked erased user: {c}"
+        );
+    }
+
+    // 3. GET /cohorts/:cid/export must agree on count = 1 (only canon_b).
+    for cid in [&ev_cid, &users_cid] {
+        let (s, body) = send_admin(
+            &admin_app,
+            "GET",
+            &format!("/v1/projects/proj_erased/cohorts/{cid}/export?format=json"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let exp_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exp_json["count"].as_u64(), Some(1), "{cid}: {exp_json}");
+        assert_eq!(
+            exp_json["users"][0]["canonical_uid"].as_u64(),
+            Some(canon_b as u64),
+            "{cid}: {exp_json}"
+        );
+    }
+
+    // 4. Sibling query handler (POST /query/insights) must also reflect cross-node erasure.
+    let (s, qbytes) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/query/insights",
+        Some(json!({
+            "time_range": { "start_ts_ms": now_ms - 120_000, "end_ts_ms": now_ms + 60_000 },
+            "interval": "day",
+            "series": [{ "label": "Checkouts", "event_name": "Checkout", "metric": "uniques" }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let qjson: Value = serde_json::from_slice(&qbytes).unwrap();
+    assert!(
+        (qjson["series"][0]["overall_value"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-6,
+        "insights query leaked erased user: {qjson}"
+    );
+
+    // 5. Standalone handle_mcp_request "list_cohorts" on a fresh StorageEngine/QueryEngine BEFORE
+    // any catalog refresh must load & expand `erased_uids` and populate cohort defs, returning 1.
+    qengine.storage().flush_all_projects().await.unwrap();
+    let fresh_storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 10_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        qengine.storage().object_store().clone(),
+        qengine.storage().identity_router().clone(),
+    );
+    let fresh_qengine = QueryEngine::new(
+        fresh_storage,
+        16 * 1024 * 1024,
+        None,
+        0,
+        CatalogRegistry::new(),
+    )
+    .await
+    .unwrap();
+
+    let standalone_mcp = handle_mcp_request(
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(11),
+            method: "tools/call".into(),
+            params: json!({ "name": "list_cohorts", "arguments": {} }),
+        },
+        "proj_erased",
+        &meta,
+        &fresh_qengine,
+    )
+    .await;
+    let standalone_cohorts = standalone_mcp.result.unwrap()["structuredContent"]["cohorts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(standalone_cohorts.len(), 2, "{standalone_cohorts:?}");
+    for c in &standalone_cohorts {
+        assert_eq!(
+            c["users"].as_u64(),
+            Some(1),
+            "standalone mcp list_cohorts before refresh failed: {c}"
+        );
+    }
+}

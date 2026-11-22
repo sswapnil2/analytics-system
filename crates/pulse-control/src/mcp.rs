@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::Utc;
 use pulse_agent::{
@@ -504,6 +505,41 @@ fn pick<T: Copy>(args: &Value, key: &str, default: T, options: &[(&str, T)]) -> 
     }
 }
 
+/// Loads `erased_uids` from `MetaStore`, opens the project's read-only identity graph when
+/// non-empty, expands merged raw->canonical mappings, and syncs `StorageEngine::set_erased`.
+async fn sync_erased_for_project(
+    project_id: &str,
+    meta: &MetaStore,
+    qengine: &QueryEngine,
+) -> Result<
+    (
+        pulse_storage::ErasedUids,
+        Option<Arc<pulse_identity::ProjectIdentityGraph>>,
+    ),
+    String,
+> {
+    let erased: pulse_storage::ErasedUids = meta
+        .list_erased_uids(project_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    let id_graph = if erased.is_empty() {
+        None
+    } else {
+        Some(
+            qengine
+                .storage()
+                .identity_graph(project_id, false)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+    qengine.storage().set_erased(project_id, expanded.clone());
+    Ok((expanded, id_graph))
+}
+
 async fn invoke_tool_with_agent_store(
     tool_name: &str,
     project_id: &str,
@@ -580,6 +616,7 @@ async fn invoke_tool_with_agent_store(
             };
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.series.iter().map(|s| s.event_name.as_str()), &known)?;
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .query_insights(project_id, &q)
                 .await
@@ -642,6 +679,7 @@ async fn invoke_tool_with_agent_store(
             };
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.steps.iter().map(|s| s.event_name.as_str()), &known)?;
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .query_funnel(project_id, &q)
                 .await
@@ -687,6 +725,7 @@ async fn invoke_tool_with_agent_store(
                 global_filter: GlobalFilter::default(),
                 sampling: Default::default(),
             };
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .query_retention(project_id, &q)
                 .await
@@ -719,6 +758,7 @@ async fn invoke_tool_with_agent_store(
                     .unwrap_or(false),
                 limit: Some(args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize),
             };
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .search_sessions(project_id, &sq)
                 .await
@@ -761,6 +801,7 @@ async fn invoke_tool_with_agent_store(
                 global_filter: GlobalFilter::default(),
                 sampling: Default::default(),
             };
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .query_flows(project_id, &q)
                 .await
@@ -779,19 +820,16 @@ async fn invoke_tool_with_agent_store(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
-            let erased: pulse_storage::ErasedUids = meta
-                .list_erased_uids(project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .collect();
-            let id_graph = qengine
-                .storage()
-                .identity_graph(project_id, false)
-                .await
-                .map_err(|e| e.to_string())?;
-            let expanded = pulse_storage::expand_erased_with_identity(&erased, Some(&id_graph));
-            qengine.storage().set_erased(project_id, expanded.clone());
+            let (expanded, maybe_id_graph) =
+                sync_erased_for_project(project_id, meta, qengine).await?;
+            let id_graph = match maybe_id_graph {
+                Some(g) => g,
+                None => qengine
+                    .storage()
+                    .identity_graph(project_id, false)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            };
             let pstore = qengine
                 .storage()
                 .profile_store(project_id, false)
@@ -874,6 +912,7 @@ async fn invoke_tool_with_agent_store(
                 formula: None,
                 sampling: Default::default(),
             };
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let res = qengine
                 .query_insights(project_id, &q)
                 .await
@@ -894,10 +933,16 @@ async fn invoke_tool_with_agent_store(
             }))
         }
         "list_cohorts" => {
+            sync_erased_for_project(project_id, meta, qengine).await?;
             let cohorts = meta
                 .list_cohorts(project_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            let cat = qengine.catalogs().for_project(project_id);
+            cat.saved_cohorts.clear();
+            for c in &cohorts {
+                cat.saved_cohorts.insert(c.id.clone(), c.definition.clone());
+            }
             let mut out = Vec::with_capacity(cohorts.len());
             for c in cohorts {
                 let size = qengine

@@ -2372,6 +2372,9 @@ async fn handle_unified_query(
         .unwrap_or("insights");
 
     let inner = payload.get("query").cloned().unwrap_or(payload.clone());
+    ctrl.load_erased_for_project(&pid)
+        .await
+        .map_err(CtrlError::internal)?;
     match kind {
         "insights" => {
             let q: InsightsQuery = parse_query_value("insights", inner)?;
@@ -2421,6 +2424,9 @@ async fn handle_query_insights(
 ) -> ApiRes<pulse_exec::InsightsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: InsightsQuery = parse_json_body("insights query", &body)?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .query_insights(&id, &q)
@@ -2437,6 +2443,9 @@ async fn handle_query_funnel(
 ) -> ApiRes<pulse_exec::FunnelResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: FunnelQuery = parse_json_body("funnel query", &body)?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .query_funnel(&id, &q)
@@ -2460,6 +2469,9 @@ async fn handle_query_funnel_dropped(
         .get("step")
         .and_then(|s| s.parse::<usize>().ok())
         .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let users = ctrl
         .qengine
         .query_funnel_dropped_users(&id, &q, step)
@@ -2494,6 +2506,9 @@ async fn handle_query_retention(
 ) -> ApiRes<pulse_exec::RetentionResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: RetentionQuery = parse_json_body("retention query", &body)?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .query_retention(&id, &q)
@@ -2510,6 +2525,9 @@ async fn handle_query_flows(
 ) -> ApiRes<pulse_exec::FlowsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: FlowsQuery = parse_json_body("flows query", &body)?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .query_flows(&id, &q)
@@ -2563,6 +2581,9 @@ async fn handle_get_sessions_default(
         .resolve_and_check(&principal, params.get("project_id").map(|s| s.as_str()))
         .await?;
     let sq = session_query_from_params(&params);
+    ctrl.load_erased_for_project(&pid)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .search_sessions(&pid, &sq)
@@ -2577,6 +2598,9 @@ async fn handle_post_sessions_default(
     Json(sq): Json<SessionSearchQuery>,
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
     let pid = ctrl.resolve_and_check(&principal, None).await?;
+    ctrl.load_erased_for_project(&pid)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .search_sessions(&pid, &sq)
@@ -2593,6 +2617,9 @@ async fn handle_get_sessions(
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let sq = session_query_from_params(&params);
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .search_sessions(&id, &sq)
@@ -2608,6 +2635,9 @@ async fn handle_post_sessions(
     Json(sq): Json<SessionSearchQuery>,
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let res = ctrl
         .qengine
         .search_sessions(&id, &sq)
@@ -3083,6 +3113,9 @@ async fn handle_cohort_from_funnel_dropped(
         .get("step")
         .and_then(|s| s.parse::<usize>().ok())
         .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let uids = ctrl
         .qengine
         .query_funnel_dropped_uids(&id, &req.query, step)
@@ -3124,6 +3157,9 @@ async fn handle_preview_cohort(
     let cat = ctrl.qengine.catalogs().for_project(&id);
     validate_cohort_acyclic(None, &req.definition, &cat)
         .map_err(|e| CtrlError::bad(e.to_string()))?;
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let (user_count, exec_time_us) = ctrl
         .qengine
         .preview_cohort_count(&id, &req.definition, req.time_range)
@@ -3897,6 +3933,9 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.load_erased_for_project(&project_id)
+        .await
+        .map_err(CtrlError::internal)?;
     let bundle = build_edge_flag_bundle_with_cohorts(
         &project_id,
         &flags,
@@ -4052,6 +4091,9 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
+    ctrl.load_erased_for_project(&project_id)
+        .await
+        .map_err(CtrlError::internal)?;
     let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
         .await
         .map_err(CtrlError::internal)?;
@@ -4515,6 +4557,9 @@ async fn handle_export_events(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "ndjson".to_string());
 
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let rows = ctrl
         .qengine
         .export_events(&id, time_range, None, limit, true)
@@ -4799,6 +4844,9 @@ impl ControlPlaneService {
             let Ok(rules) = self.meta.list_alert_rules(&proj.id).await else {
                 continue;
             };
+            if !rules.is_empty() {
+                let _ = self.load_erased_for_project(&proj.id).await;
+            }
             for mut a in rules {
                 let prev_triggered_ms = a.last_triggered_ms;
                 if a.last_triggered_ms
@@ -5536,6 +5584,9 @@ async fn handle_warehouse_export(
         _ => None,
     };
     let limit = req.limit.unwrap_or(10_000).clamp(1, 50_000);
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let rows = ctrl
         .qengine
         .export_events(&id, time_range, None, limit, true)
@@ -5606,6 +5657,9 @@ async fn handle_byok_copilot(
     let llm_api_key =
         unseal_secret(&ctrl.vault_kek, &llm_cred.sealed_secret_hex).map_err(CtrlError::internal)?;
 
+    ctrl.load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let resp = run_byok_copilot(
         &ctrl.qengine,
         &ctrl.meta,
