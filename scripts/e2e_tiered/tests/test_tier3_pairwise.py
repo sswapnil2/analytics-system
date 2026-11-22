@@ -17,6 +17,7 @@ if str(_HARNESS_ROOT) not in sys.path:
 from lib.client import PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance  # noqa: E402
 from lib.oracle import (  # noqa: E402
+    decode_manifest,
     external_postgres_url,
     feature,
     make_agent_trace,
@@ -634,7 +635,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             self.assertGreaterEqual(pub_puts, 2)
             # Bounded snapshot PUTs per cycle (no per-event/per-user PUT amplification)
             self.assertLess(pub_puts, 100, f"Unexpected PUT amplification in published/: {pub_puts}")
-            pub1 = json.loads(s3.get_object(f"published/{pid}/pub_000000000001.json").decode("utf-8"))
+            pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
             self.assertGreaterEqual(int(pub1["high_water_mark"]), 50)
             self.assertEqual(int(pub1["publish_seq"]), 1)
 
@@ -908,7 +909,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             node.stop(graceful=True)
 
             # Simulate newer writer generation publishing pub_000000000001.json with lower source_local_epoch
-            pub0 = json.loads(s3.get_object(f"published/{pid}/pub_000000000000.json").decode("utf-8"))
+            pub0 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000000.json"))
             pub1 = dict(pub0)
             pub1["publish_seq"] = int(pub0["publish_seq"]) + 1
             pub1["writer_generation"] = int(pub0["writer_generation"]) + 1
@@ -932,7 +933,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
                 )
                 self.assertEqual(r.status, 503, f"Deposed writer must fail write-open with 503, got {r.status}")
             # S3 pub_1 must remain untouched with higher writer_generation
-            cur_pub1 = json.loads(s3.get_object(f"published/{pid}/pub_000000000001.json").decode("utf-8"))
+            cur_pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
             self.assertEqual(cur_pub1["writer_generation"], pub1["writer_generation"])
 
     @feature("F14", "F18")
@@ -1824,7 +1825,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             s0.client().admin_flush().raise_for_status()
             wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
 
-            pub0 = json.loads(s3.get_object(f"published/{pid}/pub_000000000000.json").decode("utf-8"))
+            pub0 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000000.json"))
             self.assertIn("writer_offsets", pub0)
             s0.kill()
 

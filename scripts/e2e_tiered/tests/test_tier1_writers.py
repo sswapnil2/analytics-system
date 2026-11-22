@@ -12,7 +12,6 @@ Exactly 5 tests per feature x 8 features = 40 Tier 1 tests.
 from __future__ import annotations
 
 import http.server
-import json
 import shutil
 import sys
 import threading
@@ -29,6 +28,7 @@ if str(_HARNESS_ROOT) not in sys.path:
 from lib.client import MetricsParser, PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance, free_port  # noqa: E402
 from lib.oracle import (  # noqa: E402
+    decode_manifest,
     external_postgres_url,
     feature,
     make_agent_trace,
@@ -1090,7 +1090,7 @@ class TestTier1F29ForwarderAndOffsets(unittest.TestCase):
 
             manifest_files = [p for p in storage.local_files() if f"manifests/{pid}/" in p and p.endswith(".json")]
             self.assertTrue(manifest_files, f"Expected local manifest for {pid}: {storage.local_files()}")
-            newest = json.loads(storage.read_local_bytes(sorted(manifest_files)[-1]).decode("utf-8"))
+            newest = decode_manifest(storage.read_local_bytes(sorted(manifest_files)[-1]))
             self.assertIn("writer_offsets", newest)
             self.assertTrue(newest["writer_offsets"], f"Expected non-empty writer_offsets in manifest: {newest}")
 

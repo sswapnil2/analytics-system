@@ -21,6 +21,7 @@ if str(_HARNESS_ROOT) not in sys.path:
 from lib.client import PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance, free_port  # noqa: E402
 from lib.oracle import (  # noqa: E402
+    decode_manifest,
     external_postgres_url,
     feature,
     make_agent_trace,
@@ -621,7 +622,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node2.stop(graceful=True)
 
             # Part B: Depose writer by advancing S3 pub_2 with higher writer_generation and lower source_local_epoch
-            pub1 = json.loads(s3.get_object(f"published/{pid}/pub_000000000001.json").decode("utf-8"))
+            pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
             pub2 = dict(pub1)
             pub2["publish_seq"] = int(pub1["publish_seq"]) + 1
             pub2["writer_generation"] = int(pub1["writer_generation"]) + 1
@@ -1007,7 +1008,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 hot_store="local",
                 upload_interval_secs=2,
                 writer_lease_ttl_secs=3,
-                extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"},
+                extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "3600"},
             )
             assert isinstance(node, NodeInstance)
             client = node.client()
@@ -1027,6 +1028,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             initial_segs = set(s3.list_objects(f"segments/{pid}/"))
             self.assertGreaterEqual(len(initial_segs), 6, f"Expected >=6 segments across 3 closed days, got {initial_segs}")
 
+            # Enable aggressive cold merge only after seeding all 6 closed-day segments
+            node = node.restart(graceful_stop=True, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"})
+            assert isinstance(node, NodeInstance)
+            client = node.client()
+
             # Verify cold S3 merge consolidates closed-day segments (<= 1 per active bucket per closed day = <= 3) after grace
             wait_until(
                 lambda: len(s3.list_objects(f"segments/{pid}/")) <= 3
@@ -1039,9 +1045,10 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 6.0,
             )
 
-            client.replay_chunk(make_replay_chunk(session_id="rs_s16", project_id=pid, chunk_start_ts_ms=now_ms), api_key=api_key, binary=True).raise_for_status()
-            client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_erase", start_ts_ms=now_ms), api_key=api_key, binary=True).raise_for_status()
-            client.erase_agent(pid, level="trace", target_id="tr_s16_erase", expires_at=now_ms + 1500).raise_for_status()
+            agent_now_ms = int(time.time() * 1000)
+            client.replay_chunk(make_replay_chunk(session_id="rs_s16", project_id=pid, chunk_start_ts_ms=agent_now_ms), api_key=api_key, binary=True).raise_for_status()
+            client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_erase", start_ts_ms=agent_now_ms), api_key=api_key, binary=True).raise_for_status()
+            client.erase_agent(pid, level="trace", target_id="tr_s16_erase", expires_at=agent_now_ms + 1500).raise_for_status()
 
             wait_until(lambda: any(k.startswith(f"replays/{pid}/") for k in s3.list_objects("replays/")), timeout=20.0)
             wait_until(lambda: any(k.startswith(f"agent_segments/{pid}/") for k in s3.list_objects("agent_segments/")), timeout=20.0)
