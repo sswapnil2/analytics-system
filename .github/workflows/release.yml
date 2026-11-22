@@ -73,7 +73,7 @@ jobs:
           tar -C dist/amd64 -xzf pulse-linux-x86_64.tar.gz
           tar -C dist/arm64 -xzf pulse-linux-aarch64.tar.gz
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Smoke test the amd64 image
         run: |
           docker buildx build --platform linux/amd64 --load -t pulse:test .
