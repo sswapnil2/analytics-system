@@ -1294,7 +1294,18 @@ fn evaluate_cohort_bounded<'a>(
                 Ok(out)
             }
             BehavioralCohortDef::Users { canonical_uids } => {
-                Ok(canonical_uids.iter().map(|u| id_snap.resolve(*u)).collect())
+                let erased = ps.erased_snapshot();
+                Ok(canonical_uids
+                    .iter()
+                    .filter_map(|&u| {
+                        let canon = id_snap.resolve(u);
+                        if erased.contains(u) || erased.contains(canon) {
+                            None
+                        } else {
+                            Some(canon)
+                        }
+                    })
+                    .collect())
             }
             BehavioralCohortDef::CohortRef { cohort_id } => {
                 let mut next_visited = visited;

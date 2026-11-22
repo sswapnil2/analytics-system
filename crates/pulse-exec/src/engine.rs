@@ -423,8 +423,8 @@ impl QueryEngine {
             let id_snap = id_graph.snapshot();
 
             let bm = evaluate_cohort(&def, None, &ps, &snap, &id_snap, &self.cache, &cat).await?;
-            // ponytail: no erasure check here; membership comes from scans and profiles, which
-            // already exclude erased events and rows.
+            // Membership comes from event scans (excluding erased events) and static `Users`
+            // cohorts (filtered by `ps.erased_snapshot()`).
             let mut out = Vec::new();
             for uid in bm.iter() {
                 let ext = id_graph

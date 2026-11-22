@@ -532,3 +532,265 @@ async fn apply_engage_and_on_identify_isolate_post_erasure_resignup_from_stale_s
         "{detail}"
     );
 }
+
+#[tokio::test]
+async fn copilot_revenue_summary_does_not_clobber_expanded_erased_uids_for_merged_users() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Create merged user: anon_0 (raw UID 0) -> user_1 (canonical UID 1), plus non-erased user_2.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Landing", "distinct_id": "anon_0", "timestamp": now_ms - 40_000 },
+                { "event": "SecretEvent", "distinct_id": "user_1", "timestamp": now_ms - 30_000 },
+                { "event": "PublicEvent", "distinct_id": "user_2", "timestamp": now_ms - 20_000 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({ "anon_id": "anon_0", "user_id": "user_1" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let id_graph = qengine
+        .storage()
+        .identity_graph("proj_erased", false)
+        .await
+        .unwrap();
+    let raw_anon0 = id_graph.lookup_raw("anon_0").unwrap();
+    let canon_u1 = id_graph.lookup_canonical("user_1").unwrap();
+    assert_eq!(raw_anon0, 0);
+    assert_ne!(raw_anon0, canon_u1);
+
+    // Record ONLY the raw UID (`anon_0` = 0) in `erased_uids`, then sync catalog/storage.
+    let t_erase = now_ms - 10_000;
+    meta.insert_erased_uids("proj_erased", &[raw_anon0], t_erase)
+        .await
+        .unwrap();
+    ctrl.refresh_project_virtual_catalog("proj_erased")
+        .await
+        .unwrap();
+
+    // Calling copilot_revenue_summary must preserve expanded erased UIDs on StorageEngine.
+    let (cp_total, cp_paying, cp_rev) =
+        copilot_revenue_summary(&meta, qengine.storage(), "proj_erased").await;
+    assert_eq!((cp_total, cp_paying), (0, 0));
+    assert!(cp_rev.abs() < 1e-6);
+
+    // Raw event export must return 0 events for merged canonical user_1 (only user_2's PublicEvent).
+    let (s, export_bytes) = send_admin(
+        &admin_app,
+        "GET",
+        "/v1/projects/proj_erased/export?format=json&limit=100",
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let export_json: Value = serde_json::from_slice(&export_bytes).unwrap();
+    assert_eq!(export_json["count"].as_u64(), Some(1), "{export_json}");
+    let events = export_json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "expected only user_2 event: {export_json}");
+    assert_eq!(events[0]["event_name"], "PublicEvent");
+
+    // Insights query for SecretEvent must return 0.
+    let (s, qbytes) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/query/insights",
+        Some(json!({
+            "time_range": { "start_ts_ms": now_ms - 120_000, "end_ts_ms": now_ms + 60_000 },
+            "interval": "day",
+            "series": [{ "label": "Secret", "event_name": "SecretEvent", "metric": "totals" }]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&qbytes));
+    let qjson: Value = serde_json::from_slice(&qbytes).unwrap();
+    let total = qjson["series"][0]["overall_value"].as_f64().unwrap_or(0.0);
+    assert!(
+        total.abs() < 1e-6,
+        "erased merged user's SecretEvent leaked into insights: {qjson}"
+    );
+}
+
+#[tokio::test]
+async fn export_cohort_preserves_post_erasure_event_only_resignup_and_filters_static_users() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let t_pre = now_ms - 60_000;
+    let t_erase = now_ms - 30_000;
+    let t_post = now_ms - 10_000;
+
+    // Pre-erasure events for `ev_resign` and `never_erased` (no /v1/engage -> no ProfileStore rows).
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Signup", "distinct_id": "ev_resign", "timestamp": t_pre },
+                { "event": "Signup", "distinct_id": "never_erased", "timestamp": t_pre },
+                { "event": "Signup", "distinct_id": "permanently_erased", "timestamp": t_pre }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let id_graph = qengine
+        .storage()
+        .identity_graph("proj_erased", false)
+        .await
+        .unwrap();
+    let ev_uid = id_graph.lookup_canonical("ev_resign").unwrap();
+    let never_uid = id_graph.lookup_canonical("never_erased").unwrap();
+    let perm_uid = id_graph.lookup_canonical("permanently_erased").unwrap();
+
+    // Erase both `ev_resign` and `permanently_erased` at `t_erase`.
+    meta.insert_erased_uids("proj_erased", &[ev_uid, perm_uid], t_erase)
+        .await
+        .unwrap();
+
+    // `ev_resign` re-signs up with an event ONLY (`t_post > t_erase`) and NO /v1/engage call.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Signup", "distinct_id": "ev_resign", "timestamp": t_post }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Confirm `ev_resign` genuinely has no ProfileStore row.
+    let pstore = qengine
+        .storage()
+        .profile_store("proj_erased", false)
+        .await
+        .unwrap();
+    assert!(
+        pstore
+            .get_by_distinct_id("ev_resign")
+            .await
+            .unwrap()
+            .is_none(),
+        "test requires event-only re-signup with no ProfileStore row"
+    );
+
+    // Create:
+    // 1. Event-based cohort (`PerformedEvent`)
+    // 2. Static `Users` cohort
+    // 3. Nested `And` cohort combining `PerformedEvent` and `Users`
+    let (s, c_ev) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({
+            "name": "Signups",
+            "definition": { "kind": "performed_event", "event_name": "Signup", "min_count": 1 }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let event_cid = serde_json::from_slice::<Value>(&c_ev).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (s, c_users) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({
+            "name": "Static List",
+            "definition": { "kind": "users", "canonical_uids": [ev_uid, never_uid, perm_uid] }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let users_cid = serde_json::from_slice::<Value>(&c_users).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (s, c_and) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({
+            "name": "Nested And",
+            "definition": {
+                "kind": "and",
+                "clauses": [
+                    { "kind": "performed_event", "event_name": "Signup", "min_count": 1 },
+                    { "kind": "users", "canonical_uids": [ev_uid, never_uid, perm_uid] }
+                ]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let and_cid = serde_json::from_slice::<Value>(&c_and).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    ctrl.refresh_project_virtual_catalog("proj_erased")
+        .await
+        .unwrap();
+
+    // Event-based cohort MUST include post-erasure event-only re-signup (`ev_uid`) and `never_uid`,
+    // while excluding `perm_uid`.
+    let (s, ev_export) = send_admin(
+        &admin_app,
+        "GET",
+        &format!("/v1/projects/proj_erased/cohorts/{event_cid}/export?format=json"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let ev_json: Value = serde_json::from_slice(&ev_export).unwrap();
+    let ev_uids: Vec<u64> = ev_json["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["canonical_uid"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ev_json["count"].as_u64(), Some(2), "{ev_json}");
+    assert!(ev_uids.contains(&(ev_uid as u64)), "{ev_json}");
+    assert!(ev_uids.contains(&(never_uid as u64)), "{ev_json}");
+    assert!(!ev_uids.contains(&(perm_uid as u64)), "{ev_json}");
+
+    // Static `Users` cohort and nested `And` containing `Users` must exclude erased UIDs.
+    for cid in [&users_cid, &and_cid] {
+        let (s, body) = send_admin(
+            &admin_app,
+            "GET",
+            &format!("/v1/projects/proj_erased/cohorts/{cid}/export?format=json"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let j: Value = serde_json::from_slice(&body).unwrap();
+        let uids: Vec<u64> = j["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["canonical_uid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(j["count"].as_u64(), Some(1), "{cid}: {j}");
+        assert_eq!(uids, vec![never_uid as u64], "{cid}: {j}");
+    }
+}

@@ -178,23 +178,32 @@ pub async fn copilot_revenue_summary(
     storage: &pulse_storage::StorageEngine,
     project_id: &str,
 ) -> (u64, u64, f64) {
-    let erased: pulse_storage::ErasedUids = meta
-        .list_erased_uids(project_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    if !erased.is_empty() {
-        storage.set_erased(project_id, erased.clone());
-    }
+    let (erased, loaded_from_meta) = match meta.list_erased_uids(project_id).await {
+        Ok(rows) => (
+            rows.into_iter().collect::<pulse_storage::ErasedUids>(),
+            true,
+        ),
+        Err(e) => {
+            tracing::warn!(
+                project_id,
+                error = %e,
+                "failed to load erased_uids in copilot_revenue_summary; using cached storage snapshot"
+            );
+            ((*storage.erased_snapshot(project_id)).clone(), false)
+        }
+    };
     let id_graph = if erased.is_empty() {
         None
     } else {
         storage.identity_graph(project_id, false).await.ok()
     };
+    let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+    if loaded_from_meta || !expanded.is_empty() {
+        storage.set_erased(project_id, expanded.clone());
+    }
     match storage.profile_store(project_id, false).await {
         Ok(ps) => ps
-            .revenue_summary_filtered(&erased, id_graph.as_deref())
+            .revenue_summary_filtered(&expanded, id_graph.as_deref())
             .await
             .unwrap_or((0, 0, 0.0)),
         Err(_) => (0, 0, 0.0),
