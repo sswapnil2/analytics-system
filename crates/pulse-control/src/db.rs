@@ -2164,6 +2164,25 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Claims an alert trigger: sets `last_triggered_ms` only if it still holds the value the
+    /// caller read. Returns false when another node claimed it first.
+    pub async fn claim_alert_trigger(
+        &self,
+        alert_id: &str,
+        prev_triggered_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "UPDATE alert_rules SET last_triggered_ms = ?
+             WHERE id = ? AND COALESCE(last_triggered_ms, 0) = ?",
+            now_ms,
+            alert_id,
+            prev_triggered_ms.unwrap_or(0),
+        );
+        Ok(affected == 1)
+    }
+
     pub async fn list_alert_rules(&self, project_id: &str) -> Result<Vec<AlertRule>, MetaError> {
         let rows = db_map_all!(
             self,

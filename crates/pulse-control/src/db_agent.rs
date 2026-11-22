@@ -1254,6 +1254,55 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Claims an alert state transition: moves the rule from `from_state` to `to_state` only if
+    /// it is still in `from_state`. Returns false when another node made the transition first.
+    pub async fn claim_agent_alert_transition(
+        &self,
+        id: &str,
+        from_state: &str,
+        to_state: &str,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = if to_state == "firing" {
+            a_exec!(
+                self,
+                "UPDATE agent_alert_rules SET state = ?, last_triggered_ms = ? WHERE id = ? AND state = ?",
+                to_state,
+                now_ms,
+                id,
+                from_state
+            )
+        } else {
+            a_exec!(
+                self,
+                "UPDATE agent_alert_rules SET state = ?, last_resolved_ms = ? WHERE id = ? AND state = ?",
+                to_state,
+                now_ms,
+                id,
+                from_state
+            )
+        };
+        Ok(affected == 1)
+    }
+
+    /// Records an evaluation without touching the rule's state, so a node that lost a claim
+    /// cannot write a stale state back.
+    pub async fn record_agent_alert_evaluation(
+        &self,
+        id: &str,
+        evaluated_ms: i64,
+        value: Option<f64>,
+    ) -> Result<(), MetaError> {
+        a_exec!(
+            self,
+            "UPDATE agent_alert_rules SET last_evaluated_ms = ?, last_value = COALESCE(?, last_value) WHERE id = ?",
+            evaluated_ms,
+            value,
+            id
+        );
+        Ok(())
+    }
+
     pub async fn get_agent_alert_rule(
         &self,
         project_id: &str,
