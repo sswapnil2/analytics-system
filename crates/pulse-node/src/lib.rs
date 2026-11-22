@@ -1506,11 +1506,7 @@ mod tests {
         node_a.shutdown().await;
         let resp = post(node_b.http_addr, "b1").await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let ps = node_b
-            .storage
-            .get_or_open_project("proj_lease")
-            .await
-            .unwrap();
+        let ps = node_b.storage.open_for_read("proj_lease").await.unwrap();
         let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
         assert_eq!(rows, 5, "takeover lost or duplicated acknowledged events");
         node_b.shutdown().await;
