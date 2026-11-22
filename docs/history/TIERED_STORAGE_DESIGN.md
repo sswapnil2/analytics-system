@@ -1,6 +1,6 @@
 # Design note: local hot tier, S3 for compacted data only (proposed)
 
-Status: proposal, revision 3 after two independent reviews (section 9). No code. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (hot state on local disk). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc`.
+Status: proposal, revision 4 after three independent reviews (section 9). No code. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (hot state on local disk). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc`.
 
 Sections 1 to 5 cover the storage half: one node, its volume, and what it sends to S3. Section 6 covers the other half of the owner's target: stateless writers that forward to storage nodes which own projects. Both halves were reviewed against the code (section 9).
 
@@ -48,24 +48,26 @@ A segment's location is its `object_path`; the path is built in one place and ev
 | Prefix | Tier | Contents |
 |---|---|---|
 | `wal/`, `agent_wal/` | local | write-ahead logs (P0-7) |
+| `wal_dead/` | local | dead-lettered events (`engine.rs:592`); local avoids 1 S3 PUT per bad event during a schema-cap storm |
 | `identity/`, `profiles/` | local | SlateDB stores (P0-7) |
 | `hot/segments/` | local | segments written by an L0 flush, not yet uploaded |
 | `manifests/` | local | the authoritative manifest, every epoch |
 | `segments/` | S3 | uploaded segments |
 | `published/` | S3 | published manifests, identity and profile snapshots |
+| `replay/`, `agent_segments/` | S3 (local hot in T4) | session-replay chunks and agent segments; move to local hot tier + cycle upload in T4 |
 
 ### 3.2 The upload cycle
 
 A per-project task runs every `PULSE_UPLOAD_INTERVAL_SECS` (proposed default 300), and earlier if local segment bytes pass a threshold.
 
-The order matters. A user id is the count of users at the time it was created (**code**: `pulse-identity/src/lib.rs:959`), so an identity store restored from a snapshot will hand out again any id the snapshot does not contain. Profile rows are keyed by that id too (`profile_store.rs:37`). Therefore identity is snapshotted last, after everything that can reference an id has been frozen:
+The order matters. A user id is the count of users at the time it was created (**code**: `pulse-identity/src/lib.rs:959`), so an identity store restored from a snapshot will hand out again any id the snapshot does not contain. Profile rows are keyed by that id too (`profile_store.rs:37`). Therefore identity is snapshotted last, after everything that can reference an id has been frozen (because identity is taken at `T_id >= T_prof >= T_freeze`, it is guaranteed to cover every id referenced by both the frozen segments and the profile snapshot; extra ids created in between without a profile yet are harmless):
 
 1. **Freeze.** Record the exact list of local segment ids to upload, and write an intent record locally (the new S3 segment ids and their sources).
 2. **Snapshot profiles** to S3.
 3. **Flush and snapshot identity** to S3. Record the user count as a high-water mark.
 4. **Upload.** Merge only the frozen segments, per partition, and write each result create-only to `segments/`. Existing S3 segments are not read or rewritten. Input bytes per output segment are capped, because the merge decodes its inputs into memory (`engine.rs:1072-1076`).
 5. **Commit** the local manifest: frozen local segments out, new S3 segments in. This reuses the existing check that the sources are still active (`engine.rs:1134-1147`).
-6. **Publish** a manifest to `published/`, create-only and epoch-named like `commit_next`, listing S3 segments only and carrying `writer_generation` and the identity high-water mark.
+6. **Publish** a manifest to `published/`, create-only and named by its own dense, contiguous `publish_seq` (`0, 1, 2, …`) rather than the sparse local `epoch` (3.6), listing S3 segments only and carrying `writer_generation`, `source_local_epoch`, and the identity high-water mark. Like `commit_next` (`manifest.rs:220-232`), verify `head(publish_seq - 1)` after create so a writer more than `retain_epochs` behind cannot slip past GC. Then record `last_published_seq = publish_seq` in the local manifest.
 7. **Clean up.** Delete the uploaded local segments once no snapshot pins them; clear the intent record.
 
 Publish and restore both assert that the identity snapshot's user count is at least the manifest's high-water mark.
@@ -77,7 +79,8 @@ Crash handling. There is no sweep of stored segments today: superseded paths sit
 | 1-3 | Snapshots newer than needed; intent with nothing uploaded | intent discarded |
 | 4 | S3 segments nothing references | intent replay deletes them |
 | 5 | Local manifest ahead of the published one | step 6 on the next cycle |
-| 6 | Uploaded local segments still on disk | sweep at open |
+| 6 (before local `last_published_seq` update) | `published/{P+1}` exists with our `writer_generation` and `source_local_epoch <= local.epoch` | open recognises its own publish, advances `last_published_seq` (3.6), sweep cleans local segments |
+| 6 (after local update) | Uploaded local segments still on disk | sweep at open |
 
 Review found no loss or duplication of an acknowledged event on a process crash in this sequence (**code**: flush order `engine.rs:743-809`, recovery from `committed_wal_seq`, `wal.rs:176`).
 
@@ -111,8 +114,11 @@ P0-7 makes a node refuse to start when the marker says `local` and the local sto
 `pulse-node restore --from-published`
 
 1. Copies the identity and profile snapshots down and checks the high-water mark.
-2. Installs the newest published manifest as the local manifest.
-3. Prints the publish time and states the loss: events, profile updates, identity merges and erasures after that time are gone.
+2. Reconciles the restored state with `erased_uids` in the external metadata DB (which is ahead of the snapshot):
+   - Deletes from the restored profile store any profile whose `canonical_uid` (or any raw `uid` for its `distinct_id` in the restored identity graph) is in `erased_uids` with `updated_at_ms <= erased_at_ms`. Without this, users erased between the last publish and volume loss would have their profiles reappear, because profile reads do not currently filter by `erased_uids` (`api.rs:790`, `:3940`, `:3989`).
+   - Deletes rows from `erased_uids` where `uid >= high_water_mark` (leaving `deletion_audit_log` intact). No restored segment or profile can reference those ids, and leaving them would poison the next new users who are handed those dense `u32` ids after restore if they send backdated or imported events with timestamps `<= erased_at_ms`.
+3. Installs the newest published manifest as the local manifest (with `last_published_seq` set to its `publish_seq`).
+4. Prints the publish time and states the loss: events, profile updates, identity merges and erasures after that time are gone.
 
 A node never restores on its own.
 
@@ -122,10 +128,10 @@ The metadata database is part of this. By default it is SQLite in the data direc
 
 ### 3.6 Fencing
 
-Today the writer generation is fenced by a manifest commit in the shared store (`engine.rs:219-235`). With the manifest local, a second machine that took the lease would see an empty local manifest and could overwrite `published/`. So:
+Today the writer generation is fenced by `commit_next` in the shared store (`engine.rs:219-235`, `manifest.rs:208-235`), which only works because `epoch` is dense (`+1` per S3 object). With local flushes advancing `local.epoch` between publishes, `published/` would have sparse epochs if named by `local.epoch`: a stale writer at local epoch `105` (gen 1) could create-only `published/105` right past a restored writer that published `published/101` (gen 2), shadowing the newer generation. So:
 
-- `published/` is create-only and carries `writer_generation` (3.2 step 6).
-- A node refuses to open a project for writing when the published epoch is ahead of its local epoch, except through `restore`.
+- `published/` is named by its own dense, contiguous `publish_seq` (`0, 1, 2, …`), written create-only with `writer_generation` and `source_local_epoch`, plus the `head(publish_seq - 1)` GC guard (3.2 step 6). Two writers always contend on the same `publish_seq + 1` key, so the loser gets `AlreadyExists`.
+- On project open for writing, a node compares the latest published manifest `(pub_seq, pub_gen, source_local_epoch)` against its local manifest `(local_last_pub_seq, local_gen, local_epoch)`. It refuses to open (except through `restore`) whenever `pub_gen > local_gen`, or whenever `pub_seq > local_last_pub_seq` except in the exact self-crash case from 3.2 step 6 (`pub_seq == local_last_pub_seq + 1`, `pub_gen == local_gen`, and `source_local_epoch <= local_epoch`, in which case it advances `local_last_pub_seq` and proceeds).
 
 ### 3.7 Backpressure and disk
 
@@ -141,7 +147,7 @@ A process crash and a machine crash are different. Review found that the local s
 ### 3.9 Encryption and erasure
 
 - The prefix router sits below the one encryption wrapper, so the local tier is encrypted when `PULSE_BYOK_MASTER_KEY` is set (`pulse-node/src/lib.rs:360`).
-- **Decided by the owner: erasure is a tombstone, applied when querying.** The tombstone lives in the metadata database and hides the user in every query from the moment of erasure. Rows are physically dropped only when a segment is rewritten (`engine.rs:1077`); an erasure does not trigger a rewrite. With S3 segments rewritten at most once, erased rows can stay in S3 indefinitely behind the tombstone, and the external id stays in the identity graph. `docs/limitations.md` must say this in plain words, because a deployment with a legal duty to delete bytes needs to know. One exception to check before relying on it: tombstones for agent data expire (`pulse-control/migrations/0011`, `db_agent.rs:1601`), so agent rows must be physically removed before their tombstone goes.
+- **Decided by the owner: erasure is a tombstone, applied when querying.** The tombstone lives in the metadata database and hides the user in every query from the moment of erasure. Event queries already filter by `erased_uids`, but profile reads and the profile catalog do not (`api.rs:790`, `:3940`, `:3989`); T1 adds `erased_uids` filtering there too (`updated_at_ms <= erased_at_ms`), so erased profiles stay hidden both on remote readers reading a published snapshot and after `restore --from-published` (which also purges them from the restored `pstore`, 3.5). Rows are physically dropped only when a segment is rewritten (`engine.rs:1077`); an erasure does not trigger a rewrite. With S3 segments rewritten at most once, erased rows can stay in S3 indefinitely behind the tombstone, and the external id stays in the identity graph. `docs/limitations.md` must say this in plain words, because a deployment with a legal duty to delete bytes needs to know. One exception to check before relying on it: tombstones for agent data expire (`pulse-control/migrations/0011`, `db_agent.rs:1601`), so agent rows must be physically removed before their tombstone goes.
 
 ## 4. What changes for operators and clients
 
@@ -184,17 +190,17 @@ client ─► writer ─► memory buffer ─► writer log (local disk) ─► 
                                                                               segments, upload (3.2)
 ```
 
-**Writer.** Authenticates the key, decodes the body, applies the checks that need no state (size limits, malformed events), applies the project's lexicon rules (drops and PII masking, so unmasked data never reaches the writer's disk), stamps the server time, appends to a bounded memory buffer and answers. It holds no identity, dedup or profile state, so any writer can take any request and writers can be added or removed freely. Two limits of that: the rate limit is counted in memory per node (`pulse-ingest/src/rate_limit.rs`), so N writers allow N times the quota until it is shared; and a batch that carries `identify` or `alias` items is split, with those items taking the synchronous path in 6.3.
+**Writer.** Authenticates the key, decodes the body, applies the checks that need no state (size limits, malformed events), applies the project's lexicon rules (drops and PII masking, so unmasked data never reaches the writer's disk), stamps the server time, appends to a bounded memory buffer and answers. It holds no identity, dedup or profile state, so any writer can take any request and writers can be added or removed freely. Two limits of that: the rate limit is counted in memory per node (`pulse-ingest/src/rate_limit.rs`), so N writers allow N times the quota until it is shared; and a batch that carries `identify` or `alias` items is split, with those items taking the synchronous path in 6.3. For a mixed batch, the writer checks buffer/log capacity first, forwards the synchronous `identify`/`alias` items to the owner, and appends the events to the memory buffer **only** if the synchronous call succeeds—otherwise it returns the error (`409`, `503`, etc.) without queuing events that the client would retry.
 
-**Writer log.** A background task flushes the buffer to an append-only log on the writer's local disk (proposed bound: every 20 ms or 1 MiB, whichever comes first). There is one log and one cursor per owning storage node, so a storage node that is down holds back only its own projects. Each log is bounded in bytes. When the buffer or a log is full the writer answers `429` for the projects it affects.
+**Writer log.** A background task flushes the buffer to an append-only log on the writer's local disk (proposed bound: every 20 ms or 1 MiB, whichever comes first). There is one log and one cursor **per project** (`writer_log/{project_id}/`), not per storage node: a single project hitting its per-project `429` bound (3.7) or moving to a new owner (6.4) therefore cannot head-of-line-block other projects on the same storage node. Open file handles for idle projects are closed after a short idle timeout while keeping the directory and cursor on disk. Each project log is bounded in bytes (plus a node-wide writer disk cap); when the buffer or log is full the writer answers `429` for the affected project.
 
-**Forwarder.** Runs inside the writer process. It reads each log in order and sends batches to that log's storage node, one batch in flight per project, in strict order. It advances its durable cursor only after the storage node confirms the batch is in its WAL and fsync'd. Log files behind the cursor are deleted.
+**Forwarder.** Runs inside the writer process. For each active project log, it reads batches in order and sends them to that project's current owning storage node, one batch in flight per project, in strict order. If the target answers "not the owner", the forwarder refreshes `project_owner` and retries against the new owner. It advances the project's durable cursor only after the storage node confirms the batch is in its WAL and fsync'd. Log files behind the cursor are deleted.
 
-**Exactly once across the hop.** The forwarder retries, so the storage node must drop repeats. The existing dedup window is not enough for this: it covers 15 minutes and 524,288 entries (`pulse-ingest/src/dedup.rs:6-8`), and a storage node can be down for longer than that after applying a batch whose confirmation was lost. So each batch carries the writer's id and its log offset, and the storage node remembers the highest offset it has applied. Three details make that hold (all found in review):
+**Exactly once across the hop.** The forwarder retries, so the storage node must drop repeats. The existing dedup window is not enough for this: it covers 15 minutes and 524,288 entries (`pulse-ingest/src/dedup.rs:6-8`), and a storage node can be down for longer than that after applying a batch whose confirmation was lost. So each batch carries the writer's id and its per-project log offset, and the storage node remembers the highest offset it has applied. Three details make that hold (all found in review):
 
 - *The key is (writer, bucket), not writer.* A batch becomes one WAL record per bucket, written in parallel and not atomically (`pulse-ingest/src/service.rs:392`, `engine.rs:522-533`). After a crash some buckets have the batch and some do not; the resend must be applied only to those that do not.
 - *The offsets outlive the WAL.* WAL files are purged once a flush commits past them (`engine.rs:353-360`). So the offsets are written in the WAL record and also carried into the manifest by the same commit that advances `committed_wal_seq`. Otherwise: apply, lose the confirmation, flush, restart, resend, duplicate.
-- *A writer's id belongs to its log.* The id is created with the log and stored in the log's directory. A writer that lost its disk starts with a new id and offset zero, and nothing it sends is mistaken for a repeat. A writer that restarts with its log keeps its id and resends from its cursor. Entries for writers not seen for longer than the log can hold data are removed from the map (proposed: 7 days).
+- *A writer's id belongs to its log, and log age is bounded below expiry.* The id is created with the writer's log root directory and stored there. A writer that lost its disk starts with a new id and offset zero, and nothing it sends is mistaken for a repeat. A writer that restarts with its log keeps its id and resends from each project's cursor. Entries for writers not seen for `T_expire` (proposed: 7 days) are removed from the map; to guarantee an expired writer can never resend and duplicate, the writer log enforces a hard maximum batch age strictly less than `T_expire` (proposed: 6 days), dropping and alerting on anything older.
 
 The existing window keeps its job: repeats sent by clients.
 
@@ -218,7 +224,7 @@ The answer says the events were received and passed the stateless checks. It doe
 The response keeps its fields (`IngestResponse`, `pulse-ingest/src/service.rs:55`), so existing SDKs still parse it. What changes is the meaning, and three things follow:
 
 - The end-to-end gate that checks the dedup count must read the metric or query the data instead.
-- Events refused during processing go to the dead-letter path that already exists (`wal_dead/`). Nothing reads that path today except a counter (`pulse-node/src/metrics.rs:178`), and the reason for the refusal is only logged (`engine.rs:606-612`). This work stores the reason with the record and adds a command that lists a project's dead-lettered events, leaving out erased users. A command is enough; an endpoint can wait.
+- Events refused during processing go to the dead-letter path that already exists (`wal_dead/`, routed to the local tier in 3.1). Nothing reads that path today except a counter (`pulse-node/src/metrics.rs:178`), and the reason for the refusal is only logged (`engine.rs:606-612`). This work stores the reason with the record and adds a command that lists a project's dead-lettered events, leaving out erased users (resolving each `WireEvent`'s `distinct_id` through the project's identity graph against `erased_uids`, since `wal_dead/` stores raw `WireEvent` rather than internal `u32` ids). A command is enough; an endpoint can wait.
 - Existing SDKs are not broken by this. They read `deduped` and `rejected` only for debug logging, drop a batch on `400`, `413` and `422`, and retry everything else (`sdks/ts-web/src/index.ts:1854-1865`). Not checked: SDK tests that assert on `deduped`.
 - Other callers of the same processing keep their synchronous results: bulk import, which reports `deduped` (`api.rs:4239-4260`), and the demo seeder. The QUIC ingest path (`pulse-ingest/src/quic.rs:219`) takes the same meaning as HTTP.
 - The SDK documentation must stop promising per-event results on the event path.
@@ -264,7 +270,7 @@ The writer lease table cannot be that record as it works today, though it looks 
 
 **Ceiling.** A project cannot grow beyond one storage node. Many projects spread across nodes; one very large project does not. The way past that is ownership by bucket, which needs the identity store divided or shared, and is not designed here.
 
-**When a storage node is down (until v2).** Its projects pause. Writers keep accepting events for them into the log until the log bound, then answer `429` for those projects. Profile calls and queries for those projects answer `503`. When the node returns with its volume, the forwarders drain the backlog and the offset rule in 6.1 drops anything already applied. While a node is down nobody else may take its projects; the owner rule above is what guarantees that. If the volume is gone, an operator runs the restore in 3.5 on a new node and changes the owner row by hand. Doing that automatically, and moving a healthy project between nodes, is v2.
+**When a storage node is down (until v2).** Its projects pause. Writers keep accepting events for them into each project's log until the log bound, then answer `429` for those projects. Profile calls and queries for those projects answer `503`. When the node returns with its volume, the forwarders drain the backlog and the offset rule in 6.1 drops anything already applied. While a node is down nobody else may take its projects; the owner rule above is what guarantees that. If the volume is gone, an operator runs the restore in 3.5 on a new node and changes the owner row by hand; each project's forwarder sees the updated `project_owner` row and drains its buffered log to the new owner (dropping anything `<=` the restored manifest's offsets). Doing that automatically, and moving a healthy project between nodes, is v2.
 
 ### 6.5 One machine
 
@@ -287,13 +293,13 @@ Each step is one PR, merged before the next starts. Revision 1 had identity goin
 | Step | Change | Exit criteria |
 |---|---|---|
 | T0 | P0-7: WAL, identity and profiles local; multipart fsync (3.8) | Counting segment store: zero calls between request and acknowledgement; idle project zero calls; a node with the marker and no local identity refuses to start |
-| T1 | Published manifest (create-only, generation, high-water mark) written at every flush, plus identity and profile snapshots taken before it; `restore --from-published`; metadata DB rule | Restore into an empty directory resolves every user id in every segment and profile row; erased users stay hidden after restore (external metadata DB); kill at each point and restore still passes; measured PUTs per hour for both snapshot candidates |
-| T2 | Manifest authoritative on local disk; publish moves to the interval; fencing rule (3.6); S3 segment deletion rule (3.3) | Manifest PUTs per hour equal cycles per hour; a stale second writer cannot overwrite `published/`; a `query` node on another machine reads published state |
+| T1 | Published manifest (create-only, dense `publish_seq`, generation, high-water mark) written at every flush, plus identity and profile snapshots taken before it; `restore --from-published` (with erased-profile purge and `uid >= HWM` tombstone cleanup); `erased_uids` filter on profile reads/catalog; metadata DB rule | Restore into an empty directory resolves every user id in every segment and profile row; erased users' events **and** profiles stay hidden after restore (external metadata DB); a user created and erased after the last publish does not poison the reused `uid` after restore; kill at each point and restore still passes; measured PUTs per hour for both snapshot candidates |
+| T2 | Manifest authoritative on local disk; publish moves to the interval with dense `publish_seq`; fencing rule (3.6); S3 segment deletion rule (3.3) | Manifest PUTs per hour equal cycles per hour; a stale second writer cannot overwrite `published/` even when its local `epoch` is ahead of the active writer's; crash right after step 6 before local `last_published_seq` update recovers cleanly; a `query` node on another machine reads published state and hides erased profiles |
 | T3 | Local segment tier and the full upload cycle; intent record and sweep | Query results identical before and after an upload; kill at each step, restart, no acknowledged event missing or duplicated and no leaked object; PUTs per hour at load-generator rate; local bytes bounded with S3 unreachable, then `429` |
 | W1 | Asynchronous event acknowledgement on one machine (6.2, 6.5). Builds on the held appender and processor split (#98) | A request returns before any disk write; kill the process under load and the events missing are no more than the flush bound allows, counted; no event duplicated; dead-lettered events are listable; throughput and p99 from three runs each, before and after |
 | W2 | Synchronous profile endpoint that returns the id (6.3) | Create, then read back on the next request; kill after the response and the profile is there after restart |
 | T4 | S3-side cold merge; the same local tier for agent segments and replay chunks | Object count per closed day equals buckets; idle project zero calls including agent maintenance |
-| W3 | Writer nodes with a local log and forwarder; ownership table; routing of profile calls and queries to the owner (6.1, 6.4) | Two writers and two storage nodes: every event lands once on the owner; kill a writer mid-forward and nothing is duplicated; stop a storage node and writers hold events up to the log bound then answer `429`; the node returns and the backlog drains with no duplicates; apply, flush, clean restart, resend gives no duplicate; a writer whose log was wiped loses only that log and nothing is dropped as a repeat; a node that is not the owner cannot take the lease; alerts fire once, on the owner |
+| W3 | Writer nodes with per-project local logs and forwarders; ownership table; routing of profile calls and queries to the owner (6.1, 6.4) | Two writers and two storage nodes: every event lands once on the owner; kill a writer mid-forward and nothing is duplicated; one project hitting `429` on a storage node does not stall another project on the same node; stop a storage node and writers hold events up to each project's log bound then answer `429`; the node returns (or a project is restored on the other node and `project_owner` updated) and the backlog drains with no duplicates; apply, flush, clean restart, resend gives no duplicate; a writer whose log was wiped loses only that log and nothing is dropped as a repeat; a node that is not the owner cannot take the lease; alerts fire once, on the owner |
 
 Left for the v2 release, by the owner's decision: automatic handling of a failed storage node, moving a project between nodes, and compute nodes that read S3 only.
 
@@ -309,6 +315,7 @@ An interval of zero means "upload eagerly", not a return to today's layout: the 
 6. Writer flush bound. 20 ms or 1 MiB is a proposal; it is the most a writer crash can lose.
 7. Do agent traces (`/v1/agent/traces`) take the asynchronous path or stay synchronous?
 8. Should a durable acknowledgement remain available as a setting for deployments that cannot lose events on a crash? Not proposed: it keeps two ingest paths alive.
+9. SQLite guardrails in local-tier mode (3.5): log a startup warning when running local-tier mode on SQLite, and have `restore --from-published` refuse on SQLite? Proposed yes; awaiting owner confirmation.
 
 Answered by the owner and now in the text: metadata database (3.5), erasure (3.9), ownership unit, what a writer's acknowledgement means, which calls stay synchronous, storage-node failure (section 6).
 
@@ -346,3 +353,15 @@ The writer, forwarding and ownership text was reviewed the same way. The reviewe
 Also taken from the review: replay chunks stay synchronous, the per-request schema cap is dropped on the asynchronous path, profile calls must return their errors, the rate limit is per node, lexicon rules run before the writer log, the dead-letter reason must be stored, placement by fewest projects instead of a hash, and a command instead of an endpoint for dead letters.
 
 Not checked: #98 (not on the reviewed branch), SDK tests that assert on `deduped`, cohort and experiment internals beyond their routes, the offset semantics of replay chunks, and which tier `wal_dead/` lands in.
+
+### Third review: cross-section invariants and restore/fencing edge cases
+
+A third read-only review against `4895bbc` checked the unchecked items from earlier reviews and cross-section interactions between storage, erasure, and writers. It found three blocking problems and four gaps, all addressed in revision 4:
+
+| Finding | Change |
+|---|---|
+| Naming `published/` by sparse local `epoch` lets a stale writer whose local epoch is ahead shadow a newer generation's publish, and bypass the open check | `published/` uses its own dense, contiguous `publish_seq` with `head(publish_seq - 1)` GC guard; open checks `writer_generation` and `publish_seq` with a self-crash exception for step 6 (3.2, 3.6) |
+| Profile reads and the profile catalog do not filter `erased_uids` (`api.rs:790`, `:3940`, `:3989`), so erased profiles reappear after `restore --from-published`; and tombstones for users created+erased after `T_publish` poison reused `u32` ids | `restore` purges erased profiles from `pstore` and deletes `erased_uids` where `uid >= high_water_mark`; profile reads/catalog also filter by `erased_uids` (3.5, 3.9, 7) |
+| One writer log and cursor per storage node causes cross-project HOL blocking on per-project `429` (3.7) and orphans buffered batches when a single project moves to a new owner (6.4) | One log and cursor per project, with idle handle closure and clean repointing on `project_owner` change (6.1, 6.4, 7) |
+
+Also addressed: `wal_dead/` (local) and `replay/`/`agent_segments/` (S3 until T4) added to the 3.1 prefix table; dead-letter listing resolves `WireEvent.distinct_id` through the identity graph (6.2); mixed `/v1/ingest` batch ordering specified so failed synchronous `identify`/`alias` calls never leave queued events (6.1); writer log max batch age bounded strictly below storage-node offset expiry (6.1); SQLite guardrails surfaced in section 8.
