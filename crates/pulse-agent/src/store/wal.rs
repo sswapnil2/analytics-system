@@ -17,7 +17,7 @@ use crate::protocol::{
     decode_plst_batch, encode_plst_batch, MAX_PLST_SPANS, MAX_PLST_TRACES, MAX_PLST_UNCOMP_BYTES,
 };
 use crate::store::error::{validate_identifier, StoreError, StoreResult};
-use crate::store::memtable::ShardedMemTable;
+use crate::store::memtable::{approx_header_bytes, approx_span_bytes, ShardedMemTable};
 
 pub const PTWL_MAGIC: [u8; 4] = *b"PTWL";
 pub const PTWL_VERSION: u8 = 1;
@@ -514,9 +514,11 @@ impl AgentWalWriter {
     }
 }
 
+/// Sizes a batch from its actual payloads, so groups are cut on real bytes. A per-span
+/// constant let a group of large traces pass the 64 MiB frame limit and fail together.
 fn estimate_batch_bytes(batch: &TraceIngestBatch) -> usize {
-    let trace_b = batch.traces.len().saturating_mul(512);
-    let span_b = batch.spans.len().saturating_mul(384);
+    let trace_b: usize = batch.traces.iter().map(approx_header_bytes).sum();
+    let span_b: usize = batch.spans.iter().map(approx_span_bytes).sum();
     trace_b.saturating_add(span_b).max(64)
 }
 
@@ -926,6 +928,46 @@ mod tests {
             .head(&wal_corrupt_path("proj_wal", &wid, "seq_000000000002.ptwl").unwrap())
             .await
             .is_ok());
+    }
+
+    /// Scalability review R-24: 24 requests of ~3 MiB each are 72 MiB together, over the 64 MiB
+    /// frame limit. Sized by a per-span constant they went into one frame and all failed.
+    #[tokio::test]
+    async fn group_of_large_requests_is_split_on_real_bytes() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let memtable = Arc::new(ShardedMemTable::new("proj_wal", 4));
+        let mut group = Vec::new();
+        let mut acks = Vec::new();
+        for i in 0..24 {
+            let mut batch = sample_batch(&format!("big_{i}"));
+            batch.spans[0].input =
+                serde_json::json!({ "text": format!("{i:02}").repeat(3 * 1024 * 1024 / 2) });
+            let (ack, rx) = oneshot::channel();
+            group.push(WalWriteReq {
+                est_bytes: estimate_batch_bytes(&batch),
+                batch,
+                ack,
+            });
+            acks.push(rx);
+        }
+        let next_seq = AtomicU64::new(1);
+        flush_wal_group(
+            "proj_wal",
+            "w1",
+            &next_seq,
+            DEFAULT_WAL_MAX_GROUP_BYTES,
+            &os,
+            &memtable,
+            group,
+        )
+        .await;
+        for rx in acks {
+            rx.await.unwrap().expect("request committed");
+        }
+        assert!(
+            next_seq.load(Ordering::Acquire) > 2,
+            "split into several frames"
+        );
     }
 
     #[tokio::test]

@@ -10,9 +10,9 @@ pub mod wal;
 
 pub use error::{StoreError, StoreResult};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use pulse_storage::EncryptedObjectStore;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
 use crate::model::{
@@ -61,6 +61,23 @@ pub struct AgentTraceStoreConfig {
     pub l0_flush_max_bytes: usize,
     pub wal_max_group_items: usize,
     pub wal_max_group_bytes: usize,
+    /// Unflushed bytes one project may hold before ingest is refused (`PULSE_AGENT_L0_PROJECT_MAX_MB`).
+    pub l0_max_bytes_project: usize,
+    /// Unflushed bytes all projects together may hold (`PULSE_AGENT_L0_MAX_MB`).
+    pub l0_max_bytes_node: usize,
+    /// Span records one trace may accumulate across batches; further spans are dropped.
+    pub max_trace_spans: usize,
+    /// Estimated bytes one trace may accumulate across batches.
+    pub max_trace_bytes: usize,
+}
+
+fn env_mb(name: &str, default_mb: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default_mb)
+        .saturating_mul(1024 * 1024)
 }
 
 impl Default for AgentTraceStoreConfig {
@@ -80,6 +97,10 @@ impl Default for AgentTraceStoreConfig {
             l0_flush_max_bytes: 32 * 1024 * 1024,
             wal_max_group_items: DEFAULT_WAL_MAX_GROUP_ITEMS,
             wal_max_group_bytes: DEFAULT_WAL_MAX_GROUP_BYTES,
+            l0_max_bytes_project: env_mb("PULSE_AGENT_L0_PROJECT_MAX_MB", 256),
+            l0_max_bytes_node: env_mb("PULSE_AGENT_L0_MAX_MB", 512),
+            max_trace_spans: 10_000,
+            max_trace_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -111,6 +132,14 @@ pub(crate) struct ProjectAgentState {
     pub wal_writer: Option<Arc<AgentWalWriter>>,
     pub applied_wal_seq: AsyncMutex<HashMap<String, u64>>,
     pub flush_lock: AsyncMutex<()>,
+    /// Unflushed memtable bytes, refreshed after every append and flush. Backpressure reads
+    /// this instead of locking every project's memtable.
+    pub l0_bytes: AtomicUsize,
+    /// Span records and bytes accepted so far per trace, kept across flushes so a looping
+    /// agent cannot grow one trace without limit.
+    // ponytail: in memory, so a restart resets the counts; entries idle for an hour or beyond
+    // 100k traces are forgotten. Persist in the manifest if a hard cap across restarts matters.
+    pub trace_usage: moka::sync::Cache<String, (usize, usize)>,
 }
 
 /// Binary storage engine for AI Agent traces and spans (`PTWL` WAL + Sharded L0 + `PLSS` 7-tag segments + MVCC Manifest).
@@ -123,6 +152,10 @@ pub struct AgentTraceStore {
     projects: DashMap<String, Arc<ProjectAgentState>>,
     project_init_lock: AsyncMutex<()>,
     closed: AtomicBool,
+    flush_notify: Notify,
+    /// Set when ingest was refused for memory: the next flush takes every shard, not only the
+    /// ones past their own threshold.
+    flush_all_next: AtomicBool,
 }
 
 impl AgentTraceStore {
@@ -165,6 +198,8 @@ impl AgentTraceStore {
             projects: DashMap::new(),
             project_init_lock: AsyncMutex::new(()),
             closed: AtomicBool::new(false),
+            flush_notify: Notify::new(),
+            flush_all_next: AtomicBool::new(false),
         };
 
         // Discover and recover any existing projects with manifests or uncommitted WALs
@@ -218,19 +253,104 @@ impl AgentTraceStore {
         }
 
         let state = self.get_or_open_project(project_id).await?;
+        self.check_l0_backpressure(&state)?;
+        let dropped_spans = self.enforce_trace_limits(&state, &mut batch);
+        if batch.traces.is_empty() && batch.spans.is_empty() {
+            return Ok(TraceIngestResponse {
+                accepted_traces: 0,
+                accepted_spans: 0,
+                truncated_payloads: 0,
+                redacted_fields: 0,
+                dropped_spans,
+                warnings: Vec::new(),
+            });
+        }
         let writer = state.wal_writer.as_ref().ok_or_else(|| {
             StoreError::Corrupted("missing WAL writer on writable project state".to_string())
         })?;
         writer.write(batch).await?;
 
+        // Flush on size from the append path; the periodic tick alone lets a burst pile up.
+        let (total, largest_shard) = state.memtable.byte_stats();
+        state.l0_bytes.store(total, Ordering::Release);
+        if largest_shard >= self.config.l0_flush_max_bytes {
+            self.flush_notify.notify_one();
+        }
+
         Ok(TraceIngestResponse {
             accepted_traces,
-            accepted_spans,
+            accepted_spans: accepted_spans - dropped_spans,
             truncated_payloads: 0,
             redacted_fields: 0,
-            dropped_spans: 0,
+            dropped_spans,
             warnings: Vec::new(),
         })
+    }
+
+    /// Drops a trace's spans from `batch` once that trace has reached its span or byte cap.
+    /// Returns how many spans were dropped. The trace header is kept: it merges, it does not grow.
+    // ponytail: read-then-insert, so concurrent batches for one trace can overshoot by a batch.
+    fn enforce_trace_limits(
+        &self,
+        state: &ProjectAgentState,
+        batch: &mut TraceIngestBatch,
+    ) -> usize {
+        let mut incoming: HashMap<&str, (usize, usize)> = HashMap::new();
+        for sp in &batch.spans {
+            let e = incoming.entry(sp.trace_id.as_str()).or_default();
+            e.0 += 1;
+            e.1 += memtable::approx_span_bytes(sp);
+        }
+        let mut over: HashSet<String> = HashSet::new();
+        for (tid, (spans, bytes)) in incoming {
+            let (used_spans, used_bytes) = state.trace_usage.get(tid).unwrap_or_default();
+            let total = (used_spans + spans, used_bytes + bytes);
+            if total.0 > self.config.max_trace_spans || total.1 > self.config.max_trace_bytes {
+                over.insert(tid.to_string());
+            } else {
+                state.trace_usage.insert(tid.to_string(), total);
+            }
+        }
+        if over.is_empty() {
+            return 0;
+        }
+        let before = batch.spans.len();
+        batch.spans.retain(|sp| !over.contains(&sp.trace_id));
+        before - batch.spans.len()
+    }
+
+    /// Refuses ingest while this project, or the node as a whole, holds more unflushed bytes
+    /// than its limit, and asks for a flush so the condition clears.
+    // ponytail: requests already queued for the WAL are not counted, so the overshoot is up to
+    // one in-flight request per connection. Reserve bytes at admission if that ever matters.
+    fn check_l0_backpressure(&self, state: &ProjectAgentState) -> StoreResult<()> {
+        let project = state.l0_bytes.load(Ordering::Acquire);
+        let (bytes, max_bytes) = if project >= self.config.l0_max_bytes_project {
+            (project, self.config.l0_max_bytes_project)
+        } else {
+            let node: usize = self
+                .projects
+                .iter()
+                .map(|e| e.value().l0_bytes.load(Ordering::Acquire))
+                .sum();
+            if node < self.config.l0_max_bytes_node {
+                return Ok(());
+            }
+            (node, self.config.l0_max_bytes_node)
+        };
+        self.flush_all_next.store(true, Ordering::Release);
+        self.flush_notify.notify_one();
+        Err(StoreError::L0Backpressure {
+            project_id: state.project_id.clone(),
+            bytes,
+            max_bytes,
+        })
+    }
+
+    /// Resolves when the append path wants a flush before the next periodic tick. The node's
+    /// flush task waits on this alongside its timer.
+    pub async fn flush_requested(&self) {
+        self.flush_notify.notified().await;
     }
 
     pub async fn flush_l0(&self) -> Result<(), StoreError> {
@@ -327,6 +447,7 @@ impl AgentTraceStore {
         if self.config.read_only {
             return Ok(());
         }
+        let force_all = force_all || self.flush_all_next.swap(false, Ordering::AcqRel);
         let states: Vec<Arc<ProjectAgentState>> =
             self.projects.iter().map(|e| e.value().clone()).collect();
         // Every project gets its turn: one failing project must not leave the others'
@@ -341,6 +462,18 @@ impl AgentTraceStore {
     }
 
     async fn flush_project_l0(
+        &self,
+        state: &Arc<ProjectAgentState>,
+        force_all: bool,
+    ) -> StoreResult<()> {
+        let res = self.flush_project_l0_inner(state, force_all).await;
+        state
+            .l0_bytes
+            .store(state.memtable.byte_stats().0, Ordering::Release);
+        res
+    }
+
+    async fn flush_project_l0_inner(
         &self,
         state: &Arc<ProjectAgentState>,
         force_all: bool,
@@ -365,11 +498,44 @@ impl AgentTraceStore {
                 self.config.l0_flush_max_bytes,
                 force_all,
             );
+            // Stage and write one shard at a time, handing the staged rows to the writer, so a
+            // flush holds one extra copy of one shard rather than two copies of all of them.
             let mut staged_list: Vec<StagedShardFlush> = Vec::with_capacity(eligible.len());
+            let mut staged_trace_ids: Vec<Vec<String>> = Vec::with_capacity(eligible.len());
+            let mut new_segments = Vec::new();
             for (date, shard_id) in eligible {
-                if let Some(staged) = state.memtable.stage_shard(date, shard_id) {
-                    staged_list.push(staged);
+                let Some(mut sf) = state.memtable.stage_shard(date, shard_id) else {
+                    continue;
+                };
+                let entries = std::mem::take(&mut sf.entries);
+                staged_trace_ids.push(
+                    entries
+                        .iter()
+                        .map(|(tr, _, _)| tr.trace_id.clone())
+                        .collect(),
+                );
+                let date_str = sf.date.format("%Y-%m-%d").to_string();
+                match SegmentWriter::write_segments_split_ranked(
+                    &state.project_id,
+                    &date_str,
+                    sf.shard_id,
+                    0,
+                    entries,
+                    self.config.max_segment_bytes,
+                    &self.object_store,
+                )
+                .await
+                {
+                    Ok(segs) => new_segments.extend(segs),
+                    Err(e) => {
+                        for seg in &new_segments {
+                            let loc = ObjectPath::from(seg.object_path.as_str());
+                            let _ = self.object_store.delete(&loc).await;
+                        }
+                        return Err(e);
+                    }
                 }
+                staged_list.push(sf);
             }
             if staged_list.is_empty() {
                 if force_all || state.memtable.has_purged_wal() {
@@ -414,31 +580,6 @@ impl AgentTraceStore {
                 return Ok(());
             }
 
-            let mut new_segments = Vec::new();
-            for sf in &staged_list {
-                let date_str = sf.date.format("%Y-%m-%d").to_string();
-                match SegmentWriter::write_segments_split_ranked(
-                    &state.project_id,
-                    &date_str,
-                    sf.shard_id,
-                    0,
-                    sf.entries.clone(),
-                    self.config.max_segment_bytes,
-                    &self.object_store,
-                )
-                .await
-                {
-                    Ok(segs) => new_segments.extend(segs),
-                    Err(e) => {
-                        for seg in &new_segments {
-                            let loc = ObjectPath::from(seg.object_path.as_str());
-                            let _ = self.object_store.delete(&loc).await;
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-
             let mut retry_needed = false;
             let mut advanced_wids: Vec<(String, u64)> = Vec::new();
             let commit_res = state
@@ -447,24 +588,26 @@ impl AgentTraceStore {
                     retry_needed = false;
                     advanced_wids.clear();
                     if m.epoch != pre_manifest.epoch {
-                        let newly_erased_staged = staged_list.iter().any(|sf| {
-                            sf.entries.iter().any(|(tr, _, _)| {
-                                m.erased_traces.contains_key(&tr.trace_id)
-                                    && !pre_manifest.erased_traces.contains_key(&tr.trace_id)
-                            })
+                        let newly_erased_staged = staged_trace_ids.iter().flatten().any(|tid| {
+                            m.erased_traces.contains_key(tid)
+                                && !pre_manifest.erased_traces.contains_key(tid)
                         });
-                        let committed_while_staging = staged_list.iter().any(|sf| {
-                            sf.entries.iter().any(|(tr, _, _)| {
-                                sf.staged_wal_seqs.get(&tr.trace_id).is_some_and(|wmap| {
-                                    !wmap.is_empty()
-                                        && wmap.iter().all(|(wid, seqs)| {
-                                            let c =
-                                                m.committed_wal_seq.get(wid).copied().unwrap_or(0);
-                                            seqs.iter().all(|&s| s <= c)
-                                        })
+                        let committed_while_staging =
+                            staged_list.iter().zip(&staged_trace_ids).any(|(sf, ids)| {
+                                ids.iter().any(|tid| {
+                                    sf.staged_wal_seqs.get(tid).is_some_and(|wmap| {
+                                        !wmap.is_empty()
+                                            && wmap.iter().all(|(wid, seqs)| {
+                                                let c = m
+                                                    .committed_wal_seq
+                                                    .get(wid)
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                seqs.iter().all(|&s| s <= c)
+                                            })
+                                    })
                                 })
-                            })
-                        });
+                            });
                         if newly_erased_staged || committed_while_staging {
                             retry_needed = true;
                             return Ok(false);
@@ -602,6 +745,7 @@ impl AgentTraceStore {
             }
         }
 
+        let memtable_bytes = memtable.byte_stats().0;
         let wal_writer = if self.config.read_only {
             None
         } else {
@@ -637,6 +781,11 @@ impl AgentTraceStore {
             wal_writer,
             applied_wal_seq: AsyncMutex::new(applied),
             flush_lock: AsyncMutex::new(()),
+            l0_bytes: AtomicUsize::new(memtable_bytes),
+            trace_usage: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
         });
         self.projects.insert(project_id.to_string(), state.clone());
         Ok(state)
