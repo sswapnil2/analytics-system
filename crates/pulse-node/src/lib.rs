@@ -452,13 +452,41 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     control.attach_ingest(ingest.clone()).await;
 
     if config.auto_seed && config.role.serves_ingest() {
-        let ps = storage
-            .get_or_open_project(&config.default_project_id)
-            .await?;
-        let existing_rows = ps.total_l0_rows() as u64 + ps.snapshot().manifest.total_l1_rows();
-        if existing_rows == 0 {
-            seed_indian_fintech_dataset(&control, &ingest, &config.default_project_id).await?;
-            seeder::seed_agent_demo(&control, &config.default_project_id).await?;
+        // Each process gets a new node id, so after a crash this node waits out the lease its
+        // previous run left behind. A standby that never gets the lease skips seeding.
+        let wait = writer_leases.as_ref().map_or(Duration::ZERO, |l| {
+            use pulse_storage::WriterLeases;
+            l.ttl() + Duration::from_secs(2)
+        });
+        let deadline = std::time::Instant::now() + wait;
+        let opened = loop {
+            match storage
+                .get_or_open_project(&config.default_project_id)
+                .await
+            {
+                Err(pulse_storage::StorageError::NotWriter { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                other => break other,
+            }
+        };
+        match opened {
+            Ok(ps) => {
+                let existing_rows =
+                    ps.total_l0_rows() as u64 + ps.snapshot().manifest.total_l1_rows();
+                if existing_rows == 0 {
+                    seed_indian_fintech_dataset(&control, &ingest, &config.default_project_id)
+                        .await?;
+                    seeder::seed_agent_demo(&control, &config.default_project_id).await?;
+                }
+            }
+            Err(pulse_storage::StorageError::NotWriter { .. }) => tracing::warn!(
+                project_id = %config.default_project_id,
+                "another node holds the writer lease; not seeding"
+            ),
+            Err(e) => return Err(e.into()),
         }
     }
 
