@@ -751,7 +751,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: with P0-3.
 - Validation: a test that appends 20,000 spans to one trace and asserts bounded append time and a rejection count.
 
-**P0-5. Claim alerts before sending.**
+**P0-5. Claim alerts before sending.** — Done: [#87](https://github.com/sswapnil2/analytics-system/pull/87)
 - Problem: R-05. Evidence: B1.
 - Solution: make the state change a conditional `UPDATE … WHERE last_triggered_ms = <value read>`; send the webhook only if one row changed.
 - Cost: S. Complexity: low. Dependencies: none.
