@@ -148,6 +148,147 @@ pub fn build_object_store(data_dir: &Path) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(DurableLocalObjectStore::new_at(&root)?))
 }
 
+/// Key prefixes written on the acknowledge path: the event WAL and the agent trace WAL.
+const WAL_PREFIXES: [&str; 4] = ["wal", "wal_corrupt", "wal_dead", "agent_wal"];
+
+/// P0-7: `PULSE_HOT_STORE=local` (default) keeps the WALs on local disk at `<data_dir>/wal`,
+/// fsync'd like `DurableLocalObjectStore`, so acknowledging a request makes no segment-store
+/// write. `object` keeps them in `segments`, for when another machine may take the lease.
+pub async fn with_hot_store(
+    segments: Arc<dyn ObjectStore>,
+    data_dir: &Path,
+) -> Result<Arc<dyn ObjectStore>> {
+    let local_dir = data_dir.join("wal");
+    match std::env::var("PULSE_HOT_STORE").as_deref().map(str::trim) {
+        Ok("object") => {
+            // A local-mode run that stopped uncleanly left WAL on disk that object mode would
+            // never replay.
+            if local_dir.exists() {
+                let local: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&local_dir)?);
+                refuse_over_wal(&local, "the local disk", "local", "object").await?;
+            }
+            return Ok(segments);
+        }
+        Ok("local") | Ok("") | Err(_) => {}
+        Ok(other) => {
+            return Err(config_error(format!(
+                "PULSE_HOT_STORE must be `local` or `object`, not `{other}`"
+            )))
+        }
+    }
+    // Unflushed WAL left in the segment store (an unclean stop under `object`) would never be
+    // replayed from local disk.
+    refuse_over_wal(&segments, "the object store", "object", "local").await?;
+    Ok(Arc::new(WalRouted {
+        wal: Arc::new(DurableLocalObjectStore::new_at(&data_dir.join("wal"))?),
+        segments,
+    }))
+}
+
+/// Refuses to start rather than drop acknowledged data: `store` still holds WAL written in
+/// mode `was` that mode `now` would never replay. A LIST failure is reported as itself.
+// ponytail: replaced by the hot-store mode marker in the next PR.
+async fn refuse_over_wal(
+    store: &Arc<dyn ObjectStore>,
+    place: &str,
+    was: &str,
+    now: &str,
+) -> Result<()> {
+    for prefix in ["wal", "agent_wal"] {
+        let mut objects = store.list(Some(&ObjectPath::from(prefix)));
+        if let Some(found) = futures::StreamExt::next(&mut objects).await {
+            return Err(config_error(format!(
+                "{place} still holds unflushed WAL ({}); start once with PULSE_HOT_STORE={was} \
+                 and stop cleanly, then switch to {now}",
+                found?.location
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A startup refusal or bad setting: not data corruption.
+fn config_error(msg: String) -> StorageError {
+    StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+}
+
+/// Sends WAL keys to `wal` and every other key to `segments`. Sits below encryption, so the
+/// local WAL is encrypted like everything else.
+#[derive(Debug)]
+struct WalRouted {
+    wal: Arc<dyn ObjectStore>,
+    segments: Arc<dyn ObjectStore>,
+}
+
+impl WalRouted {
+    fn route(&self, p: Option<&ObjectPath>) -> &Arc<dyn ObjectStore> {
+        match p.and_then(|p| p.parts().next()) {
+            Some(first) if WAL_PREFIXES.contains(&first.as_ref()) => &self.wal,
+            _ => &self.segments,
+        }
+    }
+}
+
+impl Display for WalRouted {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WalRouted(wal={}, segments={})", self.wal, self.segments)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for WalRouted {
+    async fn put_opts(&self, l: &ObjectPath, p: PutPayload, o: PutOptions) -> OsResult<PutResult> {
+        self.route(Some(l)).put_opts(l, p, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        l: &ObjectPath,
+        o: PutMultipartOptions,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.route(Some(l)).put_multipart_opts(l, o).await
+    }
+    async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+        self.route(Some(l)).get_opts(l, o).await
+    }
+    async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
+        self.route(Some(l)).get_range(l, r).await
+    }
+    async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
+        self.route(Some(l)).head(l).await
+    }
+    async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+        self.route(Some(l)).delete(l).await
+    }
+    fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+        match p {
+            Some(_) => self.route(p).list(p),
+            // ponytail: a root listing walks both stores; only tests list the root.
+            None => Box::pin(futures::StreamExt::chain(
+                self.segments.list(None),
+                self.wal.list(None),
+            )),
+        }
+    }
+    async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+        if p.is_some() {
+            return self.route(p).list_with_delimiter(p).await;
+        }
+        let mut out = self.segments.list_with_delimiter(None).await?;
+        let wal = self.wal.list_with_delimiter(None).await?;
+        out.common_prefixes.extend(wal.common_prefixes);
+        out.objects.extend(wal.objects);
+        Ok(out)
+    }
+    // Copies stay within the WAL family (`wal` -> `wal_corrupt`) or outside it, so in one store.
+    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+        self.route(Some(to)).copy(from, to).await
+    }
+    async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+        self.route(Some(to)).copy_if_not_exists(from, to).await
+    }
+}
+
 pub fn build_from_url(raw_url: &str) -> Result<Arc<dyn ObjectStore>> {
     if raw_url.starts_with("memory://") {
         return Ok(Arc::new(InMemory::new()));

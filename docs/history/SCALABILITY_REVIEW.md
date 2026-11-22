@@ -396,6 +396,7 @@ Degradation starts between 10 and 15 requests per second. Beyond that, latency g
 **Not measured, and why.**
 
 - Linux and NVMe fsync cost, and S3 or MinIO latency: need other hardware or services. Run the same loadgen against a Linux node with a local disk, then with `PULSE_OBJECT_STORE_URL` pointed at a bucket.
+- P0-7 against S3 or MinIO: loadgen with `PULSE_HOT_STORE=local` and with `object`, reporting events/s, p99 and the bucket's PUT count per hour. Neither S3 nor MinIO was available for this review, so there are no numbers; the PUT counts in P0-7 come from a counting in-memory store.
 - Datasets beyond 12 M events: the existing `scale_slo` test covers 100 k to 10 M in process (`scripts/bench_scale.sh`); the 50 M and 100 M profiles are `#[ignore]`.
 - Funnel, retention and flows over HTTP: the loadgen only issues insights queries.
 - Multi-node topologies.
@@ -762,6 +763,14 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Problem: R-06.
 - Solution: say that one ingest node per project is supported, several query nodes are, and link `docs/limitations.md`.
 - Cost: S. Timing: now.
+
+**P0-7. No object-store write on the acknowledge path.** (Added after the review, at the owner's request: cost over disk-loss durability.)
+- Problem: with the object store as the WAL, every acknowledged event or trace request is one PUT, and later one DELETE when the log is purged. Measured per 1,000 single-event requests: 1,000 WAL PUTs and about 860 DELETEs; per 1,000 trace requests: 1,000 PUTs and about 970 DELETEs.
+- Solution: `PULSE_HOT_STORE=local` (the default) keeps both WALs as fsynced files under `<data_dir>/wal`; the object store receives segments and manifests only. Same WAL format, routed by key prefix below encryption.
+- Trade-off, accepted by the owner: events acknowledged since the last flush are lost if the disk is lost. A process crash must still lose nothing. More than one ingest-capable machine per project needs `PULSE_HOT_STORE=object` or a shared volume.
+- Not covered: SlateDB identity still makes about one PUT per request that interns a new id (its own 25 ms WAL flush, not awaited before the ack). Moving it is a separate decision.
+- Cost: S. Dependencies: P0-1. Timing: after B1 and B2.
+- Validation: zero WAL PUTs to the object store across 1,000 acknowledged event and trace requests in local mode; a killed node replays every acknowledged event from local disk; an unwritable WAL directory answers `503`.
 
 ### P1: near-term, as traffic and data grow
 

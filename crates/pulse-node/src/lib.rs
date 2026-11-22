@@ -19,7 +19,8 @@ use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
 use pulse_storage::{
-    build_object_store, MaintenanceKind, StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
+    build_object_store, with_hot_store, MaintenanceKind, StorageConfig, StorageEngine,
+    DEFAULT_NUM_BUCKETS,
 };
 use tokio::sync::{oneshot, watch};
 use tower_http::compression::predicate::{NotForContentType, Predicate};
@@ -362,12 +363,13 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
     start_pulse_node_with_store(config, segment_store).await
 }
 
-/// [`start_pulse_node`] on a given object store (tests count or share it).
+/// [`start_pulse_node`] on a given segment store (tests count or share it).
 pub async fn start_pulse_node_with_store(
     config: NodeConfig,
     raw_store: Arc<dyn object_store::ObjectStore>,
 ) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
+    let raw_store = with_hot_store(raw_store, &config.data_dir).await?;
     let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
     let identity_router = Arc::new(if config.role.serves_ingest() {
         IdentityRouter::new(enc_store.as_object_store())

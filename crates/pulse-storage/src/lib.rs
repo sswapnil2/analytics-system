@@ -42,7 +42,7 @@ pub use segment::{
 pub use store_factory::{
     allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
     check_resolved_addrs, is_forbidden_ssrf_ip, validate_object_store_connection,
-    validate_outbound_url_ssrf, DurableLocalObjectStore,
+    validate_outbound_url_ssrf, with_hot_store, DurableLocalObjectStore,
 };
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 
