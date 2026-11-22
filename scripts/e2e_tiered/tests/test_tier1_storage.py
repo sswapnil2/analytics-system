@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -19,6 +22,7 @@ from lib.client import PulseHttpClient  # noqa: E402
 from lib.mock_s3 import MockS3Server  # noqa: E402
 from lib.node_mgr import NodeInstance, NodeManager  # noqa: E402
 from lib.oracle import (  # noqa: E402
+    decode_manifest,
     external_postgres_url,
     feature,
     make_agent_trace,
@@ -43,6 +47,33 @@ def _local_matches(node: NodeInstance, prefix_segment: str) -> list[str]:
         ):
             out.append(rel)
     return out
+
+
+def _incompressible_str(seed: str, length: int) -> str:
+    chunks: list[str] = []
+    cur = 0
+    counter = 0
+    while cur < length:
+        digest = hashlib.sha256(f"{seed}:{counter}".encode("utf-8")).digest()
+        b85 = base64.b85encode(digest).decode("ascii")
+        chunks.append(b85)
+        cur += len(b85)
+        counter += 1
+    return "".join(chunks)[:length]
+
+
+def _pending_delete_paths(doc: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for entry in doc.get("pending_s3_deletes") or []:
+        if isinstance(entry, str):
+            paths.add(entry)
+        elif isinstance(entry, dict):
+            for k in ("path", "key", "segment_path", "object_path"):
+                val = entry.get(k)
+                if isinstance(val, str):
+                    paths.add(val)
+                    break
+    return paths
 
 
 def _wait_project_open(
@@ -758,7 +789,7 @@ class TestF07PublishedManifestDenseSeqTier1(_StorageTier1Base):
             wait_until(lambda k=expected_key: s3.head_object(k) is not None, timeout=15.0, desc=f"wait {expected_key}")
 
         pub_keys = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k)
-        seqs = [json.loads(s3.get_object(k).decode("utf-8"))["publish_seq"] for k in pub_keys]
+        seqs = [decode_manifest(s3.get_object(k))["publish_seq"] for k in pub_keys]
         self.assertEqual(seqs[:3], [0, 1, 2])
 
     def test_f07_t1_published_manifest_contains_required_fields_and_s3_segment_paths(self) -> None:
@@ -769,7 +800,7 @@ class TestF07PublishedManifestDenseSeqTier1(_StorageTier1Base):
 
         pub_key = f"published/{pid}/pub_000000000000.json"
         wait_until(lambda: s3.head_object(pub_key) is not None, timeout=15.0, desc="pub_0 manifest")
-        doc = json.loads(s3.get_object(pub_key).decode("utf-8"))
+        doc = decode_manifest(s3.get_object(pub_key))
         for req_field in (
             "publish_seq",
             "writer_generation",
@@ -801,7 +832,7 @@ class TestF07PublishedManifestDenseSeqTier1(_StorageTier1Base):
         wait_until(lambda: len(s3.list_objects(f"published/{pid}/pub_")) >= 2, timeout=15.0, desc="second publish")
 
         pub_keys = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k)
-        seqs = [json.loads(s3.get_object(k).decode("utf-8"))["publish_seq"] for k in pub_keys]
+        seqs = [decode_manifest(s3.get_object(k))["publish_seq"] for k in pub_keys]
         self.assertEqual(seqs, list(range(len(seqs))))
 
     def test_f07_t1_source_local_epoch_and_writer_generation_recorded_in_published(self) -> None:
@@ -811,7 +842,7 @@ class TestF07PublishedManifestDenseSeqTier1(_StorageTier1Base):
         client.admin_flush().raise_for_status()
         pub_key = f"published/{pid}/pub_000000000000.json"
         wait_until(lambda: s3.head_object(pub_key) is not None, timeout=15.0, desc="pub_0")
-        doc = json.loads(s3.get_object(pub_key).decode("utf-8"))
+        doc = decode_manifest(s3.get_object(pub_key))
         self.assertGreaterEqual(int(doc["writer_generation"]), 0)
         self.assertGreaterEqual(int(doc["source_local_epoch"]), 0)
         self.assertGreater(int(doc["published_at_ms"]), 0)
@@ -863,12 +894,12 @@ class TestF08IdentityProfileSnapshotsTier1(_StorageTier1Base):
         client.ingest({"events": make_events(5, event_name="hwm_ev", distinct_id_prefix="hwm_a", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
-        pub0 = json.loads(s3.get_object(f"published/{pid}/pub_000000000000.json").decode("utf-8"))
+        pub0 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000000.json"))
 
         client.ingest({"events": make_events(6, event_name="hwm_ev", distinct_id_prefix="hwm_b", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000001.json") is not None, timeout=15.0, desc="pub_1")
-        pub1 = json.loads(s3.get_object(f"published/{pid}/pub_000000000001.json").decode("utf-8"))
+        pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
 
         self.assertGreaterEqual(int(pub0["high_water_mark"]), 5)
         self.assertGreaterEqual(int(pub1["high_water_mark"]), int(pub0["high_water_mark"]) + 6)
@@ -1465,7 +1496,7 @@ class TestF15PublishSeqFencingTier1(_StorageTier1Base):
 
         epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
         self.assertGreaterEqual(len(epochs), 1)
-        latest_doc = json.loads(node.read_local_bytes(epochs[-1]).decode("utf-8"))
+        latest_doc = decode_manifest(node.read_local_bytes(epochs[-1]))
         self.assertEqual(latest_doc["last_published_seq"], 0)
         self.assertIn("writer_generation", latest_doc)
 
@@ -1478,7 +1509,7 @@ class TestF15PublishSeqFencingTier1(_StorageTier1Base):
             wait_until(lambda idx=i: s3.head_object(f"published/{pid}/pub_{idx:012d}.json") is not None, timeout=15.0, desc=f"pub_{i}")
 
         epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
-        latest_doc = json.loads(node.read_local_bytes(epochs[-1]).decode("utf-8"))
+        latest_doc = decode_manifest(node.read_local_bytes(epochs[-1]))
         self.assertGreaterEqual(latest_doc["last_published_seq"], 1)
 
     def test_f15_t1_active_writer_survives_s3_head_check_and_continues_publishing(self) -> None:
@@ -1509,8 +1540,8 @@ class TestF15PublishSeqFencingTier1(_StorageTier1Base):
         c2.ingest({"events": make_events(2, event_name="f15_hand", distinct_id_prefix="new_w", base_ts_ms=now_ms)}, api_key=key).raise_for_status()
         c2.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000001.json") is not None, timeout=15.0, desc="pub_1")
-        pub0 = json.loads(s3.get_object(f"published/{pid}/pub_000000000000.json").decode("utf-8"))
-        pub1 = json.loads(s3.get_object(f"published/{pid}/pub_000000000001.json").decode("utf-8"))
+        pub0 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000000.json"))
+        pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
         self.assertGreater(int(pub1["writer_generation"]), int(pub0["writer_generation"]))
 
 
@@ -1531,14 +1562,16 @@ class TestF16DeletionGraceRuleTier1(_StorageTier1Base):
         return segs
 
     def test_f16_t1_superseded_s3_segment_recorded_in_local_pending_s3_deletes(self) -> None:
-        s3, _, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=0)
+        s3, _, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=0, extra_env={"PULSE_NUM_BUCKETS": "1"}
+        )
         now_ms = int(time.time() * 1000)
         self._ingest_multi_segments_eager(s3, client, pid, key, now_ms - 5000)
 
         def _has_pending() -> bool:
             for p in _local_matches(node, "manifests"):
                 if pid in p and "epoch_" in p:
-                    doc = json.loads(node.read_local_bytes(p).decode("utf-8"))
+                    doc = decode_manifest(node.read_local_bytes(p))
                     if doc.get("pending_s3_deletes"):
                         return True
             return False
@@ -1560,23 +1593,43 @@ class TestF16DeletionGraceRuleTier1(_StorageTier1Base):
             self.assertIsNotNone(s3.head_object(seg))
 
     def test_f16_t1_superseded_segment_deleted_after_superseding_publish_and_2_intervals(self) -> None:
-        s3, _, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1)
+        s3, _, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=0, extra_env={"PULSE_NUM_BUCKETS": "1"}
+        )
         now_ms = int(time.time() * 1000)
         deletes: list[str] = []
         s3.on_operation(lambda op, k: deletes.append(k) if op == "DELETE" and k.startswith(f"segments/{pid}/") else None)
 
-        for i in range(5):
+        # Seed 3 segments into the same partition
+        for i in range(3):
             client.ingest({"events": make_events(2, event_name="f16_del", distinct_id_prefix="same_bucket_user", base_ts_ms=now_ms - 5000 + i * 10)}, api_key=key).raise_for_status()
             client.admin_flush().raise_for_status()
-            wait_until(lambda idx=i: s3.head_object(f"published/{pid}/pub_{idx:012d}.json") is not None, timeout=15.0, desc=f"pub_{i}")
+        orig_segs = set(wait_until(lambda: s3.list_objects(f"segments/{pid}/") if len(s3.list_objects(f"segments/{pid}/")) >= 3 else [], timeout=15.0, desc="3 initial S3 segments"))
 
-        # Trigger at least 2 more publish cycles
-        for extra in range(5, 8):
+        # 4th flush triggers compaction + superseding segment upload & publish
+        client.ingest({"events": make_events(2, event_name="f16_del", distinct_id_prefix="same_bucket_user", base_ts_ms=now_ms - 4000)}, api_key=key).raise_for_status()
+        client.admin_flush().raise_for_status()
+        wait_until(
+            lambda: len(set(s3.list_objects(f"segments/{pid}/")) - orig_segs) >= 1,
+            timeout=20.0,
+            desc="compacted S3 segment uploaded",
+        )
+
+        # Trigger at least 2 additional publish cycles so grace window completes
+        for extra in range(3):
             client.ingest({"events": [make_event(event_name="f16_del", distinct_id="same_bucket_user", ts_ms=now_ms - 100 + extra)]}, api_key=key).raise_for_status()
             client.admin_flush().raise_for_status()
-            wait_until(lambda idx=extra: s3.head_object(f"published/{pid}/pub_{idx:012d}.json") is not None, timeout=15.0, desc=f"pub_{extra}")
+            time.sleep(0.3)
 
-        self.assertGreaterEqual(_query_total(client, pid, "f16_del", now_ms - 60_000, now_ms + 60_000), 13.0)
+        wait_until(
+            lambda: all(s3.head_object(k) is None for k in orig_segs),
+            timeout=20.0,
+            desc="superseded segments deleted after 2 intervals",
+        )
+        for seg in orig_segs:
+            self.assertIn(seg, deletes)
+            self.assertIsNone(s3.head_object(seg))
+        self.assertEqual(_query_total(client, pid, "f16_del", now_ms - 60_000, now_ms + 60_000), 11.0)
 
     def test_f16_t1_remote_query_reads_prior_published_segment_during_grace_window(self) -> None:
         s3, nm = self._provision_s3_and_mgr()
@@ -1599,15 +1652,58 @@ class TestF16DeletionGraceRuleTier1(_StorageTier1Base):
         wait_until(lambda: _query_total(qc, pid, "f16_q", now_ms - 60_000, now_ms + 60_000) == 5.0, timeout=15.0, desc="query node sees 5")
 
     def test_f16_t1_pending_s3_deletes_survives_restart_and_completes_after_grace(self) -> None:
-        s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1)
+        s3, nm, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=0, extra_env={"PULSE_NUM_BUCKETS": "1"}
+        )
         now_ms = int(time.time() * 1000)
-        client.ingest({"events": make_events(4, event_name="f16_rst", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
-        client.admin_flush().raise_for_status()
-        wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
+        for i in range(3):
+            client.ingest({"events": make_events(2, event_name="f16_rst", distinct_id_prefix="rst_u", base_ts_ms=now_ms - 2000 + i * 10)}, api_key=key).raise_for_status()
+            client.admin_flush().raise_for_status()
+        orig_segs = set(wait_until(lambda: s3.list_objects(f"segments/{pid}/") if len(s3.list_objects(f"segments/{pid}/")) >= 3 else [], timeout=15.0, desc="3 initial S3 segments"))
 
-        node2 = nm.restart(node, graceful_stop=True)
+        # Block S3 DELETE before supersession so pending_s3_deletes persists across restart
+        s3.set_fault(fail_prefixes=["segments/"], status=403, ops=["DELETE"])
+        client.ingest({"events": make_events(2, event_name="f16_rst", distinct_id_prefix="rst_u", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
+        client.admin_flush().raise_for_status()
+
+        def _latest_pending() -> set[str]:
+            epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
+            if not epochs:
+                return set()
+            return _pending_delete_paths(decode_manifest(node.read_local_bytes(epochs[-1])))
+
+        pending_before = wait_until(lambda: orig_segs & _latest_pending(), timeout=20.0, desc="pending_s3_deletes populated")
+        self.assertTrue(orig_segs.issubset(pending_before))
+
+        node.stop(graceful=True)
+        for seg in orig_segs:
+            self.assertIsNotNone(s3.head_object(seg))
+
+        s3.clear_faults()
+        node2 = nm.start_node(
+            role="all",
+            data_dir=node.data_dir,
+            hot_store="local",
+            mock_s3=s3,
+            admin_token=node.admin_token,
+            upload_interval_secs=0,
+            extra_env={"PULSE_NUM_BUCKETS": "1"},
+        )
         assert isinstance(node2, NodeInstance)
-        self.assertEqual(_query_total(node2.client(), pid, "f16_rst", now_ms - 60_000, now_ms + 60_000), 4.0)
+        c2 = node2.client()
+        for extra in range(3):
+            c2.ingest({"events": [make_event(event_name="f16_rst", distinct_id="rst_u_extra", ts_ms=now_ms - 100 + extra)]}, api_key=key).raise_for_status()
+            c2.admin_flush().raise_for_status()
+            time.sleep(0.3)
+
+        wait_until(
+            lambda: all(s3.head_object(seg) is None for seg in orig_segs),
+            timeout=20.0,
+            desc="pending_s3_deletes completed after restart",
+        )
+        epochs_after = sorted(p for p in _local_matches(node2, "manifests") if pid in p and "epoch_" in p)
+        self.assertEqual(orig_segs & _pending_delete_paths(decode_manifest(node2.read_local_bytes(epochs_after[-1]))), set())
+        self.assertEqual(_query_total(c2, pid, "f16_rst", now_ms - 60_000, now_ms + 60_000), 11.0)
 
 
 # ===========================================================================
@@ -1831,14 +1927,44 @@ class TestF19UploadCycleTier1(_StorageTier1Base):
         self.assertEqual(s3.total_calls(), 0, f"Expected 0 idle S3 calls, got {s3.get_counts()}")
 
     def test_f19_t1_closed_date_large_bytes_gt_4mib_uploads_immediately(self) -> None:
-        s3, _, _, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1)
+        s3, _, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_NUM_BUCKETS": "1"}
+        )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
-        big_prop = "Z" * 4096
-        for b in range(6):
-            batch = make_events(250, event_name="closed_big", distinct_id_prefix=f"cb_{b}", base_ts_ms=old_ms + b * 100, props={"pad": big_prop})
+        # Hold S3 segment PUTs briefly so we can verify actual compressed .pvtx bytes > 4 MiB on disk
+        s3.set_fault(fail_prefixes=["segments/"], status=403, ops=["PUT"])
+        total_sent = 0
+        local_pvtx_bytes = 0
+        for b in range(12):
+            batch = [
+                make_event(
+                    event_name="closed_big",
+                    distinct_id=f"cb_{b}_{i}",
+                    ts_ms=old_ms + b * 1000 + i,
+                    props={"pad": _incompressible_str(f"cb:{b}:{i}", 4096)},
+                )
+                for i in range(200)
+            ]
             client.ingest({"events": batch}, api_key=key).raise_for_status()
-        client.admin_flush().raise_for_status()
+            total_sent += len(batch)
+            client.admin_flush().raise_for_status()
+            local_pvtx_bytes = sum(
+                (node.data_dir / p).stat().st_size
+                for p in _local_matches(node, "hot/segments")
+                if p.endswith(".pvtx")
+            )
+            if local_pvtx_bytes > 4 * 1024 * 1024:
+                break
+
+        self.assertGreater(
+            local_pvtx_bytes,
+            4 * 1024 * 1024,
+            f"Expected local .pvtx size sum > 4 MiB, got {local_pvtx_bytes} bytes",
+        )
+        self.assertEqual(s3.list_objects(f"segments/{pid}/"), [])
+        s3.clear_faults()
         wait_until(lambda: len(s3.list_objects(f"segments/{pid}/")) >= 1, timeout=20.0, desc="closed >4MiB uploaded")
+        self.assertEqual(_query_total(client, pid, "closed_big", old_ms - 60_000, old_ms + 60_000), float(total_sent))
 
 
 # ===========================================================================
@@ -1889,14 +2015,55 @@ class TestF20IntentAndSweepTier1(_StorageTier1Base):
         self.assertNotIn(orphan_rel, node2.local_files())
 
     def test_f20_t1_startup_clears_completed_step6_intent_and_advances_seq(self) -> None:
-        s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1)
+        s3, nm, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=1, writer_lease_ttl_secs=3
+        )
         now_ms = int(time.time() * 1000)
-        client.ingest({"events": make_events(4, event_name="s6_ok", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
+        client.ingest({"events": make_events(4, event_name="s6_ok", distinct_id_prefix="s6a", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
-        node2 = nm.restart(node, graceful_stop=True)
+
+        # Induce step-6 crash immediately when pub_000000000001.json is written to S3
+        killed = threading.Event()
+
+        def _kill_on_pub1(op: str, obj_key: str) -> None:
+            if op == "PUT" and obj_key == f"published/{pid}/pub_000000000001.json" and not killed.is_set():
+                killed.set()
+                if node.proc is not None:
+                    node.proc.kill()
+
+        s3.on_operation(_kill_on_pub1)
+        client.ingest({"events": make_events(3, event_name="s6_ok", distinct_id_prefix="s6b", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
+        client.admin_flush().raise_for_status()
+        wait_until(killed.is_set, timeout=20.0, desc="step-6 SIGKILL on pub_1")
+        s3.clear_callbacks()
+        node.stop(graceful=False)
+        self.assertIsNotNone(s3.head_object(f"published/{pid}/pub_000000000001.json"))
+
+        node2 = nm.start_node(
+            role="all",
+            data_dir=node.data_dir,
+            hot_store="local",
+            mock_s3=s3,
+            admin_token=node.admin_token,
+            upload_interval_secs=1,
+            writer_lease_ttl_secs=3,
+        )
         assert isinstance(node2, NodeInstance)
-        self.assertEqual([p for p in node2.local_files() if "intent" in p.lower()], [])
+        c2 = node2.client()
+        _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
+        wait_until(lambda: [p for p in node2.local_files() if "intent" in p.lower()] == [], timeout=15.0, desc="step-6 intent cleared")
+        epochs = sorted(p for p in _local_matches(node2, "manifests") if pid in p and "epoch_" in p)
+        self.assertGreaterEqual(len(epochs), 1)
+        self.assertGreaterEqual(int(decode_manifest(node2.read_local_bytes(epochs[-1]))["last_published_seq"]), 1)
+        self.assertEqual(_query_total(c2, pid, "s6_ok", now_ms - 60_000, now_ms + 60_000), 7.0)
+
+        # Verify subsequent publish cleanly advances to pub_2
+        c2.ingest({"events": make_events(2, event_name="s6_ok", distinct_id_prefix="s6c", base_ts_ms=now_ms - 100)}, api_key=key).raise_for_status()
+        c2.admin_flush().raise_for_status()
+        wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000002.json") is not None, timeout=15.0, desc="pub_2 after step-6")
+        epochs_after = sorted(p for p in _local_matches(node2, "manifests") if pid in p and "epoch_" in p)
+        self.assertGreaterEqual(int(decode_manifest(node2.read_local_bytes(epochs_after[-1]))["last_published_seq"]), 2)
 
     def test_f20_t1_zero_events_lost_or_duplicated_across_clean_intent_cycles(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1)
@@ -1919,7 +2086,7 @@ class TestF20IntentAndSweepTier1(_StorageTier1Base):
 class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
     def test_f21_t1_below_1x_local_segment_bound_returns_200_and_waits_for_interval(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENT_MAX_BYTES": str(10 * 1024 * 1024)}
+            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": str(10 * 1024 * 1024)}
         )
         s3.reset_counts()
         now_ms = int(time.time() * 1000)
@@ -1930,7 +2097,7 @@ class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
 
     def test_f21_t1_between_1x_and_2x_bound_triggers_immediate_upload_while_returning_200(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENT_MAX_BYTES": "65536"}
+            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": "65536"}
         )
         now_ms = int(time.time() * 1000)
         batch = make_events(200, event_name="b_1x", base_ts_ms=now_ms - 500, props={"pad": "A" * 512})
@@ -1941,7 +2108,7 @@ class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
 
     def test_f21_t1_immediate_upload_drains_hot_segments_below_1x(self) -> None:
         s3, _, node, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENT_MAX_BYTES": "32768"}
+            hot_store="local", upload_interval_secs=300, extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": "32768"}
         )
         now_ms = int(time.time() * 1000)
         client.ingest({"events": make_events(120, event_name="b_drain", base_ts_ms=now_ms - 500, props={"pad": "B" * 512})}, api_key=key).raise_for_status()
@@ -1952,7 +2119,7 @@ class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
         _, _, _, client, pid, key = self._boot_single_node(
             hot_store="local",
             upload_interval_secs=2,
-            extra_env={"PULSE_HOT_SEGMENT_MAX_BYTES": "1048576", "PULSE_NODE_HOT_SEGMENT_MAX_BYTES": "4194304"},
+            extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": "1048576", "PULSE_HOT_SEGMENTS_MAX_BYTES": "4194304"},
         )
         now_ms = int(time.time() * 1000)
         resp = client.ingest({"events": make_events(20, event_name="b_norm", base_ts_ms=now_ms - 500)}, api_key=key)
@@ -1961,7 +2128,7 @@ class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
 
     def test_f21_t1_recovered_s3_drains_backlog_and_preserves_all_events(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_HOT_SEGMENT_MAX_BYTES": "32768"}
+            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": "32768"}
         )
         s3.set_fault(fail_prefixes=["segments/", "published/"], status=403)
         now_ms = int(time.time() * 1000)
@@ -2011,7 +2178,7 @@ class TestF26ColdS3MergeTier1(_StorageTier1Base):
         wait_until(lambda: len(s3.list_objects(f"published/{pid}/pub_")) >= 4, timeout=20.0, desc="cold merge publish")
 
         pub_keys = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k)
-        seqs = [json.loads(s3.get_object(k).decode("utf-8"))["publish_seq"] for k in pub_keys]
+        seqs = [decode_manifest(s3.get_object(k))["publish_seq"] for k in pub_keys]
         self.assertEqual(seqs, list(range(len(seqs))))
 
     def test_f26_t1_cold_merge_physically_drops_erased_user_rows(self) -> None:

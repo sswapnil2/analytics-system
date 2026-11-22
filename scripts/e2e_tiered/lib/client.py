@@ -932,13 +932,15 @@ def encode_otlp_trace_protobuf(req: dict[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------
 
 _METRIC_LINE_RE = re.compile(
-    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([^\s]+)(?:\s+[^\s]+)?$"
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{((?:[^}"]|"(?:\\.|[^"\\])*")*)\})?\s+([^\s]+)(?:\s+[^\s]+)?$'
 )
 _LABEL_PAIR_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"')
+_PROM_UNESCAPE_RE = re.compile(r'\\(\\|"|n)')
+_PROM_UNESCAPE_MAP = {"\\": "\\", '"': '"', "n": "\n"}
 
 
 def _unescape_prom_label(val: str) -> str:
-    return val.replace(r"\\", "\\").replace(r"\"", '"').replace(r"\n", "\n")
+    return _PROM_UNESCAPE_RE.sub(lambda m: _PROM_UNESCAPE_MAP[m.group(1)], val)
 
 
 class MetricsParser(dict[tuple[str, frozenset[tuple[str, str]]], float]):

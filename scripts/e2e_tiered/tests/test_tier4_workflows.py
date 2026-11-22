@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.server
 import json
 import os
@@ -58,8 +60,14 @@ def _shared_meta_url(cluster: ClusterHarness, label: str) -> str:
     pg = external_postgres_url()
     if pg:
         return pg
+    url, _ = _shared_sqlite_meta_url(cluster, label)
+    return url
+
+
+def _shared_sqlite_meta_url(cluster: ClusterHarness, label: str) -> tuple[str, Path]:
     shared_dir = cluster.node_mgr.make_temp_data_dir(f"pulse_{label}_")
-    return f"sqlite://{(shared_dir / 'shared_meta.db').resolve()}"
+    db_path = (shared_dir / "shared_meta.db").resolve()
+    return f"sqlite://{db_path}", db_path
 
 
 def _chmod_tree(root: Path, dir_mode: int, file_mode: int | None = None) -> None:
@@ -681,7 +689,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
     @feature("F18", "F19", "F21")
     @require_milestone("T3")
     def test_s11_local_segment_tier_7step_upload_64mib_cap_closed_date_idle_zero_s3(self) -> None:
-        """S11: High-volume local segment tier + 7-step upload cycle + >64 MiB partition cap + closed-date trickle + idle 0 S3 calls."""
+        """S11: High-volume local segment tier + 7-step upload cycle + >merge cap split + closed-date trickle + 429 backpressure + idle 0 S3 calls."""
+        def _incompressible_pad(tag: str) -> str:
+            raw = b"".join(hashlib.sha256(f"{tag}:{k}".encode("utf-8")).digest() for k in range(16))
+            return base64.b85encode(raw).decode("ascii")
+
         with ClusterHarness(use_mock_s3=True) as cluster:
             s3 = cluster.mock_s3
             assert s3 is not None
@@ -690,7 +702,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 hot_store="local",
                 upload_interval_secs=3,
                 writer_lease_ttl_secs=3,
-                extra_env={"PULSE_MERGE_PART_MAX_BYTES": str(128 * 1024)},  # test-sized cap fallback; real default 64 MiB
+                extra_env={
+                    "PULSE_MERGE_PART_MAX_BYTES": str(64 * 1024),
+                    "PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": str(64 * 1024),
+                    "PULSE_HOT_SEGMENTS_MAX_BYTES": str(128 * 1024),
+                },
             )
             assert isinstance(node, NodeInstance)
             client = node.client()
@@ -700,15 +716,65 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             # Small closed-date late event (<= 4 MiB) stays local past short 3s active timer
             yesterday_ms = now_ms - 86_400_000
             client.ingest({"events": [make_event(event_name="s11_late", distinct_id="u_late", ts_ms=yesterday_ms)]}, api_key=api_key).raise_for_status()
-            client.ingest({"events": make_events(80, event_name="s11_hot", distinct_id_prefix="u_hot", base_ts_ms=now_ms, props={"pad": "X" * 1024})}, api_key=api_key).raise_for_status()
-            client.admin_flush().raise_for_status()
+
+            # Ingest incompressible payloads across multiple flushes exceeding 64 KiB merge cap -> multi-segment split
+            hot_count = 0
+            for b in range(6):
+                evs = [
+                    make_event(
+                        event_name="s11_hot",
+                        distinct_id=f"u_hot_{b}_{i}",
+                        ts_ms=now_ms + b * 100 + i,
+                        props={"pad": _incompressible_pad(f"s11a:{b}:{i}")},
+                    )
+                    for i in range(60)
+                ]
+                client.ingest({"events": evs}, api_key=api_key).raise_for_status()
+                client.admin_flush().raise_for_status()
+                hot_count += len(evs)
 
             wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=25.0)
-            self.assertEqual(_insights_total(client, pid, "s11_hot", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 80.0)
+            wait_until(lambda: len(s3.list_objects(f"segments/{pid}/")) >= 2, timeout=20.0, desc="multi-segment split under merge cap")
+            self.assertEqual(_insights_total(client, pid, "s11_hot", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), float(hot_count))
             self.assertEqual(_insights_total(client, pid, "s11_late", start_ms=yesterday_ms - 60_000, end_ms=yesterday_ms + 60_000), 1.0)
 
+            # Trigger F21 429 backpressure under S3 outage with incompressible segments, then recover with zero loss
+            s3.set_fault(fail_prefixes=["segments/", "published/"], status=503)
+            bp_acked = 0
+            hit_429 = False
+            for b in range(40):
+                evs = [
+                    make_event(
+                        event_name="s11_hot",
+                        distinct_id=f"u_bp_{b}_{i}",
+                        ts_ms=now_ms + 10_000 + b * 100 + i,
+                        props={"pad": _incompressible_pad(f"s11bp:{b}:{i}")},
+                    )
+                    for i in range(60)
+                ]
+                r = client.ingest({"events": evs}, api_key=api_key)
+                if r.status == 429:
+                    self.assertIsNotNone(r.header("retry-after"))
+                    hit_429 = True
+                    break
+                r.raise_for_status()
+                bp_acked += int(r.json()["accepted"])
+                client.admin_flush().raise_for_status()
+            self.assertTrue(hit_429, "Expected HTTP 429 once hot/segments/ exceeded 2x byte bound")
+
+            s3.clear_faults()
+            wait_until(
+                lambda: client.ingest({"events": [make_event(event_name="s11_hot", distinct_id="u_s11_rec", ts_ms=now_ms + 50_000)]}, api_key=api_key).status == 200,
+                timeout=25.0,
+                desc="ingest recovers to 200 after S3 fault cleared",
+            )
+            self.assertEqual(
+                _insights_total(client, pid, "s11_hot", start_ms=now_ms - 60_000, end_ms=now_ms + 120_000),
+                float(hot_count + bp_acked + 1),
+            )
+
             # Verify idle zero S3 calls after upload settles
-            time.sleep(2.0)
+            time.sleep(3.5)
             s3.reset_counts()
             time.sleep(4.0)
             self.assertEqual(s3.total_calls(), 0, f"Idle project made S3 calls: {s3.get_counts()}")
@@ -747,6 +813,31 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 client = node.client()
 
             wait_until(lambda: _insights_total(client, pid, "s12_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 10.0, timeout=20.0)
+
+            # F20: S3 unreachable during restart dedup seeding must refuse project open rather than accepting duplicates
+            node.stop(graceful=True)
+            s3.set_fault(unreachable=True)
+            node_down = cluster.start_node(
+                data_dir=node.data_dir,
+                hot_store="local",
+                upload_interval_secs=2,
+                writer_lease_ttl_secs=3,
+                wait_ready=False,
+            )
+            assert isinstance(node_down, NodeInstance)
+            time.sleep(2.0)
+            if node_down.proc is not None and node_down.proc.poll() is None:
+                r_dup = node_down.client().ingest(
+                    {"events": make_events(5, event_name="s12_ev", distinct_id_prefix="u_s12_0", base_ts_ms=now_ms, seed_prefix="s12_0")},
+                    api_key=api_key,
+                )
+                self.assertGreaterEqual(r_dup.status, 500)
+            s3.clear_faults()
+            node_down.stop(graceful=False)
+
+            node_rec = cluster.start_node(data_dir=node.data_dir, hot_store="local", upload_interval_secs=2, writer_lease_ttl_secs=3)
+            assert isinstance(node_rec, NodeInstance)
+            self.assertEqual(_insights_total(node_rec.client(), pid, "s12_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 10.0)
 
     @feature("F19", "F21")
     @require_milestone("T3")
@@ -796,13 +887,14 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
     def test_s14_w1_async_ingest_pii_masking_retries_sigkill_dead_letter_erasure(self) -> None:
         """S14: W1 async event ingest + Lexicon PII masking + duplicate retries + SIGKILL flush-bound + dead-letter CLI w/ erasure."""
         with ClusterHarness(use_mock_s3=True) as cluster:
+            assert cluster.mock_s3 is not None
             node = cluster.start_node(role="all", hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node, NodeInstance)
             client = node.client()
             pid, api_key = _create_project(client, "S14 W1 Async")
             now_ms = int(time.time() * 1000)
 
-            client.update_lexicon_property(pid, "secret_pan", {"pii": True, "masking": "mask"}).raise_for_status()
+            client.update_lexicon_property(pid, "secret_pan", {"pii_masked": True}).raise_for_status()
             evs = make_events(15, event_name="s14_ev", distinct_id_prefix="u_s14", base_ts_ms=now_ms, props={"secret_pan": "ABCDE1234F"}, seed_prefix="s14")
             r1 = client.ingest({"events": evs}, api_key=api_key).raise_for_status().json()
             r2 = client.ingest({"events": evs}, api_key=api_key).raise_for_status().json()
@@ -821,7 +913,54 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node.kill()
             node2 = cluster.start_node(data_dir=node.data_dir, hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
-            self.assertEqual(_insights_total(node2.client(), pid, "s14_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 15.0)
+            c2 = node2.client()
+            self.assertEqual(_insights_total(c2, pid, "s14_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 15.0)
+
+            # F23: Trigger per-project schema-cap dead-lettering (8192 event dictionary cap), inspect CLI, then DPDP-erase user
+            c2.identify({"anon_id": "a_s14_dl", "user_id": "u_s14_dl"}, api_key=api_key).raise_for_status()
+            idx = 0
+            while idx < 8192:
+                chunk = [
+                    make_event(event_name=f"s14_dict_{idx + j:04d}", distinct_id="u_s14_dict", ts_ms=now_ms + 1000 + idx + j)
+                    for j in range(min(256, 8192 - idx))
+                ]
+                c2.ingest({"events": chunk}, api_key=api_key).raise_for_status()
+                idx += len(chunk)
+            wait_until(lambda: c2.parsed_metrics().sum_by_name("pulse_ingest_log_lag_bytes") == 0.0, timeout=30.0)
+
+            c2.ingest(
+                {"events": [make_event(event_name="s14_overflow_8193", distinct_id="u_s14_dl", ts_ms=now_ms + 20_000)]},
+                api_key=api_key,
+            ).raise_for_status()
+            wait_until(lambda: c2.parsed_metrics().sum_by_name("pulse_ingest_dead_lettered_events_total") >= 1.0, timeout=15.0)
+            wait_until(lambda: any("wal_dead/" in p for p in node2.local_files()), timeout=15.0)
+
+            caps = cluster.node_mgr.probe_capabilities()
+            dl_cmd = next((c for c in ("dead-letters", "dead-letter", "wal-dead", "inspect-dead-letters") if caps.has_subcommand(c)), None)
+            self.assertIsNotNone(dl_cmd, f"Expected dead-letter CLI subcommand in {sorted(caps.subcommands)}")
+            assert dl_cmd is not None
+
+            node2.stop(graceful=True)
+            cli_before = cluster.node_mgr.run_cli(
+                [dl_cmd, "--project-id", pid, "--data-dir", str(node2.data_dir)],
+                env=cluster.mock_s3.env_vars(),
+            )
+            self.assertEqual(cli_before.returncode, 0, cli_before.stderr)
+            self.assertIn("s14_overflow_8193", cli_before.stdout)
+            self.assertIn("u_s14_dl", cli_before.stdout)
+
+            node3 = cluster.start_node(data_dir=node2.data_dir, hot_store="local", writer_lease_ttl_secs=3)
+            assert isinstance(node3, NodeInstance)
+            node3.client().delete_user(pid, "u_s14_dl").raise_for_status()
+            node3.stop(graceful=True)
+
+            cli_after = cluster.node_mgr.run_cli(
+                [dl_cmd, "--project-id", pid, "--data-dir", str(node3.data_dir)],
+                env=cluster.mock_s3.env_vars(),
+            )
+            self.assertEqual(cli_after.returncode, 0, cli_after.stderr)
+            self.assertNotIn("s14_overflow_8193", cli_after.stdout)
+            self.assertNotIn("u_s14_dl", cli_after.stdout)
 
     @feature("F04", "F22", "F25")
     @require_milestone("W2")
@@ -875,23 +1014,43 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             pid, api_key = _create_project(client, "S16 T4 Cold & Agent/Replay")
             now_ms = int(time.time() * 1000)
 
+            pub_seq = 0
             for day_off in (3, 2, 1):
                 ts = now_ms - day_off * 86_400_000
                 for c in range(2):
                     client.ingest({"events": [make_event(event_name="s16_cold", distinct_id="u_s16", ts_ms=ts + c * 100)]}, api_key=api_key).raise_for_status()
                     client.admin_flush().raise_for_status()
-                    wait_until(lambda: s3.put_count("published/") >= 1, timeout=20.0)
+                    target_pub = f"published/{pid}/pub_{pub_seq:012}.json"
+                    wait_until(lambda k=target_pub: k in s3.list_objects(f"published/{pid}/"), timeout=20.0)
+                    pub_seq += 1
+
+            initial_segs = set(s3.list_objects(f"segments/{pid}/"))
+            self.assertGreaterEqual(len(initial_segs), 6, f"Expected >=6 segments across 3 closed days, got {initial_segs}")
+
+            # Verify cold S3 merge consolidates closed-day segments (<= 1 per active bucket per closed day = <= 3) after grace
+            wait_until(
+                lambda: len(s3.list_objects(f"segments/{pid}/")) <= 3
+                and not initial_segs.issubset(set(s3.list_objects(f"segments/{pid}/"))),
+                timeout=35.0,
+                desc="cold merge consolidated closed-day S3 segments",
+            )
+            self.assertEqual(
+                _insights_total(client, pid, "s16_cold", start_ms=now_ms - 4 * 86_400_000, end_ms=now_ms + 60_000),
+                6.0,
+            )
 
             client.replay_chunk(make_replay_chunk(session_id="rs_s16", project_id=pid, chunk_start_ts_ms=now_ms), api_key=api_key, binary=True).raise_for_status()
             client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_erase", start_ts_ms=now_ms), api_key=api_key, binary=True).raise_for_status()
             client.erase_agent(pid, level="trace", target_id="tr_s16_erase", expires_at=now_ms + 1500).raise_for_status()
 
             wait_until(lambda: any(k.startswith(f"replays/{pid}/") for k in s3.list_objects("replays/")), timeout=20.0)
+            wait_until(lambda: any(k.startswith(f"agent_segments/{pid}/") for k in s3.list_objects("agent_segments/")), timeout=20.0)
             time.sleep(2.5)
             client.admin_flush().raise_for_status()
             self.assertEqual(client.get_agent_trace(pid, "tr_s16_erase").status, 404)
             self.assertEqual(client.get_replay(pid, "rs_s16", byte_range="bytes=0-15").status, 206)
 
+            time.sleep(2.5)
             s3.reset_counts()
             time.sleep(4.0)
             self.assertEqual(s3.total_calls(), 0, f"Expected 0 idle S3 calls, got {s3.get_counts()}")
@@ -903,23 +1062,28 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
         sink = _WebhookSink().start()
         self.addCleanup(sink.stop)
         with ClusterHarness(use_mock_s3=True) as cluster:
-            meta_url = _shared_meta_url(cluster, "s17")
-            topo = cluster.start_w3_cluster(num_writers=2, num_storage=2, database_url=meta_url, writer_lease_ttl_secs=3)
+            meta_url, db_path = _shared_sqlite_meta_url(cluster, "s17")
+            topo = cluster.start_w3_cluster(
+                num_writers=2,
+                num_storage=2,
+                database_url=meta_url,
+                writer_lease_ttl_secs=3,
+                extra_env={"PULSE_ALERT_EVAL_INTERVAL_SECS": "1"},
+            )
             s0, s1 = topo["storages"]
             w0, w1 = topo["writers"]
             sc = s0.client()
 
             projects = [_create_project(sc, f"S17_P{i}") for i in range(4)]
             p1, k1 = projects[0]
-            if meta_url.startswith("sqlite://"):
-                rows = cluster.node_mgr.sqlite_query(
-                    "SELECT node_name, COUNT(*) AS cnt FROM project_owner GROUP BY node_name",
-                    db_path=Path(meta_url[len("sqlite://") :]),
-                )
-                counts = {r["node_name"]: int(r["cnt"]) for r in rows}
-                self.assertEqual(sum(counts.values()), 4)
-                self.assertEqual(counts.get("storage-0", 0), 2)
-                self.assertEqual(counts.get("storage-1", 0), 2)
+            rows = cluster.node_mgr.sqlite_query(
+                "SELECT node_name, COUNT(*) AS cnt FROM project_owner GROUP BY node_name",
+                db_path=db_path,
+            )
+            counts = {r["node_name"]: int(r["cnt"]) for r in rows}
+            self.assertEqual(sum(counts.values()), 4)
+            self.assertEqual(counts.get("storage-0", 0), 2)
+            self.assertEqual(counts.get("storage-1", 0), 2)
 
             sc.create_alert(p1, {"name": "s17_spike", "event_name": "s17_alert_ev", "operator": "gte", "threshold": 3.0, "webhook_url": sink.url}).raise_for_status()
             now_ms = int(time.time() * 1000)
@@ -942,7 +1106,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
     def test_s18_multinode_w3_resilience_sigkill_resend_no_hol_503_and_owner_migration(self) -> None:
         """S18: Multi-node W3 resilience: writer SIGKILL mid-forward, flush-purged resend dedup, no HOL on 429, owner crash 503 vs async buffer, owner migration."""
         with ClusterHarness(use_mock_s3=True) as cluster:
-            meta_url = _shared_meta_url(cluster, "s18")
+            meta_url, db_path = _shared_sqlite_meta_url(cluster, "s18")
             topo = cluster.start_w3_cluster(num_writers=2, num_storage=2, database_url=meta_url, writer_lease_ttl_secs=3)
             s0, s1 = topo["storages"]
             w0, w1 = topo["writers"]
@@ -960,13 +1124,20 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             assert isinstance(w0_up, NodeInstance)
             wait_until(lambda: _insights_total(sc, p1, "s18_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 60.0, timeout=20.0)
 
-            # Stop owner of P1 -> sync/query return 503 while async /v1/ingest buffers 200; P2 stays 200
-            owner_p1 = s0
-            other_s = s1
-            if meta_url.startswith("sqlite://"):
-                rows = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p1,), db_path=Path(meta_url[len("sqlite://") :]))
-                owner_p1 = s0 if rows[0]["node_name"] == "storage-0" else s1
-                other_s = s1 if owner_p1 is s0 else s0
+            # Stop owner of P1 -> sync/query return 503 while async /v1/ingest buffers 200; P2 on other_s stays 200
+            rows1 = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p1,), db_path=db_path)
+            rows2 = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p2,), db_path=db_path)
+            o1_name = rows1[0]["node_name"]
+            owner_p1 = s0 if o1_name == "storage-0" else s1
+            other_s = s1 if owner_p1 is s0 else s0
+            if rows2[0]["node_name"] == o1_name:
+                other_name = "storage-1" if o1_name == "storage-0" else "storage-0"
+                cluster.node_mgr.sqlite_query(
+                    "UPDATE project_owner SET node_name = ?, address = ? WHERE project_id = ?",
+                    (other_name, other_s.base_url, p2),
+                    db_path=db_path,
+                    readonly=False,
+                )
 
             owner_p1.stop(graceful=True)
             self.assertEqual(w1.client().identify({"anon_id": "a_s18_down", "user_id": "u_s18_down"}, api_key=k1).status, 503)

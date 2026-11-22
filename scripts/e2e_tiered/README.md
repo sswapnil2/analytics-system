@@ -18,7 +18,7 @@ scripts/e2e_tiered/
 │   └── oracle.py                 # @tier/@feature/@require_milestone gating, wait_until, fixture helpers
 └── tests/
     ├── __init__.py
-    ├── test_harness_self.py      # Offline harness tests + live pulse-node & MockS3Server integration (8 tests)
+    ├── test_harness_self.py      # Offline harness tests + live pulse-node & MockS3Server integration (11 tests)
     ├── test_tier1_storage.py     # Tier 1 happy-path tests for F01–F21, F26–F27 (115 tests)
     ├── test_tier1_writers.py     # Tier 1 happy-path tests for F22–F25, F28–F31 (40 tests)
     ├── test_tier2_storage.py     # Tier 2 boundary/negative tests for F01–F21, F26–F27 (115 tests)
@@ -29,24 +29,24 @@ scripts/e2e_tiered/
 
 ## Suite Coverage & Exact Test Counts
 
-Total discovered tests: **371** across **31/31** features (`F01`–`F31`) and **9** milestones (`T0a`–`W3`):
+Total discovered tests: **374** across **31/31** features (`F01`–`F31`) and **9** milestones (`T0a`–`W3`):
 
 ### By Tier
 
 | Tier | Scope | Count |
 |---|---|---:|
-| `self` | Harness unit & live `MockS3Server` + `pulse-node` integration (`test_harness_self.py`) | 8 |
+| `self` | Harness unit & live `MockS3Server` + `pulse-node` integration (`test_harness_self.py`) | 11 |
 | `1` | Isolated happy-path tests (`5` per feature × `31` features) | 155 |
 | `2` | Boundary, corner-case, and negative/fault tests (`5` per feature × `31` features) | 155 |
 | `3` | Pairwise cross-feature interaction tests covering all `F01`–`F31` | 35 |
 | `4` | Real-world end-to-end multi-feature workload scenarios (`S01`–`S18`) | 18 |
-| **Total** | | **371** |
+| **Total** | | **374** |
 
 ### By Milestone
 
 | Milestone | Scope | Tests |
 |---|---|---:|
-| `none` | Offline harness unit tests (`test_harness_self.py`) | 7 |
+| `none` | Offline harness unit tests (`test_harness_self.py`) | 10 |
 | `T0a` | Local WAL routing, mixed-mode refusal, `503` on WAL failure | 34 |
 | `T0b` | Local `identity/` & `profiles/`, mode marker, `DurableLocalObjectStore` multipart fsync | 36 |
 | `T1` | Published manifest (`publish_seq`), snapshots, T1 benchmark, `restore`, `erased_uids`, SQLite warn | 79 |
@@ -56,7 +56,7 @@ Total discovered tests: **371** across **31/31** features (`F01`–`F31`) and **
 | `W2` | Sync profile endpoints returning `canonical_uid` & `apply_engage`/`on_identify` error propagation | 13 |
 | `T4` | Cold S3 merge & local hot tier + upload/publish for agent & replay | 25 |
 | `W3` | Stateless writer `writer_log/`, forwarder + `(writer_id, bucket)` offsets, `project_owner`, routing | 49 |
-| **Total** | | **371** |
+| **Total** | | **374** |
 
 ### By Feature (`F01`–`F31`)
 
@@ -75,7 +75,7 @@ Run harness self-tests (including live `MockS3Server` + `pulse-node` integration
 python3 scripts/e2e_tiered/runner.py --tier self -v
 ```
 
-Run baseline-implemented milestones (e.g., `T0a` on `7757e8b`: executes `8` self + `33` `T0a` = `41` live tests and cleanly skips `330` `T0b`–`W3` tests):
+Run baseline-implemented milestones (e.g., `T0a` on `7757e8b`: executes `10` offline + `34` `T0a` = `44` live tests and cleanly skips `330` `T0b`–`W3` tests):
 ```bash
 python3 scripts/e2e_tiered/runner.py --tier all --mode baseline --max-milestone T0a --no-build -v
 ```
@@ -86,7 +86,7 @@ python3 scripts/e2e_tiered/runner.py --tier 1 --feature F01,F02,F03 --mode basel
 python3 scripts/e2e_tiered/runner.py --milestone T1 --no-build -v
 ```
 
-Run full strict acceptance suite (zero milestone skips allowed):
+Run full strict acceptance suite (zero milestone skips allowed; `--max-milestone` is forbidden with `--mode full` and exits with code `2`, and `E2E_TIERED_MAX_MILESTONE` is ignored):
 ```bash
 python3 scripts/e2e_tiered/runner.py --tier all --mode full --json-out /tmp/e2e_tiered_report.json
 ```
@@ -98,8 +98,8 @@ python3 scripts/e2e_tiered/runner.py --tier all --mode full --json-out /tmp/e2e_
 | `--tier {all,self,1,2,3,4}` | `all` | Tier to list or execute |
 | `--feature F01..F31` | `None` | Filter by feature code (repeatable or comma-separated) |
 | `--milestone T0a..W3` | `None` | Filter to a single milestone |
-| `--mode {full,baseline}` | `full` | `full` forbids milestone skips; `baseline` enables `--max-milestone` skipping |
-| `--max-milestone T0a..W3` | `T0a` in `baseline` | Tests above this milestone raise `unittest.SkipTest` |
+| `--mode {full,baseline}` | `full` | Strict `full` forbids milestone skips, rejects `--max-milestone` (exit `2`), and ignores `E2E_TIERED_MAX_MILESTONE`; `baseline` enables `--max-milestone` skipping |
+| `--max-milestone T0a..W3` | `T0a` in `baseline` | Tests above this milestone raise `unittest.SkipTest` (only valid with `--mode baseline`) |
 | `--list` | `False` | Print discovered tests and counts by tier, feature, and milestone |
 | `--no-build` | `False` | Skip running `cargo build -p pulse-node --locked` |
 | `--binary PATH` | auto | Explicit path to `pulse-node` binary |
@@ -109,7 +109,13 @@ python3 scripts/e2e_tiered/runner.py --tier all --mode full --json-out /tmp/e2e_
 
 ## Environment Variables
 
-- `E2E_TIERED_MODE`: Active runner mode (`full` or `baseline`).
-- `E2E_TIERED_MAX_MILESTONE`: Max milestone threshold (`T0a`..`W3`) when gating skips.
+### Runner & Harness
+- `E2E_TIERED_MODE`: Active runner mode (`full` or `baseline`). In `full` mode, milestone gating is strictly disabled.
+- `E2E_TIERED_MAX_MILESTONE`: Max milestone threshold (`T0a`..`W3`) when running in `baseline` mode (ignored in `full` mode).
 - `E2E_TIERED_BINARY`: Path to `pulse-node` binary used by `NodeManager`.
 - `E2E_POSTGRES_URL` / `DATABASE_URL`: Optional external Postgres URL for tests requiring Postgres (`skip_if_no_postgres()`).
+
+### Unified `PULSE_*` Node Configuration (Exercised by the Suite)
+- **Hot store & object store**: `PULSE_HOT_STORE` (`local` | `object`), `PULSE_DATA_DIR`, `PULSE_OBJECT_STORE_URL`, `PULSE_BYOK_MASTER_KEY`, `PULSE_ALLOW_PRIVATE_ENDPOINTS`, `PULSE_ALLOW_EPHEMERAL_KEK`.
+- **Upload, merge & local segment bounds**: `PULSE_UPLOAD_INTERVAL_SECS`, `PULSE_CLOSED_DATE_UPLOAD_SECS`, `PULSE_COLD_MERGE_IDLE_SECS`, `PULSE_MERGE_PART_MAX_BYTES` (64 MiB/partition merge cap), `PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES` (per-project local `hot/segments/` bound), `PULSE_HOT_SEGMENTS_MAX_BYTES` (node-level local `hot/segments/` bound), `PULSE_NUM_BUCKETS`.
+- **Log-first writers & alerts**: `PULSE_WRITER_FLUSH_MS`, `PULSE_WRITER_FLUSH_BYTES`, `PULSE_WRITER_LOG_IDLE_CLOSE_MS`, `PULSE_WRITER_LOG_MAX_AGE_SECS`, `PULSE_WRITER_LOG_PROJECT_MAX_BYTES`, `PULSE_WRITER_LEASE_TTL_SECS`, `PULSE_L0_MAX_ROWS_PER_BUCKET`, `PULSE_ALERT_EVAL_INTERVAL_SECS`, `PULSE_NODE_NAME`, `PULSE_ADMIN_TOKEN`, `PULSE_METRICS_TOKEN`, `PULSE_SHUTDOWN_DRAIN_MS`.

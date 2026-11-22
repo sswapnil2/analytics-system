@@ -69,6 +69,10 @@ def _w3_meta_url(cluster: ClusterHarness) -> tuple[str, Path | None]:
     pg = external_postgres_url()
     if pg:
         return pg, None
+    return _w3_sqlite_meta_url(cluster)
+
+
+def _w3_sqlite_meta_url(cluster: ClusterHarness) -> tuple[str, Path]:
     shared_dir = cluster.node_mgr.make_temp_data_dir("pulse_w3_t1_meta_")
     db_path = (shared_dir / "shared_meta.db").resolve()
     return f"sqlite://{db_path}", db_path
@@ -81,8 +85,8 @@ def _transfer_project_for_failover(
     project_id: str,
     db_url: str,
 ) -> None:
-    """Restore via CLI when external Postgres is active, or copy flushed local project dirs under SQLite."""
-    if external_postgres_url():
+    """Restore via CLI when Postgres is active, or copy flushed local project dirs under SQLite."""
+    if db_url.startswith(("postgres://", "postgresql://")):
         assert cluster.mock_s3 is not None
         proc = cluster.node_mgr.run_cli(
             ["restore", "--from-published", "--data-dir", str(dst_node.data_dir)],
@@ -138,8 +142,7 @@ def _fill_event_dictionary(
 
     def _lag_drained() -> bool:
         m = client.parsed_metrics()
-        lag = m.get_metric("pulse_ingest_log_lag_bytes")
-        return lag is None or lag == 0.0
+        return m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
 
     wait_until(_lag_drained, timeout=30.0, interval=0.1, desc="dictionary fill drain")
 
@@ -428,6 +431,7 @@ class TestTier1F23DeadLetterStorageAndCli(unittest.TestCase):
     @require_milestone("W1")
     def test_dead_letter_cli_lists_events_with_reason_and_identity(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
+            assert cluster.mock_s3 is not None
             subcmd = _find_dead_letter_subcmd(cluster)
             node = cluster.start_node(role="all", hot_store="local")
             assert isinstance(node, NodeInstance)
@@ -447,7 +451,10 @@ class TestTier1F23DeadLetterStorageAndCli(unittest.TestCase):
             )
             node.stop(graceful=True)
 
-            proc = cluster.node_mgr.run_cli([subcmd, "--project-id", pid, "--data-dir", str(node.data_dir)])
+            proc = cluster.node_mgr.run_cli(
+                [subcmd, "--project-id", pid, "--data-dir", str(node.data_dir)],
+                env=cluster.mock_s3.env_vars(),
+            )
             self.assertEqual(proc.returncode, 0, f"CLI failed: stdout={proc.stdout}\nstderr={proc.stderr}")
             out = proc.stdout + "\n" + proc.stderr
             self.assertIn("dl_cli_overflow", out)
@@ -462,6 +469,7 @@ class TestTier1F23DeadLetterStorageAndCli(unittest.TestCase):
     @require_milestone("W1")
     def test_dead_letter_cli_omits_erased_users(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
+            assert cluster.mock_s3 is not None
             subcmd = _find_dead_letter_subcmd(cluster)
             node = cluster.start_node(role="all", hot_store="local")
             assert isinstance(node, NodeInstance)
@@ -492,7 +500,10 @@ class TestTier1F23DeadLetterStorageAndCli(unittest.TestCase):
             client.delete_user(pid, "u_dl_erase").raise_for_status()
             node.stop(graceful=True)
 
-            proc = cluster.node_mgr.run_cli([subcmd, "--project-id", pid, "--data-dir", str(node.data_dir)])
+            proc = cluster.node_mgr.run_cli(
+                [subcmd, "--project-id", pid, "--data-dir", str(node.data_dir)],
+                env=cluster.mock_s3.env_vars(),
+            )
             self.assertEqual(proc.returncode, 0, f"CLI failed: {proc.stderr}")
             self.assertIn("u_dl_keep", proc.stdout)
             self.assertNotIn("u_dl_erase", proc.stdout)
@@ -580,15 +591,15 @@ class TestTier1F24IngestObservabilityAndAlerts(unittest.TestCase):
 
             client.ingest({"events": make_events(25, event_name="f24_drain")}, api_key=api_key).raise_for_status()
             wait_until(
-                lambda: (client.parsed_metrics().get_metric("pulse_ingest_log_lag_bytes") or 0.0) == 0.0,
+                lambda: client.parsed_metrics().sum_by_name("pulse_ingest_log_lag_bytes") == 0.0,
                 timeout=15.0,
                 desc="log lag drained to 0",
             )
             client.admin_flush().raise_for_status()
             m = client.parsed_metrics()
-            self.assertEqual(m.get_metric("pulse_ingest_log_lag_bytes"), 0.0)
-            self.assertEqual(m.get_metric("pulse_l0_bytes"), 0.0)
-            self.assertEqual(m.get_metric("pulse_l0_rows"), 0.0)
+            self.assertEqual(m.sum_by_name("pulse_ingest_log_lag_bytes"), 0.0)
+            self.assertEqual(m.sum_by_name("pulse_l0_bytes"), 0.0)
+            self.assertEqual(m.sum_by_name("pulse_l0_rows"), 0.0)
 
     @tier(1)
     @feature("F24")
@@ -631,7 +642,7 @@ class TestTier1F24IngestObservabilityAndAlerts(unittest.TestCase):
             resp = client.metrics(token=token).raise_for_status()
             parsed = MetricsParser.parse(resp.text())
             self.assertEqual(parsed.get_metric("pulse_ready"), 1.0)
-            self.assertIsNotNone(parsed.get_metric("pulse_ingest_log_lag_bytes"))
+            self.assertTrue(any(n == "pulse_ingest_log_lag_bytes" for (n, _) in parsed.keys()))
 
     @tier(1)
     @feature("F24")
@@ -877,7 +888,7 @@ class TestTier1F28StatelessWriterAndWriterLog(unittest.TestCase):
             pid, api_key = _create_project(s_client, "F28 Lexicon PII")
             now_ms = int(time.time() * 1000)
 
-            s_client.update_lexicon_property(pid, "pan_secret", {"pii": True}).raise_for_status()
+            s_client.update_lexicon_property(pid, "pan_secret", {"pii_masked": True}).raise_for_status()
             s_client.update_lexicon_event(pid, "f28_dropped_ev", {"status": "dropped"}).raise_for_status()
             # Ensure writer refreshes lexicon rules (or restart writer to force immediate reload)
             writer = writer.restart(graceful_stop=True)
@@ -1089,9 +1100,7 @@ class TestTier1F29ForwarderAndOffsets(unittest.TestCase):
     def test_forwarder_refreshes_owner_on_not_owner_after_manual_transfer(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
             assert cluster.mock_s3 is not None
-            db_url, db_path = _w3_meta_url(cluster)
-            if db_path is None:
-                self.skipTest("[external-tool] Local SQLite MetaStore helper required for direct project_owner update")
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=1, num_storage=2, database_url=db_url, upload_interval_secs=1)
             s1, s2 = topo["storages"]
             writer = topo["writers"][0]
@@ -1157,7 +1166,7 @@ class TestTier1F29ForwarderAndOffsets(unittest.TestCase):
                 timeout=20.0,
             )
             exp = storage.client().export_events(pid, format="json").raise_for_status().json()
-            seqs = sorted(e["properties"]["seq"] for e in exp["events"])
+            seqs = sorted(e["props"]["seq"] for e in exp["events"])
             self.assertEqual(seqs, list(range(50)))
 
 
@@ -1169,46 +1178,42 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
     @require_milestone("W3")
     def test_new_projects_balance_by_least_owned_count(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            db_url, db_path = _w3_meta_url(cluster)
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=1, num_storage=2, database_url=db_url)
             s1 = topo["storages"][0]
             s_client = s1.client()
 
             pids = [_create_project(s_client, f"F30 Bal {i}")[0] for i in range(4)]
-            if db_path is not None:
-                rows = s1.sqlite_query(
-                    f"SELECT project_id, node_name FROM project_owner WHERE project_id IN ({','.join('?' for _ in pids)})",
-                    pids,
-                    db_path=db_path,
-                )
-                counts: dict[str, int] = {}
-                for r in rows:
-                    counts[r["node_name"]] = counts.get(r["node_name"], 0) + 1
-                self.assertEqual(counts.get("storage-0"), 2)
-                self.assertEqual(counts.get("storage-1"), 2)
-            else:
-                self.assertEqual(len(pids), 4)
+            rows = s1.sqlite_query(
+                f"SELECT project_id, node_name FROM project_owner WHERE project_id IN ({','.join('?' for _ in pids)})",
+                pids,
+                db_path=db_path,
+            )
+            counts: dict[str, int] = {}
+            for r in rows:
+                counts[r["node_name"]] = counts.get(r["node_name"], 0) + 1
+            self.assertEqual(counts.get("storage-0"), 2)
+            self.assertEqual(counts.get("storage-1"), 2)
 
     @tier(1)
     @feature("F30")
     @require_milestone("W3")
     def test_project_owner_table_stores_node_name_address_and_timestamp(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            db_url, db_path = _w3_meta_url(cluster)
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=0, num_storage=2, database_url=db_url)
             s1, s2 = topo["storages"]
             pid, _ = _create_project(s1.client(), "F30 Schema")
 
-            if db_path is not None:
-                rows = s1.sqlite_query(
-                    "SELECT project_id, node_name, address, updated_at_ms FROM project_owner WHERE project_id = ?",
-                    (pid,),
-                    db_path=db_path,
-                )
-                self.assertEqual(len(rows), 1)
-                self.assertIn(rows[0]["node_name"], ("storage-0", "storage-1"))
-                self.assertIn(rows[0]["address"], (s1.base_url, s2.base_url))
-                self.assertGreater(rows[0]["updated_at_ms"], 0)
+            rows = s1.sqlite_query(
+                "SELECT project_id, node_name, address, updated_at_ms FROM project_owner WHERE project_id = ?",
+                (pid,),
+                db_path=db_path,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertIn(rows[0]["node_name"], ("storage-0", "storage-1"))
+            self.assertIn(rows[0]["address"], (s1.base_url, s2.base_url))
+            self.assertGreater(rows[0]["updated_at_ms"], 0)
 
     @tier(1)
     @feature("F30")
@@ -1235,13 +1240,10 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
                 pid,
                 {
                     "name": "High Error Spike",
-                    "metric": "event_count",
                     "event_name": "f30_alert_ev",
-                    "threshold": 1,
-                    "comparator": "gte",
-                    "window_minutes": 60,
+                    "operator": "gte",
+                    "threshold": 5.0,
                     "webhook_url": f"http://127.0.0.1:{port}/hook",
-                    "cooldown_minutes": 60,
                 },
             ).raise_for_status()
 
@@ -1259,17 +1261,16 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
     @require_milestone("W3")
     def test_adding_third_storage_node_keeps_existing_owners_and_places_new_on_third(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            db_url, db_path = _w3_meta_url(cluster)
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=0, num_storage=2, database_url=db_url)
             s1 = topo["storages"][0]
             p1, _ = _create_project(s1.client(), "F30 Keep 1")
             p2, _ = _create_project(s1.client(), "F30 Keep 2")
 
-            if db_path is not None:
-                before = {
-                    r["project_id"]: r["node_name"]
-                    for r in s1.sqlite_query("SELECT project_id, node_name FROM project_owner", db_path=db_path)
-                }
+            before = {
+                r["project_id"]: r["node_name"]
+                for r in s1.sqlite_query("SELECT project_id, node_name FROM project_owner", db_path=db_path)
+            }
 
             s3 = cluster.start_node(
                 role="all",
@@ -1280,14 +1281,13 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
             assert isinstance(s3, NodeInstance)
             p3, _ = _create_project(s1.client(), "F30 New 3")
 
-            if db_path is not None:
-                after = {
-                    r["project_id"]: r["node_name"]
-                    for r in s1.sqlite_query("SELECT project_id, node_name FROM project_owner", db_path=db_path)
-                }
-                self.assertEqual(after[p1], before[p1])
-                self.assertEqual(after[p2], before[p2])
-                self.assertEqual(after[p3], "storage-2")
+            after = {
+                r["project_id"]: r["node_name"]
+                for r in s1.sqlite_query("SELECT project_id, node_name FROM project_owner", db_path=db_path)
+            }
+            self.assertEqual(after[p1], before[p1])
+            self.assertEqual(after[p2], before[p2])
+            self.assertEqual(after[p3], "storage-2")
 
     @tier(1)
     @feature("F30")
@@ -1295,9 +1295,7 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
     def test_manual_project_owner_update_transfers_ownership_cleanly(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
             assert cluster.mock_s3 is not None
-            db_url, db_path = _w3_meta_url(cluster)
-            if db_path is None:
-                self.skipTest("[external-tool] Local SQLite MetaStore helper required for direct project_owner update")
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=1, num_storage=2, database_url=db_url, upload_interval_secs=1)
             s1, s2 = topo["storages"]
             pid, api_key = _create_project(s1.client(), "F30 Failover")
@@ -1386,7 +1384,7 @@ class TestTier1F31ForwardingAndRouting(unittest.TestCase):
     @require_milestone("W3")
     def test_non_owner_storage_node_forwards_analytics_and_user_queries(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            db_url, db_path = _w3_meta_url(cluster)
+            db_url, db_path = _w3_sqlite_meta_url(cluster)
             topo = cluster.start_w3_cluster(num_writers=1, num_storage=2, database_url=db_url)
             s1, s2 = topo["storages"]
             writer = topo["writers"][0]
@@ -1396,11 +1394,8 @@ class TestTier1F31ForwardingAndRouting(unittest.TestCase):
             writer.client().ingest({"events": make_events(5, event_name="f31_q", base_ts_ms=now_ms - 3000)}, api_key=api_key).raise_for_status()
             writer.client().identify({"anon_id": "a_q", "user_id": "u_q", "user_properties": {"k": "v"}}, api_key=api_key).raise_for_status()
 
-            if db_path is not None:
-                owner_name = s1.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)[0]["node_name"]
-                non_owner = s2 if owner_name == "storage-0" else s1
-            else:
-                non_owner = s2
+            owner_name = s1.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)[0]["node_name"]
+            non_owner = s2 if owner_name == "storage-0" else s1
 
             wait_until(
                 lambda: _insights_total(non_owner.client(), pid, "f31_q", now_ms - 60_000, now_ms + 60_000) == 5.0,

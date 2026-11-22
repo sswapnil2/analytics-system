@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import time
 import unittest
 import uuid
 from collections.abc import Callable
+from compression import zstd
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -439,3 +441,12 @@ def make_replay_chunk(
 def random_byok_hex() -> str:
     """Return a random 64-character hex string suitable for `PULSE_BYOK_MASTER_KEY`."""
     return os.urandom(32).hex()
+
+
+def decode_manifest(raw: bytes | None) -> dict[str, Any]:
+    """Decode a manifest payload (`b'PZST'` + zstd-compressed JSON or plain JSON fallback)."""
+    if raw is None:
+        raise ValueError("Cannot decode None manifest bytes")
+    if raw.startswith(b"PZST"):
+        return json.loads(zstd.decompress(raw[4:]).decode("utf-8"))
+    return json.loads(raw.decode("utf-8"))

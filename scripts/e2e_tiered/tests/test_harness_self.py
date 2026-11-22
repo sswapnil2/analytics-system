@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import http.client
+import json
 import math
+import subprocess
 import sys
 import threading
 import time
 import unittest
 import urllib.parse
 import xml.etree.ElementTree as ET
+from compression import zstd
 from pathlib import Path
 
 _HARNESS_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +24,7 @@ from lib.mock_s3 import MockS3Server  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance  # noqa: E402
 from lib.oracle import (  # noqa: E402
     MILESTONES,
+    decode_manifest,
     feature,
     get_active_gating,
     get_test_metadata,
@@ -336,6 +340,51 @@ pulse_weird_nan NaN
         self.assertEqual(parsed.get_metric("pulse_latency_bucket", le="+Inf"), math.inf)
         self.assertTrue(math.isnan(parsed[("pulse_weird_nan", frozenset())]))
         self.assertEqual(parsed.sum_by_name("pulse_ingest_events_accepted_total"), 42.0)
+
+    def test_metrics_parser_braces_in_labels_and_escapes(self) -> None:
+        text = (
+            'http_requests_total{path="/v1/projects/{id}",method="GET"} 17\n'
+            'err_total{msg="C:\\\\new\\\\path"} 5\n'
+            'quote_metric{msg="say \\"hi\\"\\nbye"} 9\n'
+        )
+        parsed = MetricsParser.parse(text)
+        self.assertEqual(
+            parsed.get_metric("http_requests_total", path="/v1/projects/{id}", method="GET"),
+            17.0,
+        )
+        self.assertEqual(
+            parsed.get_metric("err_total", msg=r"C:\new\path"),
+            5.0,
+        )
+        self.assertEqual(
+            parsed.get_metric("quote_metric", msg='say "hi"\nbye'),
+            9.0,
+        )
+
+    def test_runner_rejects_max_milestone_in_full_mode(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(_HARNESS_ROOT / "runner.py"),
+                "--mode",
+                "full",
+                "--max-milestone",
+                "T0a",
+                "--no-build",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--max-milestone", proc.stderr + proc.stdout)
+
+    def test_decode_manifest_pzst_and_plain_json(self) -> None:
+        sample = {"epoch": 3, "last_published_seq": 1, "pending_s3_deletes": []}
+        raw_json = json.dumps(sample).encode("utf-8")
+        raw_pzst = b"PZST" + zstd.compress(raw_json)
+        self.assertEqual(decode_manifest(raw_json), sample)
+        self.assertEqual(decode_manifest(raw_pzst), sample)
 
     def test_milestone_gating_and_metadata(self) -> None:
         self.assertEqual(MILESTONES[0], "T0a")

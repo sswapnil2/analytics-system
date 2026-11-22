@@ -289,11 +289,15 @@ def _prepare_binary(*, no_build: bool, explicit_binary: str | None) -> Path | No
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.mode == "full" and args.max_milestone is not None:
+        parser.error("--max-milestone cannot be combined with --mode full")
     features_filter = _parse_features_arg(args.feature)
 
     eff_max = args.max_milestone
     if args.mode == "baseline" and eff_max is None:
         eff_max = "T0a"
+    if args.mode == "full":
+        eff_max = None
 
     os.environ["E2E_TIERED_MODE"] = args.mode
     os.environ["E2E_TIERED_MAX_MILESTONE"] = eff_max or ""
@@ -381,17 +385,9 @@ def main(argv: list[str] | None = None) -> int:
     for tc, reason in result.skipped:
         if reason.startswith("[external-tool]"):
             continue
-        if eff_max is not None and reason.startswith("Milestone "):
+        if args.mode != "full" and eff_max is not None and reason.startswith("Milestone "):
             continue
         unexpected_skips.append({"id": tc.id(), "reason": reason})
-
-    if args.mode == "full" and eff_max is None:
-        # In strict full mode without --max-milestone, NO milestone skips are allowed
-        for tc, reason in result.skipped:
-            if not reason.startswith("[external-tool]") and not any(
-                u["id"] == tc.id() for u in unexpected_skips
-            ):
-                unexpected_skips.append({"id": tc.id(), "reason": reason})
 
     exit_code = 0
     if failed_count > 0 or error_count > 0 or len(result.unexpectedSuccesses) > 0:

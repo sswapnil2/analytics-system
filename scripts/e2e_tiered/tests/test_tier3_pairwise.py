@@ -96,8 +96,14 @@ def _shared_meta_url(cluster: ClusterHarness, label: str = "meta") -> str:
     pg = external_postgres_url()
     if pg:
         return pg
+    url, _ = _shared_sqlite_meta_url(cluster, label)
+    return url
+
+
+def _shared_sqlite_meta_url(cluster: ClusterHarness, label: str = "meta") -> tuple[str, Path]:
     shared_dir = cluster.node_mgr.make_temp_data_dir(f"pulse_{label}_")
-    return f"sqlite://{(shared_dir / 'shared_meta.db').resolve()}"
+    db_path = (shared_dir / "shared_meta.db").resolve()
+    return f"sqlite://{db_path}", db_path
 
 
 def _parse_wal_epoch(rel_paths: list[str]) -> int:
@@ -780,8 +786,18 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
 
             client.delete_user(pid, "u_p11").raise_for_status()
             self.assertEqual(client.list_users(pid, search="u_p11").raise_for_status().json(), [])
-            mcp_res = client.mcp_call("tools/list", project_id=pid)
-            self.assertIn(mcp_res.status, (200, 404))
+            mcp_res = client.mcp_call(
+                "tools/call",
+                {"name": "get_user", "arguments": {"distinct_id": "u_p11"}},
+                project_id=pid,
+            )
+            self.assertEqual(mcp_res.status, 200, mcp_res.text())
+            mcp_result = mcp_res.json().get("result") or {}
+            if not mcp_result.get("isError"):
+                sc_body = mcp_result.get("structuredContent") or {}
+                self.assertIsNone(sc_body.get("properties"))
+                self.assertEqual(sc_body.get("recent_events") or [], [])
+            self.assertNotIn("gold", mcp_res.text())
             node.stop(graceful=True)
 
             restored_dir = cluster.node_mgr.make_temp_data_dir("p11_restored_")
@@ -1309,6 +1325,8 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
     @require_milestone("W1")
     def test_p22_f22_f23_async_ingest_dictionary_overflow_dead_letter_cli(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
+            s3 = cluster.mock_s3
+            assert s3 is not None
             node = cluster.start_node(role="all", hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node, NodeInstance)
             client = node.client()
@@ -1349,13 +1367,13 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             self.assertIsNotNone(dl_cmd, f"Expected dead-letter CLI subcommand in {sorted(caps.subcommands)}")
             assert dl_cmd is not None
 
-            cli_res = cluster.node_mgr.run_cli([dl_cmd, "--project-id", pid], data_dir=node.data_dir)
+            cli_res = cluster.node_mgr.run_cli([dl_cmd, "--project-id", pid], data_dir=node.data_dir, env=s3.env_vars())
             self.assertEqual(cli_res.returncode, 0, cli_res.stderr)
             self.assertIn("dict_ev_overflow_8193", cli_res.stdout)
 
             # Erasing u_dead_p22 must exclude its dead-lettered event from CLI output
             client.delete_user(pid, "u_dead_p22").raise_for_status()
-            cli_after = cluster.node_mgr.run_cli([dl_cmd, "--project-id", pid], data_dir=node.data_dir)
+            cli_after = cluster.node_mgr.run_cli([dl_cmd, "--project-id", pid], data_dir=node.data_dir, env=s3.env_vars())
             self.assertEqual(cli_after.returncode, 0, cli_after.stderr)
             self.assertNotIn("dict_ev_overflow_8193", cli_after.stdout)
 
@@ -1603,7 +1621,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
     @require_milestone("W3")
     def test_p29_f29_f30_project_owner_move_and_not_owner_forwarder_refresh(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            meta_url = _shared_meta_url(cluster, "p29")
+            meta_url, db_path = _shared_sqlite_meta_url(cluster, "p29")
             topo = cluster.start_w3_cluster(num_writers=1, num_storage=2, database_url=meta_url, upload_interval_secs=2, writer_lease_ttl_secs=3)
             s0, s1 = topo["storages"]
             w0 = topo["writers"][0]
@@ -1612,16 +1630,11 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             now_ms = int(time.time() * 1000)
 
             # Determine initial owner from shared MetaStore
-            if meta_url.startswith("sqlite://"):
-                db_path = Path(meta_url[len("sqlite://") :])
-                rows = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)
-                self.assertEqual(len(rows), 1)
-                cur_owner_name = rows[0]["node_name"]
-                new_owner = s1 if cur_owner_name == "storage-0" else s0
-                new_owner_name = "storage-1" if cur_owner_name == "storage-0" else "storage-0"
-            else:
-                new_owner = s1
-                new_owner_name = "storage-1"
+            rows = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)
+            self.assertEqual(len(rows), 1)
+            cur_owner_name = rows[0]["node_name"]
+            new_owner = s1 if cur_owner_name == "storage-0" else s0
+            new_owner_name = "storage-1" if cur_owner_name == "storage-0" else "storage-0"
 
             w0.client().ingest({"events": make_events(5, event_name="p29_ev", distinct_id_prefix="u_p29_a", base_ts_ms=now_ms)}, api_key=api_key).raise_for_status()
             wait_until(
@@ -1630,14 +1643,12 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             )
 
             # Update project_owner to new_owner -> forwarder refreshes on NotOwner and delivers subsequent batch
-            if meta_url.startswith("sqlite://"):
-                db_path = Path(meta_url[len("sqlite://") :])
-                cluster.node_mgr.sqlite_query(
-                    "UPDATE project_owner SET node_name = ?, address = ?, updated_at_ms = ? WHERE project_id = ?",
-                    (new_owner_name, new_owner.base_url, int(time.time() * 1000), pid),
-                    db_path=db_path,
-                    readonly=False,
-                )
+            cluster.node_mgr.sqlite_query(
+                "UPDATE project_owner SET node_name = ?, address = ?, updated_at_ms = ? WHERE project_id = ?",
+                (new_owner_name, new_owner.base_url, int(time.time() * 1000), pid),
+                db_path=db_path,
+                readonly=False,
+            )
             w0.client().ingest({"events": make_events(5, event_name="p29_ev", distinct_id_prefix="u_p29_b", base_ts_ms=now_ms + 1000)}, api_key=api_key).raise_for_status()
             wait_until(
                 lambda: _insights_total(new_owner.client(), pid, "p29_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) >= 5.0,
@@ -1649,7 +1660,7 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
     @require_milestone("W3")
     def test_p30_f30_f31_non_owner_guard_sync_query_forwarding_and_owner_down_503(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            meta_url = _shared_meta_url(cluster, "p30")
+            meta_url, db_path = _shared_sqlite_meta_url(cluster, "p30")
             topo = cluster.start_w3_cluster(num_writers=2, num_storage=2, database_url=meta_url, writer_lease_ttl_secs=3)
             s0, s1 = topo["storages"]
             w0, w1 = topo["writers"]
@@ -1667,12 +1678,20 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             u_resp = w0.client().get_user(p1, "u_p30").raise_for_status().json()
             self.assertEqual(u_resp["profile"]["props"]["tier"], "pro")
 
-            # Identify owner of P1 and stop it -> sync/query for P1 return 503 while async /v1/ingest buffers 200
-            owner_s = s0
-            if meta_url.startswith("sqlite://"):
-                rows = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p1,), db_path=Path(meta_url[len("sqlite://") :]))
-                owner_s = s0 if rows[0]["node_name"] == "storage-0" else s1
+            # Identify owner of P1 (ensure P2 is owned by the other node) and stop P1's owner
+            rows1 = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p1,), db_path=db_path)
+            rows2 = cluster.node_mgr.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (p2,), db_path=db_path)
+            o1_name = rows1[0]["node_name"]
+            owner_s = s0 if o1_name == "storage-0" else s1
             other_s = s1 if owner_s is s0 else s0
+            if rows2[0]["node_name"] == o1_name:
+                other_name = "storage-1" if o1_name == "storage-0" else "storage-0"
+                cluster.node_mgr.sqlite_query(
+                    "UPDATE project_owner SET node_name = ?, address = ? WHERE project_id = ?",
+                    (other_name, other_s.base_url, p2),
+                    db_path=db_path,
+                    readonly=False,
+                )
             owner_s.stop(graceful=True)
 
             self.assertEqual(w0.client().identify({"anon_id": "a_down", "user_id": "u_down"}, api_key=k1).status, 503)
@@ -1696,7 +1715,9 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
             pid, api_key = _create_project(sc, "P31 PII Masking")
             now_ms = int(time.time() * 1000)
 
-            sc.update_lexicon_property(pid, "pan", {"pii": True, "masking": "mask"}).raise_for_status()
+            sc.update_lexicon_property(pid, "pan", {"pii_masked": True}).raise_for_status()
+            w0 = w0.restart(graceful_stop=True)
+            assert isinstance(w0, NodeInstance)
             s0.stop(graceful=True)
 
             w0.client().ingest(
@@ -1832,22 +1853,19 @@ class TestTier3PairwiseStorageAndWriters(unittest.TestCase):
         with ClusterHarness(use_mock_s3=True) as cluster:
             s3 = cluster.mock_s3
             assert s3 is not None
-            meta_url = _shared_meta_url(cluster, "p35")
+            meta_url, db_path = _shared_sqlite_meta_url(cluster, "p35")
             topo = cluster.start_w3_cluster(num_writers=0, num_storage=2, database_url=meta_url, upload_interval_secs=2, writer_lease_ttl_secs=3)
             s0, s1 = topo["storages"]
             pid, api_key = _create_project(s0.client(), "P35 Owner SplitBrain")
             now_ms = int(time.time() * 1000)
 
-            owner_s = s0
-            non_owner_s = s1
-            if meta_url.startswith("sqlite://"):
-                rows = cluster.node_mgr.sqlite_query(
-                    "SELECT node_name FROM project_owner WHERE project_id = ?",
-                    (pid,),
-                    db_path=Path(meta_url[len("sqlite://") :]),
-                )
-                owner_s = s0 if rows[0]["node_name"] == "storage-0" else s1
-                non_owner_s = s1 if owner_s is s0 else s0
+            rows = cluster.node_mgr.sqlite_query(
+                "SELECT node_name FROM project_owner WHERE project_id = ?",
+                (pid,),
+                db_path=db_path,
+            )
+            owner_s = s0 if rows[0]["node_name"] == "storage-0" else s1
+            non_owner_s = s1 if owner_s is s0 else s0
 
             owner_s.client().ingest({"events": [make_event(event_name="p35_ev", distinct_id="u1", ts_ms=now_ms)]}, api_key=api_key).raise_for_status()
             owner_s.client().admin_flush().raise_for_status()
