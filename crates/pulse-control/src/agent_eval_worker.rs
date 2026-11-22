@@ -51,6 +51,8 @@ pub struct AgentIngestMetrics {
     pub traces_ingested: AtomicU64,
     pub spans_ingested: AtomicU64,
     pub blobs_deduped: AtomicU64,
+    /// Spans dropped because their trace reached its span or byte cap.
+    pub spans_dropped_trace_limit: AtomicU64,
     /// Number of valid (non-error) evaluations executed and persisted.
     pub evals_executed: AtomicU64,
     pub eval_queue_dropped: AtomicU64,

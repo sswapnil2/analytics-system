@@ -470,7 +470,16 @@ async fn ingest_canonical_batch(
 
     resp.truncated_payloads = sanitize_stats.truncated_payloads;
     resp.redacted_fields = sanitize_stats.redacted_fields;
-    resp.dropped_spans = sanitize_stats.dropped_spans;
+    if resp.dropped_spans > 0 {
+        ctrl.agent_metrics()
+            .spans_dropped_trace_limit
+            .fetch_add(resp.dropped_spans as u64, Ordering::Relaxed);
+        resp.warnings.push(format!(
+            "{} span(s) dropped: their trace reached its span or size cap",
+            resp.dropped_spans
+        ));
+    }
+    resp.dropped_spans += sanitize_stats.dropped_spans;
     if sanitize_stats.dropped_spans > 0 {
         resp.warnings.push(format!(
             "{} span(s) dropped for exceeding MAX_SPANS_PER_TRACE",
