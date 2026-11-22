@@ -157,3 +157,11 @@ export function propertyOptions(props: string[]): { value: string; label: string
   );
   return [...opts.filter((o) => o.group !== "User profile"), ...opts.filter((o) => o.group === "User profile")];
 }
+
+/** "₹1,200" for a currency symbol, "3.2 items" for a word; plain when there's no unit. */
+export function withUnit(text: string, unit?: string | null): string {
+  const u = unit?.trim();
+  if (!u) return text;
+  const sign = /^[+−-]/.test(text) ? text[0] : "";
+  return /^[^\p{L}\p{N}\s]{1,3}$/u.test(u) ? `${sign}${u}${text.slice(sign.length)}` : `${text} ${u}`;
+}

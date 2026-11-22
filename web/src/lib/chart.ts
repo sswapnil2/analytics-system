@@ -51,6 +51,18 @@ export function niceTicks(max: number, target = 4): number[] {
   return Array.from({ length: n + 1 }, (_, i) => +(i * step).toPrecision(12));
 }
 
+/** Round ticks covering `[min, max]` and always 0, for axes that go negative (lift, change). */
+export function niceRange(min: number, max: number, target = 4): number[] {
+  const lo = Math.min(0, Number.isFinite(min) ? min : 0);
+  const hi = Math.max(0, Number.isFinite(max) ? max : 0);
+  if (hi - lo <= 0) return [0, 1];
+  const ticks = niceTicks(hi - lo, target);
+  const step = ticks[1] - ticks[0];
+  const first = Math.floor(lo / step + 1e-9);
+  const last = Math.ceil(hi / step - 1e-9);
+  return Array.from({ length: last - first + 1 }, (_, i) => +((first + i) * step).toPrecision(12));
+}
+
 /** Change from a to b as a percentage; null when it can't be computed. */
 export function pctChange(prev: number | null | undefined, cur: number | null | undefined): number | null {
   if (prev === null || prev === undefined || cur === null || cur === undefined || prev === 0) return null;

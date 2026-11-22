@@ -13,8 +13,8 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
-    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
-    SystemKeyringRecord, User, UserProfileRecord,
+    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedMetric,
+    SavedReport, SystemKeyringRecord, TrafficGroup, User, UserProfileRecord, WeightSnapshot,
 };
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
@@ -797,10 +797,12 @@ impl MetaStore {
     pub async fn upsert_feature_flag(&self, f: &FeatureFlag) -> Result<(), MetaError> {
         let en = i32::from(f.enabled);
         let vjson = serde_json::to_string(&f.variants).unwrap_or_else(|_| "[]".into());
+        let placement = (f.holdout.is_some() || f.layer.is_some())
+            .then(|| serde_json::json!({ "holdout": f.holdout, "layer": f.layer }).to_string());
         let affected = db_exec!(
             self,
-            "INSERT INTO feature_flags (id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO feature_flags (id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms, placement_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 flag_key = excluded.flag_key,
                 description = excluded.description,
@@ -808,7 +810,8 @@ impl MetaStore {
                 rollout_pct = excluded.rollout_pct,
                 targeting_cohort_id = excluded.targeting_cohort_id,
                 variants_json = excluded.variants_json,
-                updated_at_ms = excluded.updated_at_ms
+                updated_at_ms = excluded.updated_at_ms,
+                placement_json = excluded.placement_json
              WHERE feature_flags.project_id = excluded.project_id",
             &f.id,
             &f.project_id,
@@ -819,6 +822,7 @@ impl MetaStore {
             &f.targeting_cohort_id,
             &vjson,
             f.updated_at_ms,
+            &placement,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -835,11 +839,17 @@ impl MetaStore {
     ) -> Result<Vec<FeatureFlag>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms
+            "SELECT id, project_id, flag_key, description, enabled, rollout_pct, targeting_cohort_id, variants_json, updated_at_ms, placement_json
              FROM feature_flags WHERE project_id = ? ORDER BY flag_key ASC",
             |r| {
                 let vstr: String = r.get("variants_json");
+                let placement: serde_json::Value = r
+                    .get::<Option<String>, _>("placement_json")
+                    .and_then(|p| serde_json::from_str(&p).ok())
+                    .unwrap_or_default();
                 FeatureFlag {
+                    holdout: serde_json::from_value(placement["holdout"].clone()).ok().flatten(),
+                    layer: serde_json::from_value(placement["layer"].clone()).ok().flatten(),
                     id: r.get("id"),
                     project_id: r.get("project_id"),
                     key: r.get("flag_key"),
@@ -859,10 +869,20 @@ impl MetaStore {
     pub async fn upsert_experiment(&self, exp: &Experiment) -> Result<(), MetaError> {
         let pjson = serde_json::to_string(&exp.primary_metric).unwrap_or_else(|_| "{}".into());
         let gjson = serde_json::to_string(&exp.guardrail_metrics).unwrap_or_else(|_| "[]".into());
+        let sjson = serde_json::to_string(&exp.secondary_metrics).unwrap_or_else(|_| "[]".into());
+        let ajson = serde_json::to_string(&exp.analysis).unwrap_or_else(|_| "{}".into());
+        let bjson = exp
+            .bandit
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok());
+        let djson = exp
+            .decision
+            .as_ref()
+            .and_then(|d| serde_json::to_string(d).ok());
         let affected = db_exec!(
             self,
-            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO experiments (id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 flag_id = excluded.flag_id,
@@ -872,7 +892,17 @@ impl MetaStore {
                 start_ts_ms = excluded.start_ts_ms,
                 end_ts_ms = excluded.end_ts_ms,
                 primary_metric_json = excluded.primary_metric_json,
-                guardrail_metrics_json = excluded.guardrail_metrics_json
+                guardrail_metrics_json = excluded.guardrail_metrics_json,
+                analysis_json = excluded.analysis_json,
+                stop_reason = excluded.stop_reason,
+                kind = excluded.kind,
+                bandit_json = excluded.bandit_json,
+                decision_json = excluded.decision_json,
+                secondary_metrics_json = excluded.secondary_metrics_json,
+                problem = excluded.problem,
+                owner = excluded.owner,
+                notify = excluded.notify,
+                pause_reason = excluded.pause_reason
              WHERE experiments.project_id = excluded.project_id",
             &exp.id,
             &exp.project_id,
@@ -885,7 +915,18 @@ impl MetaStore {
             exp.end_ts_ms,
             &pjson,
             &gjson,
+            &ajson,
             exp.created_at_ms,
+            &exp.stop_reason,
+            &exp.kind,
+            &bjson,
+            &djson,
+            &sjson,
+            &exp.created_by,
+            &exp.problem,
+            &exp.owner,
+            i32::from(exp.notify),
+            &exp.pause_reason,
         );
         if affected == 0 {
             return Err(MetaError::Conflict(format!(
@@ -899,7 +940,7 @@ impl MetaStore {
     pub async fn list_experiments(&self, project_id: &str) -> Result<Vec<Experiment>, MetaError> {
         let rows = db_map_all!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason
              FROM experiments WHERE project_id = ? ORDER BY created_at_ms DESC",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -916,7 +957,32 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
+                    pause_reason: r.get("pause_reason"),
+                    analysis: r
+                        .get::<Option<String>, _>("analysis_json")
+                        .and_then(|a| serde_json::from_str(&a).ok())
+                        .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
+                    stop_reason: r.get("stop_reason"),
+                    kind: r
+                        .get::<Option<String>, _>("kind")
+                        .unwrap_or_else(|| "ab".to_string()),
+                    bandit: r
+                        .get::<Option<String>, _>("bandit_json")
+                        .and_then(|b| serde_json::from_str(&b).ok()),
+                    decision: r
+                        .get::<Option<String>, _>("decision_json")
+                        .and_then(|d| serde_json::from_str(&d).ok()),
                 })
             },
             project_id,
@@ -932,7 +998,7 @@ impl MetaStore {
     ) -> Result<Option<Experiment>, MetaError> {
         let row = db_map_opt!(
             self,
-            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, created_at_ms
+            "SELECT id, project_id, name, flag_id, flag_key, hypothesis, status, start_ts_ms, end_ts_ms, primary_metric_json, guardrail_metrics_json, analysis_json, created_at_ms, stop_reason, kind, bandit_json, decision_json, secondary_metrics_json, created_by, problem, owner, notify, pause_reason
              FROM experiments WHERE id = ? AND project_id = ?",
             |r| {
                 let pstr: String = r.get("primary_metric_json");
@@ -949,7 +1015,32 @@ impl MetaStore {
                     end_ts_ms: r.get("end_ts_ms"),
                     primary_metric,
                     guardrail_metrics: serde_json::from_str(&gstr).unwrap_or_default(),
+                    secondary_metrics: r
+                        .get::<Option<String>, _>("secondary_metrics_json")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_by: r
+                        .get::<Option<String>, _>("created_by")
+                        .unwrap_or_default(),
+                    problem: r.get::<Option<String>, _>("problem").unwrap_or_default(),
+                    owner: r.get::<Option<String>, _>("owner").unwrap_or_default(),
+                    notify: r.get::<i32, _>("notify") != 0,
+                    pause_reason: r.get("pause_reason"),
+                    analysis: r
+                        .get::<Option<String>, _>("analysis_json")
+                        .and_then(|a| serde_json::from_str(&a).ok())
+                        .unwrap_or_default(),
                     created_at_ms: r.get("created_at_ms"),
+                    stop_reason: r.get("stop_reason"),
+                    kind: r
+                        .get::<Option<String>, _>("kind")
+                        .unwrap_or_else(|| "ab".to_string()),
+                    bandit: r
+                        .get::<Option<String>, _>("bandit_json")
+                        .and_then(|b| serde_json::from_str(&b).ok()),
+                    decision: r
+                        .get::<Option<String>, _>("decision_json")
+                        .and_then(|d| serde_json::from_str(&d).ok()),
                 })
             },
             exp_id,
@@ -1021,6 +1112,49 @@ impl MetaStore {
         Ok(row)
     }
 
+    pub async fn insert_weight_snapshot(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+        snap: &WeightSnapshot,
+    ) -> Result<(), MetaError> {
+        let wjson = serde_json::to_string(&snap.weights).unwrap_or_else(|_| "{}".into());
+        db_exec!(
+            self,
+            "INSERT INTO experiment_weight_history (experiment_id, project_id, effective_from_ms, weights_json)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(experiment_id, effective_from_ms) DO UPDATE SET weights_json = excluded.weights_json",
+            experiment_id,
+            project_id,
+            snap.effective_from_ms,
+            &wjson,
+        );
+        Ok(())
+    }
+
+    /// Oldest first.
+    pub async fn list_weight_history(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+    ) -> Result<Vec<WeightSnapshot>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT effective_from_ms, weights_json FROM experiment_weight_history
+             WHERE experiment_id = ? AND project_id = ? ORDER BY effective_from_ms ASC",
+            |r| {
+                let w: String = r.get("weights_json");
+                WeightSnapshot {
+                    effective_from_ms: r.get("effective_from_ms"),
+                    weights: serde_json::from_str(&w).unwrap_or_default(),
+                }
+            },
+            experiment_id,
+            project_id,
+        );
+        Ok(rows)
+    }
+
     /// Returns `false` when no report with this id exists in the project.
     pub async fn insert_annotation(&self, a: &Annotation) -> Result<(), MetaError> {
         db_exec!(
@@ -1063,6 +1197,151 @@ impl MetaStore {
             end_ms,
         );
         Ok(rows)
+    }
+
+    pub async fn insert_saved_metric(&self, m: &SavedMetric) -> Result<(), MetaError> {
+        let spec = serde_json::to_string(&m.spec).unwrap_or_default();
+        db_exec!(
+            self,
+            "INSERT INTO saved_metrics (id, project_id, name, spec_json, created_by, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            m.id.as_str(),
+            m.project_id.as_str(),
+            m.name.as_str(),
+            spec.as_str(),
+            m.created_by.as_str(),
+            m.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// A project's saved metrics by name; rows whose spec no longer parses are skipped.
+    pub async fn list_saved_metrics(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SavedMetric>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, name, spec_json, created_by, created_at_ms FROM saved_metrics
+             WHERE project_id = ? ORDER BY name ASC",
+            |r| {
+                serde_json::from_str(&r.get::<String, _>("spec_json"))
+                    .ok()
+                    .map(|spec| SavedMetric {
+                        id: r.get("id"),
+                        project_id: r.get("project_id"),
+                        name: r.get("name"),
+                        spec,
+                        created_by: r.get("created_by"),
+                        created_at_ms: r.get("created_at_ms"),
+                    })
+            },
+            project_id,
+        );
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    pub async fn delete_saved_metric(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM saved_metrics WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
+    }
+
+    pub async fn insert_traffic_group(&self, g: &TrafficGroup) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "INSERT INTO traffic_groups (id, project_id, kind, name, bps, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            g.id.as_str(),
+            g.project_id.as_str(),
+            g.kind.as_str(),
+            g.name.as_str(),
+            g.bps as i64,
+            g.created_at_ms,
+        );
+        Ok(())
+    }
+
+    /// Holdouts (`kind = "holdout"`) or layers (`"layer"`), oldest first.
+    pub async fn list_traffic_groups(
+        &self,
+        project_id: &str,
+        kind: &str,
+    ) -> Result<Vec<TrafficGroup>, MetaError> {
+        let rows = db_map_all!(
+            self,
+            "SELECT id, project_id, kind, name, bps, created_at_ms, metric_event FROM traffic_groups
+             WHERE project_id = ? AND kind = ? ORDER BY created_at_ms ASC",
+            |r| {
+                TrafficGroup {
+                    id: r.get("id"),
+                    project_id: r.get("project_id"),
+                    kind: r.get("kind"),
+                    name: r.get("name"),
+                    bps: r.get::<i64, _>("bps") as u32,
+                    created_at_ms: r.get("created_at_ms"),
+                    metric_event: r.get("metric_event"),
+                }
+            },
+            project_id,
+            kind,
+        );
+        Ok(rows)
+    }
+
+    pub async fn set_traffic_group_metric(
+        &self,
+        project_id: &str,
+        id: &str,
+        metric_event: &str,
+    ) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            "UPDATE traffic_groups SET metric_event = ? WHERE project_id = ? AND id = ?",
+            metric_event,
+            project_id,
+            id,
+        );
+        Ok(())
+    }
+
+    /// Records that `milestone` was announced for an experiment; false when it already was, so
+    /// each milestone goes out once even with several nodes checking.
+    pub async fn claim_experiment_milestone(
+        &self,
+        project_id: &str,
+        experiment_id: &str,
+        milestone: &str,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "INSERT INTO experiment_milestones (project_id, experiment_id, milestone, sent_at_ms) VALUES (?, ?, ?, ?)
+             ON CONFLICT(experiment_id, milestone) DO NOTHING",
+            project_id,
+            experiment_id,
+            milestone,
+            now_ms,
+        );
+        Ok(affected == 1)
+    }
+
+    pub async fn delete_traffic_group(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "DELETE FROM traffic_groups WHERE project_id = ? AND id = ?",
+            project_id,
+            id,
+        );
+        Ok(affected > 0)
     }
 
     pub async fn delete_annotation(&self, project_id: &str, id: &str) -> Result<bool, MetaError> {

@@ -9,8 +9,8 @@ use std::time::Duration;
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use pulse_wire::{
-    evaluate_flag_rule, mask_input_value, InteractionKind, NodeKind, PropValue, ReplayChunk,
-    WireBatch, WireEvent, WireNode, WireframeOp, FIXED_MASK_PLACEHOLDER,
+    mask_input_value, InteractionKind, NodeKind, PropValue, ReplayChunk, WireBatch, WireEvent,
+    WireNode, WireframeOp, FIXED_MASK_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
@@ -74,6 +74,10 @@ pub struct SdkConfig {
     pub storage_dir: String,
     pub flush_batch_size: u32,
     pub flush_interval_ms: u64,
+    /// Re-fetch flags in the background when they are older than this, so rollbacks and
+    /// guardrail stops reach running apps. `0` fetches only on first use and `refresh_flags`.
+    #[uniffi(default = 300000)]
+    pub flags_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -467,7 +471,7 @@ struct EdgeVariant {
     weight_bps: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct EdgeRule {
     key: String,
     enabled: bool,
@@ -477,6 +481,35 @@ struct EdgeRule {
     #[serde(default)]
     cohort_member_hashes: Option<Vec<String>>,
     variants: Vec<EdgeVariant>,
+    #[serde(default)]
+    holdout_id: Option<String>,
+    #[serde(default)]
+    holdout_bps: u32,
+    #[serde(default)]
+    layer_id: Option<String>,
+    #[serde(default)]
+    layer_start_bps: u32,
+    #[serde(default)]
+    layer_end_bps: u32,
+}
+
+impl EdgeRule {
+    fn placement(&self) -> pulse_wire::Placement<'_> {
+        pulse_wire::Placement {
+            holdout: self
+                .holdout_id
+                .as_deref()
+                .map(|id| pulse_wire::HoldoutGate {
+                    id,
+                    bps: self.holdout_bps,
+                }),
+            layer: self.layer_id.as_deref().map(|id| pulse_wire::LayerGate {
+                id,
+                start_bps: self.layer_start_bps,
+                end_bps: self.layer_end_bps,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -489,6 +522,8 @@ struct EdgeBundleResp {
 struct FlagCache {
     etag: Option<String>,
     rules: HashMap<String, EdgeRule>,
+    /// When the last fetch started; `None` before the first.
+    checked_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -994,9 +1029,17 @@ impl PulseClient {
     }
 
     /// Synchronizes the Edge Flag bundle (with ETag caching) and evaluates `flag_key` locally in < 1ms (`P2-02`, `P2-03`).
-    pub async fn evaluate_flag(&self, flag_key: String) -> Result<Option<String>, SdkError> {
+    pub async fn evaluate_flag(
+        self: Arc<Self>,
+        flag_key: String,
+    ) -> Result<Option<String>, SdkError> {
         if self.flag_cache.read().rules.is_empty() {
             let _ = self.refresh_flags().await;
+        } else if self.flags_stale() {
+            let me = self.clone();
+            sdk_runtime().spawn(async move {
+                let _ = me.refresh_flags().await;
+            });
         }
         let did = self.distinct_id();
         let cache = self.flag_cache.read();
@@ -1011,11 +1054,12 @@ impl PulseClient {
                 cohort_id,
                 member_hashes: rule.cohort_member_hashes.as_deref().unwrap_or_default(),
             });
-        Ok(evaluate_flag_rule(
+        Ok(pulse_wire::evaluate_placed_flag_rule(
             &rule.key,
             rule.enabled,
             rule.rollout_bps,
             gate,
+            rule.placement(),
             rule.variants.iter().map(|v| (v.key.as_str(), v.weight_bps)),
             &did,
         ))
@@ -1024,16 +1068,33 @@ impl PulseClient {
     /// Like `evaluate_flag`, and with `track_exposure` sends `$experiment_started`
     /// (`flag_key`, `variant`) once, which is what experiment results count.
     pub async fn get_variant(
-        &self,
+        self: Arc<Self>,
         flag_key: String,
         track_exposure: bool,
     ) -> Result<Option<String>, SdkError> {
-        let variant = self.evaluate_flag(flag_key.clone()).await?;
+        let variant = self.clone().evaluate_flag(flag_key.clone()).await?;
         if let (true, Some(v)) = (track_exposure, variant.as_ref()) {
             if !self.is_opted_out() && self.exposures_sent.lock().insert(format!("{flag_key}:{v}"))
             {
                 let props = serde_json::json!({ "flag_key": flag_key, "variant": v }).to_string();
                 self.track("$experiment_started".to_string(), props)?;
+            }
+        }
+        // Once per holdout, whether or not a variant was served: both groups are "users who
+        // reached a flag in this holdout", so comparing them measures the flags' total effect.
+        let holdout = track_exposure
+            .then(|| {
+                let cache = self.flag_cache.read();
+                let rule = cache.rules.get(&flag_key)?;
+                let gate = rule.placement().holdout?;
+                Some((gate.id.to_string(), gate.holds_out(&self.distinct_id())))
+            })
+            .flatten();
+        if let Some((id, held)) = holdout {
+            if !self.is_opted_out() && self.exposures_sent.lock().insert(format!("holdout:{id}")) {
+                let group = if held { "holdout" } else { "exposed" };
+                let props = serde_json::json!({ "holdout_id": id, "group": group }).to_string();
+                self.track("$holdout_assigned".to_string(), props)?;
             }
         }
         Ok(variant)
@@ -1042,7 +1103,11 @@ impl PulseClient {
     pub async fn refresh_flags(&self) -> Result<(), SdkError> {
         let base = self.config.endpoint_url.trim_end_matches('/');
         let url = format!("{base}/v1/flags/{}", self.config.api_key);
-        let etag = self.flag_cache.read().etag.clone();
+        let etag = {
+            let mut cache = self.flag_cache.write();
+            cache.checked_at = Some(std::time::Instant::now());
+            cache.etag.clone()
+        };
         let client = self.http_client.clone();
 
         let bundle_opt = sdk_runtime()
@@ -1245,6 +1310,16 @@ impl PulseClient {
 }
 
 impl PulseClient {
+    fn flags_stale(&self) -> bool {
+        let ttl = self.config.flags_ttl_ms;
+        ttl > 0
+            && self
+                .flag_cache
+                .read()
+                .checked_at
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(ttl))
+    }
+
     fn fresh_identity() -> PersistedIdentityState {
         let seed = format!("dev_{}", Uuid::new_v4().simple());
         let anon = format!("anon_{}", &Uuid::new_v4().simple().to_string()[..12]);
@@ -1610,6 +1685,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 10,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         };
 
         let client = PulseClient::new(cfg.clone()).unwrap();
@@ -1693,6 +1769,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().into_owned(),
             flush_batch_size: 20,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         })
         .unwrap();
         client.record_wireframe_snapshot(390, 844, vec![]).unwrap();
@@ -1760,6 +1837,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 1,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         })
         .unwrap();
 
@@ -1806,6 +1884,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 1,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         })
         .unwrap();
         let big_str = "x".repeat(40_000);
@@ -1847,6 +1926,7 @@ mod tests {
                 storage_dir: dir.path().to_string_lossy().to_string(),
                 flush_batch_size: 1,
                 flush_interval_ms: 250,
+                flags_ttl_ms: 0,
             })
             .expect("PulseClient::new must succeed without ambient Tokio runtime");
 
@@ -1871,6 +1951,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 50,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         };
 
         let expected_session_id = {
@@ -1924,6 +2005,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 1,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         };
         let client = PulseClient::new(cfg.clone()).unwrap();
         assert!(!client.is_opted_out());
@@ -1995,6 +2077,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().to_string(),
             flush_batch_size: 1000,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         })
         .unwrap();
         client.flag_cache.write().rules.insert(
@@ -2009,6 +2092,9 @@ mod tests {
                     key: "b".into(),
                     weight_bps: 10_000,
                 }],
+                // A 0 bps holdout holds no one back, so this user reports as "exposed".
+                holdout_id: Some("hld_q4".into()),
+                ..Default::default()
             },
         );
         let exposures = || {
@@ -2021,6 +2107,7 @@ mod tests {
         };
         assert_eq!(
             client
+                .clone()
                 .get_variant("checkout".into(), false)
                 .await
                 .unwrap()
@@ -2028,14 +2115,92 @@ mod tests {
             Some("b")
         );
         assert_eq!(exposures(), 0);
-        client.get_variant("checkout".into(), true).await.unwrap();
-        client.get_variant("checkout".into(), true).await.unwrap();
+        client
+            .clone()
+            .get_variant("checkout".into(), true)
+            .await
+            .unwrap();
+        client
+            .clone()
+            .get_variant("checkout".into(), true)
+            .await
+            .unwrap();
         assert_eq!(exposures(), 1);
         assert_eq!(
-            client.get_variant("missing".into(), true).await.unwrap(),
+            client
+                .clone()
+                .get_variant("missing".into(), true)
+                .await
+                .unwrap(),
             None
         );
         assert_eq!(exposures(), 1);
+        let holdout: Vec<String> = client
+            .event_ring
+            .lock()
+            .iter()
+            .filter(|e| e.event_name == "$holdout_assigned")
+            .map(|e| format!("{:?}", e.props))
+            .collect();
+        assert_eq!(holdout.len(), 1, "one $holdout_assigned per holdout");
+        assert!(holdout[0].contains("exposed") && holdout[0].contains("hld_q4"));
+    }
+
+    /// Stale flags refresh in the background, so a rollback reaches a running app.
+    #[tokio::test]
+    async fn stale_flags_refresh_in_the_background() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/v1/flags/:key",
+            axum::routing::get(move || {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                // First fetch: everyone gets b. Later: rolled back to a.
+                let (a, b) = if n == 0 { (0, 10_000) } else { (10_000, 0) };
+                async move {
+                    axum::Json(serde_json::json!({
+                        "etag": format!("e{n}"),
+                        "flags": [{"key": "checkout", "enabled": true, "rollout_bps": 10_000,
+                                   "variants": [{"key": "a", "weight_bps": a}, {"key": "b", "weight_bps": b}]}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let client = PulseClient::new(SdkConfig {
+            endpoint_url: format!("http://{addr}"),
+            api_key: "pk_ttl".into(),
+            storage_dir: dir.path().to_string_lossy().to_string(),
+            flush_batch_size: 1000,
+            flush_interval_ms: 0,
+            flags_ttl_ms: 50,
+        })
+        .unwrap();
+        let variant = |c: &Arc<PulseClient>| c.clone().evaluate_flag("checkout".into());
+        assert_eq!(variant(&client).await.unwrap().as_deref(), Some("b"));
+        assert_eq!(variant(&client).await.unwrap().as_deref(), Some("b"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "fresh flags are not refetched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Stale: this call still answers from cache and refreshes behind it.
+        assert_eq!(variant(&client).await.unwrap().as_deref(), Some("b"));
+        for _ in 0..50 {
+            if client.flag_cache.read().etag.as_deref() == Some("e1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(variant(&client).await.unwrap().as_deref(), Some("a"));
     }
 
     #[test]
@@ -2087,6 +2252,7 @@ mod tests {
             storage_dir: dir.path().to_string_lossy().into_owned(),
             flush_batch_size: 20,
             flush_interval_ms: 0,
+            flags_ttl_ms: 0,
         }
     }
 

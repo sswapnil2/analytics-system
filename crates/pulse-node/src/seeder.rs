@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use chrono::Utc;
 use pulse_control::{
-    AlertRule, CohortRecord, ControlPlaneService, Dashboard, DashboardCard, Experiment,
-    ExperimentMetricSpec, FeatureFlag, LexiconProperty, SavedReport, VariantAllocation,
+    AlertRule, AnalysisConfig, CohortRecord, ControlPlaneService, Dashboard, DashboardCard,
+    Experiment, ExperimentMetricSpec, FeatureFlag, LexiconProperty, MetricDenominator, SavedReport,
+    VariantAllocation,
 };
 use pulse_exec::{
     BehavioralCohortDef, CustomEventDef, CustomPropertyDef, LookupTableDef, TimeInterval,
@@ -175,6 +176,8 @@ m_croma,Electronics_EMI,9.5,Prime\n";
         enabled: true,
         rollout_pct: 50.0,
         targeting_cohort_id: None,
+        holdout: None,
+        layer: None,
         variants: vec![
             VariantAllocation {
                 key: "control".to_string(),
@@ -206,16 +209,86 @@ m_croma,Electronics_EMI,9.5,Prime\n";
             event_name: "UPI_Autopay_Mandate_Approved".to_string(),
             metric_type: "conversion".to_string(),
             numeric_prop: None,
+            filters: Vec::new(),
+            denominator: None,
             conversion_window_ms: 7 * 86_400_000,
+            direction: "decrease_is_bad".to_string(),
+            auto_stop: false,
+            unit: None,
         },
-        guardrail_metrics: vec![ExperimentMetricSpec {
-            name: "NSDL Gateway 504 Timeout Rate".to_string(),
-            event_name: "NSDL_Gateway_504_Timeout".to_string(),
-            metric_type: "conversion".to_string(),
-            numeric_prop: None,
-            conversion_window_ms: 7 * 86_400_000,
-        }],
+        guardrail_metrics: vec![
+            ExperimentMetricSpec {
+                name: "NSDL Gateway 504 Timeout Rate".to_string(),
+                event_name: "NSDL_Gateway_504_Timeout".to_string(),
+                metric_type: "conversion".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "increase_is_bad".to_string(),
+                auto_stop: true,
+                unit: None,
+            },
+            ExperimentMetricSpec {
+                name: "Mandate amount per user".to_string(),
+                event_name: "UPI_Autopay_Mandate_Approved".to_string(),
+                metric_type: "sum".to_string(),
+                numeric_prop: Some("amount".to_string()),
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+                unit: Some("₹".to_string()),
+            },
+        ],
+        secondary_metrics: vec![
+            ExperimentMetricSpec {
+                name: "First disbursal".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric_type: "conversion".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: None,
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+                unit: None,
+            },
+            ExperimentMetricSpec {
+                name: "Mandate to disbursal".to_string(),
+                event_name: "First_Disbursal_Success".to_string(),
+                metric_type: "step_through".to_string(),
+                numeric_prop: None,
+                filters: Vec::new(),
+                denominator: Some(MetricDenominator {
+                    event_name: "UPI_Autopay_Mandate_Approved".to_string(),
+                    numeric_prop: None,
+                }),
+                conversion_window_ms: 7 * 86_400_000,
+                direction: "decrease_is_bad".to_string(),
+                auto_stop: false,
+                unit: None,
+            },
+        ],
+        // Demo users are exposed on their first day, so CUPED has no pre-period to use here.
+        analysis: AnalysisConfig {
+            sequential: true,
+            cuped: true,
+            // The hypothesis promises >12%, so the verdict checks the range against it.
+            target_lift_pct: Some(12.0),
+            ..AnalysisConfig::default()
+        },
         created_at_ms: now_ms,
+        created_by: "Pulse demo".to_string(),
+        problem: "Users drop off at the UPI Autopay mandate step, where they type their VPA by hand.".to_string(),
+        owner: "Pulse demo".to_string(),
+        notify: true,
+        stop_reason: None,
+        pause_reason: None,
+        kind: "ab".to_string(),
+        bandit: None,
+        decision: None,
     };
     ctrl.meta().upsert_experiment(&exp).await?;
 

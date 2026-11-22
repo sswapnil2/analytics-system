@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { ArrowDown, Download, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, Download, FlaskConical, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { api, DroppedSessionSample, FunnelResult, isAbortError, SamplingMode } from "../api/client";
 import { SessionReplay } from "../components/WireframePlayer";
 import { useAccess } from "../auth/access";
@@ -30,9 +30,10 @@ import {
   SortHeader,
   useSort,
 } from "../components/ui";
-import { FilterPanel, useTopValues, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
+import { FilterPanel, EMPTY_FILTER, FilterDraft, describeFilter, fromGlobalFilter, toGlobalFilter } from "../components/FilterPanel";
 import { displayUserId, downloadTextFile, errorMessage, formatCount, formatDateTime, formatDuration, humanizeEvent } from "../lib/format";
 import { PropertyPicker, propertyOptions } from "../components/PropertyPicker";
+import { StepWhere, StepWhereEditor, stepWhereFromFilters, stepWhereToFilters } from "../components/StepWhere";
 
 interface Props {
   projectId: string;
@@ -42,19 +43,6 @@ interface Props {
 }
 
 type OrderMode = "loose_order" | "strict_order" | "any_order";
-
-/** One "where" condition on a single funnel step (e.g. Product Viewed where category = shoes). */
-type StepWhere = { prop: string; op: "eq" | "neq" | "contains"; value: string };
-
-const stepWhereToFilters = (w: StepWhere | null | undefined) =>
-  w && w.prop && w.value.trim() ? [{ prop_name: w.prop, filter: { op: w.op, val: w.value.trim() } }] : [];
-
-function stepWhereFromFilters(filters: unknown): StepWhere | null {
-  const f = Array.isArray(filters) ? (filters[0] as { prop_name?: string; filter?: { op?: string; val?: unknown } }) : null;
-  if (!f?.prop_name || !f.filter) return null;
-  const op = f.filter.op === "neq" || f.filter.op === "contains" ? f.filter.op : "eq";
-  return { prop: f.prop_name, op, value: String(f.filter.val ?? "") };
-}
 
 const WINDOWS: { hours: number; label: string }[] = [
   { hours: 1, label: "1 hour" },
@@ -476,7 +464,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                           <div className="my-1.5 flex flex-wrap items-center gap-3 rounded-lg bg-danger-soft px-3.5 py-2.5 text-sm text-danger sm:ml-[13.5rem]">
                             <ArrowDown className="h-4 w-4" aria-hidden="true" />
                             <span className="font-semibold tabular">
-                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)}). Biggest drop
+                              {humanizeEvent(overall[idx - 1].event_name)} → {humanizeEvent(st.event_name)}: {formatCount(lost)} dropped (
+                              {pct(100 - st.conversion_from_prev_pct)}). Biggest drop
                             </span>
                             <button
                               type="button"
@@ -490,7 +479,8 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                           <div className="flex items-center gap-2.5 py-0.5 text-[0.8125rem] text-muted sm:ml-[13.5rem]">
                             <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
                             <span className="tabular">
-                              {formatCount(lost)} dropped ({pct(100 - st.conversion_from_prev_pct)})
+                              {humanizeEvent(overall[idx - 1].event_name)} → {humanizeEvent(st.event_name)}: {formatCount(lost)} dropped (
+                              {pct(100 - st.conversion_from_prev_pct)})
                             </span>
                             <button
                               type="button"
@@ -529,6 +519,13 @@ export const FunnelsWorkspace: React.FC<Props> = ({
                             </span>
                           )}
                         </span>
+                        {idx > 0 && st.entered_users === 0 && overall[idx - 1].entered_users > 0 && (
+                          <span className="col-span-2 text-xs text-warn sm:col-span-3 sm:ml-[13.5rem]">
+                            No one reached {humanizeEvent(st.event_name)} after {humanizeEvent(overall[idx - 1].event_name)}{" "}
+                            in this window. If it usually happens first, swap the two steps; otherwise try a longer window
+                            or check that the event is still tracked.
+                          </span>
+                        )}
                       </div>
                     </li>
                   );
@@ -706,10 +703,17 @@ const DropOffDrawer: React.FC<{
             </p>
             {downloadError && <p className="mt-1 text-sm text-danger">{downloadError}</p>}
           </div>
+          <a
+            href={`#/experiments?${new URLSearchParams({ p: projectId, new: "1", from: fromEvent, to: toEvent })}`}
+            className={`${btn.secondary} ml-auto`}
+            title={`Start an experiment measuring how many users go from ${fromStep} to ${toStep}`}
+          >
+            <FlaskConical className="h-4 w-4" /> Test a fix
+          </a>
           {canAdmin && (
             <button
               type="button"
-              className={`${btn.secondary} ml-auto`}
+              className={btn.secondary}
               disabled={downloading || droppedCount === 0}
               onClick={() => void downloadAll()}
             >
@@ -918,75 +922,3 @@ const SegmentCompare: React.FC<{ groups: FunnelResult["breakdowns"] }> = ({ grou
   );
 };
 
-/** "+ where" on one funnel step: a single property condition, shown inline under the step. */
-const StepWhereEditor: React.FC<{
-  idx: number;
-  projectId: string;
-  /** The step's event; value suggestions come from it. */
-  event: string;
-  value: StepWhere | null;
-  props: string[];
-  onChange: (w: StepWhere | null) => void;
-}> = ({ idx, projectId, event, value, props, onChange }) => {
-  const listId = useId();
-  const suggestions = useTopValues(projectId, value ? event : "", value?.prop ?? "");
-  if (!value) {
-    return (
-      <button
-        type="button"
-        disabled={props.length === 0}
-        onClick={() => onChange({ prop: "", op: "eq", value: "" })}
-        className="self-start rounded px-1.5 py-0.5 text-xs text-muted hover:bg-hover hover:text-ink disabled:opacity-50"
-        aria-label={`Add a condition to step ${idx + 1}`}
-      >
-        + where
-      </button>
-    );
-  }
-  return (
-    <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1 pl-1.5 text-xs">
-      <span className="text-faint">where</span>
-      <PropertyPicker
-        dense
-        label={`Step ${idx + 1} condition property`}
-        value={value.prop}
-        onChange={(p) => onChange({ ...value, prop: p, value: "" })}
-        recentKey={`pulse.recent-props.${projectId}`}
-        options={propertyOptions(Array.from(new Set([value.prop, ...props])).filter(Boolean))}
-      />
-      <select
-        aria-label={`Step ${idx + 1} condition operator`}
-        value={value.op}
-        onChange={(e) => onChange({ ...value, op: e.target.value as StepWhere["op"] })}
-        className={`${field} w-auto py-1 text-xs`}
-      >
-        <option value="eq">is</option>
-        <option value="neq">is not</option>
-        <option value="contains">contains</option>
-      </select>
-      <input
-        aria-label={`Step ${idx + 1} condition value`}
-        value={value.value}
-        onChange={(e) => onChange({ ...value, value: e.target.value })}
-        placeholder="value"
-        list={suggestions.length ? listId : undefined}
-        className={`${field} w-28 py-1 text-xs`}
-      />
-      {suggestions.length > 0 && (
-        <datalist id={listId}>
-          {suggestions.map((v) => (
-            <option key={v} value={v} />
-          ))}
-        </datalist>
-      )}
-      <button
-        type="button"
-        onClick={() => onChange(null)}
-        className="rounded p-1 text-faint hover:bg-hover hover:text-ink"
-        aria-label={`Remove the condition on step ${idx + 1}`}
-      >
-        <X className="h-3 w-3" />
-      </button>
-    </span>
-  );
-};

@@ -277,6 +277,24 @@ export interface FeatureFlag {
   targeting_cohort_id: string | null;
   variants: { key: string; weight_bps: number; payload?: unknown }[];
   updated_at_ms: number;
+  /** Users in this holdout get no variant. */
+  holdout?: { id: string; bps: number };
+  /** The flag only reaches this slice of the layer's users. */
+  layer?: { id: string; start_bps: number; end_bps: number };
+}
+
+/** A holdout (`bps` held back) or a layer, with the flags in it. */
+export interface TrafficGroup {
+  id: string;
+  kind: "holdout" | "layer";
+  name: string;
+  bps: number;
+  created_at_ms: number;
+  /** Holdouts: the event last used to measure their impact. */
+  metric_event?: string | null;
+  flags: { flag_key: string; enabled: boolean; start_bps?: number; end_bps?: number }[];
+  /** Layers: share no live flag uses yet. */
+  free_bps?: number;
 }
 
 export interface FlagPatch {
@@ -285,6 +303,10 @@ export interface FlagPatch {
   /** A cohort id, or "" for everyone. */
   targeting_cohort_id?: string;
   variants?: { key: string; weight_bps: number }[];
+  /** A holdout id, or "" to detach. */
+  holdout_id?: string;
+  /** Only "": leave the layer. */
+  layer_id?: "";
 }
 
 export interface Experiment {
@@ -297,16 +319,131 @@ export interface Experiment {
   status: string;
   start_ts_ms: number;
   end_ts_ms: number;
-  primary_metric: {
-    name: string;
-    event_name: string;
-    metric_type: string;
-    conversion_window_ms: number;
-  };
-  guardrail_metrics: {
-    name: string;
-    event_name: string;
+  primary_metric: ExperimentMetric;
+  guardrail_metrics: ExperimentMetric[];
+  /** Reported next to the primary metric; never decide or stop anything. */
+  secondary_metrics?: ExperimentMetric[];
+  /** Email of whoever created it (or "admin token"). */
+  created_by?: string;
+  /** The problem it tests a fix for. */
+  problem?: string;
+  /** Who answers for it; empty means `created_by`. */
+  owner?: string;
+  /** Whether milestones go to the project webhook. */
+  notify?: boolean;
+  analysis?: ExperimentAnalysis;
+  /** Set when Pulse stopped the experiment itself, e.g. a guardrail got worse. */
+  stop_reason?: string | null;
+  pause_reason?: string | null;
+  /** "ab" (fixed split, p-values) or "bandit" (traffic moves daily to the best variant). */
+  kind?: ExperimentKind;
+  bandit?: BanditConfig | null;
+  /** Recorded when the experiment was concluded. */
+  decision?: ExperimentDecision | null;
+}
+
+export type DecisionOutcome = "ship" | "keep_control" | "inconclusive";
+/** rollout: everyone gets the variant; rollback: flag off; keep: flag unchanged. */
+export type FlagAction = "rollout" | "staged" | "rollback" | "keep";
+
+export interface DecisionInput {
+  outcome: DecisionOutcome;
+  variant?: string | null;
+  reason: string;
+  flag_action: FlagAction;
+  /** Caveats the decider accepted when shipping. */
+  acknowledged?: string[];
+  /** With `flag_action: "staged"`: days between rollout steps (1 to 14). */
+  every_days?: number;
+}
+
+/** A ship whose rollout rises step by step. */
+export interface StagedRollout {
+  steps_pct: number[];
+  every_ms: number;
+  /** Index of the next step; equals steps_pct.length once done. */
+  next_step: number;
+  next_at_ms: number;
+  halted?: string | null;
+}
+
+/** An experiment metric defined once and reused as a guardrail or secondary metric. */
+export interface SavedMetric {
+  id: string;
+  name: string;
+  spec: ExperimentMetric;
+  created_by: string;
+  created_at_ms: number;
+}
+
+export interface ExperimentDecision extends DecisionInput {
+  decided_by: string;
+  decided_at_ms: number;
+  staged?: StagedRollout | null;
+}
+
+export type ExperimentKind = "ab" | "bandit";
+
+export interface BanditConfig {
+  /** No variant drops below this share (basis points). */
+  min_weight_bps: number;
+  /** Weights stay put until every variant has this many users. */
+  burn_in_users: number;
+}
+
+export interface BanditResults {
+  arms: {
+    variant_key: string;
+    users: number;
+    mean_value: number;
+    ci_low: number;
+    ci_high: number;
+    prob_best: number;
+    /** Expected shortfall versus the best variant, in metric units. */
+    expected_loss: number;
+    weight_bps: number;
   }[];
+  weight_history: { effective_from_ms: number; weights: Record<string, number> }[];
+  best_variant: string | null;
+  burn_in_complete: boolean;
+  ready_to_ship: boolean;
+}
+
+export type MetricDirection = "decrease_is_bad" | "increase_is_bad";
+
+/** `step_through`: share of users who did `denominator.event_name` (A) and then `event_name` (B).
+ *  `time_between`: seconds from A to B among users who did both. */
+export type MetricType = "conversion" | "count" | "sum" | "ratio" | "step_through" | "time_between";
+
+export interface ExperimentMetric {
+  name: string;
+  event_name: string;
+  metric_type?: MetricType | "continuous";
+  /** Summed per user for `sum`; the numerator total for `ratio` (else a count). */
+  numeric_prop?: string | null;
+  /** Required for `ratio`: a count of `event_name`, or the total of `numeric_prop`. */
+  denominator?: { event_name: string; numeric_prop?: string | null } | null;
+  conversion_window_ms: number;
+  /** Only `event_name` events matching every condition count. */
+  filters?: { prop_name: string; filter: { op: string; val?: unknown } }[];
+  /** Which way is bad: guardrails flag a move this way, and for the primary it decides what "better" means. */
+  direction?: MetricDirection;
+  /** Guardrails: roll everyone back to control when a treatment makes this significantly worse. */
+  auto_stop?: boolean;
+  /** What a sum or ratio value is in: a currency symbol ("₹") or a word ("items"). */
+  unit?: string | null;
+}
+
+export interface ExperimentAnalysis {
+  /** Always-valid results, safe to check at any time. */
+  sequential: boolean;
+  alpha: number;
+  planned_users_per_variant?: number | null;
+  /** Adjust for each user's pre-exposure value of the metric (CUPED). */
+  cuped?: boolean;
+  cuped_pre_window_ms?: number;
+  /** Smallest relative lift (%) worth shipping. */
+  target_lift_pct?: number | null;
 }
 
 export interface VariantLiftRow {
@@ -323,6 +460,20 @@ export interface VariantLiftRow {
   p_value: number;
   bayesian_prob_to_beat_control: number;
   statistically_significant: boolean;
+  abs_diff?: number;
+  abs_ci_low?: number;
+  abs_ci_high?: number;
+  sequential?: boolean;
+}
+
+/** A guardrail's or secondary metric's results. */
+export interface MetricResult {
+  metric_name: string;
+  event_name: string;
+  direction: MetricDirection;
+  regressed_variants: string[];
+  metric_type?: MetricType;
+  variants: VariantLiftRow[];
 }
 
 export interface ExperimentResults {
@@ -333,12 +484,41 @@ export interface ExperimentResults {
   hypothesis: string;
   metric_name: string;
   exec_time_us: number;
+  srm_p_value: number;
+  /** The traffic split doesn't match the flag's weights, so results can't be trusted. */
+  sample_ratio_mismatch: boolean;
+  statistical_methodology_note: string;
+  sequential: boolean;
+  /** Confidence level of every interval, e.g. 0.95. */
+  confidence_level: number;
   variants: VariantLiftRow[];
-  guardrails: {
-    metric_name: string;
-    event_name: string;
-    variants: VariantLiftRow[];
+  guardrails: MetricResult[];
+  /** Secondary metrics: reported only, `regressed_variants` always empty. */
+  secondary?: MetricResult[];
+  metric_type: MetricType;
+  cuped_applied: boolean;
+  variance_reduction_pct: number;
+  /** Users who saw more than one variant, left out of the results. */
+  multi_variant_users: number;
+  segment_by: string | null;
+  /** Exploratory: not corrected across segments. */
+  segments: { segment: string; variants: VariantLiftRow[] }[];
+  /** Cumulative lift by exposure day. */
+  timeseries: {
+    day_start_ms: number;
+    variants: {
+      variant_key: string;
+      is_control: boolean;
+      users: number;
+      mean_value: number;
+      relative_lift_pct: number;
+      ci_low_pct: number;
+      ci_high_pct: number;
+    }[];
   }[];
+  kind?: ExperimentKind;
+  /** Bandits only; their `variants` and `guardrails` are empty. */
+  bandit?: BanditResults | null;
 }
 
 export const ADMIN_TOKEN_STORAGE_KEY = "pulse_admin_bearer_token";
@@ -1246,7 +1426,19 @@ export const api = {
     ),
 
   /** Stop (`concluded`), pause or resume an experiment. */
-  patchExperiment: (projectId: string, expId: string, body: { status?: "running" | "paused" | "concluded"; end_ts_ms?: number }) =>
+  patchExperiment: (
+    projectId: string,
+    expId: string,
+    body: {
+      status?: "running" | "paused" | "concluded";
+      end_ts_ms?: number;
+      decision?: DecisionInput;
+      problem?: string;
+      owner?: string;
+      notify?: boolean;
+      reason?: string;
+    },
+  ) =>
     fetchJson<Experiment>(
       `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}`,
       { method: "PATCH", body: JSON.stringify(body) },
@@ -1261,8 +1453,16 @@ export const api = {
       hypothesis: string;
       start_ts_ms: number;
       end_ts_ms: number;
-      primary_metric: { name: string; event_name: string; conversion_window_ms: number };
-      guardrail_metrics: { name: string; event_name: string; conversion_window_ms: number }[];
+      primary_metric: ExperimentMetric;
+      guardrail_metrics: ExperimentMetric[];
+      secondary_metrics?: ExperimentMetric[];
+      analysis: ExperimentAnalysis;
+      kind?: ExperimentKind;
+      status?: "draft" | "running";
+      layer?: { layer_id: string; traffic_pct: number } | null;
+      bandit?: BanditConfig;
+      problem?: string;
+      owner?: string;
     },
   ) =>
     fetchJson<Experiment>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`, {
@@ -1272,7 +1472,13 @@ export const api = {
 
   createFlag: (
     projectId: string,
-    body: { key: string; description: string; rollout_pct: number },
+    body: {
+      key: string;
+      description: string;
+      rollout_pct: number;
+      enabled?: boolean;
+      variants?: { key: string; weight_bps: number; payload?: unknown }[];
+    },
   ) =>
     fetchJson<FeatureFlag>(`/v1/projects/${encodeURIComponent(projectId)}/flags`, {
       method: "POST",
@@ -1282,9 +1488,34 @@ export const api = {
   getExperiments: (projectId: string) =>
     fetchJson<Experiment[]>(`/v1/projects/${encodeURIComponent(projectId)}/experiments`),
 
-  getExperimentResults: (projectId: string, expId: string) =>
+  listTrafficGroups: (projectId: string, kind: "holdouts" | "layers") =>
+    fetchJson<TrafficGroup[]>(projectPath(projectId, `/${kind}`)),
+
+  createTrafficGroup: (projectId: string, kind: "holdouts" | "layers", body: { name: string; holdout_pct?: number }) =>
+    fetchJson<TrafficGroup>(projectPath(projectId, `/${kind}`), { method: "POST", body: JSON.stringify(body) }),
+
+  deleteTrafficGroup: (projectId: string, kind: "holdouts" | "layers", id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/${kind}/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  listSavedMetrics: (projectId: string) => fetchJson<SavedMetric[]>(projectPath(projectId, "/saved-metrics")),
+
+  createSavedMetric: (projectId: string, spec: ExperimentMetric) =>
+    fetchJson<SavedMetric>(projectPath(projectId, "/saved-metrics"), { method: "POST", body: JSON.stringify(spec) }),
+
+  deleteSavedMetric: (projectId: string, id: string) =>
+    fetchJson<unknown>(projectPath(projectId, `/saved-metrics/${encodeURIComponent(id)}`), { method: "DELETE" }),
+
+  /** Exposed users against held-back users, on any metric. */
+  getHoldoutResults: (projectId: string, id: string, metric: ExperimentMetric, startTsMs: number) =>
+    fetchJson<ExperimentResults>(projectPath(projectId, `/holdouts/${encodeURIComponent(id)}/results`), {
+      method: "POST",
+      body: JSON.stringify({ metric, start_ts_ms: startTsMs }),
+    }),
+
+  getExperimentResults: (projectId: string, expId: string, segment?: string) =>
     fetchJson<ExperimentResults>(
-      `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results`,
+      `/v1/projects/${encodeURIComponent(projectId)}/experiments/${encodeURIComponent(expId)}/results` +
+        (segment ? `?segment=${encodeURIComponent(segment)}` : ""),
     ),
 
   listUsers: (projectId: string, search = "", limit = 100, offset = 0, signal?: AbortSignal) =>

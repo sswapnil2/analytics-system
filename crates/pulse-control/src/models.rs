@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef};
+use pulse_exec::{BehavioralCohortDef, CustomEventDef, CustomPropertyDef, PropPredicate};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -259,19 +259,144 @@ pub struct FeatureFlag {
     pub targeting_cohort_id: Option<String>,
     pub variants: Vec<VariantAllocation>,
     pub updated_at_ms: i64,
+    /// Users in this holdout get no variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout: Option<FlagHoldout>,
+    /// The flag only reaches users in this slice of a layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<FlagLayer>,
+}
+
+/// Copied onto the flag so the bundle needs no lookup; a holdout's share never changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlagHoldout {
+    pub id: String,
+    pub bps: u32,
+}
+
+/// `[start_bps, end_bps)` of `pulse_wire::layer_slot(id, user)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlagLayer {
+    pub id: String,
+    pub start_bps: u32,
+    pub end_bps: u32,
+}
+
+/// An experiment metric defined once and reused as a guardrail or secondary metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedMetric {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub spec: ExperimentMetricSpec,
+    #[serde(default)]
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
+/// A holdout (`kind = "holdout"`, `bps` = share held back) or a layer (`kind = "layer"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficGroup {
+    pub id: String,
+    pub project_id: String,
+    pub kind: String,
+    pub name: String,
+    pub bps: u32,
+    pub created_at_ms: i64,
+    /// Holdouts: the event last used to measure their impact, so the Studio reopens on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_event: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentMetricSpec {
     pub name: String,
     pub event_name: String,
-    /// `"conversion"` (binary user conversion) or `"continuous"` (numeric property average/sum per user).
+    /// Per exposed user, after their first exposure:
+    /// - `"conversion"`: did `event_name` at least once (0/1);
+    /// - `"count"`: how many times;
+    /// - `"sum"`: total of `numeric_prop`;
+    /// - `"ratio"`: `numeric_prop` total (or count) over `denominator`, across users.
+    ///
+    /// `"continuous"` (older rows) reads as `"sum"` with a `numeric_prop`, else `"count"`.
     #[serde(default = "default_conversion_kind")]
     pub metric_type: String,
     #[serde(default)]
     pub numeric_prop: Option<String>,
+    /// Only `event_name` events matching every filter count.
+    #[serde(default)]
+    pub filters: Vec<PropPredicate>,
+    /// Required for `"ratio"`.
+    #[serde(default)]
+    pub denominator: Option<MetricDenominator>,
     #[serde(default = "default_window_ms")]
     pub conversion_window_ms: i64,
+    /// Which way is bad, for guardrails: `"decrease_is_bad"` (default) or `"increase_is_bad"`.
+    #[serde(default = "default_direction")]
+    pub direction: String,
+    /// Guardrails only: stop the experiment and give everyone control when a treatment makes
+    /// this metric significantly worse. Needs sequential analysis.
+    #[serde(default)]
+    pub auto_stop: bool,
+    /// What a `sum` or `ratio` value is in, for display: a currency symbol (`"₹"`) or a word (`"items"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+/// A ratio metric's denominator: a count of `event_name`, or the total of `numeric_prop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDenominator {
+    pub event_name: String,
+    #[serde(default)]
+    pub numeric_prop: Option<String>,
+}
+
+fn default_direction() -> String {
+    "decrease_is_bad".to_string()
+}
+
+/// How an experiment's results are analysed. Rows stored before this existed read as
+/// fixed-horizon at 5%, which is what they were shown with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    /// Always-valid p-values and confidence sequences, safe to check at any time.
+    #[serde(default)]
+    pub sequential: bool,
+    /// Two-sided significance level, `0 < alpha < 0.5`.
+    #[serde(default = "default_alpha")]
+    pub alpha: f64,
+    /// Tunes the sequential test to be tightest at this sample size. Defaults to 10,000.
+    #[serde(default)]
+    pub planned_users_per_variant: Option<u64>,
+    /// CUPED: adjust for each user's same metric before exposure to cut variance.
+    #[serde(default)]
+    pub cuped: bool,
+    #[serde(default = "default_cuped_pre_window_ms")]
+    pub cuped_pre_window_ms: i64,
+    /// The smallest relative lift (%) worth shipping, used to judge results against the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_lift_pct: Option<f64>,
+}
+
+fn default_cuped_pre_window_ms() -> i64 {
+    14 * 86_400_000
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            sequential: false,
+            alpha: default_alpha(),
+            planned_users_per_variant: None,
+            cuped: false,
+            cuped_pre_window_ms: default_cuped_pre_window_ms(),
+            target_lift_pct: None,
+        }
+    }
+}
+
+fn default_alpha() -> f64 {
+    0.05
 }
 
 fn default_conversion_kind() -> String {
@@ -297,7 +422,147 @@ pub struct Experiment {
     pub primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     pub guardrail_metrics: Vec<ExperimentMetricSpec>,
+    /// Reported alongside the primary metric; they never decide the outcome or stop anything.
+    #[serde(default)]
+    pub secondary_metrics: Vec<ExperimentMetricSpec>,
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
     pub created_at_ms: i64,
+    /// Who created it: an email for Studio users, otherwise `"admin token"`.
+    #[serde(default)]
+    pub created_by: String,
+    /// The problem this tests a fix for, in the PM's words.
+    #[serde(default)]
+    pub problem: String,
+    /// Who answers for it; empty reads as `created_by`.
+    #[serde(default)]
+    pub owner: String,
+    /// Send this experiment's milestones to the project webhook.
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    /// Why it was paused, when someone said; cleared on resume.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    /// Set when Pulse stopped the experiment itself, e.g. a guardrail got worse.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// `"ab"` (fixed split, p-values) or `"bandit"` (weights move daily toward the best arm).
+    #[serde(default = "default_experiment_kind")]
+    pub kind: String,
+    /// Set for bandits; `None` reads as the defaults.
+    #[serde(default)]
+    pub bandit: Option<BanditConfig>,
+    /// Recorded when the experiment is concluded through the API with a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ExperimentDecision>,
+}
+
+/// Why an experiment ended and what happened to its flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentDecision {
+    /// `"ship"` (a variant won), `"keep_control"` or `"inconclusive"`.
+    pub outcome: String,
+    /// The shipped variant, for `"ship"`.
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+    /// `"rollout"` (everyone gets `variant`), `"rollback"` (flag off) or `"keep"` (unchanged).
+    pub flag_action: String,
+    /// Caveats the decider accepted when shipping (blind guardrails, an unfinished sample).
+    #[serde(default)]
+    pub acknowledged: Vec<String>,
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub decided_at_ms: i64,
+    /// Set for `flag_action: "staged"`: the rollout rises step by step on a timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<StagedRollout>,
+}
+
+/// A ship that raises the flag's rollout in steps (e.g. 25% → 50% → 100%) instead of at once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StagedRollout {
+    pub steps_pct: Vec<f64>,
+    pub every_ms: i64,
+    /// Index into `steps_pct` of the next step; equal to its length once done.
+    pub next_step: usize,
+    pub next_at_ms: i64,
+    /// Why it stopped early, e.g. the flag was changed by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_experiment_kind() -> String {
+    "ab".to_string()
+}
+
+/// How a bandit moves traffic. Weights update once a day, in the first hour after midnight in the project's
+/// timezone, so each exposure day has a single set of weights.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditConfig {
+    /// No arm drops below this share, so the weaker arms keep being measured.
+    #[serde(default = "default_min_weight_bps")]
+    pub min_weight_bps: u32,
+    /// Weights stay as set until every arm has this many users.
+    #[serde(default = "default_burn_in_users")]
+    pub burn_in_users: u64,
+}
+
+impl Default for BanditConfig {
+    fn default() -> Self {
+        Self {
+            min_weight_bps: default_min_weight_bps(),
+            burn_in_users: default_burn_in_users(),
+        }
+    }
+}
+
+fn default_min_weight_bps() -> u32 {
+    100
+}
+
+fn default_burn_in_users() -> u64 {
+    100
+}
+
+/// Variant weights (basis points) in effect from `effective_from_ms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeightSnapshot {
+    pub effective_from_ms: i64,
+    pub weights: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditArm {
+    pub variant_key: String,
+    pub users: u64,
+    /// Stratified by exposure day, so changing weights don't bias it.
+    pub mean_value: f64,
+    pub ci_low: f64,
+    pub ci_high: f64,
+    /// Chance this arm is the best one.
+    pub prob_best: f64,
+    /// Expected shortfall versus the best arm if this one is shipped, in metric units.
+    pub expected_loss: f64,
+    /// Current flag weight.
+    pub weight_bps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditResults {
+    pub arms: Vec<BanditArm>,
+    pub weight_history: Vec<WeightSnapshot>,
+    pub best_variant: Option<String>,
+    /// Every arm has `burn_in_users`, so weights are moving.
+    pub burn_in_complete: bool,
+    /// Past burn-in, no SRM, and the best arm's expected loss is under 1% of its mean.
+    pub ready_to_ship: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,12 +580,30 @@ pub struct VariantLiftRow {
     pub p_value: f64,
     pub bayesian_prob_to_beat_control: f64,
     pub statistically_significant: bool,
+    /// Treatment minus control, in metric units (conversion rate for conversion metrics).
+    #[serde(default)]
+    pub abs_diff: f64,
+    #[serde(default)]
+    pub abs_ci_low: f64,
+    #[serde(default)]
+    pub abs_ci_high: f64,
+    /// The p-value and CIs are always valid (sequential), not fixed-horizon.
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardrailResult {
     pub metric_name: String,
     pub event_name: String,
+    #[serde(default = "default_direction")]
+    pub direction: String,
+    /// Treatments that moved this guardrail significantly in the bad direction.
+    #[serde(default)]
+    pub regressed_variants: Vec<String>,
+    /// conversion | count | sum | ratio | step_through | time_between.
+    #[serde(default = "default_metric_type")]
+    pub metric_type: String,
     pub variants: Vec<VariantLiftRow>,
 }
 
@@ -339,8 +622,68 @@ pub struct ExperimentResults {
     pub sample_ratio_mismatch: bool,
     #[serde(default = "default_stats_note")]
     pub statistical_methodology_note: String,
+    #[serde(default)]
+    pub sequential: bool,
+    /// Confidence level of every interval in these results (`1 - alpha`).
+    #[serde(default = "default_confidence_level")]
+    pub confidence_level: f64,
     pub variants: Vec<VariantLiftRow>,
     pub guardrails: Vec<GuardrailResult>,
+    /// Secondary metrics, same shape as guardrails (`regressed_variants` stays empty).
+    #[serde(default)]
+    pub secondary: Vec<GuardrailResult>,
+    /// The primary metric's normalized type (`conversion`, `count`, `sum`, `ratio`).
+    #[serde(default = "default_conversion_kind")]
+    pub metric_type: String,
+    /// CUPED adjusted the primary metric (it needs pre-exposure variation to apply).
+    #[serde(default)]
+    pub cuped_applied: bool,
+    #[serde(default)]
+    pub variance_reduction_pct: f64,
+    /// Users who saw more than one variant; left out of every result.
+    #[serde(default)]
+    pub multi_variant_users: u64,
+    #[serde(default)]
+    pub segment_by: Option<String>,
+    /// Exploratory per-segment results (`?segment=`), not corrected across segments.
+    #[serde(default)]
+    pub segments: Vec<SegmentResult>,
+    /// Cumulative lift by exposure day.
+    #[serde(default)]
+    pub timeseries: Vec<TimeseriesPoint>,
+    #[serde(default = "default_experiment_kind")]
+    pub kind: String,
+    /// Bandits only; their `variants` and `guardrails` are empty (no p-values).
+    #[serde(default)]
+    pub bandit: Option<BanditResults>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentResult {
+    pub segment: String,
+    pub variants: Vec<VariantLiftRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeseriesPoint {
+    pub day_start_ms: i64,
+    pub variants: Vec<TimeseriesVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeseriesVariant {
+    pub variant_key: String,
+    pub is_control: bool,
+    /// Users first exposed by the end of this day.
+    pub users: u64,
+    pub mean_value: f64,
+    pub relative_lift_pct: f64,
+    pub ci_low_pct: f64,
+    pub ci_high_pct: f64,
+}
+
+fn default_confidence_level() -> f64 {
+    0.95
 }
 
 fn default_stats_note() -> String {
@@ -363,10 +706,44 @@ pub struct EdgeFlagRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort_member_hashes: Option<Vec<String>>,
     pub variants: Vec<VariantAllocation>,
+    /// Holdout and layer gates, read by SDKs that know `schema_version` 2. Older SDKs ignore
+    /// them and serve held-out users anyway, so check minimum SDK versions before relying on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_start_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_end_bps: Option<u32>,
+}
+
+impl EdgeFlagRule {
+    pub fn placement(&self) -> pulse_wire::Placement<'_> {
+        pulse_wire::Placement {
+            holdout: self
+                .holdout_id
+                .as_deref()
+                .map(|id| pulse_wire::HoldoutGate {
+                    id,
+                    bps: self.holdout_bps.unwrap_or(0),
+                }),
+            layer: self.layer_id.as_deref().map(|id| pulse_wire::LayerGate {
+                id,
+                start_bps: self.layer_start_bps.unwrap_or(0),
+                end_bps: self.layer_end_bps.unwrap_or(0),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeFlagBundle {
+    /// 2 adds holdout and layer gates to rules.
+    #[serde(default)]
+    pub schema_version: u32,
     pub project_id: String,
     pub etag: String,
     pub generated_at_ms: i64,
@@ -1007,4 +1384,8 @@ mod byok_config_seal_tests {
             .get("access_key_sealed")
             .is_none());
     }
+}
+
+fn default_metric_type() -> String {
+    "conversion".to_string()
 }

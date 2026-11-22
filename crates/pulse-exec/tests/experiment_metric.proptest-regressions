@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c9432e299432fe476d07ef1c3938645ad5be506407f3506d580a593fb76b984b # shrinks to world = World { events: [], merges: [("anon_3", "user_1"), ("anon_3", "user_3")], flush_split_pct: 0 }
