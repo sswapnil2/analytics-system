@@ -473,7 +473,7 @@ impl ProjectStorage {
         &self,
         _append_guard: &AsyncMutexGuard<'_, ()>,
         bucket_id: u8,
-        events: Vec<(WireEvent, u32)>,
+        events: &[(WireEvent, u32)],
     ) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
@@ -497,7 +497,7 @@ impl ProjectStorage {
 
         // 2. Allocate monotonic `l0_seq`s and append into L0 MemBucket while still holding `bucket_append_locks[b_idx]`
         let mut rows = Vec::with_capacity(events.len());
-        for (ev, uid) in &events {
+        for (ev, uid) in events {
             let fp = event_uuid_fingerprint(&ev.event_uuid);
             rows.push(self.wire_event_to_row(ev, *uid, wal_seq, fp)?);
         }
@@ -587,7 +587,7 @@ impl ProjectStorage {
         }
         let count = {
             let guard = self.lock_bucket_append(bucket_id).await;
-            self.append_bucket_events_locked(&guard, bucket_id, events)
+            self.append_bucket_events_locked(&guard, bucket_id, &events)
                 .await?
         };
         if self.should_flush_bucket(bucket_id) {
@@ -1704,7 +1704,7 @@ mod manifest_retention_tests {
         // Wave 1: append 1 event to each of 10 buckets, flush all due buckets in ONE epoch.
         for b in 0..10u8 {
             let guard = ps.lock_bucket_append(b).await;
-            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 1), b as u32 + 1)])
+            ps.append_bucket_events_locked(&guard, b, &[(make_ev(b, 1), b as u32 + 1)])
                 .await
                 .unwrap();
         }
@@ -1721,7 +1721,7 @@ mod manifest_retention_tests {
         // Wave 2: append another event to each of 10 buckets, flush all due buckets in ONE epoch.
         for b in 0..10u8 {
             let guard = ps.lock_bucket_append(b).await;
-            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 2), b as u32 + 1)])
+            ps.append_bucket_events_locked(&guard, b, &[(make_ev(b, 2), b as u32 + 1)])
                 .await
                 .unwrap();
         }

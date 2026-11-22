@@ -470,12 +470,8 @@ impl IngestService {
                             let written = if to_append.is_empty() {
                                 Ok(0)
                             } else {
-                                ps.append_bucket_events_locked(
-                                    &append_guard,
-                                    bucket_id,
-                                    to_append.clone(),
-                                )
-                                .await
+                                ps.append_bucket_events_locked(&append_guard, bucket_id, &to_append)
+                                    .await
                             };
                             // The task runs to completion even if this request is dropped, so the
                             // group is always answered.
@@ -487,13 +483,14 @@ impl IngestService {
                                         &committed_fps,
                                         server_now_ms,
                                     );
+                                    // Hand each waiter its own events back, moved, not cloned.
+                                    let total = to_append.len();
+                                    let mut appended = to_append.into_iter().map(|(ev, _)| ev);
                                     for (i, w) in group.into_iter().enumerate() {
                                         let (start, waiter_deduped) = spans[i];
-                                        let end = spans.get(i + 1).map_or(to_append.len(), |s| s.0);
-                                        let events = to_append[start..end]
-                                            .iter()
-                                            .map(|(ev, _)| ev.clone())
-                                            .collect();
+                                        let end = spans.get(i + 1).map_or(total, |s| s.0);
+                                        let events: Vec<_> =
+                                            appended.by_ref().take(end - start).collect();
                                         let _ =
                                             w.tx.send(Ok((end - start, waiter_deduped, events)));
                                     }
