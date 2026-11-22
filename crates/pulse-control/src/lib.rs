@@ -18,7 +18,7 @@ pub use api::{
 };
 pub use api_agent::{build_agent_ingest_router, AgentRetentionStats};
 pub use copilot::{CopilotRequest, CopilotResponse};
-pub use db::{MetaError, MetaStore, OrgInvite, SessionInfo, SessionUser};
+pub use db::{DbWriterLeases, MetaError, MetaStore, OrgInvite, SessionInfo, SessionUser};
 pub use experiments::{
     build_edge_flag_bundle, build_edge_flag_bundle_with_cohorts, compare_means, compute_lift_table,
     compute_sample_ratio_mismatch, compute_statistical_lift_table, evaluate_edge_flag,

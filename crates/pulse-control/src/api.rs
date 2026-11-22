@@ -535,9 +535,12 @@ impl ControlPlaneService {
             .list_api_keys(None)
             .await
             .map_err(|e| e.to_string())?;
-        self.api_key_cache.clear();
+        // Upsert, then drop what is gone. Clearing first would 401 every ingest and flag
+        // request that looks a key up mid-reload: the cache has no DB fallback.
+        let mut live: HashSet<String> = HashSet::with_capacity(keys.len());
         for k in keys {
             if !k.revoked {
+                live.insert(k.key_hash.clone());
                 self.api_key_cache.insert(
                     k.key_hash,
                     CachedApiKey {
@@ -547,16 +550,27 @@ impl ControlPlaneService {
                 );
             }
         }
+        self.api_key_cache.retain(|hash, _| live.contains(hash));
 
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
-        self.known_projects.clear();
-        for proj in projects {
+        let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        self.known_projects
+            .retain(|id, _| live_projects.contains(id.as_str()));
+        // One project's broken catalog must not stop the others from reloading.
+        let mut first_err = None;
+        for proj in &projects {
             self.known_projects
                 .insert(proj.id.clone(), proj.org_id.clone());
-            self.refresh_project_lexicon_cache(&proj.id).await?;
-            self.refresh_project_virtual_catalog(&proj.id).await?;
+            let res = async {
+                self.refresh_project_lexicon_cache(&proj.id).await?;
+                self.refresh_project_virtual_catalog(&proj.id).await
+            }
+            .await;
+            if let Err(e) = res {
+                first_err.get_or_insert(format!("project {}: {e}", proj.id));
+            }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     /// The project's org id; 404 when the project doesn't exist.
@@ -793,8 +807,7 @@ impl ControlPlaneService {
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let started_ms = Utc::now().timestamp_millis();
@@ -853,11 +866,11 @@ impl ControlPlaneService {
         project_id: &str,
         canonical_uid: u32,
     ) -> Result<(), String> {
+        // A read: it rebuilds the in-memory index. The periodic refresh calls it on every node.
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let rows: Vec<UserProfileRecord> = pstore
@@ -950,16 +963,14 @@ impl ControlPlaneService {
         let id_graph = self
             .qengine
             .storage()
-            .identity_router()
-            .get_or_open(project_id)
+            .identity_graph(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
 
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
         let existing_prof = pstore
@@ -1163,13 +1174,7 @@ impl GovernanceProvider for ControlPlaneService {
         canonical_uid: u32,
         ops: &Value,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store");
@@ -1222,13 +1227,7 @@ impl GovernanceProvider for ControlPlaneService {
         user_id: &str,
         canonical_uid: u32,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store on identify");
@@ -1814,8 +1813,7 @@ async fn handle_status(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&pid)
+        .identity_graph(&pid, false)
         .await
         .map_err(CtrlError::internal)?;
 
@@ -5043,8 +5041,7 @@ async fn handle_list_user_profiles(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profiles = pstore
@@ -5086,16 +5083,14 @@ async fn handle_get_user_detail(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&id)
+        .identity_graph(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profile = pstore
@@ -5468,8 +5463,7 @@ async fn handle_export_cohort(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let mut by_uid: HashMap<u32, UserProfileRecord> = HashMap::with_capacity(members.len());
@@ -5560,8 +5554,7 @@ async fn handle_get_revenue_summary(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let (total_profiles, paying_users, total_revenue) = pstore
@@ -5667,8 +5660,8 @@ impl ControlPlaneService {
 
     /// Checks every alert rule, records when one fires, and posts a signed webhook for it.
     /// `pulse-node` calls this on a timer.
-    // ponytail: every query-serving node runs this, so several query nodes each deliver; add a
-    // leader lease if you run more than one.
+    /// Every query-serving node runs this; the conditional update on `last_triggered_ms` is the
+    /// claim, so only one node delivers each trigger.
     pub async fn evaluate_alerts(&self) {
         let now_ms = Utc::now().timestamp_millis();
         let Ok(projects) = self.meta.list_projects().await else {
@@ -5679,6 +5672,7 @@ impl ControlPlaneService {
                 continue;
             };
             for mut a in rules {
+                let prev_triggered_ms = a.last_triggered_ms;
                 if a.last_triggered_ms
                     .is_some_and(|t| now_ms - t < ALERT_WINDOW_MS)
                 {
@@ -5689,9 +5683,17 @@ impl ControlPlaneService {
                     continue;
                 }
                 a.last_triggered_ms = Some(now_ms);
-                if let Err(e) = self.meta.upsert_alert_rule(&a).await {
-                    tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
-                    continue;
+                match self
+                    .meta
+                    .claim_alert_trigger(&a.id, prev_triggered_ms, now_ms)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue, // another node claimed this trigger
+                    Err(e) => {
+                        tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
+                        continue;
+                    }
                 }
                 match self.deliver_alert(&a, value, now_ms).await {
                     Ok(Some(status)) => {

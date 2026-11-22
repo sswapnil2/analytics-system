@@ -14,6 +14,7 @@
 | `--seed` / `--no-seed` | `PULSE_SEED=1` | off | Load the synthetic demo dataset into an empty default project | `pulse-node/src/main.rs` |
 | `--role <role>` | `PULSE_NODE_ROLE` | `all` | `all`, `ingest`, `query` or `compactor`. See [node roles](architecture.md#node-roles-and-deployment) | `pulse-node/src/lib.rs` |
 | `--quic-addr <ip:port>` / `--no-quic` | `PULSE_QUIC_ADDR` | off | Optional QUIC/UDP ingest listener, with a self-signed certificate | `pulse-ingest/src/quic.rs` |
+| | `PULSE_WRITER_LEASE_TTL_SECS` | `15` (min `3`) | How long a project's writer lease lasts without renewal: how long another ingest node, or this node restarted after a crash, must wait before it can write the projects a dead holder had. Running a standby is not supported yet ([limitations](limitations.md#operational-limitations)). Renewed every third of it; node clocks must agree to within a third of it. See [limitations](limitations.md#operational-limitations) | `pulse-control/src/db.rs` |
 | | `PULSE_SHUTDOWN_DRAIN_MS` | `0` | Wait this long after `/readyz` turns `503` before closing the listener | `pulse-node/src/lib.rs` |
 | | `RUST_LOG` | `info,slatedb=warn` | Log filter | `pulse-node/src/main.rs` |
 
@@ -42,6 +43,7 @@
 | `PULSE_OBJECT_STORE_URL` | `<data_dir>/object_store` (fsynced local files) | `s3://bucket`, `file:///path` or `memory://` |
 | `AWS_REGION`, `AWS_ENDPOINT` (+ standard `AWS_*` credentials) | region `ap-south-1` | S3-compatible region and endpoint (R2, MinIO, …) |
 | `PULSE_NUM_BUCKETS` | `16` (1–256) | Storage buckets per day partition. Choose before you ingest real data |
+| `PULSE_L0_PROJECT_MAX_MB` / `PULSE_L0_MAX_MB` | `512` / `1024` | Estimated bytes of in-memory rows, per project and per node, before ingest returns `429` (`l0_backpressure`). A bucket is flushed when it reaches the project limit ÷ (2 × buckets) |
 | `PULSE_L0_MAX_ROWS_PER_BUCKET` | `1,000,000` (4 × the 250k flush threshold) | In-memory rows per bucket before ingest returns `429` |
 
 ## Ingest
@@ -49,7 +51,10 @@
 | Env var | Default | Meaning |
 |---|---|---|
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
+| `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |
+| `PULSE_AGENT_L0_MAX_MB` | `512` | Unflushed agent-trace bytes the node may hold in memory across all projects. Above it, agent ingest answers `429` (`l0_backpressure`) and every shard is flushed at once. The figure is an estimate; measured process memory is about twice the limit in use plus roughly 250 MB for flush buffers and caches |
+| `PULSE_AGENT_L0_PROJECT_MAX_MB` | `256` | The same limit for one project, so a single tenant cannot use the whole node budget |
 
 ## Queries
 

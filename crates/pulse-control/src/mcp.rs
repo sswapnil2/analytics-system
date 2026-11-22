@@ -781,8 +781,7 @@ async fn invoke_tool_with_agent_store(
                 .clamp(1, 200) as usize;
             let pstore = qengine
                 .storage()
-                .profile_router()
-                .get_or_open(project_id)
+                .profile_store(project_id, false)
                 .await
                 .map_err(|e| e.to_string())?;
             let profile = pstore
@@ -792,8 +791,7 @@ async fn invoke_tool_with_agent_store(
                 .map(crate::ControlPlaneService::from_stored_profile);
             let id_graph = qengine
                 .storage()
-                .identity_router()
-                .get_or_open(project_id)
+                .identity_graph(project_id, false)
                 .await
                 .map_err(|e| e.to_string())?;
             let canon = id_graph

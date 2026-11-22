@@ -2443,6 +2443,25 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Claims an alert trigger: sets `last_triggered_ms` only if it still holds the value the
+    /// caller read. Returns false when another node claimed it first.
+    pub async fn claim_alert_trigger(
+        &self,
+        alert_id: &str,
+        prev_triggered_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(
+            self,
+            "UPDATE alert_rules SET last_triggered_ms = ?
+             WHERE id = ? AND COALESCE(last_triggered_ms, 0) = ?",
+            now_ms,
+            alert_id,
+            prev_triggered_ms.unwrap_or(0),
+        );
+        Ok(affected == 1)
+    }
+
     pub async fn list_alert_rules(&self, project_id: &str) -> Result<Vec<AlertRule>, MetaError> {
         let rows = db_map_all!(
             self,
@@ -2804,5 +2823,140 @@ impl MetaStore {
             category,
         );
         Ok(affected)
+    }
+}
+
+impl MetaStore {
+    /// Takes or renews `node_id`'s writer lease on a project. `Some(generation)` when the node
+    /// holds it afterwards; the generation grows by one each time the holder changes.
+    pub async fn acquire_writer_lease(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<Option<u64>, MetaError> {
+        // A single statement, so two nodes racing for an expired lease cannot both win.
+        db_exec!(
+            self,
+            "INSERT INTO writer_leases (project_id, node_id, generation, expires_at_ms)
+             VALUES (?, ?, 1, ?)
+             ON CONFLICT(project_id) DO UPDATE SET
+                generation = CASE WHEN writer_leases.node_id = excluded.node_id
+                    THEN writer_leases.generation ELSE writer_leases.generation + 1 END,
+                node_id = excluded.node_id,
+                expires_at_ms = excluded.expires_at_ms
+             WHERE writer_leases.node_id = excluded.node_id OR writer_leases.expires_at_ms < ?",
+            project_id,
+            node_id,
+            expires_at_ms,
+            now_ms,
+        );
+        Ok(db_map_opt!(
+            self,
+            "SELECT generation FROM writer_leases WHERE project_id = ? AND node_id = ?",
+            |r| { r.get::<i64, _>("generation") as u64 },
+            project_id,
+            node_id,
+        ))
+    }
+
+    /// Expires every lease `node_id` holds so another node can take over at once.
+    pub async fn release_writer_leases(&self, node_id: &str) -> Result<u64, MetaError> {
+        Ok(db_exec!(
+            self,
+            "UPDATE writer_leases SET expires_at_ms = 0 WHERE node_id = ?",
+            node_id,
+        ))
+    }
+}
+
+/// Writer leases kept in the metadata database, shared by every node of a deployment.
+pub struct DbWriterLeases {
+    meta: MetaStore,
+    node_id: String,
+    ttl: std::time::Duration,
+}
+
+impl DbWriterLeases {
+    /// `PULSE_WRITER_LEASE_TTL_SECS` (default 15, minimum 3) sets how long a dead writer blocks
+    /// a takeover. Node clocks must agree to within a third of it.
+    pub fn from_env(meta: MetaStore) -> Self {
+        let ttl_secs = std::env::var("PULSE_WRITER_LEASE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(15)
+            .max(3);
+        Self {
+            meta,
+            // Per process, never reused: a restarted node is a new holder and waits out its
+            // old lease unless it released it on a clean shutdown.
+            node_id: uuid::Uuid::new_v4().simple().to_string(),
+            ttl: std::time::Duration::from_secs(ttl_secs),
+        }
+    }
+
+    pub async fn release_all(&self) -> Result<u64, MetaError> {
+        self.meta.release_writer_leases(&self.node_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl pulse_storage::WriterLeases for DbWriterLeases {
+    async fn acquire(&self, project_id: &str) -> std::result::Result<Option<u64>, String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.meta
+            .acquire_writer_lease(
+                project_id,
+                &self.node_id,
+                now_ms,
+                now_ms + self.ttl.as_millis() as i64,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+}
+
+#[cfg(test)]
+mod writer_lease_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lease_has_one_holder_and_generation_grows_on_each_change_of_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        let acquire = |node: &'static str, now_ms: i64| {
+            let meta = meta.clone();
+            async move {
+                meta.acquire_writer_lease("p", node, now_ms, now_ms + 1_000)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(acquire("a", 0).await, Some(1));
+        assert_eq!(acquire("b", 500).await, None, "unexpired lease was taken");
+        assert_eq!(
+            acquire("a", 900).await,
+            Some(1),
+            "renewal changed generation"
+        );
+        assert_eq!(acquire("b", 1_500).await, None, "renewal did not extend");
+        assert_eq!(acquire("b", 2_000).await, Some(2));
+        assert_eq!(acquire("a", 2_100).await, None);
+        // Renewing after its own expiry, with no other holder in between, keeps the generation.
+        assert_eq!(acquire("b", 9_000).await, Some(2));
+        meta.release_writer_leases("b").await.unwrap();
+        assert_eq!(acquire("a", 9_001).await, Some(3));
+        // Leases are per project.
+        assert_eq!(
+            meta.acquire_writer_lease("q", "b", 9_001, 10_000)
+                .await
+                .unwrap(),
+            Some(1)
+        );
     }
 }

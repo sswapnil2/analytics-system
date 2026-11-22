@@ -35,6 +35,17 @@ pub enum StorageError {
     #[error("mvcc manifest conflict after retries")]
     ManifestConflict,
 
+    /// Rows held in memory and not yet in a segment reached their byte limit.
+    #[error("l0 backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
+    Backpressure {
+        project_id: String,
+        bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("this node does not hold the writer lease for project '{project_id}'")]
+    NotWriter { project_id: String },
+
     #[error("project dictionary capacity exceeded for {kind} (max 65536)")]
     DictionaryFull { kind: &'static str },
 

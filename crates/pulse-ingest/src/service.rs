@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -144,15 +144,52 @@ impl IngestMetrics {
     }
 }
 
+/// One WAL record holds at most about this many bytes of events. Requests beyond it wait for
+/// the next record, so a single PUT stays bounded however many requests are queued.
+const WAL_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A routed, interned event waiting for its bucket's WAL: `(event, uid, uuid fingerprint)`.
+type Candidate = (WireEvent, u32, u64);
+/// What one request got from a bucket: `(accepted, deduped, the accepted events)`.
+type BucketOutcome = (usize, usize, Vec<WireEvent>);
+
+/// One request's events for one bucket, queued until a WAL record that includes them is
+/// durable. `Err` hands the events back after a failed write so the request retries itself.
+struct GroupWaiter {
+    candidates: Vec<Candidate>,
+    bytes: usize,
+    tx: tokio::sync::oneshot::Sender<std::result::Result<BucketOutcome, Vec<Candidate>>>,
+}
+
+type BucketQueues = Arc<Vec<Mutex<VecDeque<GroupWaiter>>>>;
+
+fn approx_event_bytes(ev: &WireEvent) -> usize {
+    64 + ev.distinct_id.len()
+        + ev.session_id.len()
+        + ev.event_name.len()
+        + ev.routing_seed.len()
+        + ev.props
+            .iter()
+            .map(|(k, v)| {
+                16 + k.len()
+                    + match v {
+                        PropValue::Str(s) => s.len(),
+                        _ => 8,
+                    }
+            })
+            .sum::<usize>()
+}
+
 /// Core transport-agnostic Ingestion Pipeline shared by HTTP/1.1, HTTP/2, QUIC, and Seeder.
 pub struct IngestService {
     storage: Arc<StorageEngine>,
     governance: Arc<dyn GovernanceProvider>,
-    dedup: DedupRegistry,
-    seeded_projects: DashMap<String, bool>,
+    dedup: Arc<DedupRegistry>,
     dict_registry: Arc<DictionaryRegistry>,
     metrics: IngestMetrics,
     rate_limit: crate::rate_limit::RateLimiter,
+    /// Per project, per bucket: requests waiting to share the next WAL record.
+    wal_groups: DashMap<String, BucketQueues>,
 }
 
 impl IngestService {
@@ -172,11 +209,11 @@ impl IngestService {
         Arc::new(Self {
             storage,
             governance,
-            dedup: DedupRegistry::new(),
-            seeded_projects: DashMap::new(),
+            dedup: Arc::new(DedupRegistry::new()),
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
             rate_limit,
+            wal_groups: DashMap::new(),
         })
     }
 
@@ -209,12 +246,10 @@ impl IngestService {
         now_ms: i64,
     ) -> Result<Arc<pulse_storage::ProjectStorage>> {
         let ps = self.storage.get_or_open_project(project_id).await?;
-        if !self.seeded_projects.contains_key(project_id) {
-            let recovered = ps.take_recovered_uuid_fps();
-            if !recovered.is_empty() {
-                self.dedup.seed_recovered(project_id, &recovered, now_ms);
-            }
-            self.seeded_projects.insert(project_id.to_string(), true);
+        // Empty except right after an open, including a re-open after a writer-lease takeover.
+        let recovered = ps.take_recovered_uuid_fps();
+        if !recovered.is_empty() {
+            self.dedup.seed_recovered(project_id, &recovered, now_ms);
         }
         Ok(ps)
     }
@@ -336,56 +371,157 @@ impl IngestService {
             id_graph.flush().await?;
         }
 
-        // 8. Under per-bucket append locks in parallel across buckets: re-check dedup -> durable WAL append -> L0 append -> commit dedup (`P1-01`, `P1-02`).
+        // 8. Group commit per bucket (`P0-2`). Each request queues its events, then takes the bucket
+        //    append lock. Whoever holds the lock writes ONE WAL record for everything queued (up to
+        //    `WAL_GROUP_MAX_BYTES`), so there is one PUT in flight per bucket log and requests that
+        //    arrive during it share the next one. Under the lock, as before (`P1-01`, `P1-02`):
+        //    re-check dedup -> durable WAL append -> L0 append -> commit dedup; a request is
+        //    answered only after the record holding its events is durable.
         //    L0 -> L1 segment flushes are scheduled asynchronously so ingestion never blocks on storage segment creation!
+        let queues = self
+            .wal_groups
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(
+                    (0..num_buckets)
+                        .map(|_| Mutex::new(VecDeque::new()))
+                        .collect(),
+                )
+            })
+            .clone();
         let bucket_results =
             futures::future::try_join_all(by_bucket.into_iter().map(|(bucket_id, candidates)| {
                 let ps = ps.clone();
-                async move {
-                    let mut local_accepted = 0usize;
-                    let mut local_deduped = 0usize;
-                    let mut appended_events = Vec::new();
-                    let should_flush = {
+                let queues = queues.clone();
+                let dedup = self.dedup.clone();
+                let project_id = project_id.to_string();
+                // Spawned so the lock holder, who writes for every request queued behind it,
+                // cannot be cancelled by its own client going away.
+                let task = tokio::spawn(async move {
+                    let project_id = project_id.as_str();
+                    let queue = &queues[bucket_id as usize];
+                    let enqueue = |candidates: Vec<Candidate>| {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let bytes = candidates
+                            .iter()
+                            .map(|(ev, _, _)| approx_event_bytes(ev))
+                            .sum();
+                        queue.lock().push_back(GroupWaiter {
+                            candidates,
+                            bytes,
+                            tx,
+                        });
+                        rx
+                    };
+                    let mut rx = enqueue(candidates);
+                    let (outcome, should_flush) = {
                         let append_guard = ps.lock_bucket_append(bucket_id).await;
-                        let mut to_append = Vec::with_capacity(candidates.len());
-                        let mut committed_fps = Vec::with_capacity(candidates.len());
-
-                        for (ev, uid, fp) in candidates {
-                            if self
-                                .dedup
-                                .contains(project_id, bucket_id, fp, server_now_ms)
-                            {
-                                local_deduped += 1;
-                                continue;
+                        let outcome = loop {
+                            use tokio::sync::oneshot::error::TryRecvError;
+                            match rx.try_recv() {
+                                // An earlier lock holder wrote our events.
+                                Ok(Ok(outcome)) => break outcome,
+                                // The record carrying our events failed: write them ourselves.
+                                Ok(Err(candidates)) => rx = enqueue(candidates),
+                                Err(TryRecvError::Empty) => {}
+                                Err(TryRecvError::Closed) => return Err(IngestError::Storage(
+                                    StorageError::Io(std::io::Error::other(
+                                        "WAL group write was abandoned before completing; retry",
+                                    )),
+                                )),
                             }
-                            committed_fps.push(fp);
-                            to_append.push((ev, uid));
-                        }
 
-                        if !to_append.is_empty() {
-                            ps.append_bucket_events_locked(
-                                &append_guard,
-                                bucket_id,
-                                to_append.clone(),
-                            )
-                            .await?;
-                            self.dedup.commit_batch(
-                                project_id,
-                                bucket_id,
-                                &committed_fps,
-                                server_now_ms,
-                            );
-                            local_accepted = to_append.len();
-                            appended_events = to_append.into_iter().map(|(ev, _)| ev).collect();
-                        }
-                        ps.should_flush_bucket(bucket_id)
+                            let mut group = Vec::new();
+                            let mut group_bytes = 0usize;
+                            {
+                                let mut q = queue.lock();
+                                while let Some(w) = q.front() {
+                                    if !group.is_empty()
+                                        && group_bytes + w.bytes > WAL_GROUP_MAX_BYTES
+                                    {
+                                        break;
+                                    }
+                                    group_bytes += w.bytes;
+                                    group.extend(q.pop_front());
+                                }
+                            }
+
+                            let mut seen_in_group: HashSet<u64> = HashSet::new();
+                            let mut to_append = Vec::new();
+                            let mut committed_fps = Vec::new();
+                            // Per waiter: where its events start in `to_append`, and its dedup count.
+                            let mut spans = Vec::with_capacity(group.len());
+                            for w in &group {
+                                let start = to_append.len();
+                                let mut waiter_deduped = 0usize;
+                                for (ev, uid, fp) in &w.candidates {
+                                    if dedup.contains(project_id, bucket_id, *fp, server_now_ms)
+                                        || !seen_in_group.insert(*fp)
+                                    {
+                                        waiter_deduped += 1;
+                                        continue;
+                                    }
+                                    committed_fps.push(*fp);
+                                    to_append.push((ev.clone(), *uid));
+                                }
+                                spans.push((start, waiter_deduped));
+                            }
+
+                            let written = if to_append.is_empty() {
+                                Ok(0)
+                            } else {
+                                ps.append_bucket_events_locked(&append_guard, bucket_id, &to_append)
+                                    .await
+                            };
+                            // The task runs to completion even if this request is dropped, so the
+                            // group is always answered.
+                            match written {
+                                Ok(_) => {
+                                    dedup.commit_batch(
+                                        project_id,
+                                        bucket_id,
+                                        &committed_fps,
+                                        server_now_ms,
+                                    );
+                                    // Hand each waiter its own events back, moved, not cloned.
+                                    let total = to_append.len();
+                                    let mut appended = to_append.into_iter().map(|(ev, _)| ev);
+                                    for (i, w) in group.into_iter().enumerate() {
+                                        let (start, waiter_deduped) = spans[i];
+                                        let end = spans.get(i + 1).map_or(total, |s| s.0);
+                                        let events: Vec<_> =
+                                            appended.by_ref().take(end - start).collect();
+                                        let _ =
+                                            w.tx.send(Ok((end - start, waiter_deduped, events)));
+                                    }
+                                }
+                                Err(e) => {
+                                    for w in group {
+                                        let _ = w.tx.send(Err(w.candidates));
+                                    }
+                                    // Ours was in the failed record: report the failure. Otherwise
+                                    // it is still queued; keep going.
+                                    if matches!(rx.try_recv(), Ok(Err(_))) {
+                                        return Err(IngestError::Storage(e));
+                                    }
+                                }
+                            }
+                        };
+                        (outcome, ps.should_flush_bucket(bucket_id))
                     };
 
                     if should_flush {
                         ps.schedule_background_flush(bucket_id);
                     }
 
-                    Ok::<_, IngestError>((local_accepted, local_deduped, appended_events))
+                    Ok::<_, IngestError>(outcome)
+                });
+                async move {
+                    task.await.map_err(|e| {
+                        IngestError::Storage(StorageError::Io(std::io::Error::other(format!(
+                            "WAL group write task failed: {e}"
+                        ))))
+                    })?
                 }
             }))
             .await?;

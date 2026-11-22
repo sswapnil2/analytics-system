@@ -4259,9 +4259,11 @@ name = "pulse-node"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "constant_time_eq",
+ "futures",
  "mimalloc",
  "object_store",
  "parking_lot",
@@ -4279,6 +4281,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

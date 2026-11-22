@@ -30,6 +30,12 @@ pub enum StoreError {
     ManifestConflict,
     #[error("WAL group-commit backpressure on project '{project_id}' (queued={queued})")]
     WalBackpressure { project_id: String, queued: usize },
+    #[error("agent memtable over its byte limit on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
+    L0Backpressure {
+        project_id: String,
+        bytes: usize,
+        max_bytes: usize,
+    },
     #[error("agent trace store is shutting down")]
     Shutdown,
 }

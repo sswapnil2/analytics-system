@@ -779,7 +779,17 @@ pub(crate) fn recompute_trace_from_spans_with_explicit(
 
 /// Deduplicates spans by `span_id` (`Final > Update > Start`) and recomputes trace rollups.
 pub(crate) fn recompute_trace_from_spans(trace: &mut AgentTrace, spans: &[AgentSpan]) {
-    if spans.is_empty() {
+    let mut dedup_map: HashMap<String, (AgentSpan, SpanFieldRanks)> =
+        HashMap::with_capacity(spans.len());
+    merge_spans_crdt_ranked(&mut dedup_map, spans.iter().cloned());
+    let mut deduped: Vec<AgentSpan> = dedup_map.into_values().map(|(sp, _)| sp).collect();
+    rollup_trace_from_unique_spans(trace, &mut deduped);
+}
+
+/// Recomputes trace rollups from spans that already hold one row per `span_id` (the memtable's
+/// span map does), sorting them by start time in place.
+fn rollup_trace_from_unique_spans(trace: &mut AgentTrace, deduped: &mut [AgentSpan]) {
+    if deduped.is_empty() {
         trace.input_tokens = trace.input_tokens.max(0);
         trace.output_tokens = trace.output_tokens.max(0);
         trace.cached_tokens = trace.cached_tokens.max(0);
@@ -788,12 +798,6 @@ pub(crate) fn recompute_trace_from_spans(trace: &mut AgentTrace, spans: &[AgentS
         sync_trace_cost(trace);
         return;
     }
-
-    let mut dedup_map: HashMap<String, (AgentSpan, SpanFieldRanks)> =
-        HashMap::with_capacity(spans.len());
-    merge_spans_crdt_ranked(&mut dedup_map, spans.iter().cloned());
-
-    let mut deduped: Vec<AgentSpan> = dedup_map.into_values().map(|(sp, _)| sp).collect();
     deduped.sort_by(|a, b| {
         a.start_ts_ms
             .cmp(&b.start_ts_ms)
@@ -813,7 +817,7 @@ pub(crate) fn recompute_trace_from_spans(trace: &mut AgentTrace, spans: &[AgentS
     let mut span_model: Option<String> = None;
     let mut span_provider: Option<String> = None;
 
-    for sp in &deduped {
+    for sp in deduped.iter() {
         match sp.span_type {
             SpanType::Llm => llm_calls = llm_calls.saturating_add(1),
             SpanType::Tool => tool_calls = tool_calls.saturating_add(1),
@@ -883,37 +887,72 @@ pub(crate) fn recompute_trace_from_spans(trace: &mut AgentTrace, spans: &[AgentS
         }
     }
     if err_spans > 0 || matches!(trace.status, TraceStatus::Error | TraceStatus::Timeout) {
-        let span_fs = classify_failure_source(&deduped);
+        let span_fs = classify_failure_source(deduped);
         if failure_source_rank(Some(span_fs)) > failure_source_rank(trace.failure_source) {
             trace.failure_source = Some(span_fs);
         }
     }
-    if detect_execution_loop(&deduped).is_some() {
+    if detect_execution_loop(deduped).is_some() {
         trace.has_loop_warning = true;
     }
 }
 
-fn approx_trace_bytes(
-    trace: &AgentTrace,
-    spans: &HashMap<String, (AgentSpan, SpanFieldRanks)>,
-) -> usize {
-    let mut bytes = 256 + trace.trace_id.len() + trace.agent_name.len();
-    bytes += trace.input.to_string().len() + trace.output.to_string().len();
-    for (sp, _) in spans.values() {
-        bytes += 192
-            + sp.span_id.len()
-            + sp.name.len()
-            + sp.input.to_string().len()
-            + sp.output.to_string().len()
-            + sp.attributes.to_string().len();
+/// Heap bytes a JSON value occupies, roughly: content plus per-node overhead. Small objects
+/// are mostly overhead, so counting serialised length alone under-reports memory several times.
+fn value_bytes(v: &Value) -> usize {
+    32 + match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(value_bytes).sum(),
+        // serde_json's map is a B-tree: one ~640-byte node for up to 11 entries.
+        Value::Object(m) => {
+            640.max(m.len() * 80)
+                + m.iter()
+                    .map(|(k, v)| k.len() + value_bytes(v))
+                    .sum::<usize>()
+        }
+        _ => 0,
     }
-    bytes
+}
+
+fn opt_len(s: &Option<String>) -> usize {
+    s.as_ref().map_or(0, String::len)
+}
+
+pub(crate) fn approx_span_bytes(sp: &AgentSpan) -> usize {
+    // Struct, its slot in the span map (keyed by a second copy of the id), strings, payloads.
+    std::mem::size_of::<AgentSpan>()
+        + 96
+        + 2 * sp.span_id.len()
+        + sp.trace_id.len()
+        + sp.project_id.len()
+        + sp.name.len()
+        + opt_len(&sp.parent_span_id)
+        + opt_len(&sp.error_message)
+        + opt_len(&sp.error_stack)
+        + value_bytes(&sp.input)
+        + value_bytes(&sp.output)
+        + value_bytes(&sp.attributes)
+        + value_bytes(&sp.metadata)
+        + value_bytes(&sp.model_params)
+        + sp.events
+            .iter()
+            .map(|e| 64 + e.name.len() + value_bytes(&e.attributes))
+            .sum::<usize>()
+}
+
+pub(crate) fn approx_header_bytes(trace: &AgentTrace) -> usize {
+    256 + std::mem::size_of::<AgentTrace>()
+        + trace.trace_id.len()
+        + trace.agent_name.len()
+        + opt_len(&trace.error_message)
+        + value_bytes(&trace.input)
+        + value_bytes(&trace.output)
+        + value_bytes(&trace.metadata)
 }
 
 struct MemTraceEntry {
     explicit_trace: AgentTrace,
     field_ranks: TraceFieldRanks,
-    trace: AgentTrace,
     has_explicit_header: bool,
     spans: HashMap<String, (AgentSpan, SpanFieldRanks)>,
     last_l0_seq: u64,
@@ -922,6 +961,15 @@ struct MemTraceEntry {
 }
 
 impl MemTraceEntry {
+    /// The header with span rollups applied, and the spans sorted by start time. Computed on
+    /// read so that an append costs the size of its batch, not the size of the trace.
+    fn rolled_up(&self) -> (AgentTrace, Vec<AgentSpan>) {
+        let mut spans: Vec<AgentSpan> = self.spans.values().map(|(sp, _)| sp.clone()).collect();
+        let mut trace = self.explicit_trace.clone();
+        rollup_trace_from_unique_spans(&mut trace, &mut spans);
+        (trace, spans)
+    }
+
     fn crdt_meta(&self) -> TraceCrdtMeta {
         TraceCrdtMeta {
             field_ranks: self.field_ranks,
@@ -1084,7 +1132,18 @@ impl ShardedMemTable {
             let cur_l0_seq = shard.l0_seq;
 
             if let Some(entry) = shard.traces.get_mut(&tid) {
-                let old_bytes = entry.approx_bytes;
+                // Running size: re-measure only the header and spans this batch touches.
+                let touched: HashSet<String> =
+                    new_spans.iter().map(|sp| sp.span_id.clone()).collect();
+                let touched_bytes = |entry: &MemTraceEntry| -> usize {
+                    touched
+                        .iter()
+                        .filter_map(|id| entry.spans.get(id))
+                        .map(|(sp, _)| approx_span_bytes(sp))
+                        .sum::<usize>()
+                        + approx_header_bytes(&entry.explicit_trace)
+                };
+                let old_bytes = touched_bytes(entry);
                 if let Some((tr, tr_ranks)) = trace_opt {
                     if entry.has_explicit_header {
                         merge_trace_headers_ranked(
@@ -1100,10 +1159,6 @@ impl ShardedMemTable {
                     }
                 }
                 merge_spans_crdt_ranked(&mut entry.spans, new_spans);
-                let span_vec: Vec<AgentSpan> =
-                    entry.spans.values().map(|(sp, _)| sp.clone()).collect();
-                entry.trace = entry.explicit_trace.clone();
-                recompute_trace_from_spans(&mut entry.trace, &span_vec);
                 entry.last_l0_seq = cur_l0_seq;
                 if wal_seq > 0 {
                     entry
@@ -1112,11 +1167,9 @@ impl ShardedMemTable {
                         .or_default()
                         .insert(wal_seq);
                 }
-                entry.approx_bytes = approx_trace_bytes(&entry.trace, &entry.spans);
-                shard.approx_bytes = shard
-                    .approx_bytes
-                    .saturating_sub(old_bytes)
-                    .saturating_add(entry.approx_bytes);
+                let new_bytes = touched_bytes(entry);
+                entry.approx_bytes = entry.approx_bytes.saturating_sub(old_bytes) + new_bytes;
+                shard.approx_bytes = shard.approx_bytes.saturating_sub(old_bytes) + new_bytes;
             } else {
                 let (explicit_trace, field_ranks, has_explicit_header) = match trace_opt {
                     Some((tr, ranks)) => (tr, ranks, true),
@@ -1168,10 +1221,11 @@ impl ShardedMemTable {
                 };
                 let mut spans = HashMap::new();
                 merge_spans_crdt_ranked(&mut spans, new_spans);
-                let span_vec: Vec<AgentSpan> = spans.values().map(|(sp, _)| sp.clone()).collect();
-                let mut trace = explicit_trace.clone();
-                recompute_trace_from_spans(&mut trace, &span_vec);
-                let approx = approx_trace_bytes(&trace, &spans);
+                let approx = approx_header_bytes(&explicit_trace)
+                    + spans
+                        .values()
+                        .map(|(sp, _)| approx_span_bytes(sp))
+                        .sum::<usize>();
                 let mut wal_map = HashMap::new();
                 if wal_seq > 0 {
                     let mut s = BTreeSet::new();
@@ -1184,7 +1238,6 @@ impl ShardedMemTable {
                     MemTraceEntry {
                         explicit_trace,
                         field_ranks,
-                        trace,
                         has_explicit_header,
                         spans,
                         last_l0_seq: cur_l0_seq,
@@ -1197,6 +1250,15 @@ impl ShardedMemTable {
         }
 
         Ok(touched)
+    }
+
+    /// `(total bytes, largest shard's bytes)` of unflushed traces, by the same estimate the
+    /// flush thresholds use.
+    pub fn byte_stats(&self) -> (usize, usize) {
+        let inner = self.inner.read();
+        inner.shards.values().fold((0, 0), |(total, max), s| {
+            (total + s.approx_bytes, max.max(s.approx_bytes))
+        })
     }
 
     pub fn eligible_shards(
@@ -1239,17 +1301,15 @@ impl ShardedMemTable {
         let mut flushed_writer_max_seq: BTreeMap<String, u64> = BTreeMap::new();
 
         for (tid, entry) in &shard.traces {
-            let mut spans: Vec<(AgentSpan, SpanFieldRanks)> = entry
-                .spans
-                .values()
-                .map(|(sp, sr)| (sp.clone(), *sr))
+            let (trace, spans) = entry.rolled_up();
+            let spans: Vec<(AgentSpan, SpanFieldRanks)> = spans
+                .into_iter()
+                .map(|sp| {
+                    let ranks = entry.spans[&sp.span_id].1;
+                    (sp, ranks)
+                })
                 .collect();
-            spans.sort_by(|a, b| {
-                a.0.start_ts_ms
-                    .cmp(&b.0.start_ts_ms)
-                    .then_with(|| a.0.span_id.cmp(&b.0.span_id))
-            });
-            entries.push((entry.trace.clone(), entry.crdt_meta(), spans));
+            entries.push((trace, entry.crdt_meta(), spans));
             if !entry.unflushed_wal_seqs.is_empty() {
                 staged_wal_seqs.insert(tid.clone(), entry.unflushed_wal_seqs.clone());
                 for (wid, seqs) in &entry.unflushed_wal_seqs {
@@ -1484,18 +1544,12 @@ impl ShardedMemTable {
         let mut span_ranks = HashMap::new();
         for shard in inner.shards.values() {
             for entry in shard.traces.values() {
-                let mut spans: Vec<AgentSpan> = Vec::with_capacity(entry.spans.len());
+                let tid = &entry.explicit_trace.trace_id;
                 for (sp, sr) in entry.spans.values() {
-                    span_ranks.insert((entry.trace.trace_id.clone(), sp.span_id.clone()), *sr);
-                    spans.push(sp.clone());
+                    span_ranks.insert((tid.clone(), sp.span_id.clone()), *sr);
                 }
-                spans.sort_by(|a, b| {
-                    a.start_ts_ms
-                        .cmp(&b.start_ts_ms)
-                        .then_with(|| a.span_id.cmp(&b.span_id))
-                });
-                trace_meta.insert(entry.trace.trace_id.clone(), entry.crdt_meta());
-                entries.push((entry.trace.clone(), spans));
+                trace_meta.insert(tid.clone(), entry.crdt_meta());
+                entries.push(entry.rolled_up());
             }
         }
         RankedL0Snapshot {
@@ -1510,13 +1564,7 @@ impl ShardedMemTable {
         let key = inner.trace_route.get(trace_id)?;
         let shard = inner.shards.get(key)?;
         let entry = shard.traces.get(trace_id)?;
-        let mut spans: Vec<AgentSpan> = entry.spans.values().map(|(sp, _)| sp.clone()).collect();
-        spans.sort_by(|a, b| {
-            a.start_ts_ms
-                .cmp(&b.start_ts_ms)
-                .then_with(|| a.span_id.cmp(&b.span_id))
-        });
-        Some((entry.trace.clone(), spans))
+        Some(entry.rolled_up())
     }
 
     pub fn snapshot_for_session(&self, session_id: &str) -> Vec<(AgentTrace, Vec<AgentSpan>)> {
@@ -1524,15 +1572,8 @@ impl ShardedMemTable {
         let mut out = Vec::new();
         for shard in inner.shards.values() {
             for entry in shard.traces.values() {
-                if entry.trace.session_id.as_deref() == Some(session_id) {
-                    let mut spans: Vec<AgentSpan> =
-                        entry.spans.values().map(|(sp, _)| sp.clone()).collect();
-                    spans.sort_by(|a, b| {
-                        a.start_ts_ms
-                            .cmp(&b.start_ts_ms)
-                            .then_with(|| a.span_id.cmp(&b.span_id))
-                    });
-                    out.push((entry.trace.clone(), spans));
+                if entry.explicit_trace.session_id.as_deref() == Some(session_id) {
+                    out.push(entry.rolled_up());
                 }
             }
         }
@@ -1569,7 +1610,7 @@ impl ShardedMemTable {
             let mut to_remove = Vec::new();
             for (tid, entry) in &shard.traces {
                 let matches = active.iter().any(|tb| {
-                    tb.matches_trace(&entry.trace)
+                    tb.matches_trace(&entry.explicit_trace)
                         || ((tb.project_id.is_empty() || tb.project_id == self.project_id)
                             && tb.level == ErasureLevel::Trace
                             && tb.target_id == *tid)
@@ -1877,6 +1918,47 @@ mod tests {
             error_message: None,
             error_stack: None,
         }
+    }
+
+    /// Scalability review R-04: appending to a long trace must cost the size of the batch, not
+    /// the size of the trace. Before, every append cloned and re-serialised every span so far.
+    #[test]
+    fn append_cost_does_not_grow_with_trace_length() {
+        let mt = ShardedMemTable::new("p1", 8);
+        let batch = |n: usize| TraceIngestBatch {
+            traces: vec![],
+            spans: (0..100)
+                .map(|i| {
+                    let mut sp = mk_span(
+                        &format!("sp_{n}_{i}"),
+                        "tr_long",
+                        SpanPhase::Final,
+                        TraceStatus::Ok,
+                    );
+                    sp.input = serde_json::json!({ "text": "x".repeat(2_000) });
+                    sp
+                })
+                .collect(),
+        };
+        let timed = |range: std::ops::Range<usize>| {
+            let batches: Vec<_> = range.clone().map(batch).collect();
+            let start = Instant::now();
+            for (n, b) in range.zip(batches) {
+                mt.insert_batch("w1", n as u64 + 1, b).unwrap();
+            }
+            start.elapsed()
+        };
+        let first = timed(0..10);
+        timed(10..90);
+        let last = timed(90..100);
+        assert!(
+            last < first * 5 + Duration::from_millis(20),
+            "appends 90-100 took {last:?}, appends 0-10 took {first:?}"
+        );
+        let (tr, spans) = mt.snapshot_for_trace("tr_long").unwrap();
+        assert_eq!(spans.len(), 10_000);
+        assert_eq!(tr.span_count, 10_000, "rollups are still applied on read");
+        assert_eq!(tr.total_tokens, 150_000);
     }
 
     #[test]
