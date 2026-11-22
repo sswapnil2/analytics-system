@@ -51,6 +51,8 @@
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
 | `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |
+| `PULSE_AGENT_L0_MAX_MB` | `512` | Unflushed agent-trace bytes the node may hold in memory across all projects. Above it, agent ingest answers `429` (`l0_backpressure`) and every shard is flushed at once. The figure is an estimate; measured process memory is about twice the limit in use plus roughly 250 MB for flush buffers and caches |
+| `PULSE_AGENT_L0_PROJECT_MAX_MB` | `256` | The same limit for one project, so a single tenant cannot use the whole node budget |
 
 ## Queries
 

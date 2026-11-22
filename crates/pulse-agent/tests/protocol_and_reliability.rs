@@ -194,6 +194,60 @@ fn test_store_config(read_only: bool, gc_grace_secs: i64) -> AgentTraceStoreConf
         l0_flush_max_bytes: 32 * 1024 * 1024,
         wal_max_group_items: 64,
         wal_max_group_bytes: 8 * 1024 * 1024,
+        l0_max_bytes_project: 256 * 1024 * 1024,
+        l0_max_bytes_node: 512 * 1024 * 1024,
+    }
+}
+
+/// Scalability review R-03: the memtable is bounded in bytes. Past the high-water mark ingest
+/// is refused (the API maps it to 429) and a flush is requested without waiting for the tick;
+/// after the flush, ingest is accepted again.
+#[tokio::test]
+async fn memtable_is_byte_bounded_and_requests_flush_from_the_append_path() {
+    let big_batch = |i: usize| {
+        let mut b = make_batch(&format!("tr_big_{i}"), None, None, 1_700_000_000_000);
+        b.traces[0].input = json!({ "q": "x".repeat(16 * 1024) });
+        b
+    };
+    for (project_cap, node_cap) in [(64 * 1024, usize::MAX), (usize::MAX, 64 * 1024)] {
+        let store = AgentTraceStore::open(
+            Arc::new(InMemory::new()),
+            AgentTraceStoreConfig {
+                l0_flush_max_bytes: 32 * 1024,
+                l0_max_bytes_project: project_cap,
+                l0_max_bytes_node: node_cap,
+                ..test_store_config(false, 0)
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut accepted = 0;
+        let refused = loop {
+            match store.ingest_batch("proj_bound", big_batch(accepted)).await {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted < 100, "memtable grew without bound");
+        };
+        assert!(
+            matches!(refused, StoreError::L0Backpressure { .. }),
+            "{refused}"
+        );
+        assert!(
+            (1..=4).contains(&accepted),
+            "accepted {accepted} against 64 KiB"
+        );
+
+        // A shard passed its flush threshold, so the append path asked for a flush.
+        tokio::time::timeout(std::time::Duration::from_secs(1), store.flush_requested())
+            .await
+            .expect("append path requested a flush");
+        store.flush_l0().await.unwrap();
+        store
+            .ingest_batch("proj_bound", big_batch(999))
+            .await
+            .unwrap();
     }
 }
 

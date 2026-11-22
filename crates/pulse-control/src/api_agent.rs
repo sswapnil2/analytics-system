@@ -461,7 +461,9 @@ async fn ingest_canonical_batch(
         .await
         .map_err(|e| match e {
             StoreError::InvalidIdentifier(msg) => IngestError::BadRequest(msg),
-            StoreError::WalBackpressure { .. } => IngestError::RateLimited(1, "l0_backpressure"),
+            StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
+                IngestError::RateLimited(1, "l0_backpressure")
+            }
             StoreError::Shutdown => IngestError::ServiceUnavailable("store shutting down".into()),
             other => IngestError::Internal(other.to_string()),
         })?;
@@ -572,7 +574,7 @@ fn collect_eval_candidates(batch: &TraceIngestBatch) -> Vec<(String, Option<Stri
 fn map_store_err(err: StoreError) -> CtrlError {
     match err {
         StoreError::InvalidIdentifier(msg) => CtrlError::bad(msg),
-        StoreError::WalBackpressure { .. } => {
+        StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
             CtrlError::new(StatusCode::TOO_MANY_REQUESTS, err.to_string())
         }
         StoreError::Shutdown => CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),

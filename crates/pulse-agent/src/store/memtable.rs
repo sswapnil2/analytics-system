@@ -893,21 +893,67 @@ pub(crate) fn recompute_trace_from_spans(trace: &mut AgentTrace, spans: &[AgentS
     }
 }
 
+/// Heap bytes a JSON value occupies, roughly: content plus per-node overhead. Small objects
+/// are mostly overhead, so counting serialised length alone under-reports memory several times.
+fn value_bytes(v: &Value) -> usize {
+    32 + match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(value_bytes).sum(),
+        // serde_json's map is a B-tree: one ~640-byte node for up to 11 entries.
+        Value::Object(m) => {
+            640.max(m.len() * 80)
+                + m.iter()
+                    .map(|(k, v)| k.len() + value_bytes(v))
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn opt_len(s: &Option<String>) -> usize {
+    s.as_ref().map_or(0, String::len)
+}
+
+fn approx_span_bytes(sp: &AgentSpan) -> usize {
+    // Struct, its slot in the span map (keyed by a second copy of the id), strings, payloads.
+    std::mem::size_of::<AgentSpan>()
+        + 96
+        + 2 * sp.span_id.len()
+        + sp.trace_id.len()
+        + sp.project_id.len()
+        + sp.name.len()
+        + opt_len(&sp.parent_span_id)
+        + opt_len(&sp.error_message)
+        + opt_len(&sp.error_stack)
+        + value_bytes(&sp.input)
+        + value_bytes(&sp.output)
+        + value_bytes(&sp.attributes)
+        + value_bytes(&sp.metadata)
+        + value_bytes(&sp.model_params)
+        + sp.events
+            .iter()
+            .map(|e| 64 + e.name.len() + value_bytes(&e.attributes))
+            .sum::<usize>()
+}
+
+/// Estimated resident bytes of one memtable entry. The header is held twice (as sent, and
+/// with span rollups applied).
 fn approx_trace_bytes(
     trace: &AgentTrace,
     spans: &HashMap<String, (AgentSpan, SpanFieldRanks)>,
 ) -> usize {
-    let mut bytes = 256 + trace.trace_id.len() + trace.agent_name.len();
-    bytes += trace.input.to_string().len() + trace.output.to_string().len();
-    for (sp, _) in spans.values() {
-        bytes += 192
-            + sp.span_id.len()
-            + sp.name.len()
-            + sp.input.to_string().len()
-            + sp.output.to_string().len()
-            + sp.attributes.to_string().len();
-    }
-    bytes
+    let header = std::mem::size_of::<AgentTrace>()
+        + trace.trace_id.len()
+        + trace.agent_name.len()
+        + opt_len(&trace.error_message)
+        + value_bytes(&trace.input)
+        + value_bytes(&trace.output)
+        + value_bytes(&trace.metadata);
+    256 + 2 * header
+        + spans
+            .values()
+            .map(|(sp, _)| approx_span_bytes(sp))
+            .sum::<usize>()
 }
 
 struct MemTraceEntry {
@@ -1197,6 +1243,15 @@ impl ShardedMemTable {
         }
 
         Ok(touched)
+    }
+
+    /// `(total bytes, largest shard's bytes)` of unflushed traces, by the same estimate the
+    /// flush thresholds use.
+    pub fn byte_stats(&self) -> (usize, usize) {
+        let inner = self.inner.read();
+        inner.shards.values().fold((0, 0), |(total, max), s| {
+            (total + s.approx_bytes, max.max(s.approx_bytes))
+        })
     }
 
     pub fn eligible_shards(
