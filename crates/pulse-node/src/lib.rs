@@ -407,6 +407,15 @@ pub async fn start_pulse_node_with_store(
     .await?;
 
     let meta = MetaStore::connect_auto(&config.data_dir).await?;
+    if meta.is_sqlite() && pulse_storage::is_local_hot_store_mode().unwrap_or(true) {
+        tracing::warn!(
+            data_dir = %config.data_dir.display(),
+            "PULSE_HOT_STORE=local is using SQLite (pulse_meta.db); \
+             losing this volume will lose accounts, projects, API keys, and erased_uids tombstones, \
+             and `pulse-node restore --from-published` refuses SQLite. \
+             Set DATABASE_URL to an external PostgreSQL database for recoverable deployments."
+        );
+    }
     // Set before anything can open a project: only the lease holder may write one.
     let writer_leases = config
         .role
@@ -807,6 +816,179 @@ pub async fn start_pulse_node_with_store(
         http_task,
         ready,
     })
+}
+
+/// Summary of one project restored by [`restore_from_published`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredProjectReport {
+    pub project_id: String,
+    pub publish_seq: u64,
+    pub published_at_ms: i64,
+    pub high_water_mark: u64,
+    pub identity_user_count: u64,
+    pub erased_profiles_purged: u64,
+    pub erased_tombstones_deleted: u64,
+}
+
+/// Explicitly restores local hot-tier state (`identity/`, `profiles/`, `manifests/`, and
+/// `<data_dir>/hot_store_mode`) from the newest `published/` manifest per project in the object
+/// store, purges erased profiles from restored snapshots, and deletes post-publish `erased_uids`
+/// (`uid >= high_water_mark`) while keeping `deletion_audit_log` intact.
+///
+/// Refuses SQLite metadata databases before touching `data_dir`.
+pub async fn restore_from_published(
+    data_dir: &std::path::Path,
+    project_id_filter: Option<&str>,
+) -> anyhow::Result<Vec<RestoredProjectReport>> {
+    let db_url = std::env::var("DATABASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "restore --from-published refuses SQLite metadata DB: DATABASE_URL is not set. \
+                 Accounts, projects, and erased_uids tombstones on SQLite are lost with the volume; \
+                 set DATABASE_URL to your external PostgreSQL database (`postgres://...`)."
+            )
+        })?;
+    if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
+        anyhow::bail!(
+            "restore --from-published refuses SQLite or non-PostgreSQL metadata DB: \
+             set DATABASE_URL to a `postgres://` or `postgresql://` connection string"
+        );
+    }
+    let meta = MetaStore::connect_url(&db_url).await?;
+    if meta.is_sqlite() {
+        anyhow::bail!(
+            "restore --from-published refuses SQLite metadata DB; set DATABASE_URL to PostgreSQL"
+        );
+    }
+
+    std::fs::create_dir_all(data_dir)?;
+    let raw_s3 = build_object_store(data_dir)?;
+    restore_from_published_inner(data_dir, project_id_filter, raw_s3, &meta).await
+}
+
+#[doc(hidden)]
+pub async fn restore_from_published_with_store_and_meta_for_test(
+    data_dir: &std::path::Path,
+    project_id_filter: Option<&str>,
+    raw_s3: Arc<dyn object_store::ObjectStore>,
+    meta: &MetaStore,
+) -> anyhow::Result<Vec<RestoredProjectReport>> {
+    std::fs::create_dir_all(data_dir)?;
+    restore_from_published_inner(data_dir, project_id_filter, raw_s3, meta).await
+}
+
+async fn restore_from_published_inner(
+    data_dir: &std::path::Path,
+    project_id_filter: Option<&str>,
+    raw_s3: Arc<dyn object_store::ObjectStore>,
+    meta: &MetaStore,
+) -> anyhow::Result<Vec<RestoredProjectReport>> {
+    let routed = pulse_storage::open_hot_store_for_restore(raw_s3, data_dir).await?;
+    let enc = Arc::new(pulse_storage::EncryptedObjectStore::new(routed));
+    if !meta.list_system_keyring().await?.is_empty() {
+        pulse_control::restore_encryption_keyring_to_store(meta, &enc)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    let enc_store = enc.as_object_store();
+
+    let project_ids: Vec<String> = if let Some(pid) = project_id_filter {
+        vec![pid.to_string()]
+    } else {
+        let listing = enc_store
+            .list_with_delimiter(Some(&object_store::path::Path::from("published")))
+            .await?;
+        let mut ids: Vec<String> = listing
+            .common_prefixes
+            .into_iter()
+            .filter_map(|p| p.parts().nth(1).map(|seg| seg.as_ref().to_string()))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+
+    let mut reports = Vec::new();
+    for project_id in project_ids {
+        let Some(pub_m) =
+            pulse_storage::PublishedManifestStore::new(&project_id, enc_store.clone())
+                .load_latest()
+                .await?
+        else {
+            if project_id_filter.is_some() {
+                anyhow::bail!("no published manifest found for project `{project_id}`");
+            }
+            continue;
+        };
+
+        // Clear any stale local WAL from an earlier partial volume before restoring.
+        pulse_storage::delete_objects_with_prefix(&enc_store, &format!("wal/{project_id}")).await?;
+
+        let restored =
+            pulse_storage::restore_project_from_published(&project_id, &pub_m, enc_store.clone())
+                .await?;
+
+        let erased: pulse_storage::ErasedUids = meta
+            .list_erased_uids(&project_id)
+            .await?
+            .into_iter()
+            .collect();
+        let mut erased_profiles_purged = 0u64;
+        if !erased.is_empty() {
+            let expanded =
+                pulse_storage::expand_erased_with_identity(&erased, Some(&restored.identity_graph));
+            if let Some(ref pstore) = restored.profile_store {
+                let all_profiles = pstore.list_updated_since(0).await?;
+                let to_delete: Vec<String> = all_profiles
+                    .into_iter()
+                    .filter(|prof| {
+                        pulse_storage::is_profile_erased(
+                            prof,
+                            &expanded,
+                            Some(&restored.identity_graph),
+                        )
+                    })
+                    .map(|prof| prof.distinct_id)
+                    .collect();
+                for chunk in to_delete.chunks(10_000) {
+                    let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                    erased_profiles_purged += pstore.delete_for_ids(&refs).await?;
+                    let _ = meta
+                        .delete_user_profiles_for_ids(&project_id, chunk)
+                        .await?;
+                }
+            }
+        }
+
+        if let Some(pstore) = restored.profile_store {
+            pstore.close().await?;
+        }
+        restored.identity_graph.close().await?;
+
+        let erased_tombstones_deleted = meta
+            .delete_erased_uids_from_hwm(&project_id, pub_m.high_water_mark)
+            .await?;
+
+        reports.push(RestoredProjectReport {
+            project_id,
+            publish_seq: pub_m.publish_seq,
+            published_at_ms: pub_m.published_at_ms,
+            high_water_mark: pub_m.high_water_mark,
+            identity_user_count: restored.identity_user_count,
+            erased_profiles_purged,
+            erased_tombstones_deleted,
+        });
+    }
+
+    if reports.is_empty() {
+        anyhow::bail!("no published manifests found under `published/` in object store");
+    }
+
+    pulse_storage::finalize_local_hot_store_marker(data_dir).await?;
+    Ok(reports)
 }
 
 fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {

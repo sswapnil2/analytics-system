@@ -223,6 +223,11 @@ where
 }
 
 impl MetaStore {
+    /// Returns `true` when this `MetaStore` is backed by SQLite rather than PostgreSQL.
+    pub fn is_sqlite(&self) -> bool {
+        matches!(self, Self::Sqlite(_))
+    }
+
     /// Connects to `DATABASE_URL` (`postgres://...` or `sqlite://...`) or falls back to `<data_dir>/pulse_meta.db`.
     pub async fn connect_auto(data_dir: &Path) -> Result<Self, MetaError> {
         if let Ok(url) = std::env::var("DATABASE_URL") {
@@ -2066,6 +2071,24 @@ impl MetaStore {
         Ok(rows)
     }
 
+    /// Deletes erasure tombstones at or above `high_water_mark` for `project_id` after restore,
+    /// leaving `deletion_audit_log` intact.
+    pub async fn delete_erased_uids_from_hwm(
+        &self,
+        project_id: &str,
+        high_water_mark: u64,
+    ) -> Result<u64, MetaError> {
+        let Ok(hwm) = i64::try_from(high_water_mark) else {
+            return Ok(0);
+        };
+        Ok(db_exec!(
+            self,
+            "DELETE FROM erased_uids WHERE project_id = ? AND uid >= ?",
+            project_id,
+            hwm,
+        ))
+    }
+
     /// Records event ids taken in by an import and returns the ones not seen before. Claiming
     /// first makes two concurrent imports of the same file add each event once.
     pub async fn claim_import_uuids(
@@ -2679,5 +2702,51 @@ mod writer_lease_tests {
                 .unwrap(),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn is_sqlite_delete_erased_uids_from_hwm_and_pg_rewrite() {
+        assert_eq!(
+            pg_rewrite("DELETE FROM erased_uids WHERE project_id = ? AND uid >= ?"),
+            "DELETE FROM erased_uids WHERE project_id = $1 AND uid >= $2"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        assert!(meta.is_sqlite());
+
+        meta.insert_erased_uids("proj_a", &[0, 2, 5, 6], 10_000)
+            .await
+            .unwrap();
+        meta.insert_erased_uids("proj_b", &[0, 5, 9], 20_000)
+            .await
+            .unwrap();
+        meta.insert_deletion_audit(&DeletionAuditRecord {
+            id: "del_1".into(),
+            project_id: "proj_a".into(),
+            distinct_id_masked: "u***".into(),
+            canonical_uid: 5,
+            events_purged: 10,
+            replays_purged: 1,
+            requested_by: "admin".into(),
+            deleted_at_ms: 10_000,
+        })
+        .await
+        .unwrap();
+
+        let deleted = meta.delete_erased_uids_from_hwm("proj_a", 5).await.unwrap();
+        assert_eq!(deleted, 2);
+
+        let mut remaining_a = meta.list_erased_uids("proj_a").await.unwrap();
+        remaining_a.sort_by_key(|(u, _)| *u);
+        assert_eq!(remaining_a, vec![(0, 10_000), (2, 10_000)]);
+
+        let mut remaining_b = meta.list_erased_uids("proj_b").await.unwrap();
+        remaining_b.sort_by_key(|(u, _)| *u);
+        assert_eq!(remaining_b, vec![(0, 20_000), (5, 20_000), (9, 20_000)]);
+
+        let audit = meta.list_deletion_audit("proj_a").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].id, "del_1");
     }
 }

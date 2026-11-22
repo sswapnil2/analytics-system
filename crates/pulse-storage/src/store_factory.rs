@@ -275,6 +275,11 @@ fn parse_hot_store_env() -> Result<HotStoreMode> {
     }
 }
 
+/// Returns `true` when `PULSE_HOT_STORE` selects local hot-tier storage (`local` or unset).
+pub fn is_local_hot_store_mode() -> Result<bool> {
+    Ok(parse_hot_store_env()? == HotStoreMode::Local)
+}
+
 async fn read_mode_marker(marker_path: &Path) -> Result<Option<HotStoreMode>> {
     let path = marker_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Option<HotStoreMode>> {

@@ -13,11 +13,12 @@ pub use agent_eval_worker::{
     MAX_CONCURRENT_LLM_JUDGES,
 };
 pub use api::{
-    build_admin_control_router, build_control_router, build_public_flag_router, AuthConfig,
-    AuthPrincipal, BootstrapCredentials, ControlPlaneService,
+    build_admin_control_router, build_control_router, build_public_flag_router,
+    restore_encryption_keyring_to_store, AuthConfig, AuthPrincipal, BootstrapCredentials,
+    ControlPlaneService,
 };
 pub use api_agent::{build_agent_ingest_router, AgentRetentionStats};
-pub use copilot::{CopilotRequest, CopilotResponse};
+pub use copilot::{copilot_revenue_summary, CopilotRequest, CopilotResponse};
 pub use db::{DbWriterLeases, MetaError, MetaStore, OrgInvite, SessionInfo, SessionUser};
 pub use experiments::{
     build_edge_flag_bundle, build_edge_flag_bundle_with_cohorts, compute_sample_ratio_mismatch,

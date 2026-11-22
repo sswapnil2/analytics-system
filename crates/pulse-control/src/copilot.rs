@@ -171,12 +171,42 @@ fn find_biggest_dropoff(funnel: &FunnelResult) -> Option<(String, f64)> {
     worst
 }
 
+/// Computes the erasure-filtered `(total_profiles, paying_users, total_revenue)` summary used by
+/// the BYOK copilot when answering revenue/ARPU/LTV prompts.
+pub async fn copilot_revenue_summary(
+    meta: &MetaStore,
+    storage: &pulse_storage::StorageEngine,
+    project_id: &str,
+) -> (u64, u64, f64) {
+    let erased: pulse_storage::ErasedUids = meta
+        .list_erased_uids(project_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !erased.is_empty() {
+        storage.set_erased(project_id, erased.clone());
+    }
+    let id_graph = if erased.is_empty() {
+        None
+    } else {
+        storage.identity_graph(project_id, false).await.ok()
+    };
+    match storage.profile_store(project_id, false).await {
+        Ok(ps) => ps
+            .revenue_summary_filtered(&erased, id_graph.as_deref())
+            .await
+            .unwrap_or((0, 0, 0.0)),
+        Err(_) => (0, 0, 0.0),
+    }
+}
+
 /// Executes question-driven analytics tools against `QueryEngine` and sends the PII-safe tool
 /// context + prompt directly to the customer's configured LLM provider (`H4`).
 /// Fails explicitly (`CopilotError::Upstream`) if the external LLM call fails — never returns fake templated text.
 pub async fn run_byok_copilot(
     qengine: &Arc<QueryEngine>,
-    _meta: &MetaStore,
+    meta: &MetaStore,
     project_id: &str,
     llm_cred: &ByokCredentialRecord,
     llm_api_key: &str,
@@ -430,11 +460,8 @@ pub async fn run_byok_copilot(
         || prompt_lower.contains("ltv")
         || prompt_lower.contains("pay")
     {
-        let (_, paying, total_rev) = match qengine.storage().profile_store(project_id, false).await
-        {
-            Ok(ps) => ps.revenue_summary().await.unwrap_or((0, 0, 0.0)),
-            Err(_) => (0, 0, 0.0),
-        };
+        let (_, paying, total_rev) =
+            copilot_revenue_summary(meta, qengine.storage(), project_id).await;
         metrics_map.insert(
             "revenue".to_string(),
             json!({ "total_revenue": total_rev, "paying_users": paying }),

@@ -1,6 +1,8 @@
 use std::net::IpAddr;
+use std::path::PathBuf;
 
-use pulse_node::{start_pulse_node, NodeConfig, NodeRole};
+use chrono::{DateTime, SecondsFormat};
+use pulse_node::{restore_from_published, start_pulse_node, NodeConfig, NodeRole};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +17,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("info,slatedb=warn")),
         )
         .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("restore") {
+        return run_restore_cli(&args[1..]).await;
+    }
 
     let mut cfg = NodeConfig::default();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -128,6 +135,11 @@ fn print_usage() {
          \n\
          USAGE:\n\
          \tpulse-node [OPTIONS]\n\
+         \tpulse-node restore --from-published [--data-dir <PATH>] [--project-id <ID>]\n\
+         \n\
+         SUBCOMMANDS:\n\
+         \trestore --from-published   Restore local hot state from newest S3 published manifest(s)\n\
+         \t                           (requires external Postgres DATABASE_URL; refuses SQLite)\n\
          \n\
          OPTIONS:\n\
          \t--host <IP>          HTTP bind address (default: 127.0.0.1, env: PULSE_HOST)\n\
@@ -144,4 +156,77 @@ fn print_usage() {
          \t-V, --version        Print version information",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+async fn run_restore_cli(args: &[String]) -> anyhow::Result<()> {
+    let mut from_published = false;
+    let mut data_dir = std::env::var("PULSE_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./pulse_data"));
+    let mut project_id: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let next_val = |flag: &str, idx: &mut usize| -> anyhow::Result<&str> {
+            *idx += 1;
+            args.get(*idx)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+        };
+        match arg {
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            "--from-published" => {
+                from_published = true;
+            }
+            "--data-dir" => {
+                data_dir = PathBuf::from(next_val("--data-dir", &mut i)?);
+            }
+            "--project-id" => {
+                let pid = next_val("--project-id", &mut i)?.trim().to_string();
+                if pid.is_empty() {
+                    anyhow::bail!("--project-id cannot be empty");
+                }
+                project_id = Some(pid);
+            }
+            other => {
+                anyhow::bail!("unknown restore argument '{other}' (run with --help for usage)");
+            }
+        }
+        i += 1;
+    }
+
+    if !from_published {
+        anyhow::bail!("restore requires --from-published (run with --help for usage)");
+    }
+
+    let reports = restore_from_published(&data_dir, project_id.as_deref()).await?;
+    for r in &reports {
+        let ts_iso = DateTime::from_timestamp_millis(r.published_at_ms)
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_else(|| format!("{}ms", r.published_at_ms));
+        println!(
+            "Restored project `{}` from publish_seq={} (published at {} / published_at_ms={}, \
+             high_water_mark={}, identity_user_count={}, erased_profiles_purged={}, erased_tombstones_deleted={})",
+            r.project_id,
+            r.publish_seq,
+            ts_iso,
+            r.published_at_ms,
+            r.high_water_mark,
+            r.identity_user_count,
+            r.erased_profiles_purged,
+            r.erased_tombstones_deleted,
+        );
+        eprintln!(
+            "WARNING [{}]: Data loss notice — events, profile updates, identity merges, and erasures \
+             after {} ({}ms) were lost with the previous local volume.",
+            r.project_id, ts_iso, r.published_at_ms
+        );
+    }
+    Ok(())
 }

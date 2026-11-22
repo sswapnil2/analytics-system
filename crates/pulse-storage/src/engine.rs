@@ -1456,7 +1456,9 @@ impl ProjectStorage {
                         })
                         .await?;
                     if let Some(ref c) = committed_opt {
-                        if !self.id_graph.is_read_only() {
+                        if !self.id_graph.is_read_only()
+                            && self.publish_enabled.load(Ordering::Acquire)
+                        {
                             self.publish_committed_state(c).await?;
                         }
                     }

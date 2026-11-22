@@ -175,6 +175,8 @@ pub struct ControlPlaneService {
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     /// Per project: the update time up to which user profiles are loaded into the catalog.
     profiles_synced_ms: DashMap<String, i64>,
+    /// Per project: `canonical_uid -> merged updated_at_ms` currently stored in `ColumnarProfileIndex`.
+    profile_catalog_ts: DashMap<String, HashMap<u32, i64>>,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
     auth_cfg: parking_lot::RwLock<AuthConfig>,
     auth_state: auth::AuthState,
@@ -307,6 +309,7 @@ impl ControlPlaneService {
             known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
             profiles_synced_ms: DashMap::new(),
+            profile_catalog_ts: DashMap::new(),
             discovery_tx: tx,
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
@@ -785,10 +788,49 @@ impl ControlPlaneService {
         }
     }
 
+    /// Loads `erased_uids` from `MetaStore`, opens the project's read-only identity graph when
+    /// non-empty, expands merged raw->canonical mappings, and syncs `StorageEngine::set_erased`.
+    async fn load_erased_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<
+        (
+            pulse_storage::ErasedUids,
+            Option<Arc<pulse_identity::ProjectIdentityGraph>>,
+        ),
+        String,
+    > {
+        let erased: pulse_storage::ErasedUids = self
+            .meta
+            .list_erased_uids(project_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        let id_graph = if erased.is_empty() {
+            None
+        } else {
+            Some(
+                self.qengine
+                    .storage()
+                    .identity_graph(project_id, false)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+        self.qengine
+            .storage()
+            .set_erased(project_id, expanded.clone());
+        Ok((expanded, id_graph))
+    }
+
     /// Syncs the project's `ColumnarProfileIndex` from the object-store-backed SlateDB `ProfileStore`.
     /// On the first call for a project, migrates any legacy SQL `user_profiles` rows automatically.
     async fn refresh_user_profiles(&self, project_id: &str) -> Result<(), String> {
         let cat = self.qengine.catalogs().for_project(project_id);
+        let (erased, id_graph) = self.load_erased_for_project(project_id).await?;
+        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
         let pstore = self
             .qengine
             .storage()
@@ -799,28 +841,51 @@ impl ControlPlaneService {
         let since = self.profiles_synced_ms.get(project_id).map(|v| *v);
         match since {
             None => {
-                let mut rows: Vec<UserProfileRecord> = pstore
+                let mut stored_rows = pstore
                     .list_updated_since(0)
                     .await
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .map(Self::from_stored_profile)
-                    .collect();
-                if rows.is_empty() && !self.qengine.storage().profile_router().is_read_only() {
+                    .map_err(|e| e.to_string())?;
+                if stored_rows.is_empty() && !self.qengine.storage().profile_router().is_read_only()
+                {
                     if let Ok(legacy) = self
                         .meta
                         .list_user_profiles_updated_since(project_id, 0)
                         .await
                     {
                         if !legacy.is_empty() {
-                            let stored: Vec<_> =
-                                legacy.iter().map(Self::to_stored_profile).collect();
-                            let _ = pstore.upsert_batch(&stored).await;
-                            rows = legacy;
+                            let filtered_stored: Vec<_> = legacy
+                                .into_iter()
+                                .map(|r| Self::to_stored_profile(&r))
+                                .filter(|s| {
+                                    !pulse_storage::is_profile_erased(
+                                        s,
+                                        &expanded,
+                                        id_graph.as_deref(),
+                                    )
+                                })
+                                .collect();
+                            if !filtered_stored.is_empty() {
+                                let _ = pstore.upsert_batch(&filtered_stored).await;
+                            }
+                            stored_rows = filtered_stored;
                         }
                     }
                 }
-                let merged = merge_profile_rows(rows)
+                let rows: Vec<UserProfileRecord> = stored_rows
+                    .into_iter()
+                    .filter(|s| {
+                        !pulse_storage::is_profile_erased(s, &expanded, id_graph.as_deref())
+                    })
+                    .map(Self::from_stored_profile)
+                    .collect();
+                let merged_map = merge_profile_rows(rows);
+                let ts_map: HashMap<u32, i64> = merged_map
+                    .iter()
+                    .map(|(&uid, p)| (uid, p.updated_at_ms))
+                    .collect();
+                self.profile_catalog_ts
+                    .insert(project_id.to_string(), ts_map);
+                let merged = merged_map
                     .into_iter()
                     .map(|(uid, p)| (uid, profile_to_catalog_props(&p)))
                     .collect();
@@ -831,10 +896,30 @@ impl ControlPlaneService {
                     .list_updated_since(since)
                     .await
                     .map_err(|e| e.to_string())?;
-                let uids: std::collections::BTreeSet<u32> =
+                let mut uids: std::collections::BTreeSet<u32> =
                     rows.iter().map(|r| r.canonical_uid).collect();
+                // Evict profiles newly hidden by `erased_uids` (e.g. erased on another node) even
+                // when `pstore` was not modified after `since`.
+                if !expanded.is_empty() {
+                    if let Some(ts_map) = self.profile_catalog_ts.get(project_id) {
+                        let id_snap = id_graph.as_deref().map(|ig| ig.snapshot());
+                        for (&cat_uid, &prof_ts) in ts_map.value() {
+                            let resolved = id_snap.as_ref().map_or(cat_uid, |s| s.resolve(cat_uid));
+                            if expanded.hides(cat_uid, prof_ts) || expanded.hides(resolved, prof_ts)
+                            {
+                                uids.insert(cat_uid);
+                            }
+                        }
+                    }
+                }
                 for uid in uids {
-                    self.rebuild_user_profile(project_id, uid).await?;
+                    self.rebuild_user_profile_with_erased(
+                        project_id,
+                        uid,
+                        &expanded,
+                        id_graph.as_deref(),
+                    )
+                    .await?;
                 }
             }
         }
@@ -851,6 +936,24 @@ impl ControlPlaneService {
         project_id: &str,
         canonical_uid: u32,
     ) -> Result<(), String> {
+        let (erased, id_graph) = self.load_erased_for_project(project_id).await?;
+        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+        self.rebuild_user_profile_with_erased(
+            project_id,
+            canonical_uid,
+            &expanded,
+            id_graph.as_deref(),
+        )
+        .await
+    }
+
+    async fn rebuild_user_profile_with_erased(
+        &self,
+        project_id: &str,
+        canonical_uid: u32,
+        expanded_erased: &pulse_storage::ErasedUids,
+        id_graph: Option<&pulse_identity::ProjectIdentityGraph>,
+    ) -> Result<(), String> {
         // A read: it rebuilds the in-memory index. The periodic refresh calls it on every node.
         let pstore = self
             .qengine
@@ -863,12 +966,24 @@ impl ControlPlaneService {
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
+            .filter(|s| !pulse_storage::is_profile_erased(s, expanded_erased, id_graph))
             .map(Self::from_stored_profile)
             .collect();
         let cat = self.qengine.catalogs().for_project(project_id);
         match merge_profile_rows(rows).remove(&canonical_uid) {
-            Some(p) => cat.upsert_user_profile(canonical_uid, profile_to_catalog_props(&p)),
-            None => cat.remove_user_profile(canonical_uid),
+            Some(p) => {
+                self.profile_catalog_ts
+                    .entry(project_id.to_string())
+                    .or_default()
+                    .insert(canonical_uid, p.updated_at_ms);
+                cat.upsert_user_profile(canonical_uid, profile_to_catalog_props(&p));
+            }
+            None => {
+                if let Some(mut map) = self.profile_catalog_ts.get_mut(project_id) {
+                    map.remove(&canonical_uid);
+                }
+                cat.remove_user_profile(canonical_uid);
+            }
         }
         Ok(())
     }
@@ -925,8 +1040,8 @@ impl ControlPlaneService {
             cat.saved_cohorts.insert(c.id.clone(), c.definition);
         }
 
-        self.refresh_user_profiles(project_id).await?;
-
+        // Sync `erased_uids` into StorageEngine BEFORE refreshing user profiles so initial loads
+        // and remote readers always observe fresh erasure tombstones.
         let erased = self
             .meta
             .list_erased_uids(project_id)
@@ -935,6 +1050,8 @@ impl ControlPlaneService {
         self.qengine
             .storage()
             .set_erased(project_id, erased.into_iter().collect());
+
+        self.refresh_user_profiles(project_id).await?;
 
         Ok(())
     }
@@ -1046,6 +1163,9 @@ impl ControlPlaneService {
             erased.insert(u, erased_at_ms);
         }
         storage.set_erased(project_id, erased);
+        if let Some(mut map) = self.profile_catalog_ts.get_mut(project_id) {
+            map.remove(&canon_uid);
+        }
         let cat = self.qengine.catalogs().for_project(project_id);
         cat.remove_user_profile(canon_uid);
 
@@ -1065,6 +1185,45 @@ impl ControlPlaneService {
             .map_err(CtrlError::meta)?;
         Ok(rec)
     }
+}
+
+/// Restores sealed BYOK encryption keys from `system_keyring` into `enc_store` (used by
+/// `pulse-node restore --from-published`). Skips KEK resolution when `system_keyring` is empty.
+pub async fn restore_encryption_keyring_to_store(
+    meta: &MetaStore,
+    enc_store: &pulse_storage::EncryptedObjectStore,
+) -> Result<(), String> {
+    let keyring_rows = meta
+        .list_system_keyring()
+        .await
+        .map_err(|e| e.to_string())?;
+    if keyring_rows.is_empty() {
+        return Ok(());
+    }
+    let vault_kek = meta.resolve_or_create_cluster_kek().await?.ok_or_else(|| {
+        "system_keyring contains sealed encryption keys, but PULSE_VAULT_KEK is not set".to_string()
+    })?;
+    for row in keyring_rows {
+        let secret = unseal_secret(&vault_kek, &row.sealed_key_hex).map_err(|e| {
+            format!(
+                "failed to unseal cluster encryption key '{}': {e}",
+                row.key_id
+            )
+        })?;
+        let salt_bytes = hex::decode(row.salt_hex.trim())
+            .map_err(|e| format!("corrupted salt_hex for keyring '{}': {e}", row.key_id))?;
+        if salt_bytes.len() != 16 {
+            return Err(format!("keyring '{}' salt must be 16 bytes", row.key_id));
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&salt_bytes);
+        let master = parse_or_derive_master_key(&secret, &salt)
+            .map_err(|e| format!("failed to derive master key for '{}': {e}", row.key_id))?;
+        enc_store
+            .register_master_key(&row.key_id, master, row.is_active)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// How far back each incremental profile reload re-reads, to cover writes that were in flight.
@@ -1166,7 +1325,31 @@ impl GovernanceProvider for ControlPlaneService {
                 return;
             }
         };
-        let existing = pstore.get_by_distinct_id(distinct_id).await.ok().flatten();
+        let (erased, id_graph) = match self.load_erased_for_project(project_id).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    project_id,
+                    error = %e,
+                    "failed to load erased_uids in apply_engage; using cached storage snapshot"
+                );
+                (
+                    (*self.qengine.storage().erased_snapshot(project_id)).clone(),
+                    self.qengine
+                        .storage()
+                        .identity_graph(project_id, false)
+                        .await
+                        .ok(),
+                )
+            }
+        };
+        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+        let existing = pstore
+            .get_by_distinct_id(distinct_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, id_graph.as_deref()));
         let mut props = existing
             .as_ref()
             .map(|p| p.props.clone())
@@ -1219,18 +1402,56 @@ impl GovernanceProvider for ControlPlaneService {
                 return;
             }
         };
+        let (erased, id_graph) = match self.load_erased_for_project(project_id).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    project_id,
+                    error = %e,
+                    "failed to load erased_uids in on_identify; using cached storage snapshot"
+                );
+                (
+                    (*self.qengine.storage().erased_snapshot(project_id)).clone(),
+                    self.qengine
+                        .storage()
+                        .identity_graph(project_id, false)
+                        .await
+                        .ok(),
+                )
+            }
+        };
+        let mut to_rekey = Vec::with_capacity(2);
+        let mut to_purge = Vec::new();
+        if !erased.is_empty() {
+            let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+            for did in [anon_id, user_id] {
+                if let Ok(Some(prof)) = pstore.get_by_distinct_id(did).await {
+                    if pulse_storage::is_profile_erased(&prof, &expanded, id_graph.as_deref()) {
+                        to_purge.push(did);
+                        continue;
+                    }
+                }
+                to_rekey.push(did);
+            }
+            if !to_purge.is_empty() {
+                if let Err(e) = pstore.delete_for_ids(&to_purge).await {
+                    tracing::error!(project_id, error = %e, "failed to purge erased profile row on identify");
+                }
+            }
+        } else {
+            to_rekey.push(anon_id);
+            to_rekey.push(user_id);
+        }
         // Rows written before the merge carry the pre-merge uid; point both ids at the
         // canonical user so the anonymous traits show on the identified user.
-        if let Err(e) = pstore
-            .rekey(
-                &[anon_id, user_id],
-                canonical_uid,
-                Utc::now().timestamp_millis(),
-            )
-            .await
-        {
-            tracing::error!(project_id, error = %e, "failed to re-key profiles after identify");
-            return;
+        if !to_rekey.is_empty() {
+            if let Err(e) = pstore
+                .rekey(&to_rekey, canonical_uid, Utc::now().timestamp_millis())
+                .await
+            {
+                tracing::error!(project_id, error = %e, "failed to re-key profiles after identify");
+                return;
+            }
         }
         if let Err(e) = self.rebuild_user_profile(project_id, canonical_uid).await {
             tracing::error!(project_id, error = %e, "failed to refresh user profile in catalog");
@@ -3935,6 +4156,10 @@ async fn handle_list_user_profiles(
         .get("offset")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
+    let (erased, id_graph) = ctrl
+        .load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let pstore = ctrl
         .qengine
         .storage()
@@ -3942,7 +4167,13 @@ async fn handle_list_user_profiles(
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profiles = pstore
-        .list_paginated(q.get("search").map(String::as_str), limit, offset)
+        .list_paginated_filtered(
+            q.get("search").map(String::as_str),
+            limit,
+            offset,
+            &erased,
+            id_graph.as_deref(),
+        )
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 
@@ -3977,12 +4208,17 @@ async fn handle_get_user_detail(
     Query(q): Query<UserDetailQuery>,
 ) -> ApiRes<Value> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    let (erased, _) = ctrl
+        .load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let id_graph = ctrl
         .qengine
         .storage()
         .identity_graph(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
+    let expanded = pulse_storage::expand_erased_with_identity(&erased, Some(&id_graph));
 
     let pstore = ctrl
         .qengine
@@ -3994,17 +4230,18 @@ async fn handle_get_user_detail(
         .get_by_distinct_id(&distinct_id)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?
+        .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
         .map(ControlPlaneService::from_stored_profile);
 
-    let canon_uid = q
+    let resolved_canon = q
         .uid
-        .filter(|u| *u > 0)
         .or_else(|| id_graph.lookup_canonical(&distinct_id))
         .or_else(|| id_graph.lookup_raw(&distinct_id))
-        .or_else(|| profile.as_ref().map(|p| p.canonical_uid))
-        .unwrap_or(0);
+        .or_else(|| profile.as_ref().map(|p| p.canonical_uid));
+    let has_user = resolved_canon.is_some();
+    let canon_uid = resolved_canon.unwrap_or(0);
 
-    let events = if canon_uid > 0 || id_graph.lookup_raw(&distinct_id).is_some() {
+    let events = if has_user {
         ctrl.qengine
             .export_events(&id, None, Some(canon_uid), 200, true)
             .await
@@ -4025,12 +4262,13 @@ async fn handle_get_user_detail(
     }
 
     // Show what every id merged into this user set, not just this id's row.
-    let profile = if canon_uid > 0 {
+    let profile = if has_user {
         let rows: Vec<UserProfileRecord> = pstore
             .list_for_canonical(canon_uid)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?
             .into_iter()
+            .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
             .map(ControlPlaneService::from_stored_profile)
             .collect();
         merge_profile_rows(rows).remove(&canon_uid).or(profile)
@@ -4352,7 +4590,12 @@ async fn handle_export_cohort(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, CtrlError> {
     ctrl.authorize_and_check(&principal, &id).await?;
-    let members = ctrl
+    let (erased, id_graph) = ctrl
+        .load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
+    let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+    let mut members = ctrl
         .qengine
         .evaluate_saved_cohort_uids(&id, &cohort_id)
         .await
@@ -4370,11 +4613,15 @@ async fn handle_export_cohort(
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?
             .into_iter()
+            .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, id_graph.as_deref()))
             .map(ControlPlaneService::from_stored_profile)
             .collect();
         if let Some(merged) = merge_profile_rows(rows).remove(&uid) {
             by_uid.insert(uid, merged);
         }
+    }
+    if !expanded.is_empty() {
+        members.retain(|(uid, _)| by_uid.contains_key(uid) || !expanded.contains(*uid));
     }
 
     let format = q
@@ -4448,6 +4695,10 @@ async fn handle_get_revenue_summary(
         .filter(|s| !s.is_empty())
         .unwrap_or("$revenue")
         .to_string();
+    let (erased, id_graph) = ctrl
+        .load_erased_for_project(&id)
+        .await
+        .map_err(CtrlError::internal)?;
     let pstore = ctrl
         .qengine
         .storage()
@@ -4455,7 +4706,7 @@ async fn handle_get_revenue_summary(
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let (total_profiles, paying_users, total_revenue) = pstore
-        .revenue_summary()
+        .revenue_summary_filtered(&erased, id_graph.as_deref())
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 

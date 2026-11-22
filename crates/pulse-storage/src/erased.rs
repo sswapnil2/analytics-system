@@ -25,6 +25,18 @@ impl ErasedUids {
         *e = (*e).max(at_ms);
     }
 
+    /// True when `uid` has an erasure tombstone recorded (regardless of timestamp).
+    #[inline]
+    pub fn contains(&self, uid: u32) -> bool {
+        self.at.contains_key(&uid)
+    }
+
+    /// Iterates `(uid, erased_at_ms)` pairs in this set.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (u32, i64)> + '_ {
+        self.at.iter().map(|(&u, &t)| (u, t))
+    }
+
     /// True when an event by `uid` at `ts_ms` must not be shown or kept.
     #[inline]
     pub fn hides(&self, uid: u32, ts_ms: i64) -> bool {

@@ -779,6 +779,19 @@ async fn invoke_tool_with_agent_store(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
+            let erased: pulse_storage::ErasedUids = meta
+                .list_erased_uids(project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect();
+            let id_graph = qengine
+                .storage()
+                .identity_graph(project_id, false)
+                .await
+                .map_err(|e| e.to_string())?;
+            let expanded = pulse_storage::expand_erased_with_identity(&erased, Some(&id_graph));
+            qengine.storage().set_erased(project_id, expanded.clone());
             let pstore = qengine
                 .storage()
                 .profile_store(project_id, false)
@@ -788,12 +801,8 @@ async fn invoke_tool_with_agent_store(
                 .get_by_distinct_id(distinct_id)
                 .await
                 .map_err(|e| e.to_string())?
+                .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
                 .map(crate::ControlPlaneService::from_stored_profile);
-            let id_graph = qengine
-                .storage()
-                .identity_graph(project_id, false)
-                .await
-                .map_err(|e| e.to_string())?;
             let canon = id_graph
                 .lookup_canonical(distinct_id)
                 .or_else(|| {
@@ -817,9 +826,12 @@ async fn invoke_tool_with_agent_store(
                 .await
                 .map_err(|e| e.to_string())?
                 .into_iter()
+                .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
                 .map(crate::ControlPlaneService::from_stored_profile)
                 .collect();
-            let merged = crate::api::merge_profile_rows(rows).remove(&canon);
+            let merged = crate::api::merge_profile_rows(rows)
+                .remove(&canon)
+                .or(profile);
             Ok(json!({
                 "distinct_id": distinct_id,
                 "properties": merged.as_ref().map(|p| &p.props),

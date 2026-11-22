@@ -19,6 +19,7 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use pulse_identity::{IdentitySnapshot, ProjectIdentityGraph};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use slatedb::config::{
@@ -27,6 +28,7 @@ use slatedb::config::{
 };
 use slatedb::{Db, DbReader, SlateDBError, WriteBatch};
 
+use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
 
 const PROFILE_ZSTD_MAGIC: &[u8; 4] = b"PZST";
@@ -568,6 +570,20 @@ impl ProjectProfileStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<StoredUserProfile>> {
+        self.list_paginated_filtered(search, limit, offset, &ErasedUids::default(), None)
+            .await
+    }
+
+    /// Newest-first paginated listing using the `t/` reverse-timestamp index, filtering out
+    /// erased users (`updated_at_ms <= erased_at_ms`) *before* applying `offset`/`limit`.
+    pub async fn list_paginated_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        erased: &ErasedUids,
+        id_graph: Option<&ProjectIdentityGraph>,
+    ) -> Result<Vec<StoredUserProfile>> {
         let lim = limit.clamp(1, 1000);
         let needle = search
             .map(str::trim)
@@ -575,7 +591,11 @@ impl ProjectProfileStore {
             .map(|s| s.to_lowercase());
         let start = b"t/".to_vec();
         let end = b"t0".to_vec();
-        let max_keys = needle.is_none().then(|| offset.saturating_add(lim));
+        let max_keys = (needle.is_none() && erased.is_empty()).then(|| offset.saturating_add(lim));
+        let expanded = expand_erased_with_identity(erased, id_graph);
+        let id_snap = (!expanded.is_empty())
+            .then(|| id_graph.map(ProjectIdentityGraph::snapshot))
+            .flatten();
 
         if self.read_only {
             let Some(reader) = self.shared_reader().await? else {
@@ -591,7 +611,7 @@ impl ProjectProfileStore {
                 let Ok(did) = std::str::from_utf8(&key[19..]) else {
                     continue;
                 };
-                if needle.is_none() {
+                if needle.is_none() && expanded.is_empty() {
                     if matched < offset {
                         matched += 1;
                         continue;
@@ -605,15 +625,28 @@ impl ProjectProfileStore {
                     matched += 1;
                 } else if let Some(b) = reader.get(record_key(did)).await.map_err(slatedb_err)? {
                     let prof = decode_profile(&b)?;
-                    if profile_matches_needle(&prof, needle.as_deref().unwrap()) {
-                        if matched >= offset {
-                            out.push(prof);
-                            if out.len() >= lim {
-                                break;
-                            }
-                        }
-                        matched += 1;
+                    if !expanded.is_empty()
+                        && is_profile_erased_preexpanded(
+                            &prof,
+                            &expanded,
+                            id_graph,
+                            id_snap.as_ref(),
+                        )
+                    {
+                        continue;
                     }
+                    if let Some(ref n) = needle {
+                        if !profile_matches_needle(&prof, n) {
+                            continue;
+                        }
+                    }
+                    if matched >= offset {
+                        out.push(prof);
+                        if out.len() >= lim {
+                            break;
+                        }
+                    }
+                    matched += 1;
                 }
             }
             return Ok(out);
@@ -638,7 +671,7 @@ impl ProjectProfileStore {
             let Ok(did) = std::str::from_utf8(&key[19..]) else {
                 continue;
             };
-            if needle.is_none() {
+            if needle.is_none() && expanded.is_empty() {
                 if matched < offset {
                     matched += 1;
                     continue;
@@ -652,15 +685,23 @@ impl ProjectProfileStore {
                 matched += 1;
             } else if let Some(b) = db.get(record_key(did)).await.map_err(slatedb_err)? {
                 let prof = decode_profile(&b)?;
-                if profile_matches_needle(&prof, needle.as_deref().unwrap()) {
-                    if matched >= offset {
-                        out.push(prof);
-                        if out.len() >= lim {
-                            break;
-                        }
-                    }
-                    matched += 1;
+                if !expanded.is_empty()
+                    && is_profile_erased_preexpanded(&prof, &expanded, id_graph, id_snap.as_ref())
+                {
+                    continue;
                 }
+                if let Some(ref n) = needle {
+                    if !profile_matches_needle(&prof, n) {
+                        continue;
+                    }
+                }
+                if matched >= offset {
+                    out.push(prof);
+                    if out.len() >= lim {
+                        break;
+                    }
+                }
+                matched += 1;
             }
         }
         Ok(out)
@@ -715,11 +756,31 @@ impl ProjectProfileStore {
 
     /// Returns `(total_profiles, paying_profiles, total_revenue)` over all profiles in this project.
     pub async fn revenue_summary(&self) -> Result<(u64, u64, f64)> {
+        self.revenue_summary_filtered(&ErasedUids::default(), None)
+            .await
+    }
+
+    /// Returns `(total_profiles, paying_profiles, total_revenue)` excluding erased profiles
+    /// (`updated_at_ms <= erased_at_ms`).
+    pub async fn revenue_summary_filtered(
+        &self,
+        erased: &ErasedUids,
+        id_graph: Option<&ProjectIdentityGraph>,
+    ) -> Result<(u64, u64, f64)> {
         let profiles = self.list_updated_since(0).await?;
+        let expanded = expand_erased_with_identity(erased, id_graph);
+        let id_snap = (!expanded.is_empty())
+            .then(|| id_graph.map(ProjectIdentityGraph::snapshot))
+            .flatten();
         let mut total_profiles = 0u64;
         let mut paying_profiles = 0u64;
         let mut total_revenue = 0.0f64;
         for p in profiles {
+            if !expanded.is_empty()
+                && is_profile_erased_preexpanded(&p, &expanded, id_graph, id_snap.as_ref())
+            {
+                continue;
+            }
             total_profiles += 1;
             if p.total_revenue > 0.0 {
                 paying_profiles += 1;
@@ -861,6 +922,114 @@ impl ProjectProfileStore {
         }
         Ok(())
     }
+}
+
+/// Expands an [`ErasedUids`] map through `id_graph` so that if any raw UID merged into a
+/// canonical root is erased, that canonical root also carries the maximum erasure timestamp.
+pub fn expand_erased_with_identity(
+    erased: &ErasedUids,
+    id_graph: Option<&ProjectIdentityGraph>,
+) -> ErasedUids {
+    if erased.is_empty() {
+        return ErasedUids::default();
+    }
+    let Some(ig) = id_graph else {
+        return erased.clone();
+    };
+    let snap = ig.snapshot();
+    let mut expanded = erased.clone();
+    for (uid, at_ms) in erased.iter() {
+        let canon = snap.resolve(uid);
+        expanded.insert(canon, at_ms);
+    }
+    expanded
+}
+
+/// Fast-path profile erasure check when `expanded` has already been computed by
+/// [`expand_erased_with_identity`].
+fn is_profile_erased_preexpanded(
+    prof: &StoredUserProfile,
+    expanded: &ErasedUids,
+    id_graph: Option<&ProjectIdentityGraph>,
+    id_snap: Option<&IdentitySnapshot>,
+) -> bool {
+    if expanded.is_empty() {
+        return false;
+    }
+    if expanded.hides(prof.canonical_uid, prof.updated_at_ms) {
+        return true;
+    }
+    if let Some(snap) = id_snap {
+        let resolved_prof = snap.resolve(prof.canonical_uid);
+        if resolved_prof != prof.canonical_uid && expanded.hides(resolved_prof, prof.updated_at_ms)
+        {
+            return true;
+        }
+    }
+    if let Some(ig) = id_graph {
+        if let Some(raw) = ig.lookup_raw(&prof.distinct_id) {
+            if expanded.hides(raw, prof.updated_at_ms) {
+                return true;
+            }
+        }
+        if let Some(canon) = ig.lookup_canonical(&prof.distinct_id) {
+            if expanded.hides(canon, prof.updated_at_ms) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` when `prof` belongs to an erased user with `prof.updated_at_ms <= erased_at_ms`.
+///
+/// Checks `prof.canonical_uid`, `ig.lookup_raw(&prof.distinct_id)`,
+/// `ig.lookup_canonical(&prof.distinct_id)`, and any erased raw UID whose canonical root in
+/// `id_graph` matches the profile's user (so pre-merge and post-merge rows are all covered,
+/// including UID `0`).
+pub fn is_profile_erased(
+    prof: &StoredUserProfile,
+    erased: &ErasedUids,
+    id_graph: Option<&ProjectIdentityGraph>,
+) -> bool {
+    if erased.is_empty() {
+        return false;
+    }
+    if erased.hides(prof.canonical_uid, prof.updated_at_ms) {
+        return true;
+    }
+    if let Some(ig) = id_graph {
+        if let Some(raw) = ig.lookup_raw(&prof.distinct_id) {
+            if erased.hides(raw, prof.updated_at_ms) {
+                return true;
+            }
+        }
+        let snap = ig.snapshot();
+        let canon_from_prof = snap.resolve(prof.canonical_uid);
+        if canon_from_prof != prof.canonical_uid
+            && erased.hides(canon_from_prof, prof.updated_at_ms)
+        {
+            return true;
+        }
+        let canon_from_did = ig.lookup_canonical(&prof.distinct_id);
+        if let Some(canon) = canon_from_did {
+            if erased.hides(canon, prof.updated_at_ms) {
+                return true;
+            }
+        }
+        for (uid, at_ms) in erased.iter() {
+            if prof.updated_at_ms <= at_ms {
+                let resolved = snap.resolve(uid);
+                if resolved == prof.canonical_uid
+                    || resolved == canon_from_prof
+                    || canon_from_did == Some(resolved)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn profile_matches_needle(prof: &StoredUserProfile, lower_needle: &str) -> bool {
@@ -1093,5 +1262,162 @@ mod tests {
         assert_eq!(page[1].distinct_id, "u_a");
         assert_eq!(restored.list_updated_since(1500).await.unwrap().len(), 1);
         restored.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn erased_profile_helpers_filter_uid0_aliases_pagination_search_and_resignups() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+
+        let ig = ProjectIdentityGraph::open("proj_er", store.clone())
+            .await
+            .unwrap();
+        // UID 0 is valid (0-based): anon_0 -> user_0 (canonical_uid 1).
+        let raw0 = ig.get_or_intern("anon_0", 0);
+        assert_eq!(raw0, 0);
+        let raw1 = ig.get_or_intern("user_0", 1);
+        assert_eq!(raw1, 1);
+        let canon_01 = ig.alias_durable("anon_0", "user_0", 0, 1).await.unwrap();
+        // Separate user at UID 2 (kept), UID 3 (erased & re-signed up), UID 4 (kept).
+        let uid2 = ig.get_or_intern("user_2", 2);
+        let uid3 = ig.get_or_intern("user_3", 3);
+        let uid4 = ig.get_or_intern("user_4", 0);
+
+        let ps = ProjectProfileStore::open("proj_er", store.clone())
+            .await
+            .unwrap();
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_er".into(),
+            distinct_id: "anon_0".into(),
+            canonical_uid: raw0, // pre-merge canonical_uid = 0
+            props: BTreeMap::from([("plan".into(), json!("vip"))]),
+            total_revenue: 100.0,
+            updated_at_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_er".into(),
+            distinct_id: "user_0".into(),
+            canonical_uid: canon_01,
+            props: BTreeMap::from([("plan".into(), json!("vip"))]),
+            total_revenue: 250.0,
+            updated_at_ms: 1_500,
+        })
+        .await
+        .unwrap();
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_er".into(),
+            distinct_id: "user_2".into(),
+            canonical_uid: uid2,
+            props: BTreeMap::from([("plan".into(), json!("vip"))]),
+            total_revenue: 40.0,
+            updated_at_ms: 2_000,
+        })
+        .await
+        .unwrap();
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_er".into(),
+            distinct_id: "user_3".into(),
+            canonical_uid: uid3,
+            props: BTreeMap::from([("plan".into(), json!("vip"))]),
+            total_revenue: 75.0,
+            updated_at_ms: 3_000, // re-signup AFTER erasure at 2_500
+        })
+        .await
+        .unwrap();
+        ps.upsert(&StoredUserProfile {
+            project_id: "proj_er".into(),
+            distinct_id: "user_4".into(),
+            canonical_uid: uid4,
+            props: BTreeMap::from([("plan".into(), json!("free"))]),
+            total_revenue: 0.0,
+            updated_at_ms: 4_000,
+        })
+        .await
+        .unwrap();
+
+        // Erase raw UID 0 ONLY (merged into canon_01) at 2_000, and UID 3 at 2_500.
+        let mut erased = ErasedUids::default();
+        erased.insert(0, 2_000);
+        erased.insert(uid3, 2_500);
+
+        // Both anon_0 (uid 0) and user_0 (merged with raw uid 0) must be treated as erased.
+        let p_anon = ps.get_by_distinct_id("anon_0").await.unwrap().unwrap();
+        let p_user0 = ps.get_by_distinct_id("user_0").await.unwrap().unwrap();
+        let p_user2 = ps.get_by_distinct_id("user_2").await.unwrap().unwrap();
+        let p_user3 = ps.get_by_distinct_id("user_3").await.unwrap().unwrap();
+        assert!(is_profile_erased(&p_anon, &erased, Some(&ig)));
+        assert!(is_profile_erased(&p_user0, &erased, Some(&ig)));
+        assert!(!is_profile_erased(&p_user2, &erased, Some(&ig)));
+        assert!(
+            !is_profile_erased(&p_user3, &erased, Some(&ig)),
+            "post-erasure re-signup must survive"
+        );
+
+        // Pagination without search skips erased rows BEFORE applying offset & limit.
+        let page0 = ps
+            .list_paginated_filtered(None, 2, 0, &erased, Some(&ig))
+            .await
+            .unwrap();
+        assert_eq!(
+            page0
+                .iter()
+                .map(|p| p.distinct_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_4", "user_3"]
+        );
+        let page1 = ps
+            .list_paginated_filtered(None, 2, 1, &erased, Some(&ig))
+            .await
+            .unwrap();
+        assert_eq!(
+            page1
+                .iter()
+                .map(|p| p.distinct_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_3", "user_2"]
+        );
+
+        // Search filter also excludes erased rows.
+        let search = ps
+            .list_paginated_filtered(Some("vip"), 10, 0, &erased, Some(&ig))
+            .await
+            .unwrap();
+        assert_eq!(
+            search
+                .iter()
+                .map(|p| p.distinct_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_3", "user_2"]
+        );
+
+        // Revenue summary excludes erased profiles (350.0) and retains user_2 + user_3 + user_4.
+        let (total_p, paying_p, rev) = ps
+            .revenue_summary_filtered(&erased, Some(&ig))
+            .await
+            .unwrap();
+        assert_eq!(total_p, 3);
+        assert_eq!(paying_p, 2);
+        assert!((rev - 115.0).abs() < 1e-6, "rev={rev}");
+
+        // Read-only reader matches writable results.
+        let ro = ProjectProfileStore::open_read_only("proj_er", store);
+        let ro_page = ro
+            .list_paginated_filtered(None, 10, 0, &erased, Some(&ig))
+            .await
+            .unwrap();
+        assert_eq!(ro_page.len(), 3);
+        assert_eq!(
+            ro.revenue_summary_filtered(&erased, Some(&ig))
+                .await
+                .unwrap(),
+            (3, 2, 115.0)
+        );
+
+        ro.close().await.unwrap();
+        ps.close().await.unwrap();
+        ig.close().await.unwrap();
     }
 }

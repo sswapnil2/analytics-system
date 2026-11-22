@@ -36,7 +36,10 @@ pub use manifest::{
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
-pub use profile_store::{ProfileRouter, ProjectProfileStore, StoredUserProfile};
+pub use profile_store::{
+    expand_erased_with_identity, is_profile_erased, ProfileRouter, ProjectProfileStore,
+    StoredUserProfile,
+};
 pub use replay_store::{validate_replay_identifier, ReplayAppendResult, ReplayStore};
 pub use segment::{
     decode_session_index, decode_tier_c_row, tier_c_key_bit, write_vortex_segment,
@@ -45,14 +48,15 @@ pub use segment::{
     MAX_TIER_B_KEYS,
 };
 pub use snapshot::{
-    restore_identity_from_snapshot, restore_profiles_from_snapshot, restore_project_from_published,
-    CandidateACheckpointFiles, RestoredProjectSnapshot, SlateDbCheckpointSyncState,
+    delete_objects_with_prefix, restore_identity_from_snapshot, restore_profiles_from_snapshot,
+    restore_project_from_published, CandidateACheckpointFiles, RestoredProjectSnapshot,
+    SlateDbCheckpointSyncState,
 };
 pub use store_factory::{
     allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
     check_resolved_addrs, finalize_local_hot_store_marker, is_forbidden_ssrf_ip,
-    open_hot_store_for_restore, validate_object_store_connection, validate_outbound_url_ssrf,
-    with_hot_store, DurableLocalObjectStore,
+    is_local_hot_store_mode, open_hot_store_for_restore, validate_object_store_connection,
+    validate_outbound_url_ssrf, with_hot_store, DurableLocalObjectStore,
 };
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 
