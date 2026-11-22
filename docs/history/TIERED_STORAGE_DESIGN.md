@@ -1,6 +1,6 @@
 # Design note: local hot tier, S3 for compacted data only (proposed)
 
-Status: proposal, revision 4 after three independent reviews (section 9). No code. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (hot state on local disk). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc`.
+Status: ready for implementation (revision 5, after three independent reviews and owner decisions on all open questions except the T1 snapshot benchmark). No code. It follows section 15 of [SCALABILITY_REVIEW.md](SCALABILITY_REVIEW.md) and the P0-7 decision (`PULSE_HOT_STORE=local`, WAL half already in PR #114). File and line references are to `fix/scalability-review-quick-wins` at `4895bbc` unless noted.
 
 Sections 1 to 5 cover the storage half: one node, its volume, and what it sends to S3. Section 6 covers the other half of the owner's target: stateless writers that forward to storage nodes which own projects. Both halves were reviewed against the code (section 9).
 
@@ -47,25 +47,25 @@ A segment's location is its `object_path`; the path is built in one place and ev
 
 | Prefix | Tier | Contents |
 |---|---|---|
-| `wal/`, `agent_wal/` | local | write-ahead logs (P0-7) |
-| `wal_dead/` | local | dead-lettered events (`engine.rs:592`); local avoids 1 S3 PUT per bad event during a schema-cap storm |
-| `identity/`, `profiles/` | local | SlateDB stores (P0-7) |
+| `wal/`, `wal_corrupt/`, `agent_wal/` | local | write-ahead logs and corrupt-WAL quarantine (P0-7, PR #114) |
+| `wal_dead/` | local | dead-lettered events (`engine.rs:592`, PR #114); local avoids 1 S3 PUT per bad event during a schema-cap storm |
+| `identity/`, `profiles/` | local | SlateDB stores (P0-7, T0b) |
 | `hot/segments/` | local | segments written by an L0 flush, not yet uploaded |
 | `manifests/` | local | the authoritative manifest, every epoch |
 | `segments/` | S3 | uploaded segments |
 | `published/` | S3 | published manifests, identity and profile snapshots |
-| `replay/`, `agent_segments/` | S3 (local hot in T4) | session-replay chunks and agent segments; move to local hot tier + cycle upload in T4 |
+| `replay/`, `agent_segments/`, `agent_manifests/` | S3 (local hot in T4) | session-replay chunks, agent segments, and agent manifests; move to local hot tier + cycle upload/publish in T4 |
 
 ### 3.2 The upload cycle
 
-A per-project task runs every `PULSE_UPLOAD_INTERVAL_SECS` (proposed default 300), and earlier if local segment bytes pass a threshold.
+A per-project task runs every `PULSE_UPLOAD_INTERVAL_SECS` (default `300`), and earlier if local segment bytes pass a threshold. Hot segments for closed (old) dates from late-arriving events upload on a separate 1-hour timer (or immediately if their local bytes exceed 4 MiB) so trickle late events do not cause 12 PUTs/hour per old date.
 
 The order matters. A user id is the count of users at the time it was created (**code**: `pulse-identity/src/lib.rs:959`), so an identity store restored from a snapshot will hand out again any id the snapshot does not contain. Profile rows are keyed by that id too (`profile_store.rs:37`). Therefore identity is snapshotted last, after everything that can reference an id has been frozen (because identity is taken at `T_id >= T_prof >= T_freeze`, it is guaranteed to cover every id referenced by both the frozen segments and the profile snapshot; extra ids created in between without a profile yet are harmless):
 
 1. **Freeze.** Record the exact list of local segment ids to upload, and write an intent record locally (the new S3 segment ids and their sources).
 2. **Snapshot profiles** to S3.
 3. **Flush and snapshot identity** to S3. Record the user count as a high-water mark.
-4. **Upload.** Merge only the frozen segments, per partition, and write each result create-only to `segments/`. Existing S3 segments are not read or rewritten. Input bytes per output segment are capped, because the merge decodes its inputs into memory (`engine.rs:1072-1076`).
+4. **Upload.** Merge only the frozen segments, per `(date, bucket)` partition, and write each result create-only to `segments/` (one object per `(date, bucket)`, preserving bucket pruning and future per-bucket sharding). Existing S3 segments are not read or rewritten. Merge one partition at a time per project with an explicit input-byte cap (default 64 MiB per output segment), because the merge decodes its inputs into memory (`engine.rs:1072-1076`) and PR #98 measured 2.3–3.2 GB RSS under concurrent flush/compaction copies.
 5. **Commit** the local manifest: frozen local segments out, new S3 segments in. This reuses the existing check that the sources are still active (`engine.rs:1134-1147`).
 6. **Publish** a manifest to `published/`, create-only and named by its own dense, contiguous `publish_seq` (`0, 1, 2, …`) rather than the sparse local `epoch` (3.6), listing S3 segments only and carrying `writer_generation`, `source_local_epoch`, and the identity high-water mark. Like `commit_next` (`manifest.rs:220-232`), verify `head(publish_seq - 1)` after create so a writer more than `retain_epochs` behind cannot slip past GC. Then record `last_published_seq = publish_seq` in the local manifest.
 7. **Clean up.** Delete the uploaded local segments once no snapshot pins them; clear the intent record.
@@ -124,7 +124,7 @@ A node never restores on its own.
 
 The metadata database is part of this. By default it is SQLite in the data directory (`pulse-control/src/db.rs:227`), on the same volume, and it holds accounts, API keys, projects, cohorts and the erasure tombstones that hide erased users at query time (`api.rs:1037`). Losing it with the volume would bring erased users back.
 
-**Decided by the owner: run an external metadata database.** A production deployment sets `DATABASE_URL` to a database that does not live on the node's volume. The tombstones, accounts and keys then survive the loss of a volume, so nothing about erasure needs to be published to S3. SQLite stays for evaluation on one machine. Proposed consequences (the owner has not ruled on these two): the node logs a warning at start when it runs local-tier mode on SQLite, and `restore --from-published` refuses on SQLite, because the accounts and projects it would restore into are gone with the same volume.
+**Decided by the owner: run an external metadata database.** A production deployment sets `DATABASE_URL` to a database that does not live on the node's volume. The tombstones, accounts and keys then survive the loss of a volume, so nothing about erasure needs to be published to S3. SQLite stays for evaluation on one machine. Guardrails (decided): the node logs a prominent warning at start when running local-tier mode on SQLite, and `restore --from-published` refuses on SQLite with an error pointing to `DATABASE_URL`, because the accounts and projects it would restore into are gone with the same volume.
 
 ### 3.6 Fencing
 
@@ -264,7 +264,7 @@ The writer lease table cannot be that record as it works today, though it looks 
 
 **Why a table and not a ring alone.** On a ring, adding or removing a node moves partitions by itself. Here the state for a project sits on one node's disk, and moving it means publish, stop, restore on the new node, then resume. That cannot happen as a side effect of membership changing. So a new project is placed once, on the storage node that owns the fewest projects, and the choice is written down. Writers and the query router read the table, keep it in memory, and refresh it on a timer and whenever a storage node answers "not the owner".
 
-**Background work.** Several loops run on every node over every project today: alert evaluation (`pulse-control/src/api.rs:4561-4585`), two agent jobs (`api_agent.rs:2965`, `3253`), the catalog reload (`api.rs:540-557`) and the compactor (`pulse-node/src/lib.rs:614`). With more than one storage node each of these must run only for the projects the node owns; otherwise a node that does not own a project evaluates an alert on data it does not have and claims the result. The agent store is one per node and collects garbage using every project's tombstones (`pulse-node/src/lib.rs:560-562`); agent traces (`/v1/agent/traces`) must be routed to the project's owner like everything else. Whether traces take the asynchronous path is open (section 8).
+**Background work and store-open guard.** Several loops run on every node over every project today: alert evaluation (`pulse-control/src/api.rs:4561-4585`), two agent jobs (`api_agent.rs:2965`, `3253`), the catalog reload (`api.rs:540-557`) and the compactor (`pulse-node/src/lib.rs:614`). With more than one storage node each of these must run only for the projects the node owns; otherwise a node that does not own a project evaluates an alert on data it does not have and claims the result. Equally important: `identity_graph()` and `profile_store()` (not only `get_or_open_project()`) must refuse to open for writing when the node is not the project's owner in `project_owner`—PR #98 observed a second ingest node opening `profile_store` at startup and fencing the owner's SlateDB handle (`api.rs:795`). The agent store is one per node and collects garbage using every project's tombstones (`pulse-node/src/lib.rs:560-562`); agent traces (`/v1/agent/traces`) route to the project's owner and take the same asynchronous per-project writer path as events (section 8).
 
 **Queries.** Every query route is under `/v1/projects/:id/`, so a query goes to the one node that owns the project. That node answers from its memory, its local segments and S3. No merging across nodes is needed while a project has one owner.
 
@@ -292,7 +292,8 @@ Each step is one PR, merged before the next starts. Revision 1 had identity goin
 
 | Step | Change | Exit criteria |
 |---|---|---|
-| T0 | P0-7: WAL, identity and profiles local; multipart fsync (3.8) | Counting segment store: zero calls between request and acknowledgement; idle project zero calls; a node with the marker and no local identity refuses to start |
+| T0a | P0-7 WAL half (PR #114): `PULSE_HOT_STORE=local` (default) routes `wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/` to local disk; 503 on WAL write failure | Counting store: zero `wal/` and `agent_wal/` PUTs/DELETEs; refuses mixed start over leftover object-mode WAL (**implemented in PR #114**) |
+| T0b | P0-7 hot-store half: `identity/` and `profiles/` local under `PULSE_HOT_STORE=local`; mode marker; multipart fsync (3.8) | Counting store: zero calls between request and acknowledgement (including identity); a node with the marker and no local identity refuses to start; multipart local write fsyncs file and directory |
 | T1 | Published manifest (create-only, dense `publish_seq`, generation, high-water mark) written at every flush, plus identity and profile snapshots taken before it; `restore --from-published` (with erased-profile purge and `uid >= HWM` tombstone cleanup); `erased_uids` filter on profile reads/catalog; metadata DB rule | Restore into an empty directory resolves every user id in every segment and profile row; erased users' events **and** profiles stay hidden after restore (external metadata DB); a user created and erased after the last publish does not poison the reused `uid` after restore; kill at each point and restore still passes; measured PUTs per hour for both snapshot candidates |
 | T2 | Manifest authoritative on local disk; publish moves to the interval with dense `publish_seq`; fencing rule (3.6); S3 segment deletion rule (3.3) | Manifest PUTs per hour equal cycles per hour; a stale second writer cannot overwrite `published/` even when its local `epoch` is ahead of the active writer's; crash right after step 6 before local `last_published_seq` update recovers cleanly; a `query` node on another machine reads published state and hides erased profiles |
 | T3 | Local segment tier and the full upload cycle; intent record and sweep | Query results identical before and after an upload; kill at each step, restart, no acknowledged event missing or duplicated and no leaked object; PUTs per hour at load-generator rate; local bytes bounded with S3 unreachable, then `429` |
@@ -305,19 +306,23 @@ Left for the v2 release, by the owner's decision: automatic handling of a failed
 
 An interval of zero means "upload eagerly", not a return to today's layout: the manifest stays local-authoritative and count-based compaction stays on. Going back to the old layout after T2 is a documented manual procedure, not a setting.
 
-## 8. Open questions
+## 8. Decisions and remaining open question
 
-1. Checkpoint copy or logical export for identity and profiles (3.4)? Decided by the T1 measurement.
-2. Default upload interval. 300 s is a proposal; it is the loss window on volume loss and the staleness on other machines.
-3. Should the upload merge all buckets of a date into one object? It cuts PUTs by the bucket count but changes pruning. Not proposed.
-4. Late events for old dates create small partitions. Proposed: they upload on a longer maximum age.
-5. Session-replay chunks: buffer locally and upload per session on the cycle?
-6. Writer flush bound. 20 ms or 1 MiB is a proposal; it is the most a writer crash can lose.
-7. Do agent traces (`/v1/agent/traces`) take the asynchronous path or stay synchronous?
-8. Should a durable acknowledgement remain available as a setting for deployments that cannot lose events on a crash? Not proposed: it keeps two ingest paths alive.
-9. SQLite guardrails in local-tier mode (3.5): log a startup warning when running local-tier mode on SQLite, and have `restore --from-published` refuse on SQLite? Proposed yes; awaiting owner confirmation.
+Only one question remains open (decided empirically by the T1 benchmark):
 
-Answered by the owner and now in the text: metadata database (3.5), erasure (3.9), ownership unit, what a writer's acknowledgement means, which calls stay synchronous, storage-node failure (section 6).
+1. **Checkpoint copy or logical export for identity and profiles (3.4)?** Decided by the T1 counting-store measurement.
+
+All other design questions are now decided:
+
+- **Default upload interval:** `300` s (`PULSE_UPLOAD_INTERVAL_SECS`).
+- **Bucket layout on upload:** Keep one S3 object per `(date, bucket)` (do not merge across buckets), preserving bucket pruning and future per-bucket sharding.
+- **Late events for old dates:** Upload on a 1-hour timer (or immediately if local bytes for the closed date exceed 4 MiB).
+- **Session-replay chunks:** Buffer locally under `hot/replay/` and upload per session on the cycle (T4).
+- **Writer flush bound:** `20` ms or `1` MiB, whichever comes first (`PULSE_WRITER_FLUSH_MS` / `PULSE_WRITER_FLUSH_BYTES`).
+- **Agent traces (`/v1/agent/traces`):** Take the asynchronous per-project writer path, like events.
+- **Optional durable-ack setting:** No—keep a single ingest path.
+- **SQLite guardrails in local-tier mode (3.5):** Log a startup warning on SQLite, and have `restore --from-published` refuse on SQLite.
+- Previously decided: metadata database (3.5), erasure (3.9), ownership unit, what a writer's acknowledgement means, which calls stay synchronous, storage-node failure (section 6).
 
 ## 9. Review record
 
