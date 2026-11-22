@@ -734,7 +734,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before production traffic from browsers or many small clients.
 - Validation: `loadgen events --concurrency 64 --batch 100` should exceed 1,000 requests/s on the laptop used here with p99 under 100 ms; kill-9 tests show zero acknowledged loss.
 
-**P0-3. Bound the agent memtable.**
+**P0-3. Bound the agent memtable.** — Done: [#92](https://github.com/sswapnil2/analytics-system/pull/92)
 - Problem: R-03. Evidence: C1.
 - Solution: track bytes per project and per node; trigger flush from the append path when a shard passes its threshold instead of waiting for the tick; return `429` above a high-water mark (`PULSE_AGENT_L0_MAX_MB`).
 - Why it matters: the current behaviour is an out-of-memory kill under burst.
@@ -743,7 +743,7 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: before production agent traffic.
 - Validation: `loadgen traces --concurrency 128` holds RSS under the configured bound and returns `429`s instead of growing.
 
-**P0-4. Per-trace limits.**
+**P0-4. Per-trace limits.** — Done: [#95](https://github.com/sswapnil2/analytics-system/pull/95) (also fixes R-24)
 - Problem: R-04. Evidence: C2.
 - Solution: cap spans and bytes per trace across batches (for example 10,000 spans and 64 MiB), count rejections in a metric, and avoid re-serialising the whole trace on each append by keeping a running size.
 - Why it matters: one misbehaving agent should not stall a project.
@@ -751,14 +751,14 @@ Not changed on purpose: the event WAL commit path and anything touching durabili
 - Timing: with P0-3.
 - Validation: a test that appends 20,000 spans to one trace and asserts bounded append time and a rejection count.
 
-**P0-5. Claim alerts before sending.**
+**P0-5. Claim alerts before sending.** — Done: [#87](https://github.com/sswapnil2/analytics-system/pull/87)
 - Problem: R-05. Evidence: B1.
 - Solution: make the state change a conditional `UPDATE … WHERE last_triggered_ms = <value read>`; send the webhook only if one row changed.
 - Cost: S. Complexity: low. Dependencies: none.
 - Timing: before a second query node.
 - Validation: a test with two control-plane instances on one DB asserts one webhook.
 
-**P0-6. Correct the README.**
+**P0-6. Correct the README.** — Done: [#86](https://github.com/sswapnil2/analytics-system/pull/86)
 - Problem: R-06.
 - Solution: say that one ingest node per project is supported, several query nodes are, and link `docs/limitations.md`.
 - Cost: S. Timing: now.

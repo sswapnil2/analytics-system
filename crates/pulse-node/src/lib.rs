@@ -495,7 +495,15 @@ pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode>
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {
+                    // The timer, or the append path asking early because a shard or the
+                    // memtable as a whole passed its byte threshold.
+                    _ = async {
+                        let store = flush_control.agent_store();
+                        tokio::select! {
+                            _ = ticker.tick() => {}
+                            _ = store.flush_requested() => {}
+                        }
+                    } => {
                         if let Err(e) = flush_control.agent_store().flush_l0().await {
                             tracing::warn!(error = %e, "agent L0 flush failed");
                         }

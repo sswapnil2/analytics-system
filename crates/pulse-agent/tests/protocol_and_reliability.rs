@@ -194,6 +194,131 @@ fn test_store_config(read_only: bool, gc_grace_secs: i64) -> AgentTraceStoreConf
         l0_flush_max_bytes: 32 * 1024 * 1024,
         wal_max_group_items: 64,
         wal_max_group_bytes: 8 * 1024 * 1024,
+        l0_max_bytes_project: 256 * 1024 * 1024,
+        l0_max_bytes_node: 512 * 1024 * 1024,
+        max_trace_spans: 10_000,
+        max_trace_bytes: 64 * 1024 * 1024,
+    }
+}
+
+/// Scalability review R-04: one trace cannot grow without limit across batches. Spans past the
+/// cap are dropped and counted; the cap survives a flush; other traces are unaffected.
+#[tokio::test]
+async fn per_trace_span_and_byte_caps_hold_across_batches_and_flushes() {
+    let spans = |trace: &str, from: usize, n: usize| TraceIngestBatch {
+        traces: vec![],
+        spans: (from..from + n)
+            .map(|i| make_span(trace, &format!("{trace}_sp{i}"), None, 1_700_000_000_000))
+            .collect(),
+    };
+    let store = AgentTraceStore::open(
+        Arc::new(InMemory::new()),
+        AgentTraceStoreConfig {
+            max_trace_spans: 250,
+            ..test_store_config(false, 0)
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut dropped = 0;
+    for batch in 0..5 {
+        let resp = store
+            .ingest_batch("proj_cap", spans("tr_loop", batch * 100, 100))
+            .await
+            .unwrap();
+        assert_eq!(resp.accepted_spans + resp.dropped_spans, 100);
+        dropped += resp.dropped_spans;
+        if batch == 1 {
+            store.flush_all_l0().await.unwrap(); // the count must not reset with the memtable
+        }
+    }
+    assert_eq!(dropped, 300, "200 of 500 spans fit under the cap of 250");
+    let detail = store
+        .get_trace_detail("proj_cap", "tr_loop", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.spans.len(), 200);
+
+    let other = store
+        .ingest_batch("proj_cap", spans("tr_other", 0, 100))
+        .await
+        .unwrap();
+    assert_eq!((other.accepted_spans, other.dropped_spans), (100, 0));
+
+    // Byte cap: each span is ~10 KiB with overhead, against a 32 KiB allowance.
+    let store = AgentTraceStore::open(
+        Arc::new(InMemory::new()),
+        AgentTraceStoreConfig {
+            max_trace_bytes: 32 * 1024,
+            ..test_store_config(false, 0)
+        },
+    )
+    .await
+    .unwrap();
+    let mut accepted = 0;
+    for i in 0..5 {
+        let mut b = spans("tr_fat", i, 1);
+        b.spans[0].input = json!({ "text": "x".repeat(8 * 1024) });
+        accepted += store
+            .ingest_batch("proj_cap", b)
+            .await
+            .unwrap()
+            .accepted_spans;
+    }
+    assert!((2..=3).contains(&accepted), "accepted {accepted} of 5");
+}
+
+/// Scalability review R-03: the memtable is bounded in bytes. Past the high-water mark ingest
+/// is refused (the API maps it to 429) and a flush is requested without waiting for the tick;
+/// after the flush, ingest is accepted again.
+#[tokio::test]
+async fn memtable_is_byte_bounded_and_requests_flush_from_the_append_path() {
+    let big_batch = |i: usize| {
+        let mut b = make_batch(&format!("tr_big_{i}"), None, None, 1_700_000_000_000);
+        b.traces[0].input = json!({ "q": "x".repeat(16 * 1024) });
+        b
+    };
+    for (project_cap, node_cap) in [(64 * 1024, usize::MAX), (usize::MAX, 64 * 1024)] {
+        let store = AgentTraceStore::open(
+            Arc::new(InMemory::new()),
+            AgentTraceStoreConfig {
+                l0_flush_max_bytes: 32 * 1024,
+                l0_max_bytes_project: project_cap,
+                l0_max_bytes_node: node_cap,
+                ..test_store_config(false, 0)
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut accepted = 0;
+        let refused = loop {
+            match store.ingest_batch("proj_bound", big_batch(accepted)).await {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted < 100, "memtable grew without bound");
+        };
+        assert!(
+            matches!(refused, StoreError::L0Backpressure { .. }),
+            "{refused}"
+        );
+        assert!(
+            (1..=4).contains(&accepted),
+            "accepted {accepted} against 64 KiB"
+        );
+
+        // A shard passed its flush threshold, so the append path asked for a flush.
+        tokio::time::timeout(std::time::Duration::from_secs(1), store.flush_requested())
+            .await
+            .expect("append path requested a flush");
+        store.flush_l0().await.unwrap();
+        store
+            .ingest_batch("proj_bound", big_batch(999))
+            .await
+            .unwrap();
     }
 }
 
