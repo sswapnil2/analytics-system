@@ -968,7 +968,7 @@ Takeover time grows with unconsumed log, which is a second reason to keep the fi
 | Old processor is alive but deposed | Its next manifest commit fails on generation; it drops L0 and stops. It has deleted nothing |
 | Processor falls behind | Appenders return `429` on log lag |
 | A record cannot be applied | Dead-letter object, metric, advance |
-| Metadata DB down | The current processor continues; no takeover can start. Appenders are unaffected |
+| Metadata DB down | *Corrected after the owner review of #96:* the holder stops acknowledging writes once it has gone two thirds of the lease TTL without a renewal, because it cannot tell an outage from a takeover by a node that can still reach the database. No takeover can start either. Flushes of what is already acknowledged continue (the generation check does not need the database). Ingest resumes on the next successful renewal |
 | Session flags after replay | Not reproducible: they come from a process-local cache that also receives replay chunks outside the log (`storage/engine.rs:328-367`). Accept, or move the flags into log records |
 
 ### 15.10 Deferred: more than one processor per project
