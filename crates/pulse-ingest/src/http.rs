@@ -176,6 +176,11 @@ impl IntoResponse for ApiError {
             IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict) => {
                 StatusCode::CONFLICT
             }
+            // The WAL write failed (disk full, unwritable directory, store down): nothing was
+            // acknowledged, so the client may retry.
+            IngestError::Storage(
+                pulse_storage::StorageError::Io(_) | pulse_storage::StorageError::ObjectStore(_),
+            ) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self.0 {

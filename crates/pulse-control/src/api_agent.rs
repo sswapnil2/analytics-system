@@ -465,6 +465,10 @@ async fn ingest_canonical_batch(
                 IngestError::RateLimited(1, "l0_backpressure")
             }
             StoreError::Shutdown => IngestError::ServiceUnavailable("store shutting down".into()),
+            // The WAL write failed (disk full, unwritable directory, store down): nothing acked.
+            e @ (StoreError::Io(_) | StoreError::ObjectStore(_)) => {
+                IngestError::ServiceUnavailable(e.to_string())
+            }
             other => IngestError::Internal(other.to_string()),
         })?;
 

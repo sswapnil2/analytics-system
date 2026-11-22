@@ -678,10 +678,11 @@ async fn flush_wal_group(
             }
             Err(e) => {
                 let msg = e.to_string();
+                // An I/O error, not corruption: nothing was written, so the caller answers 503.
                 for ack in acks {
-                    let _ = ack.send(Err(StoreError::Corrupted(format!(
+                    let _ = ack.send(Err(StoreError::Io(std::io::Error::other(format!(
                         "PTWL PutMode::Create failed: {msg}"
-                    ))));
+                    )))));
                 }
             }
         }
