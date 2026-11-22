@@ -140,7 +140,13 @@ impl QueryEngine {
         ));
         let out = tokio::time::timeout(timeout, crate::budget::scope(ctx.clone(), fut))
             .await
-            .map_err(|_| ExecError::QueryTimeout(timeout_ms))?;
+            .map_err(|_| {
+                if self.storage.is_project_open(project_id) {
+                    ExecError::QueryTimeout(timeout_ms)
+                } else {
+                    ExecError::ProjectLoading
+                }
+            })?;
         // Compute loops stop early once the deadline passes and return partial results; discard them.
         ctx.check()?;
         out
@@ -513,6 +519,8 @@ impl QueryEngine {
 
             let cap = limit.clamp(1, 50_000);
             let mut rows = Vec::new();
+            // One identity lookup (a lock + String) per user, not per exported row.
+            let mut distinct_ids: HashMap<u32, String> = HashMap::new();
             for chunk in &chunks {
                 crate::budget::check_current()?;
                 let ta = &chunk.tier_a;
@@ -532,14 +540,19 @@ impl QueryEngine {
                             continue;
                         }
                     }
-                    let raw_did = id_graph
-                        .external_id(canon)
-                        .unwrap_or_else(|| format!("uid_{canon}"));
-                    let distinct_id = if mask_ids {
-                        mask_user_identifier(&raw_did)
-                    } else {
-                        raw_did
-                    };
+                    let distinct_id = distinct_ids
+                        .entry(canon)
+                        .or_insert_with(|| {
+                            let raw_did = id_graph
+                                .external_id(canon)
+                                .unwrap_or_else(|| format!("uid_{canon}"));
+                            if mask_ids {
+                                mask_user_identifier(&raw_did)
+                            } else {
+                                raw_did
+                            }
+                        })
+                        .clone();
                     let event_name = id_to_name
                         .get(&ta.event_id[r])
                         .cloned()

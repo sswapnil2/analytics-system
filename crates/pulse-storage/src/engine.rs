@@ -11,7 +11,7 @@ use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parking_lot::{Mutex, RwLock};
-use pulse_identity::{IdentityRouter, ProjectIdentityGraph};
+use pulse_identity::{open_once, IdentityRouter, OpenLocks, ProjectIdentityGraph};
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
 use roaring::RoaringBitmap;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -1335,9 +1335,9 @@ pub struct StorageEngine {
     profile_router: Arc<crate::ProfileRouter>,
     segment_reader: Arc<VortexSegmentReader>,
     replay_store: Arc<ReplayStore>,
-    projects: DashMap<String, Arc<ProjectStorage>>,
-    erased: DashMap<String, Arc<ErasedUids>>,
-    open_lock: AsyncMutex<()>,
+    projects: Arc<DashMap<String, Arc<ProjectStorage>>>,
+    erased: Arc<DashMap<String, Arc<ErasedUids>>>,
+    open_locks: OpenLocks,
     writer_leases: OnceLock<Arc<dyn WriterLeases>>,
     node_load: Arc<NodeLoad>,
 }
@@ -1373,9 +1373,9 @@ impl StorageEngine {
             profile_router,
             segment_reader,
             replay_store,
-            projects: DashMap::new(),
-            erased: DashMap::new(),
-            open_lock: AsyncMutex::new(()),
+            projects: Arc::default(),
+            erased: Arc::default(),
+            open_locks: OpenLocks::default(),
             writer_leases: OnceLock::new(),
             node_load: NodeLoad::from_env(),
         })
@@ -1443,50 +1443,59 @@ impl StorageEngine {
         if let Some(p) = self.projects.get(project_id) {
             return Ok(p.clone());
         }
-        let _guard = self.open_lock.lock().await;
-        if let Some(p) = self.projects.get(project_id) {
-            return Ok(p.clone());
-        }
-        let lease = match self.writer_leases.get() {
-            Some(leases) if !self.identity_router.is_read_only() => {
-                let started = Instant::now();
-                match leases.acquire(project_id).await {
-                    Ok(Some(generation)) => {
-                        Some((generation, started + local_lease_validity(leases.ttl())))
-                    }
-                    Ok(None) => {
-                        return Err(StorageError::NotWriter {
-                            project_id: project_id.to_string(),
-                        })
-                    }
-                    Err(e) => {
-                        tracing::warn!(project_id, error = %e, "writer lease store unavailable");
-                        return Err(StorageError::NotWriter {
-                            project_id: project_id.to_string(),
-                        });
-                    }
-                }
-            }
-            _ => None,
-        };
-        let ps = ProjectStorage::open_inner(
+        let (pid, config, store, router, profiles, erased, leases, node_load) = (
             project_id.to_string(),
             self.config.clone(),
             self.object_store.clone(),
-            &self.identity_router,
-            lease,
+            self.identity_router.clone(),
+            self.profile_router.clone(),
+            self.erased.clone(),
+            self.writer_leases.get().cloned(),
             self.node_load.clone(),
+        );
+        let key = pid.clone();
+        let on_insert = move |ps: &Arc<ProjectStorage>| {
+            // After the insert, so a concurrent `set_erased` is seen by one side or the other.
+            if let Some(e) = erased.get(&key) {
+                ps.set_erased(e.clone());
+            }
+            // This node writes the project now: readers for it would only go stale.
+            router.evict_reader(&key);
+            profiles.evict_reader(&key);
+        };
+        let router = self.identity_router.clone();
+        // The lease is taken inside the open task, under its per-project lock (#68).
+        open_once(
+            &self.projects,
+            &self.open_locks,
+            project_id,
+            on_insert,
+            async move {
+                let lease = match leases {
+                    Some(leases) if !router.is_read_only() => {
+                        let started = Instant::now();
+                        match leases.acquire(&pid).await {
+                            Ok(Some(generation)) => {
+                                Some((generation, started + local_lease_validity(leases.ttl())))
+                            }
+                            Ok(None) => return Err(StorageError::NotWriter { project_id: pid }),
+                            Err(e) => {
+                                tracing::warn!(project_id = %pid, error = %e, "writer lease store unavailable");
+                                return Err(StorageError::NotWriter { project_id: pid });
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                ProjectStorage::open_inner(pid, config, store, &router, lease, node_load).await
+            },
         )
-        .await?;
-        self.projects.insert(project_id.to_string(), ps.clone());
-        // This node writes the project now: readers for it would only go stale.
-        self.identity_router.evict_reader(project_id);
-        self.profile_router.evict_reader(project_id);
-        // After the insert, so a concurrent `set_erased` is seen by one side or the other.
-        if let Some(e) = self.erased.get(project_id) {
-            ps.set_erased(e.clone());
-        }
-        Ok(ps)
+        .await
+    }
+
+    /// True once `project_id` has finished opening on this node.
+    pub fn is_project_open(&self, project_id: &str) -> bool {
+        self.projects.contains_key(project_id)
     }
 
     /// Overrides the L0 byte bounds read from the environment: `(per project, per node)`.

@@ -47,6 +47,11 @@ pub enum ExecError {
     /// No query slot freed up in time; `"project"` or `"node"` says which cap was hit.
     #[error("too many queries running for this {0}; retry shortly")]
     Overloaded(&'static str),
+
+    /// The deadline passed while the project was still opening after a restart; the open keeps
+    /// running in the background, so retrying shortly succeeds.
+    #[error("project is still loading after a restart; retry shortly")]
+    ProjectLoading,
 }
 
 /// Computes the adaptive per-query segment parallelism (`P`) from CPU count, per-query memory
@@ -107,6 +112,9 @@ pub struct DataChunk {
     /// Optional L0 raw rows (None for L1 segments).
     l0_rows: Option<Vec<StoredRow>>,
     segment_meta: Option<SegmentMeta>,
+    /// Session id per `(raw_uid, session_hash)`, decoded once per chunk on first use (#69: it was
+    /// decoded from the segment's session index for every exported row).
+    session_ids: tokio::sync::OnceCell<HashMap<(u32, u64), String>>,
 }
 
 impl DataChunk {
@@ -130,12 +138,23 @@ impl DataChunk {
         let shash = self.tier_a.session_hash[row_idx];
         let raw_uid = self.tier_a.uid_internal[row_idx];
         if let Some(meta) = &self.segment_meta {
-            if let Ok(sidx) = cache.get_session_index(meta).await {
-                for hdr in &sidx.headers {
-                    if hdr.raw_uid == raw_uid && hdr.session_hash == shash {
-                        return sidx.session_id(hdr).to_string();
+            let ids = self
+                .session_ids
+                .get_or_init(|| async {
+                    let Ok(sidx) = cache.get_session_index(meta).await else {
+                        return HashMap::new();
+                    };
+                    let mut ids = HashMap::with_capacity(sidx.headers.len());
+                    for hdr in &sidx.headers {
+                        // First header wins, matching the linear scan this replaced.
+                        ids.entry((hdr.raw_uid, hdr.session_hash))
+                            .or_insert_with(|| sidx.session_id(hdr).to_string());
                     }
-                }
+                    ids
+                })
+                .await;
+            if let Some(id) = ids.get(&(raw_uid, shash)) {
+                return id.clone();
             }
         }
         format!("sess_{shash:016x}")
@@ -636,6 +655,7 @@ pub async fn load_project_chunks_sampled(
                     prop_cols,
                     l0_rows: None,
                     segment_meta: seg_meta_opt,
+                    session_ids: Default::default(),
                 })
             }
         })
@@ -727,6 +747,7 @@ pub async fn load_project_chunks_sampled(
             prop_cols,
             l0_rows: Some(l0_rows),
             segment_meta: None,
+            session_ids: Default::default(),
         });
     }
 

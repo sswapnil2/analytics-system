@@ -1773,6 +1773,9 @@ impl CtrlError {
             e @ pulse_exec::ExecError::Overloaded(_) => {
                 Self(StatusCode::TOO_MANY_REQUESTS, e.to_string())
             }
+            e @ pulse_exec::ExecError::ProjectLoading => {
+                Self(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            }
             pulse_exec::ExecError::InvalidQuery(msg) | pulse_exec::ExecError::Expression(msg) => {
                 Self::bad(msg)
             }
@@ -1786,11 +1789,22 @@ impl CtrlError {
 
 impl IntoResponse for CtrlError {
     fn into_response(self) -> Response {
-        (
+        let mut res = (
             self.0,
             Json(json!({ "status": "error", "message": self.1 })),
         )
-            .into_response()
+            .into_response();
+        // 503 (project still loading) and 429 (no query slot) are both transient: tell clients when.
+        if matches!(
+            self.0,
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            res.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+        }
+        res
     }
 }
 
@@ -6957,6 +6971,22 @@ async fn handle_byok_copilot(
     .await;
 
     Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod exec_error_tests {
+    use super::*;
+
+    /// #68: a query that times out during a cold open is a retryable 503, not a 504.
+    #[test]
+    fn project_loading_maps_to_503_with_retry_after() {
+        let res = CtrlError::exec(pulse_exec::ExecError::ProjectLoading).into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers()[axum::http::header::RETRY_AFTER], "5");
+        let res = CtrlError::exec(pulse_exec::ExecError::QueryTimeout(30_000)).into_response();
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(res.headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
 }
 
 #[cfg(test)]
