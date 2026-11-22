@@ -851,10 +851,11 @@ impl ControlPlaneService {
         project_id: &str,
         canonical_uid: u32,
     ) -> Result<(), String> {
+        // A read: it rebuilds the in-memory index. The periodic refresh calls it on every node.
         let pstore = self
             .qengine
             .storage()
-            .profile_store(project_id, true)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let rows: Vec<UserProfileRecord> = pstore

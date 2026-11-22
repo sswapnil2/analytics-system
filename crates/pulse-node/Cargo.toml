@@ -36,6 +36,8 @@ uuid.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
 pulse-sdk-core.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
