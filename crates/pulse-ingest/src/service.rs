@@ -184,7 +184,7 @@ fn approx_event_bytes(ev: &WireEvent) -> usize {
 pub struct IngestService {
     storage: Arc<StorageEngine>,
     governance: Arc<dyn GovernanceProvider>,
-    dedup: DedupRegistry,
+    dedup: Arc<DedupRegistry>,
     dict_registry: Arc<DictionaryRegistry>,
     metrics: IngestMetrics,
     rate_limit: crate::rate_limit::RateLimiter,
@@ -209,7 +209,7 @@ impl IngestService {
         Arc::new(Self {
             storage,
             governance,
-            dedup: DedupRegistry::new(),
+            dedup: Arc::new(DedupRegistry::new()),
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
             rate_limit,
@@ -393,7 +393,12 @@ impl IngestService {
             futures::future::try_join_all(by_bucket.into_iter().map(|(bucket_id, candidates)| {
                 let ps = ps.clone();
                 let queues = queues.clone();
-                async move {
+                let dedup = self.dedup.clone();
+                let project_id = project_id.to_string();
+                // Spawned so the lock holder, who writes for every request queued behind it,
+                // cannot be cancelled by its own client going away.
+                let task = tokio::spawn(async move {
+                    let project_id = project_id.as_str();
                     let queue = &queues[bucket_id as usize];
                     let enqueue = |candidates: Vec<Candidate>| {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -450,12 +455,8 @@ impl IngestService {
                                 let start = to_append.len();
                                 let mut waiter_deduped = 0usize;
                                 for (ev, uid, fp) in &w.candidates {
-                                    if self.dedup.contains(
-                                        project_id,
-                                        bucket_id,
-                                        *fp,
-                                        server_now_ms,
-                                    ) || !seen_in_group.insert(*fp)
+                                    if dedup.contains(project_id, bucket_id, *fp, server_now_ms)
+                                        || !seen_in_group.insert(*fp)
                                     {
                                         waiter_deduped += 1;
                                         continue;
@@ -476,11 +477,11 @@ impl IngestService {
                                 )
                                 .await
                             };
-                            // No await between the durable append and the replies: a request
-                            // dropped mid-write leaves either nothing or a fully answered group.
+                            // The task runs to completion even if this request is dropped, so the
+                            // group is always answered.
                             match written {
                                 Ok(_) => {
-                                    self.dedup.commit_batch(
+                                    dedup.commit_batch(
                                         project_id,
                                         bucket_id,
                                         &committed_fps,
@@ -517,6 +518,13 @@ impl IngestService {
                     }
 
                     Ok::<_, IngestError>(outcome)
+                });
+                async move {
+                    task.await.map_err(|e| {
+                        IngestError::Storage(StorageError::Io(std::io::Error::other(format!(
+                            "WAL group write task failed: {e}"
+                        ))))
+                    })?
                 }
             }))
             .await?;
