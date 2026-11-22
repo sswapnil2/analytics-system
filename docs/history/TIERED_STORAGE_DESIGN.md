@@ -238,7 +238,7 @@ The client is not told about any of these. So the flush bound, buffer fill, log 
 
 Profile creation is synchronous: the call reaches the owning storage node, which writes the profile durably and returns its id. A writer that receives the call passes it through to the owner and waits; it adds no state of its own.
 
-Proposed, for the owner to confirm (section 8). These also stay synchronous and pass through to the owner:
+Decided by the owner: these also stay synchronous and pass through to the owner:
 
 - `/v1/identify`, `/v1/engage` and `/v1/groups`. They are rare next to events, a property set twice must end with the later value, and their errors are worth returning.
 - `identify` and `alias` items sent inside a `/v1/ingest` batch. They are profile calls in an event envelope, and they cannot be dead-lettered: `wal_dead/` holds events only (`engine.rs:583-588`).
@@ -307,11 +307,10 @@ An interval of zero means "upload eagerly", not a return to today's layout: the 
 4. Late events for old dates create small partitions. Proposed: they upload on a longer maximum age.
 5. Session-replay chunks: buffer locally and upload per session on the cycle?
 6. Writer flush bound. 20 ms or 1 MiB is a proposal; it is the most a writer crash can lose.
-7. Which calls stay synchronous besides profile creation (6.3)? Proposed: `/v1/identify`, `/v1/engage`, `/v1/groups`, `identify` and `alias` items inside a batch, and replay chunks.
-8. Do agent traces (`/v1/agent/traces`) take the asynchronous path or stay synchronous?
-9. Should a durable acknowledgement remain available as a setting for deployments that cannot lose events on a crash? Not proposed: it keeps two ingest paths alive.
+7. Do agent traces (`/v1/agent/traces`) take the asynchronous path or stay synchronous?
+8. Should a durable acknowledgement remain available as a setting for deployments that cannot lose events on a crash? Not proposed: it keeps two ingest paths alive.
 
-Answered by the owner and now in the text: metadata database (3.5), erasure (3.9), ownership unit, what a writer's acknowledgement means, storage-node failure (section 6).
+Answered by the owner and now in the text: metadata database (3.5), erasure (3.9), ownership unit, what a writer's acknowledgement means, which calls stay synchronous, storage-node failure (section 6).
 
 ## 9. Review record
 
