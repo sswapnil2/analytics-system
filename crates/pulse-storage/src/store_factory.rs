@@ -158,31 +158,59 @@ pub async fn with_hot_store(
     segments: Arc<dyn ObjectStore>,
     data_dir: &Path,
 ) -> Result<Arc<dyn ObjectStore>> {
+    let local_dir = data_dir.join("wal");
     match std::env::var("PULSE_HOT_STORE").as_deref().map(str::trim) {
-        Ok("object") => return Ok(segments),
+        Ok("object") => {
+            // A local-mode run that stopped uncleanly left WAL on disk that object mode would
+            // never replay.
+            if local_dir.exists() {
+                let local: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&local_dir)?);
+                refuse_over_wal(&local, "the local disk", "local", "object").await?;
+            }
+            return Ok(segments);
+        }
         Ok("local") | Ok("") | Err(_) => {}
         Ok(other) => {
-            return Err(StorageError::Corrupted(format!(
+            return Err(config_error(format!(
                 "PULSE_HOT_STORE must be `local` or `object`, not `{other}`"
             )))
         }
     }
     // Unflushed WAL left in the segment store (an unclean stop under `object`) would never be
-    // replayed from local disk: refuse to start rather than drop acknowledged data.
-    for prefix in ["wal", "agent_wal"] {
-        let mut objects = segments.list(Some(&ObjectPath::from(prefix)));
-        if let Some(found) = futures::StreamExt::next(&mut objects).await {
-            let at = found.map(|m| m.location.to_string()).unwrap_or_default();
-            return Err(StorageError::Corrupted(format!(
-                "the object store still holds unflushed WAL ({at}); start once with \
-                 PULSE_HOT_STORE=object and stop cleanly, then switch to local"
-            )));
-        }
-    }
+    // replayed from local disk.
+    refuse_over_wal(&segments, "the object store", "object", "local").await?;
     Ok(Arc::new(WalRouted {
         wal: Arc::new(DurableLocalObjectStore::new_at(&data_dir.join("wal"))?),
         segments,
     }))
+}
+
+/// Refuses to start rather than drop acknowledged data: `store` still holds WAL written in
+/// mode `was` that mode `now` would never replay. A LIST failure is reported as itself.
+// ponytail: replaced by the hot-store mode marker in the next PR.
+async fn refuse_over_wal(
+    store: &Arc<dyn ObjectStore>,
+    place: &str,
+    was: &str,
+    now: &str,
+) -> Result<()> {
+    for prefix in ["wal", "agent_wal"] {
+        let mut objects = store.list(Some(&ObjectPath::from(prefix)));
+        if let Some(found) = futures::StreamExt::next(&mut objects).await {
+            return Err(config_error(format!(
+                "{place} still holds unflushed WAL ({}); start once with PULSE_HOT_STORE={was} \
+                 and stop cleanly, then switch to {now}",
+                found?.location
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A startup refusal or bad setting: not data corruption.
+fn config_error(msg: String) -> StorageError {
+    StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
 }
 
 /// Sends WAL keys to `wal` and every other key to `segments`. Sits below encryption, so the
