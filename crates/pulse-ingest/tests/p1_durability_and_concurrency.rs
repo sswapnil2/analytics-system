@@ -599,7 +599,7 @@ async fn json_backfill_timestamps_and_distinct_prop_uuids_preserved() {
     );
     assert_eq!(resp.deduped, 0);
 
-    let ps = storage.get_or_open_project("proj_p1_13_14").await.unwrap();
+    let ps = storage.open_for_read("proj_p1_13_14").await.unwrap();
     let snap = ps.snapshot();
     let rows = ps.snapshot_l0_bucket(&snap, 0);
     assert_eq!(rows.len(), 2);
@@ -805,6 +805,9 @@ async fn ha_01_ingest_does_not_block_on_slow_l1_segment_flush_and_enforces_l0_ba
         .await
         .unwrap();
     assert_eq!(r2.accepted, 2);
+    // The row limit counts rows the processor has applied; what is logged and not yet applied is
+    // bounded separately, in bytes.
+    ps.wait_applied(Duration::from_secs(5)).await;
 
     // Direct service call must reject with StorageError::L0Backpressure while L0 is at high-water mark
     let err = ingest
@@ -1015,7 +1018,7 @@ async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
     assert!(puts <= 3, "34 concurrent requests made {puts} WAL writes");
 
     // What was acknowledged is in the WAL: a second engine on the same store replays all of it.
-    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    let ps = storage.open_for_read("proj_group").await.unwrap();
     assert_eq!(ps.total_l0_rows(), 33);
     let store: Arc<dyn ObjectStore> = hook.clone();
     let recovered = StorageEngine::new(
@@ -1061,5 +1064,6 @@ async fn failed_group_write_acknowledges_nothing_and_retries_are_stored() {
     hook.fail_wal_puts.store(false, Ordering::SeqCst);
     let retried = send_all().await;
     assert!(retried.iter().all(|r| r.as_ref().unwrap().accepted == 1));
+    ps.wait_applied(Duration::from_secs(5)).await;
     assert_eq!(ps.total_l0_rows(), 8);
 }

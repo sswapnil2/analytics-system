@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parking_lot::{Mutex, RwLock};
 use pulse_identity::{IdentityRouter, ProjectIdentityGraph};
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
@@ -71,6 +71,44 @@ impl Default for StorageConfig {
     }
 }
 
+/// Events that could not be turned into rows and were written to `wal_dead/` instead.
+pub static DEAD_LETTERED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+fn env_mb(name: &str, default_mb: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(default_mb)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Byte bounds on what a node holds in memory for events, and the node-wide running totals.
+pub struct NodeLoad {
+    l0_bytes: Arc<AtomicUsize>,
+    unapplied_bytes: AtomicUsize,
+    /// `PULSE_L0_PROJECT_MAX_MB` (512) / `PULSE_L0_MAX_MB` (1024): rows not yet in a segment.
+    l0_max_project: AtomicUsize,
+    l0_max_node: AtomicUsize,
+    /// `PULSE_LOG_LAG_PROJECT_MAX_MB` (256) / `PULSE_LOG_LAG_MAX_MB` (512): events in the WAL
+    /// that the processor has not applied yet.
+    log_max_project: AtomicUsize,
+    log_max_node: AtomicUsize,
+}
+
+impl NodeLoad {
+    fn from_env() -> Arc<Self> {
+        Arc::new(Self {
+            l0_bytes: Arc::new(AtomicUsize::new(0)),
+            unapplied_bytes: AtomicUsize::new(0),
+            l0_max_project: AtomicUsize::new(env_mb("PULSE_L0_PROJECT_MAX_MB", 512)),
+            l0_max_node: AtomicUsize::new(env_mb("PULSE_L0_MAX_MB", 1024)),
+            log_max_project: AtomicUsize::new(env_mb("PULSE_LOG_LAG_PROJECT_MAX_MB", 256)),
+            log_max_node: AtomicUsize::new(env_mb("PULSE_LOG_LAG_MAX_MB", 512)),
+        })
+    }
+}
+
 /// Grants one node at a time the right to write a project's event store (`P0-1`).
 #[async_trait::async_trait]
 pub trait WriterLeases: Send + Sync {
@@ -111,6 +149,14 @@ pub struct ProjectStorage {
     mem_buckets: Vec<MemBucket>,
     /// Per-bucket append mutex serializing `wal_seq` allocation, durable `wal.append`, `l0_seq` assignment,
     /// `MemBucket` insertion, and `DedupRegistry` commit (`P1-01`, `P1-02`).
+    node_load: Arc<NodeLoad>,
+    l0_bytes: Arc<AtomicUsize>,
+    /// WAL records written / applied to L0, and the bytes in between (`log_events_locked`,
+    /// `apply_logged`).
+    logged_records: AtomicU64,
+    applied_records: AtomicU64,
+    unapplied_bytes: AtomicUsize,
+    applied_notify: tokio::sync::Notify,
     bucket_append_locks: Vec<AsyncMutex<()>>,
     bucket_flush_locks: Vec<AsyncMutex<()>>,
     compaction_locks: DashMap<(NaiveDate, u8), Arc<AsyncMutex<()>>>,
@@ -169,6 +215,7 @@ impl ProjectStorage {
             object_store,
             identity_router,
             None,
+            NodeLoad::from_env(),
         )
         .await
     }
@@ -179,6 +226,7 @@ impl ProjectStorage {
         object_store: Arc<dyn ObjectStore>,
         identity_router: &IdentityRouter,
         lease: Option<(u64, Instant)>,
+        node_load: Arc<NodeLoad>,
     ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
         let mut manifest = manifest_store.load_latest().await?;
@@ -213,6 +261,7 @@ impl ProjectStorage {
         let l0_seq = AtomicU64::new(max_committed_l0);
         let max_l0_rows_per_bucket = AtomicUsize::new(default_max_l0_rows_per_bucket(&config));
 
+        let l0_bytes = Arc::new(AtomicUsize::new(0));
         let mut wals = Vec::with_capacity(config.num_buckets as usize);
         let mut mem_buckets = Vec::with_capacity(config.num_buckets as usize);
         let mut bucket_append_locks = Vec::with_capacity(config.num_buckets as usize);
@@ -235,7 +284,10 @@ impl ProjectStorage {
             );
             wal.set_min_valid_epoch(manifest.fenced_wal_epoch);
             wals.push(wal);
-            mem_buckets.push(MemBucket::new(bucket_id));
+            mem_buckets.push(MemBucket::with_totals(
+                bucket_id,
+                vec![l0_bytes.clone(), node_load.l0_bytes.clone()],
+            ));
             bucket_append_locks.push(AsyncMutex::new(()));
             bucket_flush_locks.push(AsyncMutex::new(()));
             flush_in_flight.push(AtomicBool::new(false));
@@ -257,6 +309,12 @@ impl ProjectStorage {
             dictionary,
             wals,
             mem_buckets,
+            node_load,
+            l0_bytes,
+            logged_records: AtomicU64::new(0),
+            applied_records: AtomicU64::new(0),
+            unapplied_bytes: AtomicUsize::new(0),
+            applied_notify: tokio::sync::Notify::new(),
             bucket_append_locks,
             bucket_flush_locks,
             compaction_locks: DashMap::new(),
@@ -320,7 +378,7 @@ impl ProjectStorage {
                     .unwrap_or(0);
                 let records = ps.wals[b as usize].recover(committed_wal).await?;
                 for (wal_seq, batch) in records {
-                    let mut rows = Vec::with_capacity(batch.len());
+                    let mut events = Vec::with_capacity(batch.len());
                     for ev in &batch.events {
                         let fp = event_uuid_fingerprint(&ev.event_uuid);
                         if !seen_replay_fps.insert(fp) {
@@ -328,8 +386,9 @@ impl ProjectStorage {
                         }
                         ps.recovered_uuid_fps.lock().push((bucket_id, fp));
                         let uid = ps.id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-                        rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp)?);
+                        events.push((ev, uid, fp));
                     }
+                    let rows = ps.rows_or_dead_letter(bucket_id, wal_seq, &events).await?;
                     ps.mem_buckets[b as usize].append_batch(rows);
                 }
             }
@@ -466,25 +525,40 @@ impl ProjectStorage {
         self.bucket_append_locks[bucket_id as usize].lock().await
     }
 
-    /// Appends events while the caller holds `lock_bucket_append(bucket_id)` (`P1-01`, `P1-02`).
-    /// Guarantees `wal_seq` allocation, durable `BucketWal::append`, `l0_seq` allocation, and `MemBucket` insertion
-    /// execute in strict total order for `bucket_id`.
+    /// Logs and applies in one call, for callers that do not split the two (tests, embedded use).
+    /// Events that cannot become rows are dead-lettered, so the count can be below `events.len()`.
     pub async fn append_bucket_events_locked(
         &self,
-        _append_guard: &AsyncMutexGuard<'_, ()>,
+        append_guard: &AsyncMutexGuard<'_, ()>,
         bucket_id: u8,
         events: Vec<(WireEvent, u32)>,
     ) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
-        let b_idx = bucket_id as usize;
-        let wire_events: Vec<WireEvent> = events.iter().map(|(e, _)| e.clone()).collect();
-        let batch = WireBatch::new(wire_events);
+        let batch = WireBatch::new(events.iter().map(|(e, _)| e.clone()).collect());
+        let wal_seq = self
+            .log_events_locked(append_guard, bucket_id, &batch, 0)
+            .await?;
+        let events: Vec<_> = events
+            .iter()
+            .map(|(ev, uid)| (ev, *uid, event_uuid_fingerprint(&ev.event_uuid)))
+            .collect();
+        self.apply_logged(bucket_id, wal_seq, &events, 0).await
+    }
 
+    /// The appender half: one durable WAL record for `events`, written while the caller holds
+    /// `lock_bucket_append(bucket_id)`, so there is one PUT in flight per bucket log and `wal_seq`
+    /// follows lock order. Every logged record must later go through `apply_logged`, in order.
+    pub async fn log_events_locked(
+        &self,
+        _append_guard: &AsyncMutexGuard<'_, ()>,
+        bucket_id: u8,
+        batch: &WireBatch,
+        approx_bytes: usize,
+    ) -> Result<u64> {
         self.check_writer()?;
-        // 1. Durable WAL write BEFORE allocating l0_seq or mutating L0
-        let wal_seq = match self.wals[b_idx].append(&batch).await {
+        let wal_seq = match self.wals[bucket_id as usize].append(batch).await {
             Err(e @ StorageError::NotWriter { .. }) => {
                 self.fence();
                 return Err(e);
@@ -494,22 +568,132 @@ impl ProjectStorage {
         // Checked again AFTER the write: if the lease ran out while the PUT was in flight, a new
         // holder may already have listed this log without the record, so it must not be acked.
         self.check_writer()?;
+        self.logged_records.fetch_add(1, Ordering::AcqRel);
+        self.unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        self.node_load
+            .unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        Ok(wal_seq)
+    }
 
-        // 2. Allocate monotonic `l0_seq`s and append into L0 MemBucket while still holding `bucket_append_locks[b_idx]`
-        let mut rows = Vec::with_capacity(events.len());
-        for (ev, uid) in &events {
-            let fp = event_uuid_fingerprint(&ev.event_uuid);
-            rows.push(self.wire_event_to_row(ev, *uid, wal_seq, fp)?);
-        }
+    /// The processor half: turns a logged record's events (already deduplicated and interned by
+    /// the caller) into L0 rows. Call once per logged record, in `wal_seq` order per bucket,
+    /// with the same `approx_bytes`; an `Err` means nothing was applied and the call can be
+    /// repeated.
+    pub async fn apply_logged(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        events: &[(&WireEvent, u32, u64)],
+        approx_bytes: usize,
+    ) -> Result<usize> {
+        let rows = self.rows_or_dead_letter(bucket_id, wal_seq, events).await?;
         let count = rows.len();
-        self.mem_buckets[b_idx].append_batch(rows);
+        self.mem_buckets[bucket_id as usize].append_batch(rows);
+        self.unapplied_bytes
+            .fetch_sub(approx_bytes, Ordering::AcqRel);
+        self.node_load
+            .unapplied_bytes
+            .fetch_sub(approx_bytes, Ordering::AcqRel);
+        self.applied_records.fetch_add(1, Ordering::AcqRel);
+        self.applied_notify.notify_waiters();
         Ok(count)
+    }
+
+    /// Waits, up to `timeout`, until every record logged before this call has been applied, so
+    /// a read or flush right after an acknowledged write sees it.
+    pub async fn wait_applied(&self, timeout: Duration) {
+        let target = self.logged_records.load(Ordering::Acquire);
+        let caught_up = || self.applied_records.load(Ordering::Acquire) >= target;
+        if caught_up() {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.applied_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if caught_up() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+    }
+
+    /// Converts events to rows. An event that cannot be converted (today: the project dictionary
+    /// is full) is written to `wal_dead/` and skipped, so one bad record never blocks the
+    /// project, live or during recovery.
+    async fn rows_or_dead_letter(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        events: &[(&WireEvent, u32, u64)],
+    ) -> Result<Vec<StoredRow>> {
+        let mut rows = Vec::with_capacity(events.len());
+        for &(ev, uid, fp) in events {
+            match self.wire_event_to_row(ev, uid, wal_seq, fp) {
+                Ok(row) => rows.push(row),
+                Err(reason) => {
+                    self.dead_letter(bucket_id, wal_seq, ev.clone(), fp, &reason)
+                        .await?
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Stores one event that will not be applied under
+    /// `wal_dead/{project}/bucket_{NNN}/seq_{wal_seq}_{fingerprint}.plsb` (a one-event `PLSB`
+    /// batch). The name is fixed by the record, so applying it again after a crash writes nothing
+    /// new. Fails only if the object store does; the caller must then retry, not skip.
+    pub async fn dead_letter(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        ev: WireEvent,
+        fp: u64,
+        reason: &(dyn std::fmt::Display + Sync),
+    ) -> Result<()> {
+        let path = ObjectPath::from(format!(
+            "wal_dead/{}/bucket_{:03}/seq_{:012}_{:016x}.plsb",
+            self.project_id, bucket_id, wal_seq, fp
+        ));
+        let payload = WireBatch::new(vec![ev]).encode_binary(1)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from(payload), opts)
+            .await
+        {
+            Ok(_) => {
+                DEAD_LETTERED_EVENTS.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    project_id = %self.project_id,
+                    bucket_id,
+                    dead_letter_path = %path,
+                    %reason,
+                    "event could not be applied; moved to the dead-letter path"
+                );
+                Ok(())
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn should_flush_bucket(&self, bucket_id: u8) -> bool {
         self.mem_buckets.get(bucket_id as usize).is_some_and(|mb| {
             mb.should_flush(
                 self.config.l0_flush_row_threshold,
+                // Flush early enough that all buckets together sit near half the byte limit.
+                self.node_load.l0_max_project.load(Ordering::Relaxed)
+                    / (2 * self.config.num_buckets.max(1) as usize),
                 self.config.l0_flush_max_age,
             )
         })
@@ -543,6 +727,42 @@ impl ProjectStorage {
                 current_rows,
                 max_rows,
             });
+        }
+        let load = &self.node_load;
+        let checks = [
+            (
+                "l0",
+                self.l0_bytes.load(Ordering::Acquire),
+                load.l0_max_project.load(Ordering::Relaxed),
+            ),
+            (
+                "l0",
+                load.l0_bytes.load(Ordering::Acquire),
+                load.l0_max_node.load(Ordering::Relaxed),
+            ),
+            (
+                "log",
+                self.unapplied_bytes.load(Ordering::Acquire),
+                load.log_max_project.load(Ordering::Relaxed),
+            ),
+            (
+                "log",
+                load.unapplied_bytes.load(Ordering::Acquire),
+                load.log_max_node.load(Ordering::Relaxed),
+            ),
+        ];
+        for (what, bytes, max_bytes) in checks {
+            if bytes >= max_bytes {
+                if what == "l0" {
+                    self.schedule_background_flush(bucket_id);
+                }
+                return Err(StorageError::Backpressure {
+                    project_id: self.project_id.clone(),
+                    what,
+                    bytes,
+                    max_bytes,
+                });
+            }
         }
         Ok(())
     }
@@ -854,6 +1074,8 @@ impl ProjectStorage {
     }
 
     pub async fn flush_all(&self) -> Result<usize> {
+        // Acknowledged records still on their way into L0 belong in this flush.
+        self.wait_applied(Duration::from_secs(10)).await;
         let all: Vec<u8> = (0..self.config.num_buckets).map(|b| b as u8).collect();
         self.flush_buckets(&all).await
     }
@@ -1204,6 +1426,7 @@ pub struct StorageEngine {
     erased: DashMap<String, Arc<ErasedUids>>,
     open_lock: AsyncMutex<()>,
     writer_leases: OnceLock<Arc<dyn WriterLeases>>,
+    node_load: Arc<NodeLoad>,
 }
 
 impl StorageEngine {
@@ -1241,6 +1464,7 @@ impl StorageEngine {
             erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
             writer_leases: OnceLock::new(),
+            node_load: NodeLoad::from_env(),
         })
     }
 
@@ -1338,6 +1562,7 @@ impl StorageEngine {
             self.object_store.clone(),
             &self.identity_router,
             lease,
+            self.node_load.clone(),
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
@@ -1345,6 +1570,32 @@ impl StorageEngine {
         if let Some(e) = self.erased.get(project_id) {
             ps.set_erased(e.clone());
         }
+        Ok(ps)
+    }
+
+    /// Overrides the byte bounds read from the environment: rows held in L0 and logged events not
+    /// yet applied, each per project and per node.
+    pub fn set_byte_limits(&self, l0: (usize, usize), log_lag: (usize, usize)) {
+        let load = &self.node_load;
+        load.l0_max_project.store(l0.0, Ordering::Relaxed);
+        load.l0_max_node.store(l0.1, Ordering::Relaxed);
+        load.log_max_project.store(log_lag.0, Ordering::Relaxed);
+        load.log_max_node.store(log_lag.1, Ordering::Relaxed);
+    }
+
+    /// Bytes of L0 rows and of logged-but-unapplied events held by this node.
+    pub fn memory_load(&self) -> (usize, usize) {
+        (
+            self.node_load.l0_bytes.load(Ordering::Relaxed),
+            self.node_load.unapplied_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Opens a project for a query: like `get_or_open_project`, then waits briefly for events
+    /// this node has acknowledged but not yet applied, so a read right after a write sees it.
+    pub async fn open_for_read(&self, project_id: &str) -> Result<Arc<ProjectStorage>> {
+        let ps = self.get_or_open_project(project_id).await?;
+        ps.wait_applied(Duration::from_millis(250)).await;
         Ok(ps)
     }
 
@@ -1565,6 +1816,129 @@ mod manifest_retention_tests {
             rows += reader.read_all_rows(seg).await.unwrap().len();
         }
         assert_eq!(rows, 20);
+    }
+
+    /// An event that cannot become a row (here: the dictionary is full) used to fail the request
+    /// after its WAL record was durable, and then fail every later open of the project.
+    #[tokio::test]
+    async fn unappliable_event_is_dead_lettered_and_never_blocks_the_project() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let router = IdentityRouter::new(store.clone());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            ..StorageConfig::default()
+        };
+        let ev = |name: &str, i: i64| WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u", "s", name, i, i as u64),
+            routing_seed: "u".into(),
+            distinct_id: "u".into(),
+            session_id: "s".into(),
+            event_name: name.into(),
+            client_event_ts_ms: 1_790_000_000_000 + i,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        let dead_letters = || async {
+            use futures::TryStreamExt;
+            let prefix = ObjectPath::from("wal_dead/p");
+            let found: Vec<_> = store.list(Some(&prefix)).try_collect().await.unwrap();
+            found.len()
+        };
+
+        let ps = ProjectStorage::open_and_recover("p", cfg.clone(), store.clone(), &router)
+            .await
+            .unwrap();
+        ps.append_bucket_events(0, vec![(ev("known", 0), 1)])
+            .await
+            .unwrap();
+        let mut n = 0;
+        while ps
+            .dictionary()
+            .try_get_or_intern_event(&format!("filler_{n}"))
+            .is_ok()
+        {
+            n += 1;
+        }
+        // Persist the full dictionary so recovery starts from it too.
+        ps.flush_bucket(0).await.unwrap();
+
+        let applied = ps
+            .append_bucket_events(0, vec![(ev("one_too_many", 1), 1), (ev("known", 2), 1)])
+            .await
+            .expect("a record with an unappliable event is still accepted");
+        assert_eq!(applied, 1);
+        assert_eq!(ps.total_l0_rows(), 1);
+        assert_eq!(dead_letters().await, 1);
+        drop(ps);
+
+        // Crash before the flush: recovery meets the same record and must not stop on it.
+        let reopened = ProjectStorage::open_and_recover("p", cfg, store.clone(), &router)
+            .await
+            .expect("project opens despite the unappliable event in its WAL");
+        assert_eq!(reopened.total_l0_rows(), 1);
+        assert_eq!(
+            dead_letters().await,
+            1,
+            "replay dead-lettered the event twice"
+        );
+    }
+
+    /// Events written to the WAL and not yet applied are bounded in bytes: the appender is
+    /// refused until the processor catches up.
+    #[tokio::test]
+    async fn unapplied_log_bytes_push_back_until_the_record_is_applied() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store)),
+        );
+        engine.set_byte_limits((usize::MAX, usize::MAX), (1_000, usize::MAX));
+        let ps = engine.get_or_open_project("p").await.unwrap();
+        let ev = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u", "s", "e", 1, 1),
+            routing_seed: "u".into(),
+            distinct_id: "u".into(),
+            session_id: "s".into(),
+            event_name: "e".into(),
+            client_event_ts_ms: 1_790_000_000_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        ps.check_l0_backpressure(0).unwrap();
+        let batch = WireBatch::new(vec![ev.clone()]);
+        let wal_seq = {
+            let guard = ps.lock_bucket_append(0).await;
+            ps.log_events_locked(&guard, 0, &batch, 1_000)
+                .await
+                .unwrap()
+        };
+        assert!(matches!(
+            ps.check_l0_backpressure(0),
+            Err(StorageError::Backpressure { what: "log", .. })
+        ));
+        assert_eq!(engine.memory_load().1, 1_000);
+        ps.apply_logged(0, wal_seq, &[(&ev, 1, 7)], 1_000)
+            .await
+            .unwrap();
+        ps.check_l0_backpressure(0).unwrap();
+        assert_eq!(engine.memory_load().1, 0);
+        assert!(engine.memory_load().0 > 0);
+
+        // Rows in L0 are bounded in bytes too, until a flush moves them to a segment.
+        engine.set_byte_limits((1, usize::MAX), (usize::MAX, usize::MAX));
+        assert!(matches!(
+            ps.check_l0_backpressure(0),
+            Err(StorageError::Backpressure { what: "l0", .. })
+        ));
+        ps.flush_all().await.unwrap();
+        ps.check_l0_backpressure(0).unwrap();
+        assert_eq!(engine.memory_load().0, 0);
     }
 
     struct FakeLeases {

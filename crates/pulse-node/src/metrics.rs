@@ -174,6 +174,11 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
         ing.dropped_total.load(Ordering::Relaxed),
     );
     counter(
+        "pulse_ingest_dead_lettered_events_total",
+        "Events that could not be applied and were written to wal_dead/ instead.",
+        pulse_storage::DEAD_LETTERED_EVENTS.load(Ordering::Relaxed),
+    );
+    counter(
         "pulse_ingest_batches_total",
         "Ingest batches processed.",
         ing.batches_total.load(Ordering::Relaxed),
@@ -237,6 +242,17 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
     let mut gauge = |name: &str, help: &str, v: f64| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
     };
+    let (l0_bytes, log_lag_bytes) = p.storage.memory_load();
+    gauge(
+        "pulse_l0_bytes",
+        "Estimated bytes of rows buffered in memory, not yet flushed to segments.",
+        l0_bytes as f64,
+    );
+    gauge(
+        "pulse_ingest_log_lag_bytes",
+        "Estimated bytes of events written to the WAL and not yet applied by the processor.",
+        log_lag_bytes as f64,
+    );
     gauge(
         "pulse_l0_rows",
         "Rows buffered in memory, not yet flushed to segments.",

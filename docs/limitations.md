@@ -17,6 +17,8 @@ These are the things Pulse does not do, or does with known limits. This list com
 - **Erasure is delayed on disk.** Erased users are hidden at once, but rows are physically removed only when each affected day and bucket is next compacted. Exports and backups are not touched.
 - **Schema caps.** At most 8,192 event names and 16,384 property keys per project. A single batch may add at most 128 new event names or 256 new property keys; going over rejects the whole batch.
 - **Size limits.** Event and property names: 255 characters. String values are truncated to 8 KiB. Request body: 8 MiB.
+- **Accepted is not instantly queryable everywhere.** An ingest `200` means the event is in the write-ahead log. It becomes queryable on the same node within milliseconds (queries wait up to 250 ms for that), and on other nodes after the next flush.
+- **Dead-lettered events.** An event that cannot be turned into a row (the project's dictionary or schema cap is full) is written to `wal_dead/<project>/bucket_NNN/seq_<n>_<fingerprint>.plsb` and skipped. There is no tool yet to list or replay these files; each is a one-event `PLSB` batch that can be re-sent to `/v1/ingest` after the cause is fixed.
 - **Dedup windows.** `/v1/ingest` deduplicates within 15–30 minutes only. A retry after that is counted again (`/import` remembers ids for 30 days).
 - **Changing bucket count.** Do not change `PULSE_NUM_BUCKETS` on a data directory that already has data. Events route by `hash % num_buckets`, so changing it would split one user's history across buckets. This is inferred from the routing code; migration is not documented.
 - **Two organisation tables.** `orgs` and `organizations` both exist in the metadata DB. This matters only if you query the DB directly.

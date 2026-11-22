@@ -160,7 +160,8 @@ mod tests {
             assert_eq!(total_accepted, 500_000);
             assert_eq!(total_deduped, 100_000);
 
-            let ps = storage.get_or_open_project("proj_gate2").await.unwrap();
+            // `accepted` means durably logged; the processor applies it to L0 just after.
+            let ps = storage.open_for_read("proj_gate2").await.unwrap();
             assert_eq!(ps.total_l0_rows(), 500_000);
             assert_eq!(ps.snapshot().manifest.total_segments(), 0);
             // Simulate ABRUPT NODE CRASH here: drop `ingest` and `storage` WITHOUT flushing L0 to L1!

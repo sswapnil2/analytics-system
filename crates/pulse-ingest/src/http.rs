@@ -134,6 +134,22 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if let IngestError::Storage(pulse_storage::StorageError::Backpressure { what, .. }) =
+            &self.0
+        {
+            // `l0_backpressure`: flushing is behind. `log_backpressure`: the processor is behind.
+            let body = serde_json::json!({
+                "status": "error",
+                "code": format!("{what}_backpressure"),
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(body),
+            )
+                .into_response();
+        }
         if let IngestError::Storage(pulse_storage::StorageError::NotWriter { .. }) = &self.0 {
             // Another node writes this project (or this node could not renew its lease).
             let body = serde_json::json!({

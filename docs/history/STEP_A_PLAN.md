@@ -1,6 +1,6 @@
 # Step A plan: appender and processor as separate tasks in one process
 
-Status: plan for review. No code yet. Scope is Step A of section 15.11 in `SCALABILITY_REVIEW.md` only. Line numbers are on this branch (stacked on the writer lease, #96, and group commit, #97).
+Status: built in this PR; the plan below is as reviewed, and "Decisions and outcome" at the end records what changed. Scope is Step A of section 15.11 in `SCALABILITY_REVIEW.md` only. Line numbers are on this branch (stacked on the writer lease, #96, and group commit, #97).
 
 ## What Step A changes
 
@@ -69,3 +69,27 @@ Two more decisions this plan needs that 15.11 does not list:
 - **15.4, "`deduped` is exact when the appender shares a process with the processor".** Not without extra work: a retry that arrives while the first copy is logged but not yet applied is not in the rings (`pulse-ingest/src/dedup.rs`), so the appender reports it as accepted. The event is still stored once.
 - **15.7 calls the L0 byte bound "still open (C5)".** For events it does not exist at all; there is no byte accounting to enforce it with (`engine.rs:535-548` counts rows).
 - **15.11 Step A exit criterion** needs five-second samples; `crates/pulse-node/examples/loadgen.rs` reports only whole-run percentiles.
+## Decisions and outcome (added after review)
+
+Owner decisions on the four questions: log-lag cap 256 MiB per project / 512 MiB per node; `identify`, `alias`, `engage`, `groups` and replay stay synchronous in the request path; same-node queries wait up to 250 ms for the processor; `deduped` may be best effort.
+
+Built as planned, with these differences:
+
+- **Dedup stayed in the appender.** The plan moved it to the processor. In one process the rings are local, so the appender still does the exact re-check under the bucket lock and commits after the durable write. `deduped` therefore stays exact, and the processor does no dedup. It has to move when appenders run on other nodes (Step C), not before.
+- **`identify` and in-batch `identify`/`alias` wait for earlier events to be applied** (up to 1 s), so ids are assigned in the same order as before. The caveat in "Open questions" about `identify` running ahead of a batch's events no longer applies.
+- **The row limit counts applied rows.** A request straight after another can pass the per-bucket row check before the first is applied; the gap is bounded by the log-lag byte limit.
+- **L0 byte defaults are 512 MiB per project and 1,024 MiB per node** (not decided in review; configurable). A bucket flushes at the project limit ÷ (2 × buckets), 16 MiB with 16 buckets.
+
+Exit criteria, `loadgen events --concurrency 64 --batch 100 --duration 60`, release build, M2 Pro:
+
+| | events/s (mean) | 5 s samples, min–max | p99 | RSS max |
+|---|---|---|---|---|
+| Group commit only (#97) | 108,161 | 42,020–132,740 | 209 ms | 3.87 GB |
+| Step A | 60,490 | 49,660–87,240 | 205 ms | 3.22 GB |
+
+- **No five-second sample below half the mean: met** (lowest 49,660 against a mean of 60,490). #97 alone fails it (42,020 against 108,161).
+- **A poisoned record does not block the project: met**, live and in recovery (test below).
+- **RSS under the configured bounds: not met.** The two bounded quantities stay well inside their limits (`pulse_l0_bytes` peaked at 221 MB, `pulse_ingest_log_lag_bytes` at 0.2 MB, no `429`), but RSS reached 2.3–3.2 GB and does not move with the L0 limit (2.45 GB at 128 MiB, 2.56 GB at 2,048 MiB). The memory is somewhere Step A does not bound. Not profiled; candidates are the copies made while flushing, compaction, and the dedup rings.
+- Mean throughput is lower than #97 in the 60 s run and varies between runs (60k–100k events/s). Smaller, more frequent flushes are the expected cost of the byte bound; I did not separate that from run-to-run noise.
+
+Not tested: the processor's schema-cap dead-letter branch (it needs two requests racing past the request-path check; the storage dead-letter path it calls is tested), and the QUIC path.

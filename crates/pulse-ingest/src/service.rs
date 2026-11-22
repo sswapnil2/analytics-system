@@ -148,10 +148,27 @@ impl IngestMetrics {
 /// the next record, so a single PUT stays bounded however many requests are queued.
 const WAL_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// A routed, interned event waiting for its bucket's WAL: `(event, uid, uuid fingerprint)`.
-type Candidate = (WireEvent, u32, u64);
-/// What one request got from a bucket: `(accepted, deduped, the accepted events)`.
-type BucketOutcome = (usize, usize, Vec<WireEvent>);
+/// A routed event waiting for its bucket's WAL: `(event, uuid fingerprint)`.
+type Candidate = (WireEvent, u64);
+/// What one request got from a bucket: `(accepted, deduped)`.
+type BucketOutcome = (usize, usize);
+
+/// One durable WAL record on its way from the appender (the request path) to the project's
+/// processor task, which turns it into L0 rows.
+struct LoggedRecord {
+    bucket_id: u8,
+    wal_seq: u64,
+    events: Vec<WireEvent>,
+    fps: Vec<u64>,
+    bytes: usize,
+}
+
+/// The processor of one open project: the task consuming `tx`, tied to one `ProjectStorage`
+/// instance (a project re-opened after a writer-lease takeover gets a new one).
+struct Processor {
+    ps: Arc<pulse_storage::ProjectStorage>,
+    tx: tokio::sync::mpsc::UnboundedSender<LoggedRecord>,
+}
 
 /// One request's events for one bucket, queued until a WAL record that includes them is
 /// durable. `Err` hands the events back after a failed write so the request retries itself.
@@ -180,11 +197,129 @@ fn approx_event_bytes(ev: &WireEvent) -> usize {
             .sum::<usize>()
 }
 
+fn spawn_processor(
+    ps: Arc<pulse_storage::ProjectStorage>,
+    id_graph: Arc<pulse_identity::ProjectIdentityGraph>,
+    governance: Arc<dyn GovernanceProvider>,
+) -> Processor {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LoggedRecord>();
+    let task_ps = ps.clone();
+    tokio::spawn(async move {
+        let ps = task_ps;
+        // ponytail: one task per project applies records one at a time. Split per bucket if a
+        // single project's apply rate becomes the limit.
+        while let Some(rec) = rx.recv().await {
+            // Nothing below is lost by repeating it, and the record must not be skipped: it was
+            // acknowledged. The only failure is the object store refusing a dead-letter write.
+            while let Err(e) = apply_record(&ps, &id_graph, &rec).await {
+                tracing::error!(
+                    project_id = %ps.project_id(),
+                    bucket_id = rec.bucket_id,
+                    wal_seq = rec.wal_seq,
+                    error = %e,
+                    "applying a logged record failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            record_discovery(governance.as_ref(), ps.project_id(), &rec.events);
+            if ps.should_flush_bucket(rec.bucket_id) {
+                ps.schedule_background_flush(rec.bucket_id);
+            }
+        }
+    });
+    Processor { ps, tx }
+}
+
+/// Interns ids and turns one logged record into L0 rows. Events over the project's schema caps
+/// (the request path only checks those against the dictionary it sees at the time) go to the
+/// dead-letter path instead of growing the dictionary.
+async fn apply_record(
+    ps: &Arc<pulse_storage::ProjectStorage>,
+    id_graph: &pulse_identity::ProjectIdentityGraph,
+    rec: &LoggedRecord,
+) -> std::result::Result<(), StorageError> {
+    let dict = ps.dictionary();
+    let mut new_events: HashSet<&str> = HashSet::new();
+    let mut new_keys: HashSet<&str> = HashSet::new();
+    let mut events = Vec::with_capacity(rec.events.len());
+    for (ev, &fp) in rec.events.iter().zip(&rec.fps) {
+        let event_is_new = dict.lookup_event(&ev.event_name).is_none()
+            && !new_events.contains(ev.event_name.as_str());
+        let keys_new: Vec<&str> = ev
+            .props
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| dict.lookup_prop_key(k).is_none() && !new_keys.contains(k))
+            .collect();
+        if (event_is_new && dict.event_count() + new_events.len() >= MAX_EVENTS_PER_PROJECT)
+            || (!keys_new.is_empty()
+                && dict.prop_key_count() + new_keys.len() + keys_new.len()
+                    > MAX_PROP_KEYS_PER_PROJECT)
+        {
+            ps.dead_letter(
+                rec.bucket_id,
+                rec.wal_seq,
+                ev.clone(),
+                fp,
+                &"project schema cap reached (event names or property keys)",
+            )
+            .await?;
+            continue;
+        }
+        new_events.insert(&ev.event_name);
+        new_keys.extend(keys_new);
+        let uid = id_graph.get_or_intern(&ev.distinct_id, rec.bucket_id);
+        events.push((ev, uid, fp));
+    }
+    ps.apply_logged(rec.bucket_id, rec.wal_seq, &events, rec.bytes)
+        .await?;
+    Ok(())
+}
+
+fn record_discovery(governance: &dyn GovernanceProvider, project_id: &str, events: &[WireEvent]) {
+    type Seen = (u64, Vec<(String, &'static str)>);
+    let mut discovery_map: HashMap<&str, Seen> = HashMap::new();
+    for ev in events {
+        let disc = discovery_map.entry(&ev.event_name).or_insert_with(|| {
+            let ptypes = ev
+                .props
+                .iter()
+                .map(|(k, v)| {
+                    let t = match v {
+                        PropValue::Null => "null",
+                        PropValue::Bool(_) => "bool",
+                        PropValue::Int(_) => "int",
+                        PropValue::Float(_) => "float",
+                        PropValue::Str(_) => "string",
+                    };
+                    (k.clone(), t)
+                })
+                .collect();
+            (0, ptypes)
+        });
+        disc.0 += 1;
+    }
+    if !discovery_map.is_empty() {
+        governance.record_discovery(
+            discovery_map
+                .into_iter()
+                .map(|(event_name, (count, props))| DiscoveredEventSchema {
+                    project_id: project_id.to_string(),
+                    event_name: event_name.to_string(),
+                    count,
+                    props,
+                })
+                .collect(),
+        );
+    }
+}
+
 /// Core transport-agnostic Ingestion Pipeline shared by HTTP/1.1, HTTP/2, QUIC, and Seeder.
 pub struct IngestService {
     storage: Arc<StorageEngine>,
     governance: Arc<dyn GovernanceProvider>,
     dedup: DedupRegistry,
+    processors: DashMap<String, Processor>,
     dict_registry: Arc<DictionaryRegistry>,
     metrics: IngestMetrics,
     rate_limit: crate::rate_limit::RateLimiter,
@@ -210,6 +345,7 @@ impl IngestService {
             storage,
             governance,
             dedup: DedupRegistry::new(),
+            processors: DashMap::new(),
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
             rate_limit,
@@ -254,6 +390,35 @@ impl IngestService {
         Ok(ps)
     }
 
+    /// The processor for `ps`, started on first use and restarted when the project was re-opened.
+    async fn processor_for(
+        &self,
+        project_id: &str,
+        ps: &Arc<pulse_storage::ProjectStorage>,
+    ) -> Result<tokio::sync::mpsc::UnboundedSender<LoggedRecord>> {
+        if let Some(p) = self.processors.get(project_id) {
+            if Arc::ptr_eq(&p.ps, ps) {
+                return Ok(p.tx.clone());
+            }
+        }
+        let id_graph = self
+            .storage
+            .identity_router()
+            .get_or_open(project_id)
+            .await?;
+        let mut entry = self
+            .processors
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                spawn_processor(ps.clone(), id_graph.clone(), self.governance.clone())
+            });
+        if !Arc::ptr_eq(&entry.ps, ps) {
+            // Dropping the old sender ends the old task once its queue is drained.
+            *entry = spawn_processor(ps.clone(), id_graph, self.governance.clone());
+        }
+        Ok(entry.tx.clone())
+    }
+
     pub async fn ingest_raw(
         &self,
         api_key: &str,
@@ -278,11 +443,6 @@ impl IngestService {
         server_now_ms: i64,
     ) -> Result<IngestResponse> {
         let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
-        let id_graph = self
-            .storage
-            .identity_router()
-            .get_or_open(project_id)
-            .await?;
         let rules = self.governance.lexicon_rules(project_id);
         let num_buckets = ps.config().num_buckets;
         let dict = ps.dictionary();
@@ -293,8 +453,7 @@ impl IngestService {
         let rejected = std::mem::take(&mut batch.rejected);
         let profile_calls = std::mem::take(&mut batch.profile_calls);
 
-        type PropTypeList = Vec<(String, &'static str)>;
-        let mut by_bucket: BTreeMap<u8, Vec<(WireEvent, u32, u64)>> = BTreeMap::new();
+        let mut by_bucket: BTreeMap<u8, Vec<Candidate>> = BTreeMap::new();
         let mut intra_batch_seen: HashSet<(u8, u64)> = HashSet::with_capacity(batch.len());
         let mut new_events_in_batch: HashSet<String> = HashSet::new();
         let mut new_prop_keys_in_batch: HashSet<String> = HashSet::new();
@@ -356,9 +515,8 @@ impl IngestService {
                 server_now_ms,
             );
 
-            // 5. Dense u32 Identity Interning
-            let uid = id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-            by_bucket.entry(bucket_id).or_default().push((ev, uid, fp));
+            // 5. Identity interning, row building and L0 insertion happen in the processor.
+            by_bucket.entry(bucket_id).or_default().push((ev, fp));
         }
 
         // 6. Enforce bounded L0 high-water backpressure BEFORE flushing identities or appending WALs.
@@ -366,18 +524,14 @@ impl IngestService {
             ps.check_l0_backpressure(bucket_id)?;
         }
 
-        // 7. Flush interned u32 identities durably BEFORE writing WAL or scheduling L1 flushes!
-        if !by_bucket.is_empty() && id_graph.has_pending_mutations() {
-            id_graph.flush().await?;
-        }
-
         // 8. Group commit per bucket (`P0-2`). Each request queues its events, then takes the bucket
         //    append lock. Whoever holds the lock writes ONE WAL record for everything queued (up to
         //    `WAL_GROUP_MAX_BYTES`), so there is one PUT in flight per bucket log and requests that
-        //    arrive during it share the next one. Under the lock, as before (`P1-01`, `P1-02`):
-        //    re-check dedup -> durable WAL append -> L0 append -> commit dedup; a request is
-        //    answered only after the record holding its events is durable.
-        //    L0 -> L1 segment flushes are scheduled asynchronously so ingestion never blocks on storage segment creation!
+        //    arrive during it share the next one. Under the lock (`P1-01`, `P1-02`): re-check dedup
+        //    -> durable WAL append -> commit dedup -> hand the record to the processor. A request
+        //    is answered once the record holding its events is durable; the processor makes it
+        //    queryable (interning, rows, L0, flush scheduling) in WAL order, off the request path.
+        let processor = self.processor_for(project_id, &ps).await?;
         let queues = self
             .wal_groups
             .entry(project_id.to_string())
@@ -393,13 +547,14 @@ impl IngestService {
             futures::future::try_join_all(by_bucket.into_iter().map(|(bucket_id, candidates)| {
                 let ps = ps.clone();
                 let queues = queues.clone();
+                let processor = processor.clone();
                 async move {
                     let queue = &queues[bucket_id as usize];
                     let enqueue = |candidates: Vec<Candidate>| {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         let bytes = candidates
                             .iter()
-                            .map(|(ev, _, _)| approx_event_bytes(ev))
+                            .map(|(ev, _)| approx_event_bytes(ev))
                             .sum();
                         queue.lock().push_back(GroupWaiter {
                             candidates,
@@ -409,157 +564,120 @@ impl IngestService {
                         rx
                     };
                     let mut rx = enqueue(candidates);
-                    let (outcome, should_flush) = {
-                        let append_guard = ps.lock_bucket_append(bucket_id).await;
-                        let outcome = loop {
-                            use tokio::sync::oneshot::error::TryRecvError;
-                            match rx.try_recv() {
-                                // An earlier lock holder wrote our events.
-                                Ok(Ok(outcome)) => break outcome,
-                                // The record carrying our events failed: write them ourselves.
-                                Ok(Err(candidates)) => rx = enqueue(candidates),
-                                Err(TryRecvError::Empty) => {}
-                                Err(TryRecvError::Closed) => return Err(IngestError::Storage(
-                                    StorageError::Io(std::io::Error::other(
+                    let append_guard = ps.lock_bucket_append(bucket_id).await;
+                    let outcome = loop {
+                        use tokio::sync::oneshot::error::TryRecvError;
+                        match rx.try_recv() {
+                            // An earlier lock holder wrote our events.
+                            Ok(Ok(outcome)) => break outcome,
+                            // The record carrying our events failed: write them ourselves.
+                            Ok(Err(candidates)) => rx = enqueue(candidates),
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Closed) => {
+                                return Err(IngestError::Storage(StorageError::Io(
+                                    std::io::Error::other(
                                         "WAL group write was abandoned before completing; retry",
-                                    )),
-                                )),
+                                    ),
+                                )))
                             }
+                        }
 
-                            let mut group = Vec::new();
-                            let mut group_bytes = 0usize;
-                            {
-                                let mut q = queue.lock();
-                                while let Some(w) = q.front() {
-                                    if !group.is_empty()
-                                        && group_bytes + w.bytes > WAL_GROUP_MAX_BYTES
-                                    {
-                                        break;
-                                    }
-                                    group_bytes += w.bytes;
-                                    group.extend(q.pop_front());
+                        let mut group = Vec::new();
+                        let mut group_bytes = 0usize;
+                        {
+                            let mut q = queue.lock();
+                            while let Some(w) = q.front() {
+                                if !group.is_empty() && group_bytes + w.bytes > WAL_GROUP_MAX_BYTES
+                                {
+                                    break;
                                 }
+                                group_bytes += w.bytes;
+                                group.extend(q.pop_front());
                             }
+                        }
 
-                            let mut seen_in_group: HashSet<u64> = HashSet::new();
-                            let mut to_append = Vec::new();
-                            let mut committed_fps = Vec::new();
-                            // Per waiter: where its events start in `to_append`, and its dedup count.
-                            let mut spans = Vec::with_capacity(group.len());
-                            for w in &group {
-                                let start = to_append.len();
-                                let mut waiter_deduped = 0usize;
-                                for (ev, uid, fp) in &w.candidates {
-                                    if self.dedup.contains(
-                                        project_id,
-                                        bucket_id,
-                                        *fp,
-                                        server_now_ms,
-                                    ) || !seen_in_group.insert(*fp)
-                                    {
-                                        waiter_deduped += 1;
-                                        continue;
-                                    }
-                                    committed_fps.push(*fp);
-                                    to_append.push((ev.clone(), *uid));
+                        let mut seen_in_group: HashSet<u64> = HashSet::new();
+                        let mut to_append = Vec::new();
+                        let mut committed_fps = Vec::new();
+                        // Per waiter: where its events start in `to_append`, and its dedup count.
+                        let mut spans = Vec::with_capacity(group.len());
+                        for w in &group {
+                            let start = to_append.len();
+                            let mut waiter_deduped = 0usize;
+                            for (ev, fp) in &w.candidates {
+                                if self
+                                    .dedup
+                                    .contains(project_id, bucket_id, *fp, server_now_ms)
+                                    || !seen_in_group.insert(*fp)
+                                {
+                                    waiter_deduped += 1;
+                                    continue;
                                 }
-                                spans.push((start, waiter_deduped));
+                                committed_fps.push(*fp);
+                                to_append.push(ev.clone());
                             }
+                            spans.push((start, waiter_deduped));
+                        }
 
-                            let written = if to_append.is_empty() {
-                                Ok(0)
-                            } else {
-                                ps.append_bucket_events_locked(
-                                    &append_guard,
-                                    bucket_id,
-                                    to_append.clone(),
-                                )
+                        let appended = to_append.len();
+                        let written = if to_append.is_empty() {
+                            Ok(None)
+                        } else {
+                            let batch = WireBatch::new(to_append);
+                            ps.log_events_locked(&append_guard, bucket_id, &batch, group_bytes)
                                 .await
-                            };
-                            // No await between the durable append and the replies: a request
-                            // dropped mid-write leaves either nothing or a fully answered group.
-                            match written {
-                                Ok(_) => {
-                                    self.dedup.commit_batch(
-                                        project_id,
+                                .map(|wal_seq| Some((wal_seq, batch.events)))
+                        };
+                        // No await between the durable append and the replies: a request
+                        // dropped mid-write leaves either nothing or a fully answered group.
+                        match written {
+                            Ok(logged) => {
+                                self.dedup.commit_batch(
+                                    project_id,
+                                    bucket_id,
+                                    &committed_fps,
+                                    server_now_ms,
+                                );
+                                if let Some((wal_seq, events)) = logged {
+                                    // Sent under the bucket lock, so the processor sees a
+                                    // bucket's records in `wal_seq` order. If the processor is
+                                    // gone the record is still durable and is applied by WAL
+                                    // replay on the next open.
+                                    let _ = processor.send(LoggedRecord {
                                         bucket_id,
-                                        &committed_fps,
-                                        server_now_ms,
-                                    );
-                                    for (i, w) in group.into_iter().enumerate() {
-                                        let (start, waiter_deduped) = spans[i];
-                                        let end = spans.get(i + 1).map_or(to_append.len(), |s| s.0);
-                                        let events = to_append[start..end]
-                                            .iter()
-                                            .map(|(ev, _)| ev.clone())
-                                            .collect();
-                                        let _ =
-                                            w.tx.send(Ok((end - start, waiter_deduped, events)));
-                                    }
+                                        wal_seq,
+                                        events,
+                                        fps: committed_fps,
+                                        bytes: group_bytes,
+                                    });
                                 }
-                                Err(e) => {
-                                    for w in group {
-                                        let _ = w.tx.send(Err(w.candidates));
-                                    }
-                                    // Ours was in the failed record: report the failure. Otherwise
-                                    // it is still queued; keep going.
-                                    if matches!(rx.try_recv(), Ok(Err(_))) {
-                                        return Err(IngestError::Storage(e));
-                                    }
+                                for (i, w) in group.into_iter().enumerate() {
+                                    let (start, waiter_deduped) = spans[i];
+                                    let end = spans.get(i + 1).map_or(appended, |s| s.0);
+                                    let _ = w.tx.send(Ok((end - start, waiter_deduped)));
                                 }
                             }
-                        };
-                        (outcome, ps.should_flush_bucket(bucket_id))
+                            Err(e) => {
+                                for w in group {
+                                    let _ = w.tx.send(Err(w.candidates));
+                                }
+                                // Ours was in the failed record: report the failure. Otherwise
+                                // it is still queued; keep going.
+                                if matches!(rx.try_recv(), Ok(Err(_))) {
+                                    return Err(IngestError::Storage(e));
+                                }
+                            }
+                        }
                     };
-
-                    if should_flush {
-                        ps.schedule_background_flush(bucket_id);
-                    }
-
+                    drop(append_guard);
                     Ok::<_, IngestError>(outcome)
                 }
             }))
             .await?;
 
-        let mut discovery_map: HashMap<String, (u64, PropTypeList)> = HashMap::new();
-        for (local_accepted, local_deduped, appended_events) in bucket_results {
+        for (local_accepted, local_deduped) in bucket_results {
             accepted += local_accepted;
             deduped += local_deduped;
-            for ev in &appended_events {
-                let disc = discovery_map
-                    .entry(ev.event_name.clone())
-                    .or_insert_with(|| {
-                        let ptypes = ev
-                            .props
-                            .iter()
-                            .map(|(k, v)| {
-                                let t = match v {
-                                    PropValue::Null => "null",
-                                    PropValue::Bool(_) => "bool",
-                                    PropValue::Int(_) => "int",
-                                    PropValue::Float(_) => "float",
-                                    PropValue::Str(_) => "string",
-                                };
-                                (k.clone(), t)
-                            })
-                            .collect();
-                        (0, ptypes)
-                    });
-                disc.0 += 1;
-            }
-        }
-
-        if !discovery_map.is_empty() {
-            let items = discovery_map
-                .into_iter()
-                .map(|(event_name, (count, props))| DiscoveredEventSchema {
-                    project_id: project_id.to_string(),
-                    event_name,
-                    count,
-                    props,
-                })
-                .collect();
-            self.governance.record_discovery(items);
         }
 
         self.metrics.record(
@@ -569,6 +687,10 @@ impl IngestService {
             server_now_ms,
         );
 
+        if !profile_calls.is_empty() {
+            // `identify` / `alias` in a batch act on that batch's events, as before.
+            ps.wait_applied(std::time::Duration::from_secs(1)).await;
+        }
         Ok(IngestResponse {
             status: "ok".to_string(),
             accepted,
@@ -658,6 +780,8 @@ impl IngestService {
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
             .await?;
+        // Keep the old order: events acknowledged before this call get their ids first.
+        ps.wait_applied(std::time::Duration::from_secs(1)).await;
         let num_buckets = ps.config().num_buckets;
         let id_graph = self
             .storage

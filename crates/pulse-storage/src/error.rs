@@ -35,6 +35,16 @@ pub enum StorageError {
     #[error("mvcc manifest conflict after retries")]
     ManifestConflict,
 
+    /// `what` is `"l0"` (rows in memory not yet in a segment) or `"log"` (events written to the
+    /// WAL and not yet applied).
+    #[error("{what} backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
+    Backpressure {
+        project_id: String,
+        what: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
+
     #[error("this node does not hold the writer lease for project '{project_id}'")]
     NotWriter { project_id: String },
 

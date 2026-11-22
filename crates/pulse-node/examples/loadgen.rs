@@ -220,6 +220,24 @@ async fn main() {
     let deadline = Instant::now() + Duration::from_secs(o.duration);
     let started = Instant::now();
 
+    // Acknowledged units in each five-second window, to see stalls a whole-run mean hides.
+    let sampler = {
+        let units = units.clone();
+        tokio::spawn(async move {
+            let mut samples = Vec::new();
+            let mut last = 0u64;
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.tick().await;
+            while Instant::now() + Duration::from_secs(5) <= deadline {
+                tick.tick().await;
+                let now = units.load(Ordering::Relaxed);
+                samples.push((now - last) / 5);
+                last = now;
+            }
+            samples
+        })
+    };
+
     let mut tasks = Vec::new();
     for w in 0..o.concurrency {
         let (o, client, units, bytes_sent) =
@@ -289,6 +307,7 @@ async fn main() {
         }
     }
     let secs = started.elapsed().as_secs_f64();
+    let samples = sampler.await.unwrap();
     lat.sort_unstable();
     let pct = |p: f64| -> f64 {
         if lat.is_empty() {
@@ -306,6 +325,7 @@ async fn main() {
             "requests": lat.len(),
             "ok_units": ok,
             "units_per_sec": (ok as f64 / secs).round(),
+            "units_per_sec_5s_samples": samples,
             "mb_per_sec": ((bytes_sent.load(Ordering::Relaxed) as f64 / secs / 1e6) * 100.0).round() / 100.0,
             "avg_req_bytes": bytes_sent.load(Ordering::Relaxed) / lat.len().max(1) as u64,
             "latency_ms": { "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99), "max": pct(1.0) },

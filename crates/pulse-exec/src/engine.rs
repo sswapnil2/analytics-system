@@ -168,7 +168,7 @@ impl QueryEngine {
 
     /// Pre-loads segment headers and commonly queried property columns into the cache (`EN-3`).
     pub async fn warm_project_cache(&self, project_id: &str) -> Result<usize> {
-        let ps = self.storage.get_or_open_project(project_id).await?;
+        let ps = self.storage.open_for_read(project_id).await?;
         let snap = ps.snapshot();
         let cat = self.catalogs.for_project(project_id);
         let warm_props: Vec<String> = ["city", "platform", "variant", "flag_key", "amount"]
@@ -199,7 +199,7 @@ impl QueryEngine {
         query: &InsightsQuery,
     ) -> Result<InsightsResult> {
         self.with_deadline(project_id, async {
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -223,7 +223,7 @@ impl QueryEngine {
         query: &FunnelQuery,
     ) -> Result<FunnelResult> {
         self.with_deadline(project_id, async {
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -305,7 +305,7 @@ impl QueryEngine {
         query: &RetentionQuery,
     ) -> Result<RetentionResult> {
         self.with_deadline(project_id, async {
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -325,7 +325,7 @@ impl QueryEngine {
 
     pub async fn query_flows(&self, project_id: &str, query: &FlowsQuery) -> Result<FlowsResult> {
         self.with_deadline(project_id, async {
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -350,7 +350,7 @@ impl QueryEngine {
     ) -> Result<(u64, u64)> {
         self.with_deadline(project_id, async {
             let t0 = Instant::now();
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -384,7 +384,7 @@ impl QueryEngine {
             let def = def_ref.clone();
             drop(def_ref);
 
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -413,7 +413,7 @@ impl QueryEngine {
             let def = def_ref.clone();
             drop(def_ref);
 
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -449,7 +449,7 @@ impl QueryEngine {
         mask_ids: bool,
     ) -> Result<Vec<ExportedEventRow>> {
         self.with_deadline(project_id, async {
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
@@ -564,7 +564,7 @@ impl QueryEngine {
                 }
             }
 
-            let ps = self.storage.get_or_open_project(project_id).await?;
+            let ps = self.storage.open_for_read(project_id).await?;
             let snap = ps.snapshot();
             let id_graph = self
                 .storage
