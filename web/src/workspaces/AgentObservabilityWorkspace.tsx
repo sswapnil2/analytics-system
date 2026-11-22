@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Bot, Check, ChevronDown, ChevronRight, Link2, PlayCircle, Plus, Search, Trash2, X } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleX, Copy, Link2, PlayCircle, Plus, Search, Trash2, X } from "lucide-react";
 import {
   AgentAnalytics,
   AgentBreakdownRow,
@@ -16,7 +16,8 @@ import {
   isAbortError,
 } from "../api/client";
 import { useAccess } from "../auth/access";
-import { EmptyState, ErrorNotice, ListSkeleton, PageHeader, Panel, btn, field, fieldLabel } from "../components/ui";
+import { EmptyState, ErrorNotice, Kbd, ListSkeleton, PageHeader, Panel, Segmented, Tabs, btn, field, fieldLabel } from "../components/ui";
+import { niceTicks } from "../lib/chart";
 import { formatScore, formatUsd, orderSpanTree, toChatMessages } from "../lib/agentTrace";
 import { displayUserId, errorMessage, formatCount, formatDate, formatDateTime, formatDuration, formatPercent } from "../lib/format";
 
@@ -30,10 +31,10 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "experiments", label: "Experiments" },
 ];
 const RANGES = [
-  { days: 1, label: "24 hours" },
-  { days: 7, label: "7 days" },
-  { days: 30, label: "30 days" },
-  { days: 90, label: "90 days" },
+  { days: 1, label: "24h" },
+  { days: 7, label: "7D" },
+  { days: 30, label: "30D" },
+  { days: 90, label: "90D" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -119,7 +120,13 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
   return (
     <span
       className={`whitespace-nowrap rounded px-1.5 py-0.5 text-xs font-medium ${
-        ok ? "bg-ok-soft text-ok" : running ? "bg-sunken text-muted" : "bg-warn-soft text-warn"
+        ok
+          ? "bg-ok-soft text-ok"
+          : running
+            ? "bg-sunken text-muted"
+            : status === "timeout" || status === "cancelled"
+              ? "bg-warn-soft text-warn"
+              : "bg-danger-soft text-danger"
       }`}
     >
       {ok ? "Succeeded" : running ? "Running" : status === "timeout" ? "Timed out" : status === "cancelled" ? "Cancelled" : "Failed"}
@@ -131,7 +138,7 @@ const ResultBadge: React.FC<{ ev: AgentEvaluation }> = ({ ev }) =>
   ev.error ? (
     <span className="whitespace-nowrap rounded bg-sunken px-1.5 py-0.5 text-xs font-medium text-muted">Couldn't run</span>
   ) : ev.passed === false ? (
-    <span className="whitespace-nowrap rounded bg-warn-soft px-1.5 py-0.5 text-xs font-medium text-warn">Failed</span>
+    <span className="whitespace-nowrap rounded bg-danger-soft px-1.5 py-0.5 text-xs font-medium text-danger">Failed</span>
   ) : (
     <span className="whitespace-nowrap rounded bg-ok-soft px-1.5 py-0.5 text-xs font-medium text-ok">Passed</span>
   );
@@ -175,7 +182,7 @@ const useAction = () => {
     }
   };
   const note = msg && (
-    <span role="status" className={`text-sm ${msg.ok ? "text-ok" : "text-warn"}`}>
+    <span role="status" className={`text-sm ${msg.ok ? "text-ok" : "text-danger"}`}>
       {msg.text}
     </span>
   );
@@ -214,7 +221,7 @@ export const AgentObservabilityWorkspace: React.FC<{ projectId: string; refreshT
   };
   const setOpenTrace = useCallback((id: string | null) => {
     setOpenTraceState(id);
-    setHashParams({ trace: id });
+    setHashParams({ trace: id, step: null });
   }, []);
   const setDays = (d: number) => {
     setDaysState(d);
@@ -257,18 +264,7 @@ export const AgentObservabilityWorkspace: React.FC<{ projectId: string; refreshT
         description="How your LLM agents behave in production: every run, the steps inside it, what it cost, and how it scored."
         actions={
           ever.data.total > 0 && (
-            <select
-              aria-label="Time range"
-              className={field}
-              value={days}
-              onChange={(e) => setDays(Number(e.target.value))}
-            >
-              {RANGES.map((r) => (
-                <option key={r.days} value={r.days}>
-                  Last {r.label}
-                </option>
-              ))}
-            </select>
+            <Segmented label="Time range" options={RANGES.map((r) => ({ value: r.days, label: r.label }))} value={days} onChange={setDays} />
           )
         }
       />
@@ -276,22 +272,8 @@ export const AgentObservabilityWorkspace: React.FC<{ projectId: string; refreshT
         <SetupGuide />
       ) : (
         <>
-          <div role="tablist" aria-label="AI agent views" className="flex flex-wrap gap-1 border-b border-line">
-            {TABS.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                aria-selected={tab === t.id}
-                onClick={() => setTab(t.id)}
-                className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
-                  tab === t.id ? "border-brand text-ink" : "border-transparent text-muted hover:text-ink"
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
+          <Tabs label="AI agent views" tabs={TABS} value={tab} onChange={setTab} panelId="agents-panel" />
+          <div role="tabpanel" id="agents-panel" aria-labelledby={`agents-panel-tab-${tab}`}>
           {tab === "overview" && <Overview a={analytics.data} onDrill={drill} />}
           {tab === "traces" && (
             <Traces
@@ -310,6 +292,7 @@ export const AgentObservabilityWorkspace: React.FC<{ projectId: string; refreshT
           )}
           {tab === "datasets" && <Datasets projectId={projectId} refreshToken={refreshToken} />}
           {tab === "experiments" && <Experiments projectId={projectId} refreshToken={refreshToken} />}
+          </div>
         </>
       )}
     </div>
@@ -380,7 +363,10 @@ const Overview: React.FC<{ a: AgentAnalytics; onDrill: (f: Partial<Filters>) => 
       </Panel>
     );
   }
-  const max = Math.max(1, ...a.timeseries.map((b) => b.executions));
+  // At least 3 so a quiet week gets whole-number ticks.
+  const ticks = niceTicks(Math.max(3, ...a.timeseries.map((b) => b.executions)), 3);
+  const top = ticks[ticks.length - 1];
+  const labelEvery = Math.ceil(a.timeseries.length / 10);
   const sources = Object.entries(a.failure_sources ?? {}).sort((x, y) => y[1] - x[1]);
   const hb = hover === null ? null : a.timeseries[hover];
   return (
@@ -415,27 +401,57 @@ const Overview: React.FC<{ a: AgentAnalytics; onDrill: (f: Partial<Filters>) => 
           meta={
             hb
               ? `${formatDate(hb.bucket_ts_ms)}: ${formatCount(hb.executions)} runs, ${formatCount(hb.errors)} failed, p95 ${formatDuration(hb.p95_latency_ms)}`
-              : "Hover a day for details"
+              : "Point at a day for details"
           }
         >
-          <div className="flex h-36 items-end gap-1" role="img" aria-label="Agent runs per day" onMouseLeave={() => setHover(null)}>
-            {a.timeseries.map((b, i) => (
-              <div
-                key={b.bucket_ts_ms}
-                className="flex h-full flex-1 items-end"
-                onMouseEnter={() => setHover(i)}
-                aria-label={`${formatDate(b.bucket_ts_ms)}: ${b.executions} runs`}
-              >
-                <div
-                  className={`w-full rounded-t bg-brand ${hover !== null && hover !== i ? "opacity-50" : ""}`}
-                  style={{ height: `${Math.max(2, (b.executions / max) * 100)}%` }}
-                />
+          {/* Value axis on the left, one focusable column per day, failed runs hatched on top. */}
+          <div className="flex gap-2">
+            <div className="tabular flex h-40 w-8 shrink-0 flex-col-reverse justify-between text-right text-2xs text-faint" aria-hidden="true">
+              {ticks.map((v) => (
+                <span key={v} className="leading-none">{formatCount(v)}</span>
+              ))}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="relative h-40" onMouseLeave={() => setHover(null)}>
+                <div className="absolute inset-0 flex flex-col-reverse justify-between" aria-hidden="true">
+                  {ticks.map((v) => (
+                    <span key={v} className="h-px bg-line" />
+                  ))}
+                </div>
+                <ul className="relative flex h-full items-end gap-1" aria-label="Agent runs per day">
+                  {a.timeseries.map((b, i) => (
+                    <li
+                      key={b.bucket_ts_ms}
+                      tabIndex={0}
+                      className="flex h-full flex-1 flex-col justify-end rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-brand"
+                      onMouseEnter={() => setHover(i)}
+                      onFocus={() => setHover(i)}
+                      onBlur={() => setHover(null)}
+                      aria-label={`${formatDate(b.bucket_ts_ms)}: ${b.executions} runs, ${b.errors} failed`}
+                    >
+                      <div
+                        className={`flex w-full flex-col overflow-hidden rounded-t transition-[height,opacity] duration-300 ease-out ${hover !== null && hover !== i ? "opacity-50" : ""}`}
+                        style={{ height: `${b.executions ? Math.max(2, (b.executions / top) * 100) : 0}%` }}
+                      >
+                        {b.errors > 0 && <div className="hatch-drop-strong shrink-0" style={{ height: `${(b.errors / b.executions) * 100}%`, minHeight: 3 }} />}
+                        <div className="flex-1 bg-brand" />
+                      </div>
+                    </li>
+                  ))}
+                </ul>
               </div>
-            ))}
+              <div className="tabular mt-1.5 flex gap-1 text-2xs text-faint" aria-hidden="true">
+                {a.timeseries.map((b, i) => (
+                  <span key={b.bucket_ts_ms} className="flex-1 truncate text-center">
+                    {i % labelEvery === 0 ? formatDate(b.bucket_ts_ms, { day: "numeric", month: "short", year: undefined }) : ""}
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
-          <div className="mt-2 flex justify-between text-xs text-faint tabular">
-            <span>{a.timeseries[0] ? formatDate(a.timeseries[0].bucket_ts_ms) : ""}</span>
-            <span>{a.timeseries.at(-1) ? formatDate(a.timeseries.at(-1)!.bucket_ts_ms) : ""}</span>
+          <div className="mt-3 flex items-center gap-4 text-xs text-muted">
+            <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-brand" aria-hidden="true" />Succeeded</span>
+            <span className="inline-flex items-center gap-1.5"><span className="hatch-drop-strong h-2.5 w-2.5 rounded-sm" aria-hidden="true" />Failed</span>
           </div>
         </Panel>
         <Panel
@@ -625,10 +641,19 @@ const Traces: React.FC<{
   }, [load]);
 
   const clear = () => setFilters({ ...NO_FILTERS, sort });
+  const openIdx = rows.findIndex((r) => r.trace_id === openTrace);
 
   return (
     <div className="space-y-5">
-      {openTrace && <TraceView projectId={projectId} traceId={openTrace} onClose={() => setOpenTrace(null)} />}
+      {openTrace && (
+        <TraceView
+          projectId={projectId}
+          traceId={openTrace}
+          onClose={() => setOpenTrace(null)}
+          onPrev={openIdx > 0 ? () => setOpenTrace(rows[openIdx - 1].trace_id) : undefined}
+          onNext={openIdx >= 0 && openIdx < rows.length - 1 ? () => setOpenTrace(rows[openIdx + 1].trace_id) : undefined}
+        />
+      )}
       <Panel title="Runs" meta={`${formatCount(total)} ${filtered ? "matching" : "in this period"}`}>
         <div className="mb-4 flex flex-wrap items-end gap-2">
           <form
@@ -738,7 +763,6 @@ const Traces: React.FC<{
                       onClick={(e) => {
                         e.stopPropagation();
                         setOpenTrace(t.trace_id);
-                        window.scrollTo({ top: 0, behavior: "smooth" });
                       }}
                     >
                       {formatDateTime(t.start_ts_ms, { dateStyle: "medium", timeStyle: "short" })}
@@ -776,75 +800,241 @@ const Traces: React.FC<{
 
 // ---------------------------------------------------------------------------
 
+const CopyButton: React.FC<{ text: () => string; label: string }> = ({ text, label }) => {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      className="inline-flex items-center gap-1 text-xs font-normal text-muted hover:text-ink"
+      onClick={() => {
+        void navigator.clipboard?.writeText(text()).then(() => {
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+};
+
 const Json: React.FC<{ value: unknown }> = ({ value }) =>
   value === null || value === undefined ? (
     <p className="text-xs text-faint">Not captured</p>
   ) : (
-    <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-sunken p-3 text-xs text-ink">
+    <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-sunken p-3 font-mono text-xs text-ink">
       {typeof value === "string" ? value : JSON.stringify(value, null, 2)}
     </pre>
   );
 
 /** Chat messages as a conversation when the payload is chat-shaped, raw JSON otherwise. */
-const Payload: React.FC<{ value: unknown }> = ({ value }) => {
+const Payload: React.FC<{ label: string; value: unknown }> = ({ label, value }) => {
   const [raw, setRaw] = useState(false);
   const msgs = useMemo(() => toChatMessages(value), [value]);
-  if (!msgs) return <Json value={value} />;
+  const has = value !== null && value !== undefined;
   return (
     <div>
-      {raw ? (
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-ink-2">{label}</p>
+        <span className="flex items-center gap-3">
+          {msgs && (
+            <button type="button" className="text-xs text-muted hover:text-ink" aria-pressed={raw} onClick={() => setRaw(!raw)}>
+              {raw ? "Conversation" : "Raw JSON"}
+            </button>
+          )}
+          {has && (
+            <CopyButton
+              label={`Copy ${label.toLowerCase()}`}
+              text={() => (typeof value === "string" ? value : JSON.stringify(value, null, 2))}
+            />
+          )}
+        </span>
+      </div>
+      {!msgs || raw ? (
         <Json value={value} />
       ) : (
         <ol className="max-h-80 space-y-2 overflow-auto">
           {msgs.map((m, i) => (
             <li key={i} className={`rounded-lg px-3 py-2 text-sm ${m.role === "assistant" ? "bg-brand-soft" : "bg-sunken"}`}>
-              <p className="mb-0.5 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted">{m.role}</p>
+              <p className="mb-0.5 text-2xs font-semibold uppercase tracking-wide text-muted">{m.role}</p>
               <p className="whitespace-pre-wrap break-words text-ink">{m.text || <span className="text-faint">(empty)</span>}</p>
             </li>
           ))}
         </ol>
       )}
-      <button type="button" className="mt-1 text-xs text-muted hover:text-ink hover:underline" onClick={() => setRaw(!raw)}>
-        {raw ? "Show as conversation" : "Show raw JSON"}
-      </button>
     </div>
   );
 };
 
-const TraceView: React.FC<{ projectId: string; traceId: string; onClose: () => void }> = ({ projectId, traceId, onClose }) => {
+const typing = (e: KeyboardEvent) =>
+  e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test((e.target as HTMLElement)?.tagName ?? "") ||
+  (e.target as HTMLElement)?.isContentEditable || document.querySelector('[role="dialog"]') !== null;
+
+// Step name and waterfall share these columns in the axis row and every step row.
+const STEP_GRID = "grid grid-cols-[minmax(0,1fr)_3.75rem] items-center gap-x-3 md:grid-cols-[minmax(0,5fr)_minmax(0,4fr)_3.75rem]";
+
+/**
+ * One run: the step tree with a waterfall on the left, the selected step on the right.
+ * The deepest failed step is selected on open, so the cause is on screen without a click.
+ * Keys: ↑/↓ or J/K move, ←/→ collapse and expand, [ and ] change run, Esc closes.
+ * Design notes: docs/design/trace-view-decision.md.
+ */
+const TraceView: React.FC<{
+  projectId: string;
+  traceId: string;
+  onClose: () => void;
+  onPrev?: () => void;
+  onNext?: () => void;
+}> = ({ projectId, traceId, onClose, onPrev, onNext }) => {
   const { canEdit } = useAccess();
   const { data, error, reload } = useLoad<AgentTraceDetail>((s) => api.getAgentTrace(projectId, traceId, s), [projectId, traceId]);
-  const [openSpan, setOpenSpan] = useState<string | null>(null);
+  const [sel, setSelState] = useState<string | null>(() => hashParams().get("step"));
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [panel, setPanel] = useState<"dataset" | "review" | null>(null);
   const action = useAction();
   const [copied, setCopied] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const treeRef = useRef<HTMLDivElement>(null);
 
-  const close = (
-    <button type="button" className={btn.ghost} onClick={onClose} aria-label="Close run">
-      <X className="h-4 w-4" />
-    </button>
+  const setSel = useCallback((id: string | null) => {
+    setSelState(id);
+    setHashParams({ step: id });
+  }, []);
+
+  const loaded = data && data.trace.trace_id === traceId ? data : null;
+  const rows = useMemo(() => (loaded ? orderSpanTree(loaded.spans) : []), [loaded]);
+  // Rows under a collapsed step are hidden; `kids` counts everything beneath each step.
+  const { visible, kids } = useMemo(() => {
+    const kids = new Map<string, number>();
+    const stack: { id: string; depth: number }[] = [];
+    const visible: typeof rows = [];
+    let hideBelow = Infinity;
+    for (const r of rows) {
+      while (stack.length && stack[stack.length - 1].depth >= r.depth) stack.pop();
+      for (const a of stack) kids.set(a.id, (kids.get(a.id) ?? 0) + 1);
+      stack.push({ id: r.span.span_id, depth: r.depth });
+      if (r.depth <= hideBelow) {
+        hideBelow = collapsed.has(r.span.span_id) ? r.depth : Infinity;
+        visible.push(r);
+      }
+    }
+    return { visible, kids };
+  }, [rows, collapsed]);
+  // The cause is usually the deepest failed step: its parents only failed because it did.
+  const culprit = useMemo(() => {
+    const failed = rows.filter((r) => r.span.status === "error");
+    return failed.length ? failed.reduce((a, b) => (b.depth > a.depth ? b : a)).span.span_id : null;
+  }, [rows]);
+
+  // A newly opened run starts on its failed step (or its first step) and scrolls into view.
+  useEffect(() => {
+    if (!loaded) return;
+    setCollapsed(new Set());
+    setPanel(null);
+    setSelState((cur) => {
+      const next = cur && rows.some((r) => r.span.span_id === cur) ? cur : (culprit ?? rows[0]?.span.span_id ?? null);
+      if (next !== cur) setHashParams({ step: next });
+      return next;
+    });
+    rootRef.current?.scrollIntoView({ block: "nearest" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded?.trace.trace_id]);
+  // Closing the run drops its step from the link.
+  useEffect(() => () => setHashParams({ step: null }), []);
+
+  const move = useCallback(
+    (delta: number, focus: boolean) => {
+      if (!visible.length) return;
+      const i = visible.findIndex((r) => r.span.span_id === sel);
+      const next = visible[Math.max(0, Math.min(visible.length - 1, (i < 0 ? 0 : i) + delta))].span.span_id;
+      setSel(next);
+      const el = treeRef.current?.querySelector<HTMLElement>(`[data-span="${CSS.escape(next)}"]`);
+      el?.scrollIntoView({ block: "nearest" });
+      if (focus) el?.focus();
+    },
+    [visible, sel, setSel],
   );
-  if (error) return <Panel title="Run" actions={close}><ErrorNotice message={error} onRetry={reload} /></Panel>;
-  if (!data || data.trace.trace_id !== traceId) return <Panel title="Run" actions={close}><ListSkeleton rows={4} /></Panel>;
+  const toggle = (id: string, open?: boolean) =>
+    setCollapsed((c) => {
+      const n = new Set(c);
+      if (open ?? c.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
 
-  const t = data.trace;
-  const t0 = Math.min(t.start_ts_ms, ...data.spans.map((s) => s.start_ts_ms));
-  const span = Math.max(1, ...data.spans.map((s) => s.start_ts_ms + s.duration_ms - t0), t.duration_ms);
-  const rows = orderSpanTree(data.spans);
-  const spanName = (id: string) => data.spans.find((s) => s.span_id === id)?.name ?? id;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (typing(e)) return;
+      if (e.key === "j") move(1, false);
+      else if (e.key === "k") move(-1, false);
+      else if (e.key === "[" && onPrev) onPrev();
+      else if (e.key === "]" && onNext) onNext();
+      else if (e.key === "Escape") onClose();
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [move, onPrev, onNext, onClose]);
+
+  const onTreeKey = (e: React.KeyboardEvent) => {
+    const cur = visible.find((r) => r.span.span_id === sel);
+    if (e.key === "ArrowDown") move(1, true);
+    else if (e.key === "ArrowUp") move(-1, true);
+    else if (e.key === "Home") move(-visible.length, true);
+    else if (e.key === "End") move(visible.length, true);
+    else if (e.key === "ArrowLeft" && cur && kids.get(cur.span.span_id) && !collapsed.has(cur.span.span_id)) toggle(cur.span.span_id, false);
+    else if (e.key === "ArrowRight" && cur && collapsed.has(cur.span.span_id)) toggle(cur.span.span_id, true);
+    else return;
+    e.preventDefault();
+  };
+
+  const nav = (
+    <>
+      <button type="button" className={btn.ghost} onClick={onPrev} disabled={!onPrev} aria-label="Previous run" title="Previous run  [" aria-keyshortcuts="[">
+        <ChevronUp className={`h-4 w-4 ${onPrev ? "" : "opacity-40"}`} />
+      </button>
+      <button type="button" className={btn.ghost} onClick={onNext} disabled={!onNext} aria-label="Next run" title="Next run  ]" aria-keyshortcuts="]">
+        <ChevronDown className={`h-4 w-4 ${onNext ? "" : "opacity-40"}`} />
+      </button>
+      <button type="button" className={btn.ghost} onClick={onClose} aria-label="Close run" title="Close  Esc" aria-keyshortcuts="Escape">
+        <X className="h-4 w-4" />
+      </button>
+    </>
+  );
+  if (error) return <div ref={rootRef}><Panel title="Run" actions={nav}><ErrorNotice message={error} onRetry={reload} /></Panel></div>;
+  if (!loaded) return <div ref={rootRef}><Panel title="Run" actions={nav}><ListSkeleton rows={4} /></Panel></div>;
+
+  const t = loaded.trace;
+  const t0 = Math.min(t.start_ts_ms, ...loaded.spans.map((s) => s.start_ts_ms));
+  const total = Math.max(1, ...loaded.spans.map((s) => s.start_ts_ms + s.duration_ms - t0), t.duration_ms);
+  const selected = loaded.spans.find((s) => s.span_id === sel) ?? null;
+  const culpritName = loaded.spans.find((s) => s.span_id === culprit)?.name;
   // Re-running evaluators appends results; show the newest per evaluator and step.
   const seenEval = new Set<string>();
-  const evals = data.evaluations.filter((ev) => {
+  const evals = loaded.evaluations.filter((ev) => {
     const k = `${ev.evaluator_id}|${ev.span_id ?? ""}`;
     return seenEval.has(k) ? false : (seenEval.add(k), true);
   });
+  const runEvalsList = evals.filter((ev) => !ev.span_id);
+  const failedEvalSteps = new Set(evals.filter((ev) => ev.span_id && ev.passed === false).map((ev) => ev.span_id));
 
   const runEvals = () =>
     action
       .run(() => api.runAgentTraceEvals(projectId, traceId), "Evaluators queued. Results appear in a few seconds.")
       .then((ok) => ok && window.setTimeout(reload, 2500));
 
+  const Stat: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
+    <span className="flex flex-col">
+      <span className="text-xs text-muted">{label}</span>
+      <span className="tabular text-sm text-ink">{children}</span>
+    </span>
+  );
+
   return (
+    <div ref={rootRef} className="scroll-mt-4">
     <Panel
       title={`${t.agent_name} ${t.agent_version}`}
       meta={formatDateTime(t.start_ts_ms, { dateStyle: "medium", timeStyle: "medium" })}
@@ -860,28 +1050,110 @@ const TraceView: React.FC<{ projectId: string; traceId: string; onClose: () => v
               });
             }}
           >
-            {copied ? <Check className="h-4 w-4" /> : <Link2 className="h-4 w-4" />} {copied ? "Copied" : "Copy link"}
+            {copied ? <Check className="h-4 w-4" /> : <Link2 className="h-4 w-4" />}
+            <span className="sr-only sm:not-sr-only">{copied ? "Copied" : "Copy link"}</span>
           </button>
           {t.session_id && (
             <a className={btn.ghost} href={replayHref(projectId, t.session_id)}>
-              <PlayCircle className="h-4 w-4" /> Session replay
+              <PlayCircle className="h-4 w-4" />
+              <span className="sr-only sm:not-sr-only">Session replay</span>
             </a>
           )}
-          {close}
+          {nav}
         </>
       }
     >
-      <div className="mb-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-ink-2">
+      <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-3">
         <StatusBadge status={t.status} />
-        <span className="tabular">{formatDuration(t.duration_ms)}</span>
-        <span className="tabular">{formatCount(t.total_tokens)} tokens</span>
-        <span className="tabular">{formatUsd(t.total_cost_usd)}</span>
-        {t.user_id && <span>User {displayUserId(t.user_id)}</span>}
-        <span className="text-xs text-faint">{t.trace_id}</span>
+        <Stat label="Duration">{formatDuration(t.duration_ms)}</Stat>
+        <Stat label="Tokens">{formatCount(t.total_tokens)}</Stat>
+        <Stat label="Cost">{formatUsd(t.total_cost_usd)}</Stat>
+        <Stat label="Steps">{formatCount(loaded.spans.length)}</Stat>
+        {t.user_id && <Stat label="User">{displayUserId(t.user_id)}</Stat>}
+        <span className="flex flex-col">
+          <span className="text-xs text-muted">Run id</span>
+          <span className="font-mono text-xs leading-5 text-ink-2">{t.trace_id}</span>
+        </span>
+      </div>
+
+      {t.error_message && (
+        <button
+          type="button"
+          disabled={!culprit}
+          onClick={() => culprit && setSel(culprit)}
+          className="mb-4 flex w-full items-start gap-2 rounded-lg bg-danger-soft px-3 py-2 text-left text-sm text-ink enabled:hover:ring-1 enabled:hover:ring-danger/40"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+          <span className="min-w-0 flex-1 break-words">
+            {t.error_type && <span className="font-semibold">{t.error_type}: </span>}
+            {t.error_message}
+          </span>
+          {culpritName && sel !== culprit && <span className="shrink-0 font-medium text-danger">Show {culpritName}</span>}
+        </button>
+      )}
+
+      <div className="grid rounded-lg border border-line lg:grid-cols-[minmax(0,1fr)_minmax(0,26rem)]">
+        <div className="min-w-0 border-b border-line lg:border-b-0 lg:border-r">
+          <div className={`${STEP_GRID} border-b border-line px-3 py-1.5 text-2xs text-muted`}>
+            <span>Step</span>
+            <span className="tabular hidden justify-between md:flex" aria-hidden="true">
+              {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+                <span key={f}>{f === 0 ? "0" : formatDuration(total * f)}</span>
+              ))}
+            </span>
+            <span className="text-right">Duration</span>
+          </div>
+          <div ref={treeRef} role="tree" aria-label="Steps in this run" onKeyDown={onTreeKey} className="divide-y divide-line">
+            {visible.map(({ span: s, depth }) => (
+              <SpanRow
+                key={s.span_id}
+                s={s}
+                depth={depth}
+                left={((s.start_ts_ms - t0) / total) * 100}
+                width={(s.duration_ms / total) * 100}
+                selected={sel === s.span_id}
+                children_={kids.get(s.span_id) ?? 0}
+                collapsed={collapsed.has(s.span_id)}
+                evalFailed={failedEvalSteps.has(s.span_id)}
+                onSelect={() => setSel(s.span_id)}
+                onToggle={() => toggle(s.span_id)}
+              />
+            ))}
+          </div>
+          <p className="hidden items-center gap-x-4 gap-y-1 border-t border-line px-3 py-2 text-xs text-muted lg:flex lg:flex-wrap">
+            <span><Kbd>J</Kbd> <Kbd>K</Kbd> step</span>
+            <span><Kbd>←</Kbd> <Kbd>→</Kbd> collapse, expand</span>
+            <span><Kbd>[</Kbd> <Kbd>]</Kbd> run</span>
+            <span><Kbd>Esc</Kbd> close</span>
+          </p>
+        </div>
+        <div className="min-w-0 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto" aria-live="polite">
+          {selected ? (
+            <SpanInspector
+              s={selected}
+              startOffset={selected.start_ts_ms - t0}
+              share={selected.duration_ms / total}
+              evals={evals.filter((ev) => ev.span_id === selected.span_id)}
+            />
+          ) : (
+            <p className="p-4 text-sm text-muted">This run recorded no steps.</p>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <h3 className="mb-2 text-sm font-semibold text-ink">Run evaluations</h3>
+        {evals.length === 0 ? (
+          <p className="text-sm text-muted">Not evaluated yet.{canEdit ? " Run evaluators or add a review below." : ""}</p>
+        ) : runEvalsList.length === 0 ? (
+          <p className="text-sm text-muted">Only individual steps were scored. Select a step to see its result.</p>
+        ) : (
+          <EvalList evals={runEvalsList} />
+        )}
       </div>
 
       {canEdit && (
-        <div className="mb-4 space-y-3 rounded-lg border border-line p-3">
+        <div className="mt-4 space-y-3 border-t border-line pt-4">
           <div className="flex flex-wrap items-center gap-2">
             <button type="button" className={btn.secondary} disabled={action.busy} onClick={() => void runEvals()}>
               Run evaluators
@@ -924,47 +1196,77 @@ const TraceView: React.FC<{ projectId: string; traceId: string; onClose: () => v
           )}
         </div>
       )}
+    </Panel>
+    </div>
+  );
+};
 
-      {t.error_message && (
-        <p className="mb-4 flex items-start gap-2 rounded-lg bg-warn-soft px-3 py-2 text-sm text-ink">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warn" />
-          {t.error_type ? `${t.error_type}: ` : ""}
-          {t.error_message}
+const EvalList: React.FC<{ evals: AgentEvaluation[] }> = ({ evals }) => (
+  <ul className="space-y-2">
+    {evals.map((ev) => (
+      <li key={ev.id} className="flex flex-wrap items-baseline gap-2 text-sm">
+        <ResultBadge ev={ev} />
+        <span className="font-medium text-ink">{ev.evaluator_name}</span>
+        {(ev.error ?? ev.reasoning) && <span className="min-w-0 break-words text-ink-2">{ev.error ?? ev.reasoning}</span>}
+      </li>
+    ))}
+  </ul>
+);
+
+const SPAN_KIND: Record<string, string> = { llm: "Model call", tool: "Tool call", retrieval: "Retrieval", agent: "Agent" };
+
+/** Everything about the selected step: what failed, what it cost, what went in and came out. */
+const SpanInspector: React.FC<{ s: AgentSpan; startOffset: number; share: number; evals: AgentEvaluation[] }> = ({
+  s,
+  startOffset,
+  share,
+  evals,
+}) => {
+  const Fact: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
+    <div className="min-w-0">
+      <dt className="text-xs text-muted">{label}</dt>
+      <dd className="tabular truncate text-sm text-ink">{children}</dd>
+    </div>
+  );
+  return (
+    <div className="space-y-4 p-4 text-sm">
+      <div>
+        <h3 className="break-words text-md font-semibold text-ink">{s.name}</h3>
+        <p className="text-xs text-muted">
+          {SPAN_KIND[s.span_type] ?? s.span_type} · starts at {startOffset <= 0 ? "0 ms" : formatDuration(startOffset)} ·{" "}
+          {formatPercent(share, 0)} of the run
+        </p>
+      </div>
+      {s.status === "error" && (
+        <p role="alert" className="flex items-start gap-2 rounded-lg bg-danger-soft px-3 py-2 text-ink">
+          <CircleX className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
+          <span className="min-w-0 break-words">
+            {s.error_type && <span className="font-semibold">{s.error_type}: </span>}
+            {s.error_message ?? "This step failed without an error message."}
+          </span>
         </p>
       )}
-
-      <ul className="divide-y divide-line rounded-lg border border-line" aria-label="Steps in this run">
-        {rows.map(({ span: s, depth }) => (
-          <SpanRow
-            key={s.span_id}
-            s={s}
-            depth={depth}
-            left={((s.start_ts_ms - t0) / span) * 100}
-            width={(s.duration_ms / span) * 100}
-            open={openSpan === s.span_id}
-            onToggle={() => setOpenSpan(openSpan === s.span_id ? null : s.span_id)}
-          />
-        ))}
-      </ul>
-
-      <div className="mt-5">
-        <h3 className="mb-2 text-sm font-semibold text-ink">Evaluations</h3>
-        {evals.length === 0 ? (
-          <p className="text-sm text-muted">Not evaluated yet.{canEdit ? " Use Run evaluators or Review above." : ""}</p>
-        ) : (
-          <ul className="space-y-2">
-            {evals.map((ev) => (
-              <li key={ev.id} className="flex flex-wrap items-baseline gap-2 text-sm">
-                <ResultBadge ev={ev} />
-                <span className="font-medium text-ink">{ev.evaluator_name}</span>
-                <span className="text-xs text-faint">{ev.span_id ? `step ${spanName(ev.span_id)}` : ev.target_type === "trace" ? "run" : ev.target_type}</span>
-                {(ev.error ?? ev.reasoning) && <span className="text-ink-2">{ev.error ?? ev.reasoning}</span>}
-              </li>
-            ))}
-          </ul>
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
+        <Fact label="Duration">{formatDuration(s.duration_ms)}</Fact>
+        {s.model && <Fact label="Model">{s.model}</Fact>}
+        {s.model && (
+          <Fact label="Tokens in / out">
+            {formatCount(s.input_tokens)} / {formatCount(s.output_tokens)}
+          </Fact>
         )}
-      </div>
-    </Panel>
+        {s.cost_usd > 0 && <Fact label="Cost">{formatUsd(s.cost_usd)}</Fact>}
+        {s.tool_name && <Fact label="Tool">{s.tool_name}</Fact>}
+        {s.tool_retry_count > 0 && <Fact label="Retries">{formatCount(s.tool_retry_count)}</Fact>}
+      </dl>
+      <Payload label="Input" value={s.input} />
+      <Payload label="Output" value={s.output} />
+      {evals.length > 0 && (
+        <div>
+          <p className="mb-1.5 text-xs font-semibold text-ink-2">Evaluations on this step</p>
+          <EvalList evals={evals} />
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -1023,7 +1325,7 @@ const ReviewForm: React.FC<{ onSubmit: (passed: boolean, note: string) => void; 
         <Check className="h-4 w-4 text-ok" /> Good run
       </button>
       <button type="button" className={btn.secondary} disabled={busy} onClick={() => onSubmit(false, note)}>
-        <X className="h-4 w-4 text-warn" /> Bad run
+        <X className="h-4 w-4 text-danger" /> Bad run
       </button>
     </div>
   );
@@ -1034,53 +1336,70 @@ const SpanRow: React.FC<{
   depth: number;
   left: number;
   width: number;
-  open: boolean;
+  selected: boolean;
+  /** Steps nested under this one, at any depth. */
+  children_: number;
+  collapsed: boolean;
+  evalFailed: boolean;
+  onSelect: () => void;
   onToggle: () => void;
-}> = ({ s, depth, left, width, open, onToggle }) => {
+}> = ({ s, depth, left, width, selected, children_, collapsed, evalFailed, onSelect, onToggle }) => {
   const failed = s.status === "error";
-  const detail = s.model
-    ? `${s.model} · ${formatCount(s.input_tokens)} in / ${formatCount(s.output_tokens)} out${s.cost_usd ? ` · ${formatUsd(s.cost_usd)}` : ""}`
-    : s.tool_name
-      ? `${s.tool_name}${s.tool_retry_count ? ` · ${s.tool_retry_count} retries` : ""}`
-      : "";
+  const tokens = s.input_tokens + s.output_tokens;
   return (
-    <li>
-      <button type="button" onClick={onToggle} aria-expanded={open} className="grid w-full grid-cols-12 items-center gap-3 px-3 py-2 text-left hover:bg-hover">
-        <span className="col-span-12 flex min-w-0 items-center gap-1.5 text-sm md:col-span-5" style={{ paddingLeft: depth * 16 }}>
-          {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-faint" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-faint" />}
-          <span className="rounded bg-sunken px-1.5 py-0.5 text-[0.6875rem] uppercase tracking-wide text-muted">{s.span_type}</span>
-          <span className={`truncate font-medium ${failed ? "text-warn" : "text-ink"}`}>{s.name}</span>
-        </span>
-        <span className="col-span-8 h-2 rounded bg-sunken md:col-span-5" aria-hidden>
-          <span
-            className={`block h-2 rounded ${failed ? "bg-warn" : "bg-brand"}`}
-            style={{ marginLeft: `${Math.min(99, left)}%`, width: `${Math.max(1, Math.min(100 - left, width))}%` }}
-          />
-        </span>
-        <span className="tabular col-span-4 text-right text-xs text-muted md:col-span-2">{formatDuration(s.duration_ms)}</span>
-      </button>
-      {open && (
-        <div className="space-y-3 border-t border-line bg-panel px-3 py-3 text-sm">
-          {detail && <p className="text-xs text-muted">{detail}</p>}
-          {s.error_message && (
-            <p className="text-warn">
-              {s.error_type ? `${s.error_type}: ` : ""}
-              {s.error_message}
-            </p>
-          )}
-          <div className="grid gap-3 md:grid-cols-2">
-            <div>
-              <p className="mb-1 text-xs font-semibold text-ink-2">Input</p>
-              <Payload value={s.input} />
-            </div>
-            <div>
-              <p className="mb-1 text-xs font-semibold text-ink-2">Output</p>
-              <Payload value={s.output} />
-            </div>
-          </div>
-        </div>
-      )}
-    </li>
+    <div
+      role="treeitem"
+      data-span={s.span_id}
+      aria-level={depth + 1}
+      aria-selected={selected}
+      aria-expanded={children_ ? !collapsed : undefined}
+      tabIndex={selected ? 0 : -1}
+      onClick={onSelect}
+      className={`${STEP_GRID} cursor-pointer gap-y-1 px-3 py-2 outline-none transition-colors duration-100 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand ${
+        selected ? "bg-brand-soft shadow-[inset_2px_0_0_rgb(var(--brand))]" : "hover:bg-hover"
+      }`}
+    >
+      <span className="flex min-w-0 items-center gap-1.5 text-sm" style={{ paddingLeft: Math.min(depth, 12) * 14 }}>
+        {children_ ? (
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-label={collapsed ? `Expand ${s.name}` : `Collapse ${s.name}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggle();
+            }}
+            className="-m-1 rounded p-1 text-faint hover:bg-hover hover:text-ink"
+          >
+            <ChevronRight className={`h-3.5 w-3.5 transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`} />
+          </button>
+        ) : (
+          <span className="w-3.5 shrink-0" />
+        )}
+        <span className={`shrink-0 rounded px-1.5 py-0.5 text-2xs uppercase tracking-wide text-muted ${selected ? "bg-panel" : "bg-sunken"}`}>{s.span_type}</span>
+        <span className={`truncate font-medium ${failed ? "text-danger" : "text-ink"}`}>{s.name}</span>
+        {failed && <CircleX className="h-3.5 w-3.5 shrink-0 text-danger" role="img" aria-label="Failed" />}
+        {!failed && evalFailed && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warn" role="img" aria-label="Failed an evaluation" />}
+        {collapsed && children_ > 0 && <span className="shrink-0 text-xs text-muted">+{children_}</span>}
+        {tokens > 0 && <span className="tabular ml-auto hidden shrink-0 pl-2 text-xs text-muted sm:inline">{formatCount(tokens)} tok</span>}
+      </span>
+      <span
+        className="order-last col-span-2 h-2 rounded md:order-none md:col-span-1"
+        aria-hidden="true"
+        // Quarter gridlines that line up with the axis labels above.
+        style={{
+          backgroundColor: selected ? "rgb(var(--panel))" : "rgb(var(--sunken))",
+          backgroundImage: "linear-gradient(to right, rgb(var(--line-strong)) 1px, transparent 1px)",
+          backgroundSize: "25% 100%",
+        }}
+      >
+        <span
+          className={`block h-2 rounded ${failed ? "bg-danger" : "bg-brand"}`}
+          style={{ marginLeft: `${Math.min(99, left)}%`, width: `${Math.max(1, Math.min(100 - left, width))}%` }}
+        />
+      </span>
+      <span className="tabular text-right text-xs text-muted">{formatDuration(s.duration_ms)}</span>
+    </div>
   );
 };
 

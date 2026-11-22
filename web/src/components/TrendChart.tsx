@@ -372,7 +372,7 @@ const Delta: React.FC<{ v: number | null }> = ({ v }) =>
 
 const Tooltip: React.FC<{ x: number; title: string; soFar?: boolean; children: React.ReactNode }> = ({ x, title, soFar, children }) => (
   <div
-    className="pointer-events-none absolute top-2 z-10 min-w-[12rem] max-w-[20rem] rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop"
+    className="pointer-events-none absolute top-2 z-10 min-w-[12rem] max-w-[20rem] rounded-lg border border-line-strong bg-panel px-3 py-2 text-compact shadow-pop"
     style={x > 0.6 ? { right: `${100 - x * 100 + 1.5}%` } : { left: `${x * 100 + 1.5}%` }}
   >
     <p className="mb-1.5 font-semibold text-ink">

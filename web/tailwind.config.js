@@ -50,6 +50,13 @@ export default {
       boxShadow: {
         pop: "0 12px 32px rgb(0 0 0 / 0.16)",
       },
+      // Type scale additions (no line-height, so they inherit like the arbitrary values they replaced).
+      // Full scale: 2xs 11 · xs 12 · compact 13 · sm 14 · md 15 · then titles. See docs/design/design-system.md.
+      fontSize: {
+        "2xs": "0.6875rem",
+        compact: "0.8125rem",
+        md: "0.9375rem",
+      },
       fontFamily: {
         sans: ['"Instrument Sans Variable"', "system-ui", "-apple-system", "sans-serif"],
         mono: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],

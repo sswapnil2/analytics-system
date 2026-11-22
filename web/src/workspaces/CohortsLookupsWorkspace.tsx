@@ -464,7 +464,7 @@ export const CohortsLookupsWorkspace: React.FC<Props> = ({
                       <div className="min-w-0 flex-1 basis-48">
                         <div className="text-sm font-medium text-ink">{c.name}</div>
                         <div className="text-xs text-muted">{c.description}</div>
-                        <div className="mt-0.5 text-[11px] text-faint">Saved {formatDate(c.created_at_ms)}</div>
+                        <div className="mt-0.5 text-2xs text-faint">Saved {formatDate(c.created_at_ms)}</div>
                       </div>
                       <div className="ml-auto flex shrink-0 items-center gap-1.5">
                       {canEdit && condsFromDefinition(c.definition) && (

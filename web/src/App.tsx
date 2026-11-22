@@ -14,6 +14,7 @@ import {
   Monitor,
   Moon,
   PlayCircle,
+  Search,
   Settings,
   ShieldCheck,
   Sun,
@@ -51,7 +52,9 @@ import {
 } from "./auth/AuthScreens";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { clearFilterCaches } from "./components/FilterPanel";
-import { btn, EmptyState, ErrorNotice, Panel, Spinner } from "./components/ui";
+import { CommandPalette } from "./components/CommandPalette";
+import { btn, EmptyState, ErrorNotice, Kbd, Panel, Spinner, Tabs } from "./components/ui";
+import type { Command } from "./lib/palette";
 import { errorMessage, formatCount, isNotFound, setProjectTimeZone } from "./lib/format";
 import { projectFromHash as projectInHash, withProject } from "./lib/projectUrl";
 import { AccessContext } from "./auth/access";
@@ -123,11 +126,16 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     ],
   },
   {
-    label: "Audience and shipping",
+    label: "Audience",
     items: [
       { id: "users", label: "Users", icon: UserRound },
       { id: "cohorts", label: "Cohorts", icon: Users },
       { id: "experiments", label: "Experiments", icon: FlaskConical },
+    ],
+  },
+  {
+    label: "Data",
+    items: [
       { id: "events", label: "Events and privacy", icon: ShieldCheck },
       { id: "security", label: "Security and integrations", icon: Lock },
     ],
@@ -136,6 +144,12 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
 
 // Profile and Settings open from the account area, not the workspace nav.
 const ACCOUNT_IDS: WorkspaceId[] = ["profile", "settings"];
+const PAGE_TITLES: Record<string, string> = {
+  ...Object.fromEntries(NAV_GROUPS.flatMap((g) => g.items.map((i) => [i.id, i.label]))),
+  profile: "Profile",
+  settings: "Settings",
+};
+const AGENT_VIEWS = ["Traces", "Sessions", "Evaluations", "Datasets", "Experiments"];
 const ALL_IDS = [...NAV_GROUPS.flatMap((g) => g.items.map((i) => i.id)), ...ACCOUNT_IDS];
 // Report builders that default to the project's own events.
 const NEEDS_EVENTS: WorkspaceId[] = ["trends", "funnels", "journeys", "retention", "cohorts"];
@@ -231,6 +245,30 @@ export const App: React.FC = () => {
   const [mintingKey, setMintingKey] = useState(false);
 
   useEffect(() => applyTheme(theme), [theme]);
+
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // A new page starts at its top, names the browser tab, and shows itself in the phone nav strip.
+  const navRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!signedIn) {
+      document.title = "Pulse";
+      return;
+    }
+    document.title = `${PAGE_TITLES[activeTab] ?? "Pulse"} · Pulse`;
+    window.scrollTo({ top: 0 });
+    navRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [activeTab, signedIn]);
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -654,6 +692,44 @@ export const App: React.FC = () => {
     }
   };
 
+  const commands: Command[] = [
+    ...NAV_GROUPS.flatMap((g) => g.items)
+      .filter((i) => i.id !== "security" || canManageKeys)
+      .map((i) => ({ id: `go-${i.id}`, label: i.label, group: "Go to", icon: i.icon, run: () => go(i.id) })),
+    ...AGENT_VIEWS.map((v) => ({
+      id: `agents-${v}`,
+      label: `AI agents: ${v}`,
+      group: "Go to",
+      icon: Bot,
+      keywords: "runs spans llm evals",
+      run: () => {
+        window.location.hash = `/agents?tab=${v.toLowerCase()}`;
+      },
+    })),
+    { id: "go-settings", label: "Settings", group: "Go to", icon: Settings, keywords: "members invites api keys projects", run: () => go("settings") },
+    { id: "go-profile", label: "Profile", group: "Go to", icon: UserRound, keywords: "account password", run: () => go("profile") },
+    ...projects
+      .filter((p) => p.id !== activePid)
+      .map((p) => ({ id: `proj-${p.id}`, label: `Switch to ${p.name}`, group: "Projects", keywords: p.id, run: () => switchProject(p.id, true) })),
+    ...(["light", "dark", "system"] as ThemePref[])
+      .filter((t) => t !== theme)
+      .map((t) => ({ id: `theme-${t}`, label: `Use ${t} theme`, group: "Actions", icon: t === "light" ? Sun : t === "dark" ? Moon : Monitor, run: () => setTheme(t) })),
+    {
+      id: "quickstart",
+      label: "Show how to send events",
+      group: "Actions",
+      icon: Terminal,
+      keywords: "quickstart sdk install ingest key curl",
+      run: () => {
+        setQuickstartDismissed(false);
+        setQuickstartOpen(true);
+        window.scrollTo({ top: 0 });
+      },
+    },
+    { id: "nav-toggle", label: navCollapsed ? "Expand sidebar" : "Collapse sidebar", group: "Actions", icon: navCollapsed ? PanelLeftOpen : PanelLeftClose, run: toggleNav },
+    { id: "signout", label: "Sign out", group: "Actions", icon: LogOut, run: () => void handleSignOut() },
+  ];
+
   const accountControls = (
     <div className={`flex items-center gap-0.5 ${navCollapsed ? "md:flex-col" : ""}`}>
       <button
@@ -734,7 +810,7 @@ export const App: React.FC = () => {
       </a>
 
       {/* Sidebar: full height on desktop, a scrolling tab strip on small screens. */}
-      <aside className={`shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:flex-col md:overflow-hidden md:transition-[width] md:duration-200 md:ease-out ${navCollapsed ? "md:w-[4.25rem]" : "md:w-60"} md:gap-5 md:border-b-0 md:border-r md:px-3.5 md:py-5`}>
+      <aside className={`shrink-0 border-b border-line bg-panel md:sticky md:top-0 md:flex md:h-screen md:flex-col md:overflow-hidden md:transition-[width] md:duration-200 md:ease-out ${navCollapsed ? "md:w-[4.25rem]" : "md:w-60"} md:gap-4 md:border-b-0 md:border-r md:px-3.5 md:py-5`}>
         <div className="flex items-center justify-between gap-2.5 px-4 py-3 md:px-1.5 md:py-0">
           <span className="flex items-center gap-2.5">
             <Logo size="sm" />
@@ -760,9 +836,23 @@ export const App: React.FC = () => {
           </select>
         </label>
 
+        <button
+          type="button"
+          onClick={() => setPaletteOpen(true)}
+          aria-label="Search pages and actions"
+          aria-keyshortcuts="Meta+K Control+K"
+          title="Search pages and actions"
+          className="mx-4 mb-3 hidden h-9 items-center gap-2.5 rounded-lg border border-line px-2.5 text-sm text-muted hover:bg-hover hover:text-ink md:mx-0 md:mb-0 md:flex"
+        >
+          <Search className="h-4 w-4 shrink-0" />
+          <span className={`flex-1 text-left ${nc}`}>Search</span>
+          <span className={nc}><Kbd>{/Mac|iPhone|iPad/.test(navigator.platform) ? "⌘K" : "Ctrl K"}</Kbd></span>
+        </button>
+
         <nav
+          ref={navRef}
           aria-label="Workspaces"
-          className="no-scrollbar flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-[18px] md:overflow-y-auto md:px-0 md:pb-0"
+          className="no-scrollbar flex gap-1 overflow-x-auto px-2 pb-2 md:block md:flex-1 md:space-y-3 md:overflow-y-auto md:px-0 md:pb-0"
         >
           {NAV_GROUPS.map((group) => (
             <div key={group.label} className="flex gap-1 md:block md:space-y-0.5">
@@ -835,7 +925,7 @@ export const App: React.FC = () => {
         <div className="hidden flex-col gap-2 border-t border-line px-1.5 pt-3 md:flex">
           <div className={`flex items-center gap-2.5 ${nc}`}>
           <span
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-[0.8125rem] font-semibold text-ink-2"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sunken text-compact font-semibold text-ink-2"
             aria-hidden="true"
           >
             {initials}
@@ -859,6 +949,8 @@ export const App: React.FC = () => {
           {accountControls}
         </div>
       </aside>
+
+      {paletteOpen && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
 
       <main id="main" tabIndex={-1} className="min-w-0 flex-1 px-4 py-7 outline-none md:px-8">
         <div className="mx-auto max-w-[1200px] space-y-5">
@@ -903,19 +995,14 @@ export const App: React.FC = () => {
                 </div>
               }
             >
-              <div role="tablist" aria-label="Platform" className="mb-3 flex gap-1">
-                {Object.keys(quickstartSnippets).map((t) => (
-                  <button
-                    key={t}
-                    type="button"
-                    role="tab"
-                    aria-selected={quickstartTab === t}
-                    onClick={() => setQuickstartTab(t)}
-                    className={`rounded-md px-2.5 py-1 text-sm font-medium ${quickstartTab === t ? "bg-sunken text-ink" : "text-muted hover:text-ink"}`}
-                  >
-                    {t}
-                  </button>
-                ))}
+              <div className="mb-3">
+                <Tabs
+                  label="Platform"
+                  variant="pill"
+                  tabs={Object.keys(quickstartSnippets).map((t) => ({ id: t, label: t }))}
+                  value={quickstartTab}
+                  onChange={setQuickstartTab}
+                />
               </div>
               {quickstartTab === "HTTP" && (
                 <p className="mb-3 text-sm text-ink-2">

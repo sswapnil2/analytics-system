@@ -457,7 +457,7 @@ export const FlowsWorkspace: React.FC<Props> = ({ projectId, availableEvents, av
             </div>
               {tip && (
                 <div
-                  className={`pointer-events-none absolute z-10 -translate-x-1/2 ${tip.below ? "" : "-translate-y-full"} whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-[0.8125rem] shadow-pop motion-safe:animate-pop`}
+                  className={`pointer-events-none absolute z-10 -translate-x-1/2 ${tip.below ? "" : "-translate-y-full"} whitespace-nowrap rounded-lg border border-line-strong bg-panel px-3 py-2 text-compact shadow-pop motion-safe:animate-pop`}
                   style={{ left: tip.x, top: tip.y }}
                 >
                   <p className="font-semibold text-ink">{tip.text}</p>
