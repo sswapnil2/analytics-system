@@ -1294,6 +1294,7 @@ pub struct VirtualCatalog {
     pub lookup_tables: DashMap<String, Arc<LookupTableDef>>,
     pub saved_cohorts: DashMap<String, BehavioralCohortDef>,
     user_profiles: RwLock<ColumnarProfileIndex>,
+    user_profile_ts: RwLock<HashMap<u32, i64>>,
     user_prop_keys: RwLock<HashSet<String>>,
     timezone: RwLock<Tz>,
 }
@@ -1306,6 +1307,7 @@ impl Default for VirtualCatalog {
             lookup_tables: DashMap::new(),
             saved_cohorts: DashMap::new(),
             user_profiles: RwLock::new(ColumnarProfileIndex::default()),
+            user_profile_ts: RwLock::new(HashMap::new()),
             user_prop_keys: RwLock::new(HashSet::new()),
             timezone: RwLock::new(chrono_tz::UTC),
         }
@@ -1333,6 +1335,14 @@ impl VirtualCatalog {
     }
 
     pub fn set_user_profiles(&self, profiles: HashMap<u32, HashMap<String, PropValue>>) {
+        self.set_user_profiles_with_ts(profiles, HashMap::new());
+    }
+
+    pub fn set_user_profiles_with_ts(
+        &self,
+        profiles: HashMap<u32, HashMap<String, PropValue>>,
+        timestamps: HashMap<u32, i64>,
+    ) {
         let mut keys = HashSet::new();
         for p in profiles.values() {
             for k in p.keys() {
@@ -1340,7 +1350,10 @@ impl VirtualCatalog {
             }
         }
         *self.user_prop_keys.write() = keys;
-        self.user_profiles.write().set_all(profiles);
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        idx.set_all(profiles);
+        *ts_map = timestamps;
     }
 
     pub fn upsert_user_profile(&self, canon_uid: u32, props: HashMap<String, PropValue>) {
@@ -1350,11 +1363,78 @@ impl VirtualCatalog {
                 keys.insert(k.clone());
             }
         }
-        self.user_profiles.write().upsert(canon_uid, props);
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        idx.upsert(canon_uid, props);
+        ts_map.remove(&canon_uid);
+    }
+
+    pub fn upsert_user_profile_with_ts(
+        &self,
+        canon_uid: u32,
+        props: HashMap<String, PropValue>,
+        updated_at_ms: i64,
+    ) {
+        {
+            let mut keys = self.user_prop_keys.write();
+            for k in props.keys() {
+                keys.insert(k.clone());
+            }
+        }
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        idx.upsert(canon_uid, props);
+        ts_map.insert(canon_uid, updated_at_ms);
     }
 
     pub fn remove_user_profile(&self, canon_uid: u32) {
-        self.user_profiles.write().remove(canon_uid);
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        idx.remove(canon_uid);
+        ts_map.remove(&canon_uid);
+    }
+
+    /// Evicts any cached profile entries whose `(uid, updated_at_ms)` (or resolved canonical UID)
+    /// is hidden by `expanded`. Entries without a recorded timestamp default to `0` (fail-closed).
+    pub fn evict_erased_profiles(
+        &self,
+        expanded: &pulse_storage::ErasedUids,
+        id_snap: Option<&IdentitySnapshot>,
+    ) -> Vec<u32> {
+        if expanded.is_empty() {
+            return Vec::new();
+        }
+        let any_hidden = {
+            let idx = self.user_profiles.read();
+            if idx.active_users.is_empty() {
+                return Vec::new();
+            }
+            let ts_map = self.user_profile_ts.read();
+            idx.active_users.iter().any(|cat_uid| {
+                let prof_ts = ts_map.get(&cat_uid).copied().unwrap_or(0);
+                let resolved = id_snap.map_or(cat_uid, |s| s.resolve(cat_uid));
+                expanded.hides(cat_uid, prof_ts) || expanded.hides(resolved, prof_ts)
+            })
+        };
+        if !any_hidden {
+            return Vec::new();
+        }
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        let to_evict: Vec<u32> = idx
+            .active_users
+            .iter()
+            .filter(|&cat_uid| {
+                let prof_ts = ts_map.get(&cat_uid).copied().unwrap_or(0);
+                let resolved = id_snap.map_or(cat_uid, |s| s.resolve(cat_uid));
+                expanded.hides(cat_uid, prof_ts) || expanded.hides(resolved, prof_ts)
+            })
+            .collect();
+        for &uid in &to_evict {
+            idx.remove(uid);
+            ts_map.remove(&uid);
+        }
+        to_evict
     }
 
     /// Sorted user profile property keys (without the `user.` prefix).
@@ -1493,5 +1573,9 @@ impl CatalogRegistry {
             .entry(project_id.to_string())
             .or_default()
             .clone()
+    }
+
+    pub fn get_project(&self, project_id: &str) -> Option<Arc<VirtualCatalog>> {
+        self.projects.get(project_id).map(|e| e.value().clone())
     }
 }

@@ -228,6 +228,10 @@ pub async fn run_byok_copilot(
     }
     let prompt_lower = prompt.to_ascii_lowercase();
 
+    crate::mcp::sync_erased_for_project(project_id, meta, qengine)
+        .await
+        .map_err(CopilotError::BadRequest)?;
+
     let now_ms = Utc::now().timestamp_millis();
     let seg_min_ts = qengine
         .storage()

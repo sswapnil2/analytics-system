@@ -789,7 +789,8 @@ impl ControlPlaneService {
     }
 
     /// Loads `erased_uids` from `MetaStore`, opens the project's read-only identity graph when
-    /// non-empty, expands merged raw->canonical mappings, and syncs `StorageEngine::set_erased`.
+    /// non-empty, expands merged raw->canonical mappings, syncs `StorageEngine::set_erased`, and
+    /// evicts any hidden entries from `ColumnarProfileIndex` (`cat.user_profiles` and `profile_catalog_ts`).
     async fn load_erased_for_project(
         &self,
         project_id: &str,
@@ -800,28 +801,30 @@ impl ControlPlaneService {
         ),
         String,
     > {
-        let erased: pulse_storage::ErasedUids = self
-            .meta
-            .list_erased_uids(project_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .collect();
-        let id_graph = if erased.is_empty() {
-            None
-        } else {
-            Some(
-                self.qengine
-                    .storage()
-                    .identity_graph(project_id, false)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            )
-        };
-        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
-        self.qengine
-            .storage()
-            .set_erased(project_id, expanded.clone());
+        let (expanded, id_graph) =
+            crate::mcp::sync_erased_for_project(project_id, &self.meta, &self.qengine).await?;
+        if !expanded.is_empty() {
+            let mut hidden_uids = Vec::new();
+            if let Some(mut ts_map) = self.profile_catalog_ts.get_mut(project_id) {
+                let id_snap = id_graph.as_deref().map(|ig| ig.snapshot());
+                ts_map.retain(|&cat_uid, &mut prof_ts| {
+                    let resolved = id_snap.as_ref().map_or(cat_uid, |s| s.resolve(cat_uid));
+                    let hidden =
+                        expanded.hides(cat_uid, prof_ts) || expanded.hides(resolved, prof_ts);
+                    if hidden {
+                        hidden_uids.push(cat_uid);
+                    }
+                    !hidden
+                });
+            }
+            if !hidden_uids.is_empty() {
+                if let Some(cat) = self.qengine.catalogs().get_project(project_id) {
+                    for uid in hidden_uids {
+                        cat.remove_user_profile(uid);
+                    }
+                }
+            }
+        }
         Ok((expanded, id_graph))
     }
 
@@ -881,12 +884,12 @@ impl ControlPlaneService {
                     .map(|(&uid, p)| (uid, p.updated_at_ms))
                     .collect();
                 self.profile_catalog_ts
-                    .insert(project_id.to_string(), ts_map);
+                    .insert(project_id.to_string(), ts_map.clone());
                 let merged = merged_map
                     .into_iter()
                     .map(|(uid, p)| (uid, profile_to_catalog_props(&p)))
                     .collect();
-                cat.set_user_profiles(merged);
+                cat.set_user_profiles_with_ts(merged, ts_map);
             }
             Some(since) => {
                 let rows = pstore
@@ -967,7 +970,11 @@ impl ControlPlaneService {
                     .entry(project_id.to_string())
                     .or_default()
                     .insert(canonical_uid, p.updated_at_ms);
-                cat.upsert_user_profile(canonical_uid, profile_to_catalog_props(&p));
+                cat.upsert_user_profile_with_ts(
+                    canonical_uid,
+                    profile_to_catalog_props(&p),
+                    p.updated_at_ms,
+                );
             }
             None => {
                 if let Some(mut map) = self.profile_catalog_ts.get_mut(project_id) {
@@ -1026,10 +1033,13 @@ impl ControlPlaneService {
             .list_cohorts(project_id)
             .await
             .map_err(|e| e.to_string())?;
-        cat.saved_cohorts.clear();
+        let mut active_cohort_ids = HashSet::with_capacity(cohorts.len());
         for c in cohorts {
-            cat.saved_cohorts.insert(c.id.clone(), c.definition);
+            active_cohort_ids.insert(c.id.clone());
+            cat.saved_cohorts.insert(c.id, c.definition);
         }
+        cat.saved_cohorts
+            .retain(|id, _| active_cohort_ids.contains(id));
 
         // Sync expanded `erased_uids` into StorageEngine BEFORE refreshing user profiles so
         // initial loads and remote readers always observe fresh erasure tombstones.
@@ -4115,6 +4125,9 @@ async fn handle_mcp(
     if req.id.is_null() {
         return Ok(StatusCode::ACCEPTED.into_response());
     }
+    ctrl.load_erased_for_project(&bound_pid)
+        .await
+        .map_err(CtrlError::internal)?;
     let resp = crate::mcp::handle_mcp_request_with_agent_store(
         req,
         &bound_pid,

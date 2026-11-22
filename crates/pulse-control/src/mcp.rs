@@ -506,8 +506,9 @@ fn pick<T: Copy>(args: &Value, key: &str, default: T, options: &[(&str, T)]) -> 
 }
 
 /// Loads `erased_uids` from `MetaStore`, opens the project's read-only identity graph when
-/// non-empty, expands merged raw->canonical mappings, and syncs `StorageEngine::set_erased`.
-async fn sync_erased_for_project(
+/// non-empty, expands merged raw->canonical mappings, syncs `StorageEngine::set_erased`, and
+/// evicts any hidden cached entries from `VirtualCatalog`'s `ColumnarProfileIndex`.
+pub(crate) async fn sync_erased_for_project(
     project_id: &str,
     meta: &MetaStore,
     qengine: &QueryEngine,
@@ -537,7 +538,33 @@ async fn sync_erased_for_project(
     };
     let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
     qengine.storage().set_erased(project_id, expanded.clone());
+    if !expanded.is_empty() {
+        if let Some(cat) = qengine.catalogs().get_project(project_id) {
+            let id_snap = id_graph.as_deref().map(|ig| ig.snapshot());
+            cat.evict_erased_profiles(&expanded, id_snap.as_ref());
+        }
+    }
     Ok((expanded, id_graph))
+}
+
+/// Syncs `cat.saved_cohorts` in place (`insert` + `retain`) without clearing concurrent readers.
+async fn sync_saved_cohorts(
+    project_id: &str,
+    meta: &MetaStore,
+    qengine: &QueryEngine,
+) -> Result<Vec<crate::models::CohortRecord>, String> {
+    let cohorts = meta
+        .list_cohorts(project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cat = qengine.catalogs().for_project(project_id);
+    let mut active_ids = HashSet::with_capacity(cohorts.len());
+    for c in &cohorts {
+        active_ids.insert(c.id.clone());
+        cat.saved_cohorts.insert(c.id.clone(), c.definition.clone());
+    }
+    cat.saved_cohorts.retain(|id, _| active_ids.contains(id));
+    Ok(cohorts)
 }
 
 async fn invoke_tool_with_agent_store(
@@ -617,6 +644,11 @@ async fn invoke_tool_with_agent_store(
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.series.iter().map(|s| s.event_name.as_str()), &known)?;
             sync_erased_for_project(project_id, meta, qengine).await?;
+            if q.global_filter.cohort.is_some()
+                || q.breakdown_by.iter().any(|b| b.starts_with("$cohort:"))
+            {
+                sync_saved_cohorts(project_id, meta, qengine).await?;
+            }
             let res = qengine
                 .query_insights(project_id, &q)
                 .await
@@ -680,6 +712,13 @@ async fn invoke_tool_with_agent_store(
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.steps.iter().map(|s| s.event_name.as_str()), &known)?;
             sync_erased_for_project(project_id, meta, qengine).await?;
+            if q.global_filter.cohort.is_some()
+                || q.breakdown_by
+                    .as_deref()
+                    .is_some_and(|b| b.starts_with("$cohort:"))
+            {
+                sync_saved_cohorts(project_id, meta, qengine).await?;
+            }
             let res = qengine
                 .query_funnel(project_id, &q)
                 .await
@@ -934,15 +973,7 @@ async fn invoke_tool_with_agent_store(
         }
         "list_cohorts" => {
             sync_erased_for_project(project_id, meta, qengine).await?;
-            let cohorts = meta
-                .list_cohorts(project_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            let cat = qengine.catalogs().for_project(project_id);
-            cat.saved_cohorts.clear();
-            for c in &cohorts {
-                cat.saved_cohorts.insert(c.id.clone(), c.definition.clone());
-            }
+            let cohorts = sync_saved_cohorts(project_id, meta, qengine).await?;
             let mut out = Vec::with_capacity(cohorts.len());
             for c in cohorts {
                 let size = qengine

@@ -1,19 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::post;
 use axum::Router;
+use pulse_control::copilot::{run_byok_copilot, CopilotRequest};
 use pulse_control::{
-    build_control_router, copilot_revenue_summary, handle_mcp_request, ControlPlaneService,
-    JsonRpcRequest, MetaStore,
+    build_control_router, copilot_revenue_summary, handle_mcp_request, ByokCredentialRecord,
+    ControlPlaneService, JsonRpcRequest, MetaStore,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, IngestService};
 use pulse_storage::{build_from_url, StorageConfig, StorageEngine, StoredUserProfile};
+use pulse_wire::PropValue;
 use serde_json::{json, Value};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 const ROOT: &str = "sk_root_erased_profiles_test_secret_012345";
@@ -1018,4 +1023,549 @@ async fn preview_cohort_and_mcp_list_cohorts_sync_and_expand_erased_uids_before_
             "standalone mcp list_cohorts before refresh failed: {c}"
         );
     }
+}
+
+#[tokio::test]
+async fn cross_node_erasure_evicts_columnar_profile_index_before_catalog_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let t_pre = now_ms - 60_000;
+    let t_erase = now_ms - 30_000;
+    let t_resign = now_ms - 10_000;
+
+    // 1. Ingest pre-erasure events for merged `anon_a` -> `user_a`, `user_c`, and surviving `user_b`.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Checkout", "distinct_id": "anon_a", "timestamp": t_pre },
+                { "event": "Checkout", "distinct_id": "user_b", "timestamp": t_pre },
+                { "event": "Checkout", "distinct_id": "user_c", "timestamp": t_pre }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({ "anon_id": "anon_a", "user_id": "user_a" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Set PII profile properties on all users via /v1/engage.
+    for (did, pii) in [
+        ("user_a", "alice_secret_42"),
+        ("user_b", "bob_public"),
+        ("user_c", "charlie_secret_99"),
+    ] {
+        let (s, _) = send_ingest(
+            &ingest_app,
+            "/v1/engage",
+            json!({
+                "distinct_id": did,
+                "$set": { "secret_pii": pii }
+            }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Ensure profile timestamps in SlateDB precede `t_erase` so pre-erasure profiles are hidden
+    // after erasure while `t_resign > t_erase` is treated as a post-erasure re-signup.
+    let id_graph = qengine
+        .storage()
+        .identity_graph("proj_erased", false)
+        .await
+        .unwrap();
+    let raw_anon_a = id_graph.lookup_raw("anon_a").unwrap();
+    let canon_a = id_graph.lookup_canonical("user_a").unwrap();
+    let canon_b = id_graph.lookup_canonical("user_b").unwrap();
+    let canon_c = id_graph.lookup_canonical("user_c").unwrap();
+
+    let pstore = qengine
+        .storage()
+        .profile_store("proj_erased", true)
+        .await
+        .unwrap();
+    for (did, uid, pii) in [
+        ("user_a", canon_a, "alice_secret_42"),
+        ("user_b", canon_b, "bob_public"),
+        ("user_c", canon_c, "charlie_secret_99"),
+    ] {
+        pstore
+            .upsert(&StoredUserProfile {
+                project_id: "proj_erased".into(),
+                distinct_id: did.into(),
+                canonical_uid: uid,
+                props: BTreeMap::from([("secret_pii".into(), json!(pii))]),
+                total_revenue: 0.0,
+                updated_at_ms: t_pre,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Save a cohort so standalone MCP `query_insights` with `global_filter.cohort` is also verified.
+    let (s, c_resp) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts",
+        Some(json!({
+            "name": "Checkouts Cohort",
+            "definition": { "kind": "performed_event", "event_name": "Checkout", "min_count": 1 }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let cohort_id = serde_json::from_slice::<Value>(&c_resp).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Refresh catalog BEFORE erasure so `ColumnarProfileIndex` (`cat.profiles`) caches both profiles.
+    ctrl.refresh_project_virtual_catalog("proj_erased")
+        .await
+        .unwrap();
+
+    // Baseline check: `alice_secret_42` is present before erasure.
+    let (s, base_prev) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts/preview",
+        Some(json!({
+            "definition": {
+                "kind": "property_match",
+                "predicate": { "prop_name": "user.secret_pii", "filter": { "op": "eq", "val": "alice_secret_42" } }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&base_prev).unwrap()["user_count"].as_u64(),
+        Some(1)
+    );
+
+    // 2. Simulate cross-node erasure on another node (NO `refresh_project_virtual_catalog` here).
+    meta.insert_erased_uids("proj_erased", &[raw_anon_a], t_erase)
+        .await
+        .unwrap();
+    pstore.delete_for_ids(&["anon_a", "user_a"]).await.unwrap();
+
+    // 3. User re-signs up with ONLY an event at `t_resign > t_erase` (no `/v1/engage`).
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Checkout", "distinct_id": "user_a", "timestamp": t_resign }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 4a. POST /query/insights breakdown_by user.secret_pii must NOT leak `alice_secret_42` before refresh.
+    let (s, qbytes) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/query/insights",
+        Some(json!({
+            "time_range": { "start_ts_ms": now_ms - 120_000, "end_ts_ms": now_ms + 60_000 },
+            "interval": "day",
+            "series": [{ "label": "Checkouts", "event_name": "Checkout", "metric": "uniques" }],
+            "breakdown_by": ["user.secret_pii"]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&qbytes));
+    let qjson: Value = serde_json::from_slice(&qbytes).unwrap();
+    let breakdown_keys: Vec<&str> = qjson["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["breakdown_key"].as_str().unwrap())
+        .collect();
+    assert!(
+        !breakdown_keys.contains(&"alice_secret_42"),
+        "ColumnarProfileIndex leaked erased user.secret_pii into insights: {qjson}"
+    );
+    assert!(
+        breakdown_keys.contains(&"bob_public"),
+        "non-erased user_b missing: {qjson}"
+    );
+
+    // 4b. POST /cohorts/preview PropertyMatch on user.secret_pii == "alice_secret_42" must return 0.
+    let (s, prev_after) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/projects/proj_erased/cohorts/preview",
+        Some(json!({
+            "definition": {
+                "kind": "property_match",
+                "predicate": { "prop_name": "user.secret_pii", "filter": { "op": "eq", "val": "alice_secret_42" } }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let prev_after_json: Value = serde_json::from_slice(&prev_after).unwrap();
+    assert_eq!(
+        prev_after_json["user_count"].as_u64(),
+        Some(0),
+        "cohorts/preview leaked erased profile in ColumnarProfileIndex: {prev_after_json}"
+    );
+
+    // 4c. Now erase `user_c` (`charlie_secret_99`, still cached in `cat.profiles` & `profile_catalog_ts`)
+    // and re-ingest an event-only re-signup, then hit POST /v1/mcp FIRST before any other route.
+    meta.insert_erased_uids("proj_erased", &[canon_c], t_erase)
+        .await
+        .unwrap();
+    pstore.delete_for_ids(&["user_c"]).await.unwrap();
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Checkout", "distinct_id": "user_c", "timestamp": t_resign }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, mcp_bytes) = send_admin(
+        &admin_app,
+        "POST",
+        "/v1/mcp",
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "list_property_values",
+                "arguments": {
+                    "property": "user.secret_pii",
+                    "event_name": "Checkout",
+                    "start_ts_ms": now_ms - 120_000,
+                    "end_ts_ms": now_ms + 60_000
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&mcp_bytes));
+    let mcp_json: Value = serde_json::from_slice(&mcp_bytes).unwrap();
+    let mcp_vals: Vec<&str> = mcp_json["result"]["structuredContent"]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["value"].as_str().unwrap())
+        .collect();
+    assert!(
+        !mcp_vals.contains(&"alice_secret_42") && !mcp_vals.contains(&"charlie_secret_99"),
+        "HTTP /v1/mcp leaked erased user.secret_pii: {mcp_json}"
+    );
+    assert!(
+        mcp_vals.contains(&"bob_public"),
+        "HTTP /v1/mcp missing bob_public: {mcp_json}"
+    );
+
+    // 4d. Standalone QueryEngine with pre-populated `cat.profiles` (without ControlPlaneService)
+    // calling `handle_mcp_request` (`query_insights` with `global_filter.cohort` + `user.secret_pii`
+    // breakdown) must evict `alice_secret_42` AND sync `cat.saved_cohorts`.
+    qengine.storage().flush_all_projects().await.unwrap();
+    let standalone_storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 10_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        qengine.storage().object_store().clone(),
+        qengine.storage().identity_router().clone(),
+    );
+    let standalone_qengine = QueryEngine::new(
+        standalone_storage,
+        16 * 1024 * 1024,
+        None,
+        0,
+        CatalogRegistry::new(),
+    )
+    .await
+    .unwrap();
+    standalone_qengine
+        .catalogs()
+        .for_project("proj_erased")
+        .set_user_profiles(HashMap::from([
+            (
+                canon_a,
+                HashMap::from([(
+                    "secret_pii".into(),
+                    PropValue::Str("alice_secret_42".into()),
+                )]),
+            ),
+            (
+                canon_b,
+                HashMap::from([("secret_pii".into(), PropValue::Str("bob_public".into()))]),
+            ),
+        ]));
+
+    let standalone_resp = handle_mcp_request(
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(22),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "query_insights",
+                "arguments": {
+                    "time_range": { "start_ts_ms": now_ms - 120_000, "end_ts_ms": now_ms + 60_000 },
+                    "interval": "day",
+                    "series": [{ "label": "Checkouts", "event_name": "Checkout", "metric": "uniques" }],
+                    "breakdown_by": ["user.secret_pii"],
+                    "global_filter": {
+                        "cohort": { "kind": "cohort_ref", "cohort_id": cohort_id }
+                    }
+                }
+            }),
+        },
+        "proj_erased",
+        &meta,
+        &standalone_qengine,
+    )
+    .await;
+    let sc = &standalone_resp.result.as_ref().unwrap()["structuredContent"];
+    let standalone_keys: Vec<&str> = sc["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["breakdown_key"].as_str().unwrap())
+        .collect();
+    assert!(
+        !standalone_keys.contains(&"alice_secret_42"),
+        "standalone MCP leaked erased ColumnarProfileIndex entry: {sc}"
+    );
+    assert!(
+        standalone_keys.contains(&"bob_public"),
+        "standalone MCP failed to evaluate saved cohort or bob_public: {sc}"
+    );
+}
+
+struct PrivateEndpointEnvGuard {
+    prev: Option<String>,
+}
+
+impl PrivateEndpointEnvGuard {
+    fn allow() -> Self {
+        let prev = std::env::var("PULSE_ALLOW_PRIVATE_ENDPOINTS").ok();
+        std::env::set_var("PULSE_ALLOW_PRIVATE_ENDPOINTS", "1");
+        Self { prev }
+    }
+}
+
+impl Drop for PrivateEndpointEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("PULSE_ALLOW_PRIVATE_ENDPOINTS", v),
+            None => std::env::remove_var("PULSE_ALLOW_PRIVATE_ENDPOINTS"),
+        }
+    }
+}
+
+async fn mock_copilot_llm_handler() -> impl IntoResponse {
+    axum::Json(json!({
+        "id": "chatcmpl_erasure_test",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "Mock copilot answer"
+            }
+        }]
+    }))
+}
+
+#[tokio::test]
+async fn direct_run_byok_copilot_syncs_erased_uids_before_querying() {
+    let _allow_priv = PrivateEndpointEnvGuard::allow();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_admin_app, ingest_app, _ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let t1 = now_ms - 50_000;
+    let t2 = now_ms - 40_000;
+    let t_erase = now_ms - 10_000;
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Step1", "distinct_id": "anon_erased", "timestamp": t1 },
+                { "event": "Step1", "distinct_id": "user_live", "timestamp": t1 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Step2", "distinct_id": "user_erased", "timestamp": t2 },
+                { "event": "Step2", "distinct_id": "user_live", "timestamp": t2 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({ "anon_id": "anon_erased", "user_id": "user_erased" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let id_graph = qengine
+        .storage()
+        .identity_graph("proj_erased", false)
+        .await
+        .unwrap();
+    let raw_anon_erased = id_graph.lookup_raw("anon_erased").unwrap();
+    let canon_erased = id_graph.lookup_canonical("user_erased").unwrap();
+    let canon_live = id_graph.lookup_canonical("user_live").unwrap();
+    assert_ne!(raw_anon_erased, canon_erased);
+
+    let pstore = qengine
+        .storage()
+        .profile_store("proj_erased", true)
+        .await
+        .unwrap();
+    for (did, uid, amount) in [
+        ("user_erased", canon_erased, 250.0),
+        ("user_live", canon_live, 100.0),
+    ] {
+        pstore
+            .upsert(&StoredUserProfile {
+                project_id: "proj_erased".into(),
+                distinct_id: did.into(),
+                canonical_uid: uid,
+                props: BTreeMap::new(),
+                total_revenue: amount,
+                updated_at_ms: t1,
+            })
+            .await
+            .unwrap();
+    }
+
+    qengine.storage().flush_all_projects().await.unwrap();
+
+    // Erase ONLY raw alias UID in MetaStore (simulating cross-node erasure before catalog refresh).
+    meta.insert_erased_uids("proj_erased", &[raw_anon_erased], t_erase)
+        .await
+        .unwrap();
+
+    // Fresh pre-refresh QueryEngine (empty `erased_snapshot` and empty `CatalogRegistry`).
+    let fresh_storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 10_000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        qengine.storage().object_store().clone(),
+        qengine.storage().identity_router().clone(),
+    );
+    let fresh_qengine = QueryEngine::new(
+        fresh_storage,
+        16 * 1024 * 1024,
+        None,
+        0,
+        CatalogRegistry::new(),
+    )
+    .await
+    .unwrap();
+
+    let llm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let llm_port = llm_listener.local_addr().unwrap().port();
+    let llm_app = Router::new().route("/v1/chat/completions", post(mock_copilot_llm_handler));
+    let _llm_srv = tokio::spawn(async move {
+        let _ = axum::serve(llm_listener, llm_app).await;
+    });
+
+    let llm_cred = ByokCredentialRecord {
+        id: "byok_test_llm".into(),
+        project_id: "proj_erased".into(),
+        category: "llm".into(),
+        provider: "openai".into(),
+        label: "test-llm".into(),
+        key_prefix_masked: "sk-t...".into(),
+        sealed_secret_hex: String::new(),
+        config_json: json!({
+            "endpoint": format!("http://127.0.0.1:{llm_port}/v1/chat/completions"),
+            "model": "gpt-4o-mini"
+        }),
+        status: "verified".into(),
+        last_verified_at_ms: Some(now_ms),
+        updated_at_ms: now_ms,
+    };
+
+    let resp = run_byok_copilot(
+        &fresh_qengine,
+        &meta,
+        "proj_erased",
+        &llm_cred,
+        "sk-test-key",
+        &CopilotRequest {
+            prompt: "Analyze Step1 Step2 funnel drop-off and revenue".into(),
+            start_ts_ms: Some(now_ms - 120_000),
+            end_ts_ms: Some(now_ms + 60_000),
+        },
+    )
+    .await
+    .unwrap();
+
+    let insights = resp.metrics_summary["insights"].as_array().unwrap();
+    assert!(!insights.is_empty());
+    for entry in insights {
+        assert!(
+            (entry["uniques"].as_f64().unwrap() - 1.0).abs() < 1e-6,
+            "direct run_byok_copilot leaked erased user in insights: {}",
+            resp.metrics_summary
+        );
+    }
+
+    let funnel_steps = resp.metrics_summary["funnel_steps"].as_array().unwrap();
+    assert_eq!(funnel_steps.len(), 2, "{}", resp.metrics_summary);
+    for step in funnel_steps {
+        assert_eq!(
+            step["entered_users"].as_u64(),
+            Some(1),
+            "direct run_byok_copilot funnel mismatch: {} (full={})",
+            step,
+            resp.metrics_summary
+        );
+    }
+
+    assert_eq!(
+        resp.metrics_summary["revenue"]["paying_users"].as_u64(),
+        Some(1)
+    );
+    assert!(
+        (resp.metrics_summary["revenue"]["total_revenue"]
+            .as_f64()
+            .unwrap()
+            - 100.0)
+            .abs()
+            < 1e-6,
+        "{}",
+        resp.metrics_summary
+    );
 }
