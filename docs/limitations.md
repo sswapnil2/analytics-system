@@ -47,7 +47,7 @@ These are the things Pulse does not do, or does with known limits. This list com
 
 ## Operational limitations
 
-- **One tested topology.** The single-node `all` role is the tested path. Ingest, query and compactor roles exist, but this documentation does not verify running several ingest nodes against the same project.
+- **One ingest node per project.** The single-node `all` role is the tested path. Several `query` nodes over one object store are supported. Only one ingest-capable node (`ingest` or `all`) may write a project: a second one overwrites the first's write-ahead log and loses acknowledged events, and nothing stops it from starting yet ([scalability review](history/SCALABILITY_REVIEW.md), R-01). There is no automatic write failover.
 - **Per-node state.** The ingest rate limit, login lockout, dedup windows and OAuth state are kept in memory per node. With several nodes, limits are per node, and an OAuth flow must return to the node that started it.
 - **TLS.** No built-in TLS for HTTP. Use a reverse proxy. QUIC uses a self-signed certificate.
 - **Encryption.** Event data is encrypted at rest only if you set `PULSE_BYOK_MASTER_KEY`. A passphrase is stretched with a fixed salt. Whether rotated keys survive a restart is not verified.
