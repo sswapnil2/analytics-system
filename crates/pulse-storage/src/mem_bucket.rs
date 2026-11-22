@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,24 @@ impl StoredRow {
     }
 }
 
+/// Estimated heap + inline size of one L0 row, for byte-based flush and backpressure.
+fn row_bytes(r: &StoredRow) -> usize {
+    // Row struct + its `Arc` + the slot in `rows`, then the owned strings and props.
+    136 + r.session_id.len()
+        + r.props
+            .iter()
+            .map(|(_, v)| {
+                32 + match v {
+                    PropValue::Str(s) => s.len(),
+                    _ => 0,
+                }
+            })
+            .sum::<usize>()
+}
+
 struct BucketInner {
     rows: Vec<Arc<StoredRow>>,
+    bytes: usize,
     cached_slice: Option<Arc<[Arc<StoredRow>]>>,
     oldest_unflushed_at: Option<Instant>,
 }
@@ -45,18 +62,44 @@ struct BucketInner {
 pub struct MemBucket {
     bucket_id: u8,
     inner: RwLock<BucketInner>,
+    /// Running totals (per project, per node) this bucket's bytes are added to.
+    totals: Vec<Arc<AtomicUsize>>,
+}
+
+impl Drop for MemBucket {
+    fn drop(&mut self) {
+        let bytes = self.inner.get_mut().bytes;
+        self.sub_totals(bytes);
+    }
 }
 
 impl MemBucket {
     pub fn new(bucket_id: u8) -> Self {
+        Self::with_totals(bucket_id, Vec::new())
+    }
+
+    pub fn with_totals(bucket_id: u8, totals: Vec<Arc<AtomicUsize>>) -> Self {
         Self {
             bucket_id,
+            totals,
             inner: RwLock::new(BucketInner {
                 rows: Vec::new(),
+                bytes: 0,
                 cached_slice: Some(Arc::from(&[][..])),
                 oldest_unflushed_at: None,
             }),
         }
+    }
+
+    fn sub_totals(&self, bytes: usize) {
+        for t in &self.totals {
+            t.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Estimated bytes held by this bucket's rows.
+    pub fn bytes(&self) -> usize {
+        self.inner.read().bytes
     }
 
     pub fn bucket_id(&self) -> u8 {
@@ -71,6 +114,11 @@ impl MemBucket {
         if guard.oldest_unflushed_at.is_none() {
             guard.oldest_unflushed_at = Some(Instant::now());
         }
+        let added: usize = rows.iter().map(row_bytes).sum();
+        guard.bytes += added;
+        for t in &self.totals {
+            t.fetch_add(added, Ordering::AcqRel);
+        }
         guard.rows.extend(rows.into_iter().map(Arc::new));
         guard.cached_slice = None;
         guard.rows.len()
@@ -84,12 +132,17 @@ impl MemBucket {
         self.inner.read().rows.is_empty()
     }
 
-    pub fn should_flush(&self, row_threshold: usize, max_age: Duration) -> bool {
+    pub fn should_flush(
+        &self,
+        row_threshold: usize,
+        byte_threshold: usize,
+        max_age: Duration,
+    ) -> bool {
         let guard = self.inner.read();
         if guard.rows.is_empty() {
             return false;
         }
-        if guard.rows.len() >= row_threshold {
+        if guard.rows.len() >= row_threshold || guard.bytes >= byte_threshold {
             return true;
         }
         if let Some(ts) = guard.oldest_unflushed_at {
@@ -170,7 +223,16 @@ impl MemBucket {
     pub fn complete_flush(&self, committed_l0_seq: u64) {
         let mut guard = self.inner.write();
         let prev_len = guard.rows.len();
-        guard.rows.retain(|r| r.l0_seq > committed_l0_seq);
+        let mut freed = 0usize;
+        guard.rows.retain(|r| {
+            let keep = r.l0_seq > committed_l0_seq;
+            if !keep {
+                freed += row_bytes(r);
+            }
+            keep
+        });
+        guard.bytes -= freed;
+        self.sub_totals(freed);
         if guard.rows.len() != prev_len {
             guard.cached_slice = None;
         }
@@ -189,14 +251,18 @@ impl MemBucket {
         let mut guard = self.inner.write();
         let mut sessions = Vec::new();
         let prev_len = guard.rows.len();
+        let mut freed = 0usize;
         guard.rows.retain(|r| {
             if uids.contains(r.uid_internal) {
                 sessions.push(r.session_id.clone());
+                freed += row_bytes(r);
                 false
             } else {
                 true
             }
         });
+        guard.bytes -= freed;
+        self.sub_totals(freed);
         let purged = (prev_len - guard.rows.len()) as u64;
         if purged > 0 {
             guard.cached_slice = None;
