@@ -7,10 +7,15 @@ Single-binary product analytics, session wireframe replay, feature flags, and ex
 - **Storage (`pulse-storage`):** events land in a write-ahead log, then flush to compressed columnar segments on local disk or any S3-compatible bucket, sorted by user and time so per-user questions are fast.
 - **Queries (`pulse-exec`, `pulse-identity`):** funnels, retention, trends, journeys and cohorts are computed exactly, with no sampling. Anonymous visitors are merged into users when they log in, and earlier events follow them.
 - **Session replay (`pulse-wire`):** the SDK records page layout (element boxes and masked text), not pixels or HTML. Text is masked on the device. Rage taps, dead taps, errors and network calls are on the timeline.
+- **AI agent observability (`pulse-agent`):** LLM agent runs arrive at `POST /v1/agent/traces` (or OTLP) and are stored in their own write-ahead log and columnar segments. The Studio's AI agents page (`#/agents`) shows each run's steps, cost, latency and evaluation scores, with datasets, experiments and alerts. See the [architecture](docs/agent-observability-architecture.md).
 - **Control plane (`pulse-control`):** Studio accounts and API keys, an event dictionary with PII controls, feature flags, A/B tests with sample-ratio and multiple-comparison checks, and an MCP server for AI agents.
 
 ## Documentation
 
+Browse it at **[sswapnil2.github.io/analytics-system/docs](https://sswapnil2.github.io/analytics-system/docs/)**, or read the Markdown in [`docs/`](docs/README.md):
+
+- [Concepts](docs/concepts.md), [architecture](docs/architecture.md), [how Pulse works](docs/how-it-works.md), [data model](docs/data-model.md) and [design decisions](docs/adr/README.md)
+- [Security & privacy](docs/security-privacy.md), [configuration](docs/configuration.md), [troubleshooting](docs/troubleshooting.md) and [limitations](docs/limitations.md)
 - [Quickstart](docs/quickstart.md): build, run, admin token and ingest keys
 - [Web SDK](docs/web-sdk.md) and [mobile core (beta)](docs/mobile-core.md)
 - [REST API](docs/rest-api.md) and [MCP for agents](docs/mcp.md) (Claude, Cursor, OpenAI Codex and Responses API, Gemini CLI, Antigravity)
@@ -23,7 +28,8 @@ Single-binary product analytics, session wireframe replay, feature flags, and ex
 |---|---|
 | Server (`pulse-node` + Studio) | Docker image `ghcr.io/sswapnil2/pulse` and Linux x86_64/aarch64 binaries on every [release](https://github.com/sswapnil2/analytics-system/releases/latest); build from source elsewhere |
 | Web SDK | Packed `.tgz` on every release (`npm install <asset url>`, see [Web SDK](docs/web-sdk.md)); not on the npm registry yet |
-| Backend / server-side events | Plain HTTP: `POST /v1/ingest` (Pulse or Segment JSON). No server SDKs yet |
+| Backend / server-side events | Plain HTTP: `POST /v1/ingest` (Pulse or Segment JSON) |
+| AI agent tracing | [`sdks/ts-agent`](sdks/ts-agent) (TypeScript) and [`sdks/py-agent`](sdks/py-agent) (Python), built from source; or any OpenTelemetry exporter pointed at `/v1/otel/v1/traces` |
 | iOS and Android | **No installable SDK yet.** A Rust core with Swift/Kotlin bindings exists for early adopters who build it themselves ([mobile core, beta](docs/mobile-core.md)) |
 
 ## 60-Second Quickstart
@@ -55,9 +61,17 @@ To explore with demo data instead, add `--seed`. It loads a sample fintech app (
 
 Everything is Apache-2.0, with no licence key and no event or seat limits: analytics, replay, flags, cohorts, privacy tools, the MCP server, the AI Copilot, warehouse export, the audit log and webhook alerts.
 
-## High-Availability & Node Roles
+## Node Roles
 
-By default, `pulse-node` runs in single-binary `--role all` mode. For horizontal scaling and fault isolation, run dedicated roles via `--role` (or `PULSE_NODE_ROLE`) against a shared data directory (`--data-dir` / `PULSE_DATA_DIR`), or use `PULSE_OBJECT_STORE_URL` with `DATABASE_URL` (`postgres://...`) for multi-host storage and control metadata:
+By default, `pulse-node` runs in single-binary `--role all` mode, which is the tested topology. To separate workloads, run dedicated roles via `--role` (or `PULSE_NODE_ROLE`) against a shared data directory (`--data-dir` / `PULSE_DATA_DIR`), or use `PULSE_OBJECT_STORE_URL` with `DATABASE_URL` (`postgres://...`) for multi-host storage and control metadata.
+
+**What is supported:**
+
+- **One ingest-capable node (`ingest` or `all`) per project.** The event write path has a single writer. A second ingest-capable node writing the same project overwrites the first node's write-ahead log and loses acknowledged events. Do not run two.
+- **Several `query` nodes.** Reads scale out; a query node sees data up to about a minute behind the ingest node.
+- **Roles are workload separation, not high availability.** There is no automatic write failover.
+
+See [limitations](docs/limitations.md#operational-limitations) for per-node state (rate limits, sign-in state) and the [scalability review](docs/history/SCALABILITY_REVIEW.md) for the evidence and the roadmap.
 
 - `all` *(default)*: Full ingest, query/Studio API, L0 -> L1 flushing, and background compaction in one process.
 - `ingest`: Serves `/v1/ingest` (HTTP + optional QUIC), `/healthz`, and public flag evaluation; runs background L0 -> L1 flushes and identity graph commits.
@@ -65,7 +79,7 @@ By default, `pulse-node` runs in single-binary `--role all` mode. For horizontal
 - `compactor`: Refreshes manifests and runs background L1 segment compaction (`--role compactor`, exposing `/healthz`).
 
 ```bash
-# Example multi-role cluster sharing object storage & control metadata (single-host / shared filesystem)
+# Example: one ingest node, one query node, one compactor (single host, shared data directory)
 ./target/release/pulse-node --role ingest    --port 8081 --data-dir /shared/pulse_data
 ./target/release/pulse-node --role query     --port 8080 --data-dir /shared/pulse_data --no-quic
 ./target/release/pulse-node --role compactor --port 8082 --data-dir /shared/pulse_data --no-quic

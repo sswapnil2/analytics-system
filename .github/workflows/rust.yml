@@ -29,6 +29,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  docs-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_docs_links.py
+
   web-and-sdk:
     runs-on: ubuntu-latest
     timeout-minutes: 15

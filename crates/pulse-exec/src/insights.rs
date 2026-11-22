@@ -2015,7 +2015,7 @@ mod hll_fast_path_tests {
         }
         for (b, evs) in by_bucket {
             let g = ps.lock_bucket_append(b).await;
-            ps.append_bucket_events_locked(&g, b, evs).await.unwrap();
+            ps.append_bucket_events_locked(&g, b, &evs).await.unwrap();
         }
         ps.flush_all().await.unwrap();
 

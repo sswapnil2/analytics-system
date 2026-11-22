@@ -15,6 +15,7 @@ pulse-identity.workspace = true
 pulse-storage.workspace = true
 pulse-ingest.workspace = true
 pulse-exec.workspace = true
+pulse-agent.workspace = true
 pulse-control.workspace = true
 
 anyhow.workspace = true
@@ -35,6 +36,9 @@ uuid.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
 pulse-sdk-core.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+tower.workspace = true

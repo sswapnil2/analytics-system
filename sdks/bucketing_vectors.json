@@ -5,7 +5,9 @@
     "xxh3_rollout_hex": "3b05b4c968896f25",
     "rollout_slot": 5029,
     "variant_slot_10000": 7920,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 9972,
+    "layer_slot": 5982
   },
   {
     "flag_key": "a",
@@ -13,7 +15,9 @@
     "xxh3_rollout_hex": "35a5819dd7f7c459",
     "rollout_slot": 6521,
     "variant_slot_10000": 3873,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 7393,
+    "layer_slot": 3967
   },
   {
     "flag_key": "flag",
@@ -21,7 +25,9 @@
     "xxh3_rollout_hex": "790aa19f6790ded8",
     "rollout_slot": 6296,
     "variant_slot_10000": 6046,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 4517,
+    "layer_slot": 4277
   },
   {
     "flag_key": "one_tap_upi_mandate",
@@ -29,7 +35,9 @@
     "xxh3_rollout_hex": "93a9cc18a59d1b00",
     "rollout_slot": 5568,
     "variant_slot_10000": 5518,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 7462,
+    "layer_slot": 4718
   },
   {
     "flag_key": "one_tap_upi_mandate",
@@ -37,7 +45,9 @@
     "xxh3_rollout_hex": "00154e4f6287fa78",
     "rollout_slot": 5336,
     "variant_slot_10000": 4074,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 8686,
+    "layer_slot": 6200
   },
   {
     "flag_key": "kyc_video_v2",
@@ -45,7 +55,9 @@
     "xxh3_rollout_hex": "515cae0014f518ee",
     "rollout_slot": 3214,
     "variant_slot_10000": 2183,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 6276,
+    "layer_slot": 8422
   },
   {
     "flag_key": "hindi_utf8",
@@ -53,7 +65,9 @@
     "xxh3_rollout_hex": "ac8234336e68f802",
     "rollout_slot": 9714,
     "variant_slot_10000": 2057,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 4502,
+    "layer_slot": 8916
   },
   {
     "flag_key": "len_16_exact",
@@ -61,7 +75,9 @@
     "xxh3_rollout_hex": "3d895f12f8be6acc",
     "rollout_slot": 2764,
     "variant_slot_10000": 8220,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 6091,
+    "layer_slot": 4359
   },
   {
     "flag_key": "len_64_mid",
@@ -69,7 +85,9 @@
     "xxh3_rollout_hex": "83814239e09f1f42",
     "rollout_slot": 7938,
     "variant_slot_10000": 6438,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 8339,
+    "layer_slot": 8962
   },
   {
     "flag_key": "len_160_mid2",
@@ -77,7 +95,9 @@
     "xxh3_rollout_hex": "8be46e59767f4baa",
     "rollout_slot": 1306,
     "variant_slot_10000": 4829,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 7206,
+    "layer_slot": 463
   },
   {
     "flag_key": "len_320_long",
@@ -85,7 +105,9 @@
     "xxh3_rollout_hex": "c9139333d81069b8",
     "rollout_slot": 7064,
     "variant_slot_10000": 9137,
-    "variant_50_50": "treatment"
+    "variant_50_50": "treatment",
+    "holdout_slot": 6193,
+    "layer_slot": 1720
   },
   {
     "flag_key": "len_1200_multiblock",
@@ -93,6 +115,8 @@
     "xxh3_rollout_hex": "3479157a63b07a21",
     "rollout_slot": 5441,
     "variant_slot_10000": 1241,
-    "variant_50_50": "control"
+    "variant_50_50": "control",
+    "holdout_slot": 8406,
+    "layer_slot": 6414
   }
 ]

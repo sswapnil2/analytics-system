@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use object_store::path::Path as ObjectPath;
@@ -1328,7 +1328,14 @@ impl ProjectIdentityGraph {
         self.checkpoint_if_due().await?;
         let mut db_guard = self.db.lock().await;
         if let Some(db) = db_guard.take() {
-            db.close().await?;
+            // See `ProjectProfileStore::close`: a fenced handle panics in SlateDB 0.6's `close`.
+            match tokio::spawn(async move { db.close().await }).await {
+                Ok(res) => res?,
+                Err(e) => {
+                    tracing::error!(project_id = %self.project_id, error = %e, "closing the identity store panicked (fenced by another writer?)");
+                    return Err(IdentityError::Closed);
+                }
+            }
         }
         Ok(())
     }
@@ -1378,8 +1385,13 @@ pub struct IdentityRouter {
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
     graphs: Arc<DashMap<String, Arc<ProjectIdentityGraph>>>,
+    /// Read-only graphs for projects this node does not write, with when each was last refreshed.
+    readers: DashMap<String, (Arc<ProjectIdentityGraph>, Instant)>,
     open_locks: OpenLocks,
 }
+
+/// How stale a cached reader may be before a read refreshes it. Refreshing loads only new chunks.
+const READER_REFRESH: Duration = Duration::from_secs(10);
 
 impl IdentityRouter {
     pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
@@ -1387,6 +1399,7 @@ impl IdentityRouter {
             object_store,
             read_only: false,
             graphs: Arc::default(),
+            readers: DashMap::new(),
             open_locks: OpenLocks::default(),
         }
     }
@@ -1396,12 +1409,51 @@ impl IdentityRouter {
             object_store,
             read_only: true,
             graphs: Arc::default(),
+            readers: DashMap::new(),
             open_locks: OpenLocks::default(),
         }
     }
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// A read-only graph for a project this node does not write. Never fences the writer.
+    /// Cached: loaded once, then refreshed on a read at most every `READER_REFRESH`, so a project
+    /// nobody reads costs nothing.
+    pub async fn open_reader(&self, project_id: &str) -> Result<Arc<ProjectIdentityGraph>> {
+        let stale = match self.readers.get(project_id) {
+            Some(e) if e.1.elapsed() < READER_REFRESH => return Ok(e.0.clone()),
+            Some(e) => Some(e.0.clone()),
+            None => None,
+        };
+        if let Some(g) = stale {
+            g.refresh().await?;
+            self.readers
+                .insert(project_id.to_string(), (g.clone(), Instant::now()));
+            return Ok(g);
+        }
+        // Per-project, so one cold reader open doesn't block readers of other projects (#68).
+        let lock = self
+            .open_locks
+            .entry(format!("reader:{project_id}"))
+            .or_default()
+            .clone();
+        let _guard = lock.lock().await;
+        if let Some(e) = self.readers.get(project_id) {
+            return Ok(e.0.clone());
+        }
+        let g =
+            ProjectIdentityGraph::open_read_only(project_id.to_string(), self.object_store.clone())
+                .await?;
+        self.readers
+            .insert(project_id.to_string(), (g.clone(), Instant::now()));
+        Ok(g)
+    }
+
+    /// Drops the cached reader, e.g. once this node opens the project for writing.
+    pub fn evict_reader(&self, project_id: &str) {
+        self.readers.remove(project_id);
     }
 
     pub async fn get_or_open(&self, project_id: &str) -> Result<Arc<ProjectIdentityGraph>> {
@@ -1427,6 +1479,12 @@ impl IdentityRouter {
             },
         )
         .await
+    }
+
+    /// Forgets a project's graph so the next `get_or_open` rebuilds it from storage.
+    pub fn evict(&self, project_id: &str) {
+        self.graphs.remove(project_id);
+        self.readers.remove(project_id);
     }
 
     pub async fn refresh_all(&self) -> Result<usize> {
@@ -1455,11 +1513,16 @@ impl IdentityRouter {
     pub async fn close_all(&self) -> Result<()> {
         let graphs: Vec<Arc<ProjectIdentityGraph>> =
             self.graphs.iter().map(|e| e.value().clone()).collect();
+        // Close every store even if one fails, and report the first failure.
+        let mut first_err = None;
         for g in graphs {
-            g.close().await?;
+            if let Err(e) = g.close().await {
+                first_err.get_or_insert(e);
+            }
         }
         self.graphs.clear();
-        Ok(())
+        self.readers.clear();
+        first_err.map_or(Ok(()), Err)
     }
 }
 

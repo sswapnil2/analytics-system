@@ -15,7 +15,8 @@ for replay, touch hooks) yourself. Expect an afternoon for a first integration.
 ## API (`PulseClient`)
 
 ```text
-PulseClient(config: SdkConfig)        // endpoint_url, api_key (pk_), storage_dir, flush_batch_size, flush_interval_ms
+PulseClient(config: SdkConfig)        // endpoint_url, api_key (pk_), storage_dir, flush_batch_size, flush_interval_ms,
+                                      // flags_ttl_ms (default 300000: stale flags re-fetch in the background)
 distinct_id() -> String               session_id() -> String          queued_packet_count() -> u32
 track(event_name, props_json)         identify(user_id)               reset()
 register_super_props(props_json)      time_event(event_name)          set_user_properties(props_json)
@@ -36,6 +37,11 @@ Properties are passed as a JSON object string. Errors come back as `SdkError` (`
 
 Experiment results count users who sent `$experiment_started` with `flag_key` and `variant`
 properties: call `get_variant(key, true)` where the user first sees the variant.
+
+Holdouts and layers are applied here as in the web SDK: a user in a flag's holdout gets no variant,
+a flag in a layer only reaches its slice, and `get_variant(key, true)` on a flag in a holdout also
+sends `$holdout_assigned` once per holdout. Apps on older builds serve held-out users anyway, so
+ship this version everywhere before using holdouts or layers.
 
 In Swift and Kotlin the names are camel-cased (`registerSuperProps`, `recordWireframeSnapshot`, …).
 

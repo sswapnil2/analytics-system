@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,12 +14,16 @@ use constant_time_eq::constant_time_eq;
 use dashmap::DashMap;
 use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 use parking_lot::Mutex;
+use pulse_agent::{AgentTraceStore, AgentTraceStoreConfig, StoreError as AgentStoreError};
 use pulse_exec::{
     validate_cohort_acyclic, BehavioralCohortDef, CustomEventDef, CustomPropertyDef, FlowsQuery,
     FunnelQuery, InsightsQuery, LookupTableDef, QueryEngine, RetentionQuery, SessionSearchQuery,
     TimeRange,
 };
-use pulse_ingest::{DiscoveredEventSchema, GovernanceProvider, IngestService, ProjectLexiconRules};
+use pulse_ingest::{
+    rate_limit::RateLimiter, DiscoveredEventSchema, GovernanceProvider, IngestService,
+    ProjectLexiconRules,
+};
 use pulse_storage::{
     build_customer_object_store, make_key_id, parse_or_derive_master_key,
     validate_object_store_connection, validate_outbound_url_ssrf,
@@ -30,26 +34,33 @@ use ring::rand::{SecureRandom, SystemRandom};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 mod accounts;
 mod auth;
 pub use auth::AuthConfig;
 
+use crate::agent_eval_worker::{
+    run_agent_eval_worker, AgentIngestMetrics, EvalJob, EVAL_QUEUE_CAPACITY,
+};
+
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
 use crate::db::{MetaError, MetaStore};
-use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
-use crate::mcp::{handle_mcp_request, JsonRpcRequest};
+use crate::experiments::{
+    build_edge_flag_bundle_with_cohorts, evaluate_bandit_results, evaluate_experiment_results,
+};
+use crate::mcp::JsonRpcRequest;
 use crate::models::{
     apply_profile_ops, generate_random_api_key, generate_root_admin_token, mask_byok_secret,
     mask_key_prefix, seal_byok_config_json, seal_secret, sha256_bytes, sha256_hex,
-    unseal_byok_config_json, unseal_secret, AlertRule, Annotation, ApiKeyRecord,
-    ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
+    unseal_byok_config_json, unseal_secret, AlertRule, AnalysisConfig, Annotation, ApiKeyRecord,
+    BanditConfig, ByokCredentialRecord, ByokCredentialView, CohortRecord, CreatedApiKeyResponse,
     CustomSchemaBundle, Dashboard, DashboardCard, DeletionAuditRecord, EnterpriseAuditRecord,
-    Experiment, ExperimentMetricSpec, FeatureFlag, GroupProfileRecord, LexiconEvent,
-    LexiconProperty, Organization, Project, Role, SavedReport, SystemKeyringRecord,
-    UserProfileRecord, VariantAllocation, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
+    Experiment, ExperimentDecision, ExperimentMetricSpec, ExperimentResults, FeatureFlag,
+    FlagHoldout, FlagLayer, GroupProfileRecord, LexiconEvent, LexiconProperty, Organization,
+    Project, Role, SavedMetric, SavedReport, StagedRollout, SystemKeyringRecord, TrafficGroup,
+    UserProfileRecord, VariantAllocation, WeightSnapshot, BYOK_CATEGORIES, KEY_ROLE_ADMIN,
     KEY_ROLE_INGEST_AND_FLAGS, REPORT_KINDS,
 };
 
@@ -115,7 +126,7 @@ impl AuthPrincipal {
         }
     }
 
-    fn actor_label(&self) -> String {
+    pub(crate) fn actor_label(&self) -> String {
         match self {
             AuthPrincipal::RootAdmin => "root_admin".to_string(),
             AuthPrincipal::User { user_id, .. } => format!("user:{user_id}"),
@@ -151,6 +162,10 @@ pub struct ControlPlaneService {
     meta: MetaStore,
     qengine: Arc<QueryEngine>,
     ingest: tokio::sync::RwLock<Option<Arc<IngestService>>>,
+    agent_store: parking_lot::RwLock<Arc<AgentTraceStore>>,
+    eval_tx: mpsc::Sender<EvalJob>,
+    eval_rx: parking_lot::Mutex<Option<mpsc::Receiver<EvalJob>>>,
+    agent_metrics: Arc<AgentIngestMetrics>,
     default_project_id: String,
     root_admin_hash: [u8; 32],
     vault_kek: [u8; 32],
@@ -168,6 +183,18 @@ pub struct ControlPlaneService {
     auth_state: auth::AuthState,
     /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
+    /// Per project: the edge flag bundle, keyed by the flags' latest `updated_at_ms` and count.
+    /// SDKs poll it, and building it evaluates targeting cohorts.
+    flag_bundle_cache: DashMap<
+        String,
+        (
+            i64,
+            usize,
+            std::time::Instant,
+            Arc<crate::models::EdgeFlagBundle>,
+        ),
+    >,
+    agent_rate_limit: RateLimiter,
 }
 
 impl ControlPlaneService {
@@ -186,6 +213,44 @@ impl ControlPlaneService {
         default_project_id: impl Into<String>,
         initial_ingest_key: impl Into<String>,
         explicit_admin_token: Option<String>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_options(
+            meta,
+            qengine,
+            default_project_id,
+            initial_ingest_key,
+            explicit_admin_token,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_admin_with_agent_config(
+        meta: MetaStore,
+        qengine: Arc<QueryEngine>,
+        default_project_id: impl Into<String>,
+        initial_ingest_key: impl Into<String>,
+        explicit_admin_token: Option<String>,
+        agent_store_config: AgentTraceStoreConfig,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_options(
+            meta,
+            qengine,
+            default_project_id,
+            initial_ingest_key,
+            explicit_admin_token,
+            Some(agent_store_config),
+        )
+        .await
+    }
+
+    async fn new_with_options(
+        meta: MetaStore,
+        qengine: Arc<QueryEngine>,
+        default_project_id: impl Into<String>,
+        initial_ingest_key: impl Into<String>,
+        explicit_admin_token: Option<String>,
+        agent_config: Option<AgentTraceStoreConfig>,
     ) -> Result<Arc<Self>, String> {
         let default_project_id = default_project_id.into();
         let initial_ingest_key = initial_ingest_key.into();
@@ -215,11 +280,35 @@ impl ControlPlaneService {
             }
         };
 
+        // Restore the BYOK encryption keyring BEFORE opening AgentTraceStore so
+        // encrypted manifests and WAL segments decrypt cleanly on restart.
+        Self::restore_encryption_keyring_inner(&meta, &vault_kek, &qengine).await?;
+
+        let store_cfg = agent_config.unwrap_or_else(|| AgentTraceStoreConfig {
+            read_only: qengine.storage().identity_router().is_read_only(),
+            ..Default::default()
+        });
+        let agent_store = Arc::new(
+            AgentTraceStore::open_with_encrypted(
+                qengine.storage().object_store().clone(),
+                Some(qengine.storage().encrypted_store().clone()),
+                store_cfg,
+            )
+            .await
+            .map_err(|e| format!("failed to open AgentTraceStore: {e}"))?,
+        );
+        let (eval_tx, eval_rx) = mpsc::channel::<EvalJob>(EVAL_QUEUE_CAPACITY);
+        let agent_metrics = Arc::new(AgentIngestMetrics::default());
+
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<DiscoveredEventSchema>>();
         let svc = Arc::new(Self {
             meta: meta.clone(),
             qengine,
             ingest: tokio::sync::RwLock::new(None),
+            agent_store: parking_lot::RwLock::new(agent_store),
+            eval_tx,
+            eval_rx: parking_lot::Mutex::new(Some(eval_rx)),
+            agent_metrics,
             default_project_id,
             root_admin_hash,
             vault_kek,
@@ -236,6 +325,8 @@ impl ControlPlaneService {
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
             auth_state: auth::AuthState::default(),
             outbox_path: parking_lot::RwLock::new(None),
+            flag_bundle_cache: DashMap::new(),
+            agent_rate_limit: RateLimiter::from_env(),
         });
 
         let generated_ingest = svc
@@ -243,7 +334,6 @@ impl ControlPlaneService {
             .await?;
         svc.bootstrap_creds.lock().generated_ingest_key = generated_ingest;
         svc.reload_caches_from_db().await?;
-        svc.restore_encryption_keyring().await?;
 
         let meta_bg = meta;
         tokio::spawn(async move {
@@ -273,6 +363,80 @@ impl ControlPlaneService {
 
     pub async fn attach_ingest(&self, ingest: Arc<IngestService>) {
         *self.ingest.write().await = Some(ingest);
+    }
+
+    pub fn agent_store(&self) -> Arc<AgentTraceStore> {
+        self.agent_store.read().clone()
+    }
+
+    /// Replaces the active `AgentTraceStore`. Call before `spawn_agent_eval_worker`.
+    pub fn attach_agent_store(&self, store: Arc<AgentTraceStore>) {
+        *self.agent_store.write() = store;
+    }
+
+    /// Swaps the active `AgentTraceStore` and closes the previous instance.
+    pub async fn replace_agent_store(
+        &self,
+        store: Arc<AgentTraceStore>,
+    ) -> Result<(), AgentStoreError> {
+        let prev = {
+            let mut guard = self.agent_store.write();
+            std::mem::replace(&mut *guard, store)
+        };
+        prev.close().await
+    }
+
+    pub fn agent_metrics(&self) -> &Arc<AgentIngestMetrics> {
+        &self.agent_metrics
+    }
+
+    pub fn eval_tx(&self) -> &mpsc::Sender<EvalJob> {
+        &self.eval_tx
+    }
+
+    /// Non-blocking enqueue onto the bounded eval queue; increments `eval_queue_dropped` if full/closed.
+    pub fn try_enqueue_eval(&self, job: EvalJob) -> bool {
+        match self.eval_tx.try_send(job) {
+            Ok(()) => true,
+            Err(_) => {
+                self.agent_metrics
+                    .eval_queue_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    pub fn take_eval_rx(&self) -> Option<mpsc::Receiver<EvalJob>> {
+        self.eval_rx.lock().take()
+    }
+
+    /// Spawns the background evaluation worker once (returns `None` if already taken/spawned).
+    pub fn spawn_agent_eval_worker(
+        &self,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let rx = self.take_eval_rx()?;
+        let meta = self.meta.clone();
+        let store = self.agent_store();
+        let vault_kek = self.vault_kek;
+        let metrics = self.agent_metrics.clone();
+        Some(tokio::spawn(async move {
+            run_agent_eval_worker(meta, store, vault_kek, metrics, rx, shutdown_rx).await;
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn vault_kek(&self) -> [u8; 32] {
+        self.vault_kek
+    }
+
+    pub(crate) fn agent_rate_limit(&self) -> &RateLimiter {
+        &self.agent_rate_limit
+    }
+
+    pub(crate) async fn authenticate_api_key_str(&self, api_key: &str) -> Option<String> {
+        <Self as GovernanceProvider>::authenticate_api_key(self, api_key).await
     }
 
     pub fn meta(&self) -> &MetaStore {
@@ -371,9 +535,12 @@ impl ControlPlaneService {
             .list_api_keys(None)
             .await
             .map_err(|e| e.to_string())?;
-        self.api_key_cache.clear();
+        // Upsert, then drop what is gone. Clearing first would 401 every ingest and flag
+        // request that looks a key up mid-reload: the cache has no DB fallback.
+        let mut live: HashSet<String> = HashSet::with_capacity(keys.len());
         for k in keys {
             if !k.revoked {
+                live.insert(k.key_hash.clone());
                 self.api_key_cache.insert(
                     k.key_hash,
                     CachedApiKey {
@@ -383,16 +550,27 @@ impl ControlPlaneService {
                 );
             }
         }
+        self.api_key_cache.retain(|hash, _| live.contains(hash));
 
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
-        self.known_projects.clear();
-        for proj in projects {
+        let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        self.known_projects
+            .retain(|id, _| live_projects.contains(id.as_str()));
+        // One project's broken catalog must not stop the others from reloading.
+        let mut first_err = None;
+        for proj in &projects {
             self.known_projects
                 .insert(proj.id.clone(), proj.org_id.clone());
-            self.refresh_project_lexicon_cache(&proj.id).await?;
-            self.refresh_project_virtual_catalog(&proj.id).await?;
+            let res = async {
+                self.refresh_project_lexicon_cache(&proj.id).await?;
+                self.refresh_project_virtual_catalog(&proj.id).await
+            }
+            .await;
+            if let Err(e) = res {
+                first_err.get_or_insert(format!("project {}: {e}", proj.id));
+            }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     /// The project's org id; 404 when the project doesn't exist.
@@ -454,7 +632,7 @@ impl ControlPlaneService {
         })
     }
 
-    async fn authorize_and_check(
+    pub(crate) async fn authorize_and_check(
         &self,
         principal: &AuthPrincipal,
         project_id: &str,
@@ -473,14 +651,17 @@ impl ControlPlaneService {
     }
 
     /// Restores the encryption keyring across restarts, failing closed if sealed secrets cannot decrypt.
-    async fn restore_encryption_keyring(&self) -> Result<(), String> {
-        let keyring_rows = self
-            .meta
+    async fn restore_encryption_keyring_inner(
+        meta: &MetaStore,
+        vault_kek: &[u8; 32],
+        qengine: &QueryEngine,
+    ) -> Result<(), String> {
+        let keyring_rows = meta
             .list_system_keyring()
             .await
             .map_err(|e| e.to_string())?;
         for row in keyring_rows {
-            let secret = unseal_secret(&self.vault_kek, &row.sealed_key_hex).map_err(|e| {
+            let secret = unseal_secret(vault_kek, &row.sealed_key_hex).map_err(|e| {
                 format!(
                     "failed to unseal cluster encryption key '{}': {e}",
                     row.key_id
@@ -495,12 +676,17 @@ impl ControlPlaneService {
             salt.copy_from_slice(&salt_bytes);
             let master = parse_or_derive_master_key(&secret, &salt)
                 .map_err(|e| format!("failed to derive master key for '{}': {e}", row.key_id))?;
-            self.qengine
+            qengine
                 .storage()
                 .register_byok_master_key(&row.key_id, master, row.is_active)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn restore_encryption_keyring(&self) -> Result<(), String> {
+        Self::restore_encryption_keyring_inner(&self.meta, &self.vault_kek, &self.qengine).await
     }
 
     /// Anything sealed under an ephemeral KEK is unreadable after a restart, so refuse to seal.
@@ -517,7 +703,7 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    async fn record_enterprise_audit(
+    pub(crate) async fn record_enterprise_audit(
         &self,
         actor: &str,
         action: &str,
@@ -621,8 +807,7 @@ impl ControlPlaneService {
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let started_ms = Utc::now().timestamp_millis();
@@ -681,11 +866,11 @@ impl ControlPlaneService {
         project_id: &str,
         canonical_uid: u32,
     ) -> Result<(), String> {
+        // A read: it rebuilds the in-memory index. The periodic refresh calls it on every node.
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
         let rows: Vec<UserProfileRecord> = pstore
@@ -778,16 +963,14 @@ impl ControlPlaneService {
         let id_graph = self
             .qengine
             .storage()
-            .identity_router()
-            .get_or_open(project_id)
+            .identity_graph(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
 
         let pstore = self
             .qengine
             .storage()
-            .profile_router()
-            .get_or_open(project_id)
+            .profile_store(project_id, true)
             .await
             .map_err(|e| CtrlError::internal(e.to_string()))?;
         let existing_prof = pstore
@@ -991,13 +1174,7 @@ impl GovernanceProvider for ControlPlaneService {
         canonical_uid: u32,
         ops: &Value,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store");
@@ -1050,13 +1227,7 @@ impl GovernanceProvider for ControlPlaneService {
         user_id: &str,
         canonical_uid: u32,
     ) {
-        let pstore = match self
-            .qengine
-            .storage()
-            .profile_router()
-            .get_or_open(project_id)
-            .await
-        {
+        let pstore = match self.qengine.storage().profile_store(project_id, true).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(project_id, error = %e, "failed to open profile store on identify");
@@ -1478,6 +1649,34 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/experiments/:exp_id/results",
             get(handle_experiment_results_scoped),
         )
+        .route(
+            "/v1/projects/:id/holdouts",
+            get(handle_list_holdouts).post(handle_create_holdout),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
+        )
+        .route(
+            "/v1/projects/:id/holdouts/:group_id/results",
+            post(handle_holdout_results),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics",
+            get(handle_list_saved_metrics).post(handle_create_saved_metric),
+        )
+        .route(
+            "/v1/projects/:id/saved-metrics/:metric_id",
+            axum::routing::delete(handle_delete_saved_metric),
+        )
+        .route(
+            "/v1/projects/:id/layers",
+            get(handle_list_layers).post(handle_create_layer),
+        )
+        .route(
+            "/v1/projects/:id/layers/:group_id",
+            axum::routing::delete(handle_delete_traffic_group),
+        )
         // Model Context Protocol (MCP) JSON-RPC 2.0
         .route("/v1/mcp", post(handle_mcp))
         // Encryption at rest, audit log, provider credentials, warehouse export & copilot
@@ -1506,6 +1705,7 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             get(auth::handle_me).patch(accounts::handle_update_me),
         )
         .route("/v1/auth/logout", post(auth::handle_logout))
+        .merge(crate::api_agent::agent_admin_routes())
         .merge(accounts::account_router())
         .route_layer(middleware::from_fn_with_state(
             ctrl.clone(),
@@ -1518,43 +1718,49 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         .with_state(ctrl)
 }
 
-/// Combined Control Plane router (public edge flag bundle + bearer-protected admin/query routes).
+/// Combined Control Plane router (public edge flag bundle + public agent ingest + bearer-protected admin/query routes).
 pub fn build_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
     Router::new()
         .merge(build_public_flag_router(ctrl.clone()))
+        .merge(crate::api_agent::build_agent_ingest_router(ctrl.clone()))
         .merge(build_admin_control_router(ctrl))
 }
 
-type ApiRes<T> = std::result::Result<Json<T>, CtrlError>;
+pub(crate) type ApiRes<T> = std::result::Result<Json<T>, CtrlError>;
 
-struct CtrlError(StatusCode, String);
+#[derive(Debug)]
+pub(crate) struct CtrlError(pub(crate) StatusCode, pub(crate) String);
 
 impl CtrlError {
-    fn bad(msg: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+        Self(status, msg.into())
+    }
+    pub(crate) fn bad(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, msg.into())
     }
-    fn unauthorized(msg: impl Into<String>) -> Self {
+    pub(crate) fn unauthorized(msg: impl Into<String>) -> Self {
         Self(StatusCode::UNAUTHORIZED, msg.into())
     }
-    fn forbidden(msg: impl Into<String>) -> Self {
+    pub(crate) fn forbidden(msg: impl Into<String>) -> Self {
         Self(StatusCode::FORBIDDEN, msg.into())
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self(StatusCode::NOT_FOUND, msg.into())
     }
-    fn conflict(msg: impl Into<String>) -> Self {
+    pub(crate) fn conflict(msg: impl Into<String>) -> Self {
         Self(StatusCode::CONFLICT, msg.into())
     }
-    fn bad_gateway(msg: impl Into<String>) -> Self {
+    pub(crate) fn bad_gateway(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_GATEWAY, msg.into())
     }
-    fn meta(err: MetaError) -> Self {
+    pub(crate) fn meta(err: MetaError) -> Self {
         match err {
             MetaError::Conflict(msg) => Self::conflict(msg),
             other => Self::internal(other),
         }
     }
-    fn exec(err: pulse_exec::ExecError) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn exec(err: pulse_exec::ExecError) -> Self {
         match err {
             pulse_exec::ExecError::QueryTimeout(ms) => Self(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -1576,7 +1782,7 @@ impl CtrlError {
             other => Self::internal(other),
         }
     }
-    fn internal(msg: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(msg: impl std::fmt::Display) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
     }
 }
@@ -1621,8 +1827,7 @@ async fn handle_status(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&pid)
+        .identity_graph(&pid, false)
         .await
         .map_err(CtrlError::internal)?;
 
@@ -1684,10 +1889,18 @@ async fn handle_admin_flush(
         .compact_all_projects()
         .await
         .map_err(CtrlError::internal)?;
+    ctrl.agent_store()
+        .flush_all_l0()
+        .await
+        .map_err(CtrlError::internal)?;
+    let agent_retention = ctrl.prune_expired_agent_data().await;
     Ok(Json(json!({
         "status": "ok",
         "segments_flushed": flushed,
-        "partitions_compacted": compacted
+        "partitions_compacted": compacted,
+        "agent_segments_pruned": agent_retention.segments_pruned,
+        "agent_evaluations_pruned": agent_retention.evaluations_pruned,
+        "agent_tombstones_pruned": agent_retention.tombstones_pruned,
     })))
 }
 
@@ -3437,8 +3650,23 @@ async fn handle_upsert_flag(
         }
     }
 
+    let actor = principal.actor_label();
+    let flag_id = format!("flg_{}_{}", id, req.key);
+    // Re-saving a flag keeps its holdout and layer slice; those change through their own routes.
+    let existing = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == flag_id);
+    if existing.is_some() {
+        ensure_flag_unlocked(&ctrl, &id, &req.key).await?;
+    }
     let flag = FeatureFlag {
-        id: format!("flg_{}_{}", id, req.key),
+        holdout: existing.as_ref().and_then(|f| f.holdout.clone()),
+        layer: existing.and_then(|f| f.layer),
+        id: flag_id,
         project_id: id,
         key: req.key,
         description: req.description,
@@ -3452,6 +3680,13 @@ async fn handle_upsert_flag(
         .upsert_feature_flag(&flag)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &actor,
+        "flag.saved",
+        &format!("project:{}", flag.project_id),
+        json!({ "flag_key": flag.key, "enabled": flag.enabled, "rollout_pct": flag.rollout_pct, "variants": flag.variants }),
+    )
+    .await;
     Ok(Json(flag))
 }
 
@@ -3464,6 +3699,11 @@ struct PatchFlagReq {
     targeting_cohort_id: Option<String>,
     /// Replaces the variant split (e.g. shipping the winner at 10000 bps).
     variants: Option<Vec<VariantAllocation>>,
+    /// A holdout id to attach, or `""` to detach.
+    holdout_id: Option<String>,
+    /// Only `""`: leave the layer (e.g. when shipping to everyone). Joining one goes through an
+    /// experiment's `layer`, which picks a free slice.
+    layer_id: Option<String>,
 }
 
 async fn handle_patch_flag(
@@ -3484,6 +3724,15 @@ async fn handle_patch_flag(
     else {
         return Err(CtrlError::not_found("flag not found"));
     };
+    let changes_serving = req.enabled.is_some()
+        || req.rollout_pct.is_some()
+        || req.targeting_cohort_id.is_some()
+        || req.variants.is_some()
+        || req.holdout_id.is_some()
+        || req.layer_id.is_some();
+    if changes_serving {
+        ensure_flag_unlocked(&ctrl, &id, &found.key).await?;
+    }
     if let Some(en) = req.enabled {
         found.enabled = en;
     }
@@ -3515,13 +3764,479 @@ async fn handle_patch_flag(
         }
         found.variants = variants;
     }
+    if let Some(hid) = req.holdout_id {
+        found.holdout = if hid.is_empty() {
+            None
+        } else {
+            let groups = ctrl
+                .meta
+                .list_traffic_groups(&id, "holdout")
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(h) = groups.into_iter().find(|g| g.id == hid) else {
+                return Err(CtrlError::bad(format!("holdout '{hid}' does not exist")));
+            };
+            Some(FlagHoldout {
+                id: h.id,
+                bps: h.bps,
+            })
+        };
+    }
+    match req.layer_id.as_deref() {
+        None => {}
+        Some("") => found.layer = None,
+        Some(_) => {
+            return Err(CtrlError::bad(
+                "join a layer by starting an experiment with `layer`, which picks a free slice",
+            ))
+        }
+    }
+    if found.enabled {
+        if let Some(l) = &found.layer {
+            let taken = layer_slices(&ctrl, &id, &l.id, &found.id).await?;
+            if taken
+                .iter()
+                .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+            {
+                return Err(CtrlError::conflict(format!(
+                    "another live flag now uses this flag's slice of layer '{}'; start a new experiment on it to get a free slice",
+                    l.id
+                )));
+            }
+        }
+    }
     found.updated_at_ms = Utc::now().timestamp_millis();
     ctrl.meta
         .upsert_feature_flag(&found)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "flag.updated",
+        &format!("project:{id}"),
+        json!({ "flag_key": found.key, "enabled": found.enabled, "rollout_pct": found.rollout_pct, "variants": found.variants, "holdout": found.holdout, "layer": found.layer }),
+    )
+    .await;
     Ok(Json(found))
 }
+
+/// `(start_bps, end_bps, flag_key)` held by the enabled flags in `layer_id` other than
+/// `except_flag_id`, sorted. A disabled flag serves no one, so its slice is free to reuse.
+async fn layer_slices(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    layer_id: &str,
+    except_flag_id: &str,
+) -> Result<Vec<(u32, u32, String)>, CtrlError> {
+    let mut taken: Vec<(u32, u32, String)> = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .filter(|f| f.enabled && f.id != except_flag_id)
+        .filter_map(|f| {
+            f.layer
+                .filter(|l| l.id == layer_id)
+                .map(|l| (l.start_bps, l.end_bps, f.key))
+        })
+        .collect();
+    taken.sort();
+    Ok(taken)
+}
+
+/// The first gap of at least `need` bps between sorted `taken` slices.
+fn first_free_slice(taken: &[(u32, u32, String)], need: u32) -> Option<(u32, u32)> {
+    let mut cursor = 0u32;
+    for (s, e, _) in taken {
+        if s.saturating_sub(cursor) >= need {
+            break;
+        }
+        cursor = cursor.max(*e);
+    }
+    (10_000u32.saturating_sub(cursor) >= need).then(|| (cursor, cursor + need))
+}
+
+async fn handle_list_saved_metrics(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<SavedMetric>> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    Ok(Json(
+        ctrl.meta
+            .list_saved_metrics(&id)
+            .await
+            .map_err(CtrlError::meta)?,
+    ))
+}
+
+const MAX_SAVED_METRICS: usize = 200;
+
+/// Saves `spec` under `name` (unique per project, ignoring case) for reuse in experiments.
+async fn handle_create_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut spec): Json<ExperimentMetricSpec>,
+) -> ApiRes<SavedMetric> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let name = spec.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    spec.name = name.clone();
+    // Auto-stop belongs to an experiment's guardrail, not to the definition.
+    spec.auto_stop = false;
+    crate::experiments::validate_metric_spec(&spec).map_err(CtrlError::bad)?;
+    let existing = ctrl
+        .meta
+        .list_saved_metrics(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    if existing.len() >= MAX_SAVED_METRICS {
+        return Err(CtrlError::bad(format!(
+            "a project can save at most {MAX_SAVED_METRICS} metrics; delete one first"
+        )));
+    }
+    if existing
+        .iter()
+        .any(|m| m.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(CtrlError::conflict(format!(
+            "a metric named '{name}' already exists"
+        )));
+    }
+    let m = SavedMetric {
+        id: format!("met_{}", &Uuid::new_v4().simple().to_string()[..12]),
+        project_id: id.clone(),
+        name,
+        spec,
+        created_by: ctrl.principal_label(&principal).await?,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    ctrl.meta
+        .insert_saved_metric(&m)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.created",
+        &format!("project:{id}"),
+        json!({ "id": m.id, "name": m.name }),
+    )
+    .await;
+    Ok(Json(m))
+}
+
+/// Experiments keep their own copy of a metric, so deleting a saved one changes none of them.
+async fn handle_delete_saved_metric(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, metric_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    if !ctrl
+        .meta
+        .delete_saved_metric(&id, &metric_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{metric_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "saved_metric.deleted",
+        &format!("project:{id}"),
+        json!({ "id": metric_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": metric_id })))
+}
+
+#[derive(Deserialize)]
+struct CreateTrafficGroupReq {
+    name: String,
+    /// Holdouts: the share of users held back, `0 < pct <= 50`.
+    #[serde(default)]
+    holdout_pct: f64,
+}
+
+async fn create_traffic_group(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+    req: CreateTrafficGroupReq,
+) -> ApiRes<TrafficGroup> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CtrlError::bad("name must be 1 to 80 characters"));
+    }
+    let bps = if kind == "holdout" {
+        if !(req.holdout_pct > 0.0 && req.holdout_pct <= 50.0) {
+            return Err(CtrlError::bad("holdout_pct must be above 0 and at most 50"));
+        }
+        (req.holdout_pct * 100.0).round() as u32
+    } else {
+        0
+    };
+    let g = TrafficGroup {
+        id: format!(
+            "{}_{}",
+            &kind[..3],
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        project_id: project_id.to_string(),
+        kind: kind.to_string(),
+        name: name.to_string(),
+        bps,
+        created_at_ms: Utc::now().timestamp_millis(),
+        metric_event: None,
+    };
+    ctrl.meta
+        .insert_traffic_group(&g)
+        .await
+        .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        &format!("{kind}.created"),
+        &format!("project:{project_id}"),
+        json!({ "id": g.id, "name": g.name, "bps": g.bps }),
+    )
+    .await;
+    Ok(Json(g))
+}
+
+/// A group plus the flags in it (holdouts: attached flags; layers: each flag's slice).
+async fn list_traffic_groups_with_flags(
+    ctrl: &ControlPlaneService,
+    principal: &AuthPrincipal,
+    project_id: &str,
+    kind: &str,
+) -> ApiRes<Vec<Value>> {
+    ctrl.authorize_and_check(principal, project_id).await?;
+    let groups = ctrl
+        .meta
+        .list_traffic_groups(project_id, kind)
+        .await
+        .map_err(CtrlError::meta)?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let out = groups
+        .into_iter()
+        .map(|g| {
+            let members: Vec<Value> = flags
+                .iter()
+                .filter_map(|f| match kind {
+                    "holdout" => f.holdout.as_ref().filter(|h| h.id == g.id).map(|_| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled })
+                    }),
+                    _ => f.layer.as_ref().filter(|l| l.id == g.id).map(|l| {
+                        json!({ "flag_key": f.key, "enabled": f.enabled, "start_bps": l.start_bps, "end_bps": l.end_bps })
+                    }),
+                })
+                .collect();
+            let used: u32 = flags
+                .iter()
+                .filter(|f| f.enabled)
+                .filter_map(|f| f.layer.as_ref().filter(|l| l.id == g.id))
+                .map(|l| l.end_bps - l.start_bps)
+                .sum();
+            let mut v = serde_json::to_value(&g).unwrap_or_default();
+            v["flags"] = json!(members);
+            if kind == "layer" {
+                v["free_bps"] = json!(10_000u32.saturating_sub(used));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn handle_list_holdouts(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "holdout").await
+}
+
+async fn handle_list_layers(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiRes<Vec<Value>> {
+    list_traffic_groups_with_flags(&ctrl, &principal, &id, "layer").await
+}
+
+async fn handle_create_holdout(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "holdout", req).await
+}
+
+async fn handle_create_layer(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<CreateTrafficGroupReq>,
+) -> ApiRes<TrafficGroup> {
+    create_traffic_group(&ctrl, &principal, &id, "layer", req).await
+}
+
+/// Deletes a holdout or layer no flag uses (409 otherwise).
+async fn handle_delete_traffic_group(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+) -> ApiRes<Value> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let users: Vec<&str> = flags
+        .iter()
+        .filter(|f| {
+            f.holdout.as_ref().is_some_and(|h| h.id == group_id)
+                || f.layer.as_ref().is_some_and(|l| l.id == group_id)
+        })
+        .map(|f| f.key.as_str())
+        .collect();
+    if !users.is_empty() {
+        return Err(CtrlError::conflict(format!(
+            "still used by {}; detach those flags first",
+            users.join(", ")
+        )));
+    }
+    if !ctrl
+        .meta
+        .delete_traffic_group(&id, &group_id)
+        .await
+        .map_err(CtrlError::meta)?
+    {
+        return Err(CtrlError::not_found(format!("'{group_id}' not found")));
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "traffic_group.deleted",
+        &format!("project:{id}"),
+        json!({ "id": group_id }),
+    )
+    .await;
+    Ok(Json(json!({ "deleted": group_id })))
+}
+
+#[derive(Deserialize)]
+struct HoldoutResultsReq {
+    metric: ExperimentMetricSpec,
+    /// Defaults to when the holdout was created.
+    start_ts_ms: Option<i64>,
+    /// Defaults to now.
+    end_ts_ms: Option<i64>,
+}
+
+/// Users who reached any flag in the holdout ("exposed") against those held back ("holdout"),
+/// from `$holdout_assigned`: the combined effect of every attached flag.
+async fn handle_holdout_results(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((id, group_id)): AxumPath<(String, String)>,
+    Json(req): Json<HoldoutResultsReq>,
+) -> ApiRes<ExperimentResults> {
+    ctrl.authorize_and_check(&principal, &id).await?;
+    crate::experiments::validate_metric_spec(&req.metric).map_err(CtrlError::bad)?;
+    let Some(h) = ctrl
+        .meta
+        .list_traffic_groups(&id, "holdout")
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|g| g.id == group_id)
+    else {
+        return Err(CtrlError::not_found(format!(
+            "holdout '{group_id}' not found"
+        )));
+    };
+    // Remember the impact metric, so the holdout reopens on it.
+    if h.metric_event.as_deref() != Some(req.metric.event_name.as_str()) {
+        ctrl.meta
+            .set_traffic_group_metric(&id, &h.id, &req.metric.event_name)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    let now = Utc::now().timestamp_millis();
+    let exp = Experiment {
+        id: h.id.clone(),
+        project_id: id.clone(),
+        name: h.name.clone(),
+        flag_id: h.id.clone(),
+        flag_key: h.id.clone(),
+        hypothesis: String::new(),
+        status: "running".to_string(),
+        start_ts_ms: req.start_ts_ms.unwrap_or(h.created_at_ms),
+        end_ts_ms: req.end_ts_ms.unwrap_or(now),
+        primary_metric: req.metric,
+        guardrail_metrics: Vec::new(),
+        secondary_metrics: Vec::new(),
+        created_by: String::new(),
+        problem: String::new(),
+        owner: String::new(),
+        notify: false,
+        // A holdout is read whenever someone looks, so its results must stay valid under peeking.
+        analysis: AnalysisConfig {
+            sequential: true,
+            ..AnalysisConfig::default()
+        },
+        created_at_ms: h.created_at_ms,
+        stop_reason: None,
+        pause_reason: None,
+        kind: "holdout".to_string(),
+        bandit: None,
+        decision: None,
+    };
+    let groups = FeatureFlag {
+        id: h.id.clone(),
+        project_id: id,
+        key: h.id,
+        description: String::new(),
+        enabled: true,
+        rollout_pct: 100.0,
+        targeting_cohort_id: None,
+        variants: vec![
+            VariantAllocation {
+                key: "holdout".to_string(),
+                weight_bps: h.bps,
+                payload: Value::Null,
+            },
+            VariantAllocation {
+                key: "exposed".to_string(),
+                weight_bps: 10_000 - h.bps,
+                payload: Value::Null,
+            },
+        ],
+        updated_at_ms: now,
+        holdout: None,
+        layer: None,
+    };
+    let results =
+        crate::experiments::evaluate_experiment_results(&exp, Some(&groups), &ctrl.qengine, None)
+            .await
+            .map_err(CtrlError::internal)?;
+    Ok(Json(results))
+}
+
+/// How long a built flag bundle is reused when no flag changed; cohort membership can still move.
+const FLAG_BUNDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn handle_edge_flag_bundle(
     State(ctrl): State<Arc<ControlPlaneService>>,
@@ -3536,30 +4251,51 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    let bundle = build_edge_flag_bundle_with_cohorts(
-        &project_id,
-        &flags,
-        &ctrl.qengine,
-        Utc::now().timestamp_millis(),
-    )
-    .await
-    .map_err(CtrlError::internal)?;
+    let version = flags.iter().map(|f| f.updated_at_ms).max().unwrap_or(0);
+    let cached = ctrl
+        .flag_bundle_cache
+        .get(&project_id)
+        .filter(|c| c.0 == version && c.1 == flags.len() && c.2.elapsed() < FLAG_BUNDLE_TTL)
+        .map(|c| c.3.clone());
+    let bundle = match cached {
+        Some(b) => b,
+        None => {
+            let b = Arc::new(
+                build_edge_flag_bundle_with_cohorts(
+                    &project_id,
+                    &flags,
+                    &ctrl.qengine,
+                    Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(CtrlError::internal)?,
+            );
+            ctrl.flag_bundle_cache.insert(
+                project_id.clone(),
+                (version, flags.len(), std::time::Instant::now(), b.clone()),
+            );
+            b
+        }
+    };
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
         if inm.trim() == bundle.etag {
-            return Ok(
-                (StatusCode::NOT_MODIFIED, [(header::ETAG, bundle.etag)], "").into_response(),
-            );
+            return Ok((
+                StatusCode::NOT_MODIFIED,
+                [(header::ETAG, bundle.etag.clone())],
+                "",
+            )
+                .into_response());
         }
     }
 
     Ok((
         StatusCode::OK,
         [(header::ETAG, bundle.etag.clone())],
-        Json(bundle),
+        Json(bundle.as_ref().clone()),
     )
         .into_response())
 }
@@ -3591,6 +4327,46 @@ struct CreateExpReq {
     primary_metric: ExperimentMetricSpec,
     #[serde(default)]
     guardrail_metrics: Vec<ExperimentMetricSpec>,
+    /// Reported next to the primary metric; never decide or stop anything.
+    #[serde(default)]
+    secondary_metrics: Vec<ExperimentMetricSpec>,
+    #[serde(default)]
+    analysis: AnalysisConfig,
+    /// `"ab"` (default) or `"bandit"`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    bandit: Option<BanditConfig>,
+    /// Run in a slice of this layer, so no user is also in another of its experiments.
+    #[serde(default)]
+    layer: Option<ExperimentLayerReq>,
+    /// The problem being addressed, in plain words.
+    #[serde(default)]
+    problem: String,
+    /// Who answers for the experiment; empty means whoever created it.
+    #[serde(default)]
+    owner: String,
+    /// Send milestones to the project webhook (default on).
+    #[serde(default)]
+    notify: Option<bool>,
+}
+
+/// Problem and owner are free text shown to people; keep them to a sensible size.
+fn check_context(problem: Option<&str>, owner: Option<&str>) -> Result<(), CtrlError> {
+    if problem.is_some_and(|p| p.chars().count() > 2_000) {
+        return Err(CtrlError::bad("problem must be at most 2000 characters"));
+    }
+    if owner.is_some_and(|o| o.chars().count() > 200) {
+        return Err(CtrlError::bad("owner must be at most 200 characters"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ExperimentLayerReq {
+    layer_id: String,
+    /// Share of the layer's users this experiment takes, `0 < pct <= 100`.
+    traffic_pct: f64,
 }
 
 async fn handle_create_experiment(
@@ -3600,39 +4376,412 @@ async fn handle_create_experiment(
     Json(req): Json<CreateExpReq>,
 ) -> ApiRes<Experiment> {
     ctrl.authorize_and_check(&principal, &id).await?;
+    check_context(Some(&req.problem), Some(&req.owner))?;
     if req.id.is_some() {
         return Err(CtrlError::bad(
             "experiment id is generated by the server and must not be client-supplied",
         ));
     }
+    if !(req.analysis.alpha > 0.0 && req.analysis.alpha < 0.5) {
+        return Err(CtrlError::bad("analysis.alpha must be between 0 and 0.5"));
+    }
+    if req.analysis.planned_users_per_variant == Some(0) {
+        return Err(CtrlError::bad(
+            "analysis.planned_users_per_variant must be at least 1",
+        ));
+    }
+    if req.analysis.cuped_pre_window_ms < 0 {
+        return Err(CtrlError::bad(
+            "analysis.cuped_pre_window_ms must not be negative",
+        ));
+    }
+    for m in std::iter::once(&req.primary_metric)
+        .chain(&req.guardrail_metrics)
+        .chain(&req.secondary_metrics)
+    {
+        crate::experiments::validate_metric_spec(m).map_err(CtrlError::bad)?;
+    }
+    if req.guardrail_metrics.len() + req.secondary_metrics.len() > 20 {
+        return Err(CtrlError::bad(
+            "at most 20 guardrail and secondary metrics in total",
+        ));
+    }
+    // Names are how people find and talk about experiments, so two can't share one.
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(CtrlError::bad("name must not be empty"));
+    }
+    if ctrl
+        .meta
+        .list_experiments(&id)
+        .await
+        .map_err(CtrlError::meta)?
+        .iter()
+        .any(|e| e.name.trim().eq_ignore_ascii_case(&name))
+    {
+        return Err(CtrlError::conflict(format!(
+            "an experiment named '{name}' already exists; pick another name"
+        )));
+    }
+    if req.guardrail_metrics.iter().any(|g| g.auto_stop) && !req.analysis.sequential {
+        return Err(CtrlError::bad(
+            "auto_stop guardrails need analysis.sequential: results are checked every few minutes",
+        ));
+    }
+    let kind = req.kind.unwrap_or_else(|| "ab".to_string());
+    let mut bandit_start: Option<BTreeMap<String, u32>> = None;
+    match kind.as_str() {
+        "ab" => {}
+        "bandit" => {
+            if !req.guardrail_metrics.is_empty() || !req.secondary_metrics.is_empty() {
+                return Err(CtrlError::bad(
+                    "bandits don't support guardrails or secondary metrics: their traffic moves, so guardrails can't be tested fairly",
+                ));
+            }
+            let flags = ctrl
+                .meta
+                .list_feature_flags(&id)
+                .await
+                .map_err(CtrlError::meta)?;
+            let Some(flag) = flags.iter().find(|f| f.key == req.flag_key) else {
+                return Err(CtrlError::bad(
+                    "create the flag with its variants before starting a bandit on it",
+                ));
+            };
+            let cfg = req.bandit.clone().unwrap_or_default();
+            let arms = flag.variants.len() as u32;
+            if arms < 2 {
+                return Err(CtrlError::bad(
+                    "a bandit needs a flag with at least two variants",
+                ));
+            }
+            if cfg.min_weight_bps.saturating_mul(arms) > 10_000 {
+                return Err(CtrlError::bad(format!(
+                    "bandit.min_weight_bps {} is too high for {arms} variants",
+                    cfg.min_weight_bps
+                )));
+            }
+            bandit_start = Some(
+                flag.variants
+                    .iter()
+                    .map(|v| (v.key.clone(), v.weight_bps))
+                    .collect(),
+            );
+        }
+        _ => return Err(CtrlError::bad("kind must be ab or bandit")),
+    }
+    // Two live experiments on one flag share users and assignment, so their results conflict
+    // (and a bandit rewrites the weights under the other one).
+    let status = req.status.clone().unwrap_or_else(|| "running".to_string());
+    if !matches!(
+        status.as_str(),
+        "draft" | "running" | "paused" | "concluded"
+    ) {
+        return Err(CtrlError::bad(
+            "status must be one of draft, running, paused, concluded",
+        ));
+    }
+    if is_live(&status) {
+        ensure_flag_free(&ctrl, &id, &req.flag_key, None).await?;
+    }
+    if let Some(lr) = &req.layer {
+        if !(lr.traffic_pct > 0.0 && lr.traffic_pct <= 100.0) {
+            return Err(CtrlError::bad(
+                "layer.traffic_pct must be above 0 and at most 100",
+            ));
+        }
+        let layers = ctrl
+            .meta
+            .list_traffic_groups(&id, "layer")
+            .await
+            .map_err(CtrlError::meta)?;
+        if !layers.iter().any(|l| l.id == lr.layer_id) {
+            return Err(CtrlError::bad(format!(
+                "layer '{}' does not exist",
+                lr.layer_id
+            )));
+        }
+        let flags = ctrl
+            .meta
+            .list_feature_flags(&id)
+            .await
+            .map_err(CtrlError::meta)?;
+        let Some(mut flag) = flags.into_iter().find(|f| f.key == req.flag_key) else {
+            return Err(CtrlError::bad(
+                "create the flag before starting an experiment in a layer",
+            ));
+        };
+        let need = ((lr.traffic_pct * 100.0).round() as u32).max(1);
+        let taken = layer_slices(&ctrl, &id, &lr.layer_id, &flag.id).await?;
+        let Some((start_bps, end_bps)) = first_free_slice(&taken, need) else {
+            let free = 10_000 - taken.iter().map(|(s, e, _)| e - s).sum::<u32>();
+            return Err(CtrlError::conflict(format!(
+                "layer has no free slice of {}% (free: {}%, possibly split); stop an experiment in it or ask for less",
+                lr.traffic_pct,
+                f64::from(free) / 100.0
+            )));
+        };
+        flag.layer = Some(FlagLayer {
+            id: lr.layer_id.clone(),
+            start_bps,
+            end_bps,
+        });
+        flag.updated_at_ms = Utc::now().timestamp_millis();
+        ctrl.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
     let now = Utc::now().timestamp_millis();
     let exp = Experiment {
         id: format!("exp_{}", &Uuid::new_v4().simple().to_string()[..12]),
         project_id: id.clone(),
-        name: req.name,
+        name,
         flag_id: req
             .flag_id
             .unwrap_or_else(|| format!("flg_{}_{}", id, req.flag_key)),
         flag_key: req.flag_key,
         hypothesis: req.hypothesis,
-        status: req.status.unwrap_or_else(|| "running".to_string()),
+        status,
         start_ts_ms: req.start_ts_ms.unwrap_or(now - 14 * 86_400_000),
         end_ts_ms: req.end_ts_ms.unwrap_or(now + 14 * 86_400_000),
         primary_metric: req.primary_metric,
         guardrail_metrics: req.guardrail_metrics,
+        secondary_metrics: req.secondary_metrics,
+        analysis: req.analysis,
         created_at_ms: now,
+        created_by: ctrl.principal_label(&principal).await?,
+        problem: req.problem.trim().to_string(),
+        owner: req.owner.trim().to_string(),
+        notify: req.notify.unwrap_or(true),
+        stop_reason: None,
+        pause_reason: None,
+        bandit: (kind == "bandit").then(|| req.bandit.unwrap_or_default()),
+        kind,
+        decision: None,
     };
     ctrl.meta
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    if let Some(weights) = bandit_start {
+        let snap = WeightSnapshot {
+            effective_from_ms: exp.start_ts_ms,
+            weights,
+        };
+        ctrl.meta
+            .insert_weight_snapshot(&id, &exp.id, &snap)
+            .await
+            .map_err(CtrlError::meta)?;
+    }
+    if exp.status == "running" {
+        turn_flag_on_for(&ctrl, &exp).await?;
+    }
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.created",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "name": exp.name, "flag_key": exp.flag_key }),
+    )
+    .await;
     Ok(Json(exp))
+}
+
+/// 409 when a running or paused experiment uses `flag_key`: changing who gets which variant
+/// mid-test skews its results. Pause, stop or ship the experiment instead.
+async fn ensure_flag_unlocked(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+) -> Result<(), CtrlError> {
+    let live = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| e.flag_key == flag_key && is_live(&e.status));
+    match live {
+        Some(e) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is locked while the experiment '{}' is {}. Stop or ship it to change who sees what, or pause it to turn the flag off",
+            e.name, e.status
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// 409 when another running or paused experiment (other than `except_id`) uses `flag_key`.
+async fn ensure_flag_free(
+    ctrl: &ControlPlaneService,
+    project_id: &str,
+    flag_key: &str,
+    except_id: Option<&str>,
+) -> Result<(), CtrlError> {
+    let other = ctrl
+        .meta
+        .list_experiments(project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|e| e.flag_key == flag_key && is_live(&e.status) && Some(e.id.as_str()) != except_id);
+    match other {
+        Some(o) => Err(CtrlError::conflict(format!(
+            "flag '{flag_key}' is already used by the experiment '{}'. Stop it first, or use another flag",
+            o.name
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[derive(Deserialize)]
 struct PatchExpReq {
     status: Option<String>,
     end_ts_ms: Option<i64>,
+    /// With `status: "concluded"`: what was decided, and what to do with the flag.
+    decision: Option<DecisionReq>,
+    problem: Option<String>,
+    owner: Option<String>,
+    notify: Option<bool>,
+    /// With `status: "paused"`: why, kept on the experiment and in the audit log.
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DecisionReq {
+    outcome: String,
+    variant: Option<String>,
+    #[serde(default)]
+    reason: String,
+    flag_action: String,
+    #[serde(default)]
+    acknowledged: Vec<String>,
+    /// With `flag_action: "staged"`: days between steps (1 to 14, default 2).
+    every_days: Option<u32>,
+}
+
+/// The rollout steps a staged ship goes through.
+const STAGED_STEPS_PCT: [f64; 3] = [25.0, 50.0, 100.0];
+
+/// Running and paused experiments hold their flag; drafts and concluded ones don't.
+fn is_live(status: &str) -> bool {
+    matches!(status, "running" | "paused")
+}
+
+async fn set_flag_enabled(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    enabled: bool,
+) -> Result<(), CtrlError> {
+    let Some(mut flag) = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    flag.enabled = enabled;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
+}
+
+/// Turns the experiment's flag on, first moving it to a free slice if its layer slice was
+/// taken while it was off.
+async fn turn_flag_on_for(ctrl: &ControlPlaneService, exp: &Experiment) -> Result<(), CtrlError> {
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Ok(());
+    };
+    if flag.enabled {
+        return Ok(());
+    }
+    if let Some(l) = flag.layer.clone() {
+        let taken = layer_slices(ctrl, &exp.project_id, &l.id, &flag.id).await?;
+        if taken
+            .iter()
+            .any(|(s, e, _)| *s < l.end_bps && l.start_bps < *e)
+        {
+            let Some((start_bps, end_bps)) = first_free_slice(&taken, l.end_bps - l.start_bps)
+            else {
+                return Err(CtrlError::conflict(format!(
+                    "layer '{}' no longer has a free slice of {}%; stop an experiment in it first",
+                    l.id,
+                    f64::from(l.end_bps - l.start_bps) / 100.0
+                )));
+            };
+            flag.layer = Some(FlagLayer {
+                id: l.id,
+                start_bps,
+                end_bps,
+            });
+        }
+    }
+    flag.enabled = true;
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
+}
+
+/// Applies a decision's flag action: everyone gets the winner, the flag goes off, or nothing.
+async fn apply_decision_to_flag(
+    ctrl: &ControlPlaneService,
+    exp: &Experiment,
+    d: &DecisionReq,
+) -> Result<(), CtrlError> {
+    if d.flag_action == "keep" {
+        return Ok(());
+    }
+    let flags = ctrl
+        .meta
+        .list_feature_flags(&exp.project_id)
+        .await
+        .map_err(CtrlError::meta)?;
+    let Some(mut flag) = flags
+        .into_iter()
+        .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+    else {
+        return Err(CtrlError::bad("the experiment's flag no longer exists"));
+    };
+    if d.flag_action == "rollout" || d.flag_action == "staged" {
+        let winner = d.variant.as_deref().unwrap_or_default();
+        if !flag.variants.iter().any(|v| v.key == winner) {
+            return Err(CtrlError::bad(format!(
+                "rollout needs one of the flag's variants, got '{winner}'"
+            )));
+        }
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == winner { 10_000 } else { 0 };
+        }
+        flag.enabled = true;
+        flag.rollout_pct = if d.flag_action == "staged" {
+            STAGED_STEPS_PCT[0]
+        } else {
+            100.0
+        };
+        // Leave the layer so the winner reaches everyone, not just this experiment's slice.
+        flag.layer = None;
+    } else {
+        flag.enabled = false;
+    }
+    flag.updated_at_ms = Utc::now().timestamp_millis();
+    ctrl.meta
+        .upsert_feature_flag(&flag)
+        .await
+        .map_err(CtrlError::meta)
 }
 
 /// Stop, pause or resume an experiment. Shipping a winner is a flag patch plus `status: "concluded"`.
@@ -3651,13 +4800,117 @@ async fn handle_patch_experiment(
     else {
         return Err(CtrlError::not_found("experiment not found"));
     };
+    check_context(req.problem.as_deref(), req.owner.as_deref())?;
+    if let Some(p) = req.problem {
+        exp.problem = p.trim().to_string();
+    }
+    if let Some(o) = req.owner {
+        exp.owner = o.trim().to_string();
+    }
+    if let Some(n) = req.notify {
+        exp.notify = n;
+    }
+    if req.decision.is_some() && req.status.as_deref() != Some("concluded") {
+        return Err(CtrlError::bad(
+            "a decision is recorded when concluding: send status \"concluded\"",
+        ));
+    }
     if let Some(status) = req.status {
         if !matches!(status.as_str(), "running" | "paused" | "concluded") {
             return Err(CtrlError::bad(
                 "status must be one of running, paused, concluded",
             ));
         }
+        if exp.status == "draft" && status == "paused" {
+            return Err(CtrlError::bad(
+                "a draft can't be paused; start it or conclude it",
+            ));
+        }
+        if is_live(&status) && !is_live(&exp.status) {
+            ensure_flag_free(&ctrl, &id, &exp.flag_key, Some(&exp.id)).await?;
+        }
+        if exp.status == "draft" && status == "running" {
+            // Starting a draft: the clock starts now and keeps the planned length.
+            let now = Utc::now().timestamp_millis();
+            let length = (exp.end_ts_ms - exp.start_ts_ms).max(86_400_000);
+            exp.start_ts_ms = now;
+            exp.end_ts_ms = now + length;
+            turn_flag_on_for(&ctrl, &exp).await?;
+        }
+        if exp.status == "running" && status == "paused" {
+            // Pausing serves everyone the app's default until resumed. Bucketing is deterministic,
+            // so users get their same variant back on resume.
+            set_flag_enabled(&ctrl, &exp, false).await?;
+            let reason = req.reason.as_deref().unwrap_or("").trim();
+            if reason.chars().count() > 500 {
+                return Err(CtrlError::bad("reason must be at most 500 characters"));
+            }
+            exp.pause_reason = (!reason.is_empty()).then(|| reason.to_string());
+        }
+        if exp.status == "paused" && status == "running" {
+            turn_flag_on_for(&ctrl, &exp).await?;
+            exp.pause_reason = None;
+        }
+        if status == "running" {
+            exp.stop_reason = None;
+        }
         exp.status = status;
+    }
+    if let Some(d) = req.decision {
+        if !matches!(d.outcome.as_str(), "ship" | "keep_control" | "inconclusive") {
+            return Err(CtrlError::bad(
+                "decision.outcome must be ship, keep_control or inconclusive",
+            ));
+        }
+        if !matches!(
+            d.flag_action.as_str(),
+            "rollout" | "staged" | "rollback" | "keep"
+        ) {
+            return Err(CtrlError::bad(
+                "decision.flag_action must be rollout, staged, rollback or keep",
+            ));
+        }
+        if d.flag_action == "staged" && d.outcome != "ship" {
+            return Err(CtrlError::bad("a staged rollout needs outcome ship"));
+        }
+        let every_days = d.every_days.unwrap_or(2);
+        if !(1..=14).contains(&every_days) {
+            return Err(CtrlError::bad("decision.every_days must be 1 to 14"));
+        }
+        if d.acknowledged.len() > 10 || d.acknowledged.iter().any(|a| a.chars().count() > 500) {
+            return Err(CtrlError::bad(
+                "decision.acknowledged takes at most 10 items of 500 characters",
+            ));
+        }
+        if d.reason.chars().count() > 2_000 {
+            return Err(CtrlError::bad(
+                "decision.reason must be at most 2000 characters",
+            ));
+        }
+        apply_decision_to_flag(&ctrl, &exp, &d).await?;
+        let staged = d.flag_action == "staged";
+        let now = Utc::now().timestamp_millis();
+        exp.end_ts_ms = exp.end_ts_ms.min(now);
+        let decided_by = ctrl.principal_label(&principal).await?;
+        exp.decision = Some(ExperimentDecision {
+            outcome: d.outcome,
+            variant: d.variant,
+            reason: d.reason.trim().to_string(),
+            flag_action: d.flag_action,
+            staged: staged.then(|| {
+                let every_ms = i64::from(every_days) * 86_400_000;
+                StagedRollout {
+                    steps_pct: STAGED_STEPS_PCT.to_vec(),
+                    every_ms,
+                    next_step: 1,
+                    next_at_ms: now + every_ms,
+                    halted: None,
+                }
+            }),
+            acknowledged: d.acknowledged,
+            decided_by,
+            decided_at_ms: now,
+        });
     }
     if let Some(end) = req.end_ts_ms {
         exp.end_ts_ms = end;
@@ -3666,6 +4919,13 @@ async fn handle_patch_experiment(
         .upsert_experiment(&exp)
         .await
         .map_err(CtrlError::meta)?;
+    ctrl.record_enterprise_audit(
+        &principal.actor_label(),
+        "experiment.updated",
+        &format!("project:{id}"),
+        json!({ "experiment_id": exp.id, "status": exp.status, "end_ts_ms": exp.end_ts_ms, "decision": exp.decision }),
+    )
+    .await;
     Ok(Json(exp))
 }
 
@@ -3673,6 +4933,7 @@ async fn handle_experiment_results_scoped(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath((project_id, exp_id)): AxumPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiRes<crate::models::ExperimentResults> {
     ctrl.authorize_and_check(&principal, &project_id).await?;
     let Some(exp) = ctrl
@@ -3691,9 +4952,21 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
-    let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
-        .await
-        .map_err(CtrlError::internal)?;
+    let segment = params
+        .get("segment")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let results = if exp.kind == "bandit" {
+        let history = ctrl
+            .meta
+            .list_weight_history(&project_id, &exp.id)
+            .await
+            .map_err(CtrlError::meta)?;
+        evaluate_bandit_results(&exp, flag, &history, &ctrl.qengine).await
+    } else {
+        evaluate_experiment_results(&exp, flag, &ctrl.qengine, segment).await
+    }
+    .map_err(CtrlError::internal)?;
     Ok(Json(results))
 }
 
@@ -3712,7 +4985,14 @@ async fn handle_mcp(
     if req.id.is_null() {
         return Ok(StatusCode::ACCEPTED.into_response());
     }
-    let resp = handle_mcp_request(req, &bound_pid, &ctrl.meta, &ctrl.qengine).await;
+    let resp = crate::mcp::handle_mcp_request_with_agent_store(
+        req,
+        &bound_pid,
+        &ctrl.meta,
+        &ctrl.qengine,
+        Some(ctrl.agent_store().as_ref()),
+    )
+    .await;
     Ok(Json(resp).into_response())
 }
 
@@ -3775,8 +5055,7 @@ async fn handle_list_user_profiles(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profiles = pstore
@@ -3818,16 +5097,14 @@ async fn handle_get_user_detail(
     let id_graph = ctrl
         .qengine
         .storage()
-        .identity_router()
-        .get_or_open(&id)
+        .identity_graph(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
 
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let profile = pstore
@@ -4200,8 +5477,7 @@ async fn handle_export_cohort(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let mut by_uid: HashMap<u32, UserProfileRecord> = HashMap::with_capacity(members.len());
@@ -4292,8 +5568,7 @@ async fn handle_get_revenue_summary(
     let pstore = ctrl
         .qengine
         .storage()
-        .profile_router()
-        .get_or_open(&id)
+        .profile_store(&id, false)
         .await
         .map_err(|e| CtrlError::internal(e.to_string()))?;
     let (total_profiles, paying_users, total_revenue) = pstore
@@ -4354,11 +5629,11 @@ async fn handle_get_revenue_summary(
     })))
 }
 
-const ALERT_OPERATORS: [&str; 4] = ["gt", "gte", "lt", "lte"];
+pub(crate) const ALERT_OPERATORS: [&str; 4] = ["gt", "gte", "lt", "lte"];
 /// An alert looks at the last 24 hours and, while its condition holds, fires at most once per window.
 const ALERT_WINDOW_MS: i64 = 86_400_000;
 
-fn alert_condition_met(operator: &str, value: f64, threshold: f64) -> bool {
+pub(crate) fn alert_condition_met(operator: &str, value: f64, threshold: f64) -> bool {
     match operator {
         "gt" => value > threshold,
         "gte" => value >= threshold,
@@ -4399,8 +5674,8 @@ impl ControlPlaneService {
 
     /// Checks every alert rule, records when one fires, and posts a signed webhook for it.
     /// `pulse-node` calls this on a timer.
-    // ponytail: every query-serving node runs this, so several query nodes each deliver; add a
-    // leader lease if you run more than one.
+    /// Every query-serving node runs this; the conditional update on `last_triggered_ms` is the
+    /// claim, so only one node delivers each trigger.
     pub async fn evaluate_alerts(&self) {
         let now_ms = Utc::now().timestamp_millis();
         let Ok(projects) = self.meta.list_projects().await else {
@@ -4411,6 +5686,7 @@ impl ControlPlaneService {
                 continue;
             };
             for mut a in rules {
+                let prev_triggered_ms = a.last_triggered_ms;
                 if a.last_triggered_ms
                     .is_some_and(|t| now_ms - t < ALERT_WINDOW_MS)
                 {
@@ -4421,9 +5697,17 @@ impl ControlPlaneService {
                     continue;
                 }
                 a.last_triggered_ms = Some(now_ms);
-                if let Err(e) = self.meta.upsert_alert_rule(&a).await {
-                    tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
-                    continue;
+                match self
+                    .meta
+                    .claim_alert_trigger(&a.id, prev_triggered_ms, now_ms)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue, // another node claimed this trigger
+                    Err(e) => {
+                        tracing::warn!(alert_id = %a.id, "couldn't record alert trigger: {e}");
+                        continue;
+                    }
                 }
                 match self.deliver_alert(&a, value, now_ms).await {
                     Ok(Some(status)) => {
@@ -4446,20 +5730,6 @@ impl ControlPlaneService {
         value: f64,
         now_ms: i64,
     ) -> Result<Option<reqwest::StatusCode>, String> {
-        let Some(rec) = self
-            .meta
-            .get_byok_credential(&a.project_id, "webhook")
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
-        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
-        let signing_secret = webhook_signing_secret(&cfg)
-            .ok_or("webhook credential has no signing_secret")?
-            .to_string();
-        let url = a.webhook_url.clone().unwrap_or(cred_url);
         let body = json!({
             "event": "pulse.alert.triggered",
             "project_id": a.project_id,
@@ -4474,14 +5744,480 @@ impl ControlPlaneService {
             "window_ms": ALERT_WINDOW_MS,
             "timestamp_ms": now_ms,
         });
-        post_signed_webhook(&url, &signing_secret, &body)
+        self.post_project_webhook(&a.project_id, a.webhook_url.clone(), &body)
+            .await
+    }
+
+    /// Posts `body` to `url` (or the project's webhook credential URL), signed with that
+    /// credential's secret. `Ok(None)` when the project has no webhook credential.
+    async fn post_project_webhook(
+        &self,
+        project_id: &str,
+        url: Option<String>,
+        body: &Value,
+    ) -> Result<Option<reqwest::StatusCode>, String> {
+        let Some(rec) = self
+            .meta
+            .get_byok_credential(project_id, "webhook")
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cred_url = unseal_secret(&self.vault_kek, &rec.sealed_secret_hex)?;
+        let cfg = unseal_byok_config_json(&self.vault_kek, &rec.config_json)?;
+        let signing_secret = webhook_signing_secret(&cfg)
+            .ok_or("webhook credential has no signing_secret")?
+            .to_string();
+        post_signed_webhook(&url.unwrap_or(cred_url), &signing_secret, body)
             .await
             .map(Some)
+    }
+
+    /// Stops running sequential experiments whose `auto_stop` guardrail a treatment made
+    /// significantly worse: everyone gets control, the experiment is concluded with a
+    /// `stop_reason`, and it is audited and sent to the project webhook. Also announces A/B
+    /// milestones (see [`Self::announce_milestones`]). `pulse-node` calls this on a timer.
+    // ponytail: same multi-node ceiling as `evaluate_alerts`; also re-runs every guardrail query
+    // each tick, fine at the 5-minute cadence.
+    pub async fn evaluate_experiment_guardrails(&self) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                // Paused experiments' flags are off, but users already in them can still trip a guardrail.
+                if exp.status != "running" && exp.status != "paused" {
+                    continue;
+                }
+                if let Err(e) = self.check_running_experiment(exp).await {
+                    tracing::warn!(project_id = %proj.id, "guardrail check failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Raises each staged ship's rollout to its next step once due. If the flag was changed by
+    /// hand since the last step (rollout, on/off or the winner's weight), it halts instead and
+    /// leaves the flag alone. `pulse-node` calls this on the guardrail timer.
+    pub async fn advance_staged_rollouts(&self) {
+        self.advance_staged_rollouts_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::advance_staged_rollouts`] as if the time were `now_ms`.
+    pub async fn advance_staged_rollouts_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                let due = exp
+                    .decision
+                    .as_ref()
+                    .and_then(|d| d.staged.as_ref())
+                    .is_some_and(|st| {
+                        st.halted.is_none()
+                            && st.next_step < st.steps_pct.len()
+                            && now_ms >= st.next_at_ms
+                    });
+                if due {
+                    if let Err(e) = self.advance_staged_rollout(exp, now_ms).await {
+                        tracing::warn!(project_id = %proj.id, "staged rollout failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn advance_staged_rollout(&self, mut exp: Experiment, now: i64) -> Result<(), String> {
+        let Some(d) = exp.decision.as_mut() else {
+            return Ok(());
+        };
+        let winner = d.variant.clone().unwrap_or_default();
+        let Some(st) = d.staged.as_mut() else {
+            return Ok(());
+        };
+        let flag = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
+        let expected = st.steps_pct[st.next_step - 1];
+        let action = match flag {
+            Some(mut f)
+                if f.enabled
+                    && (f.rollout_pct - expected).abs() < 0.01
+                    && f.variants
+                        .iter()
+                        .any(|v| v.key == winner && v.weight_bps == 10_000) =>
+            {
+                f.rollout_pct = st.steps_pct[st.next_step];
+                f.updated_at_ms = now;
+                self.meta
+                    .upsert_feature_flag(&f)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                st.next_step += 1;
+                st.next_at_ms += st.every_ms;
+                json!({ "experiment_id": exp.id, "flag_key": f.key, "rollout_pct": f.rollout_pct })
+            }
+            _ => {
+                st.halted = Some(
+                    "the flag was changed by hand, so Pulse stopped raising the rollout".into(),
+                );
+                json!({ "experiment_id": exp.id, "halted": st.halted })
+            }
+        };
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "pulse",
+            "experiment.rollout_advanced",
+            &format!("project:{}", exp.project_id),
+            action,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Moves each running bandit's flag weights toward its best arm, once a day, in the first
+    /// hour after midnight in the project's timezone, once every arm is past burn-in. Weights only
+    /// change at day boundaries so each exposure day (the unit results are stratified and
+    /// SRM-checked by) has one set of weights. `pulse-node` calls this on the guardrail timer.
+    // ponytail: users exposed between midnight and the next tick (up to 5 minutes) get yesterday's
+    // weights but count in today's stratum; a node that's down for that hour skips a day.
+    pub async fn evaluate_bandits(&self) {
+        self.evaluate_bandits_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// [`Self::evaluate_bandits`] as if the time were `now_ms`.
+    pub async fn evaluate_bandits_at(&self, now_ms: i64) {
+        let Ok(projects) = self.meta.list_projects().await else {
+            return;
+        };
+        for proj in projects {
+            let Ok(exps) = self.meta.list_experiments(&proj.id).await else {
+                continue;
+            };
+            for exp in exps {
+                if exp.status != "running" || exp.kind != "bandit" {
+                    continue;
+                }
+                if let Err(e) = self.reweight_bandit(exp, now_ms).await {
+                    tracing::warn!(project_id = %proj.id, "bandit update failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn reweight_bandit(&self, exp: Experiment, now: i64) -> Result<(), String> {
+        let tz = self
+            .qengine
+            .catalogs()
+            .for_project(&exp.project_id)
+            .timezone();
+        let today = pulse_exec::TimeInterval::Day.align_floor_tz(now, tz);
+        if now - today >= 3_600_000 {
+            return Ok(());
+        }
+        let history = self
+            .meta
+            .list_weight_history(&exp.project_id, &exp.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if history.last().is_some_and(|s| s.effective_from_ms >= today) {
+            return Ok(());
+        }
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(mut flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_bandit_results(&exp, Some(&flag), &history, &self.qengine)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(b) = res.bandit.filter(|b| b.burn_in_complete) else {
+            return Ok(());
+        };
+        let prob: BTreeMap<String, f64> = b
+            .arms
+            .iter()
+            .map(|a| (a.variant_key.clone(), a.prob_best))
+            .collect();
+        let cfg = exp.bandit.clone().unwrap_or_default();
+        let weights = crate::experiments::bandit::weights_from_prob_best(&prob, cfg.min_weight_bps);
+        let previous = flag.variants.clone();
+        for v in &mut flag.variants {
+            if let Some(&w) = weights.get(&v.key) {
+                v.weight_bps = w;
+            }
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.meta
+            .insert_weight_snapshot(
+                &exp.project_id,
+                &exp.id,
+                &WeightSnapshot {
+                    effective_from_ms: today,
+                    weights: weights.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:bandit",
+            "experiment.bandit_reweighted",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key,
+                "prob_best": prob, "previous_variants": previous, "weights": weights,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// One results query per running experiment per tick: announce new milestones, then
+    /// auto-stop it if an `auto_stop` guardrail regressed.
+    async fn check_running_experiment(&self, exp: Experiment) -> Result<(), String> {
+        let flags = self
+            .meta
+            .list_feature_flags(&exp.project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(flag) = flags
+            .into_iter()
+            .find(|f| f.id == exp.flag_id || f.key == exp.flag_key)
+        else {
+            return Ok(());
+        };
+        let res = evaluate_experiment_results(&exp, Some(&flag), &self.qengine, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Bandits report P(best), not p-values, so they have no significance milestones.
+        if exp.kind != "bandit" {
+            self.announce_milestones(&exp, &res).await;
+        }
+        if exp.analysis.sequential && exp.guardrail_metrics.iter().any(|g| g.auto_stop) {
+            self.auto_stop_if_regressed(exp, flag, &res).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends each milestone once, as audit row `experiment.milestone` and webhook event
+    /// `pulse.experiment.milestone`. Significance and guardrail harm only count when it's safe to
+    /// look: a sequential test, or a fixed one that reached its planned sample.
+    async fn announce_milestones(&self, exp: &Experiment, res: &ExperimentResults) {
+        let users: u64 = res.variants.iter().map(|v| v.sample_size).sum();
+        let min_users = res
+            .variants
+            .iter()
+            .map(|v| v.sample_size)
+            .min()
+            .unwrap_or(0);
+        let planned_reached = exp
+            .analysis
+            .planned_users_per_variant
+            .is_some_and(|p| p > 0 && min_users >= p);
+        let safe_to_read = res.sequential || planned_reached;
+        let mut found: Vec<(String, String)> = Vec::new();
+        if planned_reached {
+            found.push((
+                "planned_sample_reached".into(),
+                format!("Every variant has reached its planned {min_users}+ users."),
+            ));
+        }
+        if safe_to_read && !res.sample_ratio_mismatch {
+            for v in res
+                .variants
+                .iter()
+                .filter(|v| !v.is_control && v.statistically_significant)
+            {
+                found.push((
+                    format!("significant:{}", v.variant_key),
+                    format!(
+                        "{} changed {} by {:+.1}% (p = {:.4}).",
+                        v.variant_key, res.metric_name, v.relative_lift_pct, v.p_value
+                    ),
+                ));
+            }
+        }
+        for g in &res.guardrails {
+            if safe_to_read && !g.regressed_variants.is_empty() {
+                found.push((
+                    format!("guardrail_harmed:{}", g.metric_name),
+                    format!(
+                        "{} got worse in {}.",
+                        g.metric_name,
+                        g.regressed_variants.join(", ")
+                    ),
+                ));
+            }
+            // ponytail: 1,000 users is a fixed "should have seen one by now" bar; make it a
+            // setting if rare guardrail events trip it.
+            if users >= 1_000
+                && g.variants
+                    .iter()
+                    .all(|v| v.conversions == 0 && v.mean_value == 0.0)
+            {
+                found.push((
+                    format!("guardrail_no_data:{}", g.metric_name),
+                    format!(
+                        "{} has no events from {users} users in this test, so it can't catch harm. Check the event name or that your app sends it.",
+                        g.metric_name
+                    ),
+                ));
+            }
+        }
+        let now = Utc::now().timestamp_millis();
+        for (milestone, message) in found {
+            match self
+                .meta
+                .claim_experiment_milestone(&exp.project_id, &exp.id, &milestone, now)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(experiment_id = %exp.id, "milestone store failed: {e}");
+                    continue;
+                }
+            }
+            self.record_enterprise_audit(
+                "system:experiments",
+                "experiment.milestone",
+                &format!("project:{}", exp.project_id),
+                json!({"experiment_id": exp.id, "milestone": milestone, "message": message}),
+            )
+            .await;
+            let body = json!({
+                "event": "pulse.experiment.milestone",
+                "project_id": exp.project_id,
+                "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+                "milestone": milestone,
+                "message": message,
+                "timestamp_ms": now,
+            });
+            if !exp.notify {
+                continue;
+            }
+            if let Err(e) = self
+                .post_project_webhook(&exp.project_id, None, &body)
+                .await
+            {
+                tracing::warn!(experiment_id = %exp.id, "milestone webhook failed: {e}");
+            }
+        }
+    }
+
+    async fn auto_stop_if_regressed(
+        &self,
+        mut exp: Experiment,
+        mut flag: FeatureFlag,
+        res: &ExperimentResults,
+    ) -> Result<(), String> {
+        let auto: std::collections::HashSet<&str> = exp
+            .guardrail_metrics
+            .iter()
+            .filter(|g| g.auto_stop)
+            .map(|g| g.name.as_str())
+            .collect();
+        let hits: Vec<(String, String, f64)> = res
+            .guardrails
+            .iter()
+            .filter(|g| auto.contains(g.metric_name.as_str()))
+            .flat_map(|g| {
+                g.variants
+                    .iter()
+                    .filter(|v| g.regressed_variants.contains(&v.variant_key))
+                    .map(|v| (g.metric_name.clone(), v.variant_key.clone(), v.p_value))
+            })
+            .collect();
+        let Some((metric, variant, p)) = hits.first().cloned() else {
+            return Ok(());
+        };
+        let control = res
+            .variants
+            .iter()
+            .find(|v| v.is_control)
+            .map(|v| v.variant_key.clone())
+            .unwrap_or_else(|| "control".to_string());
+        let now = Utc::now().timestamp_millis();
+        let old_variants = flag.variants.clone();
+        for v in &mut flag.variants {
+            v.weight_bps = if v.key == control { 10_000 } else { 0 };
+        }
+        // A flag without a control variant can't be rolled back by weight; turn it off instead.
+        if !flag.variants.iter().any(|v| v.key == control) {
+            flag.enabled = false;
+        }
+        flag.updated_at_ms = now;
+        self.meta
+            .upsert_feature_flag(&flag)
+            .await
+            .map_err(|e| e.to_string())?;
+        let reason =
+            format!("{metric} got worse in {variant} (p = {p:.4}); everyone now gets {control}");
+        exp.status = "concluded".to_string();
+        exp.end_ts_ms = now;
+        exp.stop_reason = Some(reason.clone());
+        self.meta
+            .upsert_experiment(&exp)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.record_enterprise_audit(
+            "system:guardrail",
+            "experiment.auto_stopped",
+            &format!("project:{}", exp.project_id),
+            json!({
+                "experiment_id": exp.id, "flag_key": flag.key, "reason": reason,
+                "regressions": hits.iter().map(|(m, v, p)| json!({"metric": m, "variant": v, "p_value": p})).collect::<Vec<_>>(),
+                "previous_variants": old_variants, "variants": flag.variants,
+            }),
+        )
+        .await;
+        tracing::warn!(experiment_id = %exp.id, %reason, "experiment stopped by guardrail");
+        let body = json!({
+            "event": "pulse.experiment.auto_stopped",
+            "project_id": exp.project_id,
+            "experiment": { "id": exp.id, "name": exp.name, "flag_key": exp.flag_key },
+            "reason": reason,
+            "timestamp_ms": now,
+        });
+        if let Err(e) = self
+            .post_project_webhook(&exp.project_id, None, &body)
+            .await
+        {
+            tracing::warn!(experiment_id = %exp.id, "auto-stop webhook failed: {e}");
+        }
+        Ok(())
     }
 }
 
 /// POSTs `body` with `X-Pulse-Timestamp` and `X-Pulse-Signature-256` through the SSRF-pinned client.
-async fn post_signed_webhook(
+pub(crate) async fn post_signed_webhook(
     url: &str,
     signing_secret: &str,
     body: &Value,
@@ -4659,7 +6395,7 @@ fn storage_cfg_fields(cfg: &Value) -> StorageCfg<'_> {
     }
 }
 
-fn webhook_signing_secret(cfg: &Value) -> Option<&str> {
+pub(crate) fn webhook_signing_secret(cfg: &Value) -> Option<&str> {
     cfg.get("signing_secret")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -4667,7 +6403,7 @@ fn webhook_signing_secret(cfg: &Value) -> Option<&str> {
 }
 
 /// `sha256=<hex HMAC of "{timestamp}.{body}">`; receivers reject stale timestamps to stop replays.
-fn sign_webhook(signing_secret: &str, ts: &str, body: &[u8]) -> String {
+pub(crate) fn sign_webhook(signing_secret: &str, ts: &str, body: &[u8]) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
     let mut ctx = hmac::Context::with_key(&key);
     ctx.update(ts.as_bytes());
@@ -5270,5 +7006,219 @@ mod cluster_admin_tests {
             project_id: "p".into(),
         };
         assert!(proj.require_cluster_admin().is_err());
+    }
+}
+
+#[cfg(test)]
+mod agent_service_wiring_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use pulse_agent::{
+        AgentTrace, EvalTargetType, EvaluatorConfig, EvaluatorType, TraceIngestBatch, TraceStatus,
+    };
+    use pulse_exec::CatalogRegistry;
+    use pulse_identity::IdentityRouter;
+    use pulse_storage::{build_from_url, EncryptedObjectStore, StorageConfig, StorageEngine};
+
+    async fn make_test_service(tmp: &std::path::Path) -> Arc<ControlPlaneService> {
+        let raw_store = build_from_url("memory://").unwrap();
+        let enc_store = Arc::new(EncryptedObjectStore::new(raw_store));
+        let id_router = Arc::new(IdentityRouter::new(enc_store.as_object_store()));
+        let storage = StorageEngine::new_with_encrypted(
+            StorageConfig {
+                num_buckets: 2,
+                l0_flush_row_threshold: 1000,
+                l0_flush_max_age: Duration::from_secs(60),
+                compaction_min_segments: 4,
+            },
+            enc_store,
+            id_router,
+        );
+        let qengine = QueryEngine::new(storage, 4 * 1024 * 1024, None, 0, CatalogRegistry::new())
+            .await
+            .unwrap();
+        let meta = MetaStore::connect_auto(tmp).await.unwrap();
+        ControlPlaneService::new_with_admin_with_agent_config(
+            meta,
+            qengine,
+            "proj_wiring",
+            "pk_wiring_test_1234567890",
+            Some("sk_root_wiring_test_1234567890".to_string()),
+            AgentTraceStoreConfig::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn eval_queue_drop_counter_and_worker_shutdown_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_test_service(tmp.path()).await;
+
+        let job = |tid: &str| EvalJob {
+            project_id: "proj_wiring".to_string(),
+            session_id: None,
+            trace_id: Some(tid.to_string()),
+            span_id: None,
+            evaluator_ids: None,
+        };
+
+        // Fill the bounded queue to capacity while receiver is not yet spawned.
+        for i in 0..EVAL_QUEUE_CAPACITY {
+            assert!(
+                svc.try_enqueue_eval(job(&format!("tr_fill_{i}"))),
+                "expected enqueue {i} to succeed"
+            );
+        }
+        assert_eq!(
+            svc.agent_metrics()
+                .eval_queue_dropped
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Next enqueue must fail non-blockingly and increment eval_queue_dropped.
+        assert!(!svc.try_enqueue_eval(job("tr_overflow")));
+        assert_eq!(
+            svc.agent_metrics()
+                .eval_queue_dropped
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        // Drain the test queue before spawning worker with a real trace job.
+        {
+            let mut rx = svc.take_eval_rx().expect("eval_rx available");
+            while rx.try_recv().is_ok() {}
+            drop(rx);
+        }
+
+        // Re-test spawning & shutdown drain on a fresh service instance.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let svc2 = make_test_service(tmp2.path()).await;
+
+        let replacement_store = Arc::new(
+            AgentTraceStore::open(
+                build_from_url("memory://").unwrap(),
+                AgentTraceStoreConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        svc2.replace_agent_store(replacement_store.clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&svc2.agent_store(), &replacement_store));
+
+        svc2.agent_store()
+            .ingest_batch(
+                "proj_wiring",
+                TraceIngestBatch {
+                    traces: vec![AgentTrace {
+                        trace_id: "tr_svc_1".to_string(),
+                        project_id: "proj_wiring".to_string(),
+                        agent_name: "wiring-bot".to_string(),
+                        agent_version: "1.0.0".to_string(),
+                        prompt_version: None,
+                        model_config_version: None,
+                        tool_config_version: None,
+                        app_release: None,
+                        environment: "production".to_string(),
+                        session_id: Some("sess_svc".to_string()),
+                        user_id: None,
+                        workflow_id: None,
+                        parent_trace_id: None,
+                        status: TraceStatus::Ok,
+                        start_ts_ms: 1000,
+                        end_ts_ms: Some(1100),
+                        duration_ms: 100,
+                        input: serde_json::json!({"q": "hi"}),
+                        output: serde_json::json!({"a": "hello"}),
+                        error_type: None,
+                        error_message: None,
+                        failure_source: None,
+                        metadata: serde_json::Value::Null,
+                        tags: vec![],
+                        span_count: 0,
+                        llm_call_count: 0,
+                        tool_call_count: 0,
+                        error_span_count: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_tokens: 0,
+                        total_tokens: 0,
+                        total_cost_nanos: 0,
+                        total_cost_usd: 0.0,
+                        primary_model: None,
+                        primary_provider: None,
+                        avg_eval_score: None,
+                        eval_pass_rate: None,
+                        has_loop_warning: false,
+                    }],
+                    spans: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        svc2.agent_store().flush_all_l0().await.unwrap();
+
+        svc2.meta()
+            .upsert_evaluator_config(&EvaluatorConfig {
+                id: "ev_wiring".to_string(),
+                project_id: "proj_wiring".to_string(),
+                name: "No Errors".to_string(),
+                description: String::new(),
+                target_type: EvalTargetType::Trace,
+                evaluator_type: EvaluatorType::Deterministic,
+                kind: "no_errors".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: true,
+                agent_name: None,
+                environment: None,
+                sample_rate: 1.0,
+                config: serde_json::json!({}),
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+
+        assert!(svc2.try_enqueue_eval(EvalJob {
+            project_id: "proj_wiring".to_string(),
+            session_id: None,
+            trace_id: Some("tr_svc_1".to_string()),
+            span_id: None,
+            evaluator_ids: None,
+        }));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = svc2
+            .spawn_agent_eval_worker(shutdown_rx)
+            .expect("worker should spawn once");
+        assert!(
+            svc2.spawn_agent_eval_worker(watch::channel(false).1)
+                .is_none(),
+            "second spawn should return None"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        assert_eq!(
+            svc2.agent_metrics().evals_executed.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            svc2.meta()
+                .list_trace_evaluations("proj_wiring", "tr_svc_1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        svc2.agent_store().close().await.unwrap();
     }
 }

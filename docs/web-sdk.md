@@ -9,10 +9,10 @@ record privacy-masked DOM wireframes for session replay.
 ## Install
 
 Every [GitHub release](https://github.com/sswapnil2/analytics-system/releases/latest) attaches the
-packed SDK. Install it straight from the release (replace `0.1.1` with the release you want):
+packed SDK. Install it straight from the release (replace `0.1.2` with the release you want):
 
 ```bash
-npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.1/pulse-analytics-ts-web-0.1.1.tgz
+npm install https://github.com/sswapnil2/analytics-system/releases/download/v0.1.2/pulse-analytics-ts-web-0.1.2.tgz
 ```
 
 It is not on the npm registry yet. To build it from source instead:
@@ -53,6 +53,7 @@ Ingest routes allow any origin (permissive CORS), so the app can live on a diffe
 | `captureErrors` | `true` | `window` errors and unhandled promise rejections become `$error` events (message and script path, no query string) |
 | `captureNetwork` | same as `enableWireframeReplay` | Every `fetch`/XHR call (method, URL without query string, status, duration) goes on the replay timeline; calls to Pulse itself are skipped |
 | `debug` | `false` | Logs each tracked event and each send result, including events the server rejected |
+| `flagsTtlMs` | 300000 (5 min) | Flags older than this are re-fetched in the background on the next flag read, so a rollback or a guardrail stop reaches open pages. `0` fetches only on first use and `refreshFlags()` |
 
 ## Track and identify
 
@@ -86,9 +87,21 @@ const variant = pulse.getVariantSync("pricing_test");  // or await pulse.getVari
 const payload = pulse.getVariantPayload("pricing_test");
 ```
 
-Assignment is deterministic (xxh3 bucketing on the user's routing seed), so the client and the
-server's experiment analysis agree. Record that a user saw a variant with `trackExposure(key, variant)`
+Assignment is deterministic: `xxh3_64("{flag_key}:{distinct_id}")` picks the rollout slot, so the client, the
+other SDKs and the server's experiment analysis agree. It uses the *current* distinct id, so a user can
+land in a different variant after `identify()` switches them from the anonymous id to their user id;
+call `identify()` before the first flag check when that matters. Record that a user saw a variant with `trackExposure(key, variant)`
 or `getVariant(key, { trackExposure: true })`; repeat exposures of the same variant are deduplicated.
+
+Flags are re-checked in the background once they are older than `flagsTtlMs`; reads never wait for
+that fetch, so a change shows up on the read after it lands.
+
+Holdouts and layers are applied on the client too: a user in a flag's holdout gets `null`, and a
+flag in a layer only reaches users in its slice. With `trackExposure`, reading a flag in a holdout
+also sends `$holdout_assigned` (`holdout_id`, `group`: `holdout` or `exposed`) once per holdout,
+which is what holdout results count. Older SDKs ignore these gates and serve every user, so update
+every app before attaching flags to a holdout or a layer (bundles with gates carry
+`schema_version: 2`).
 
 ## Session replay
 
@@ -98,7 +111,7 @@ Replay records wireframes (element boxes and masked labels), not pixels or HTML.
 - Text is masked to `████` unless an element (or its ancestor) has `data-pulse-unmask` or matches `unmaskSelectors`. Inputs and `contenteditable` content stay masked regardless.
 - Errors and network calls are captured automatically (see `captureErrors` / `captureNetwork`). `recordConsoleError(message)` and `recordNetworkBreadcrumb(...)` remain for errors you catch yourself.
 - Autocapture pageviews follow `history.pushState`, `replaceState` and `popstate`, and send one `$pageview` per new path + query string (hash changes and same-URL `replaceState` calls are not pages).
-- `$current_url` includes the query string; strip sensitive parameters with `beforeSend`.
+- `$current_url` and `$referrer` are sent without their query string, fragment or embedded credentials. UTM parameters and ad click ids are read from the URL and kept as separate properties.
 
 Controls: `startSessionRecording()`, `stopSessionRecording()`, `pauseSessionRecording()`,
 `resumeSessionRecording()`, `isRecordingSession()`. Rage taps and dead taps are detected from clicks.

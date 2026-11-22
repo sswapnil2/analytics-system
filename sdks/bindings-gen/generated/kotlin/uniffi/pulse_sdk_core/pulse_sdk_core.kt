@@ -1029,7 +1029,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_touch() != 7099.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 32896.toShort()) {
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_record_wireframe_snapshot() != 49421.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_refresh_flags() != 36539.toShort()) {
@@ -1038,7 +1038,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_register_super_props() != 56505.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 14371.toShort()) {
+    if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_reset() != 45811.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pulse_sdk_core_checksum_method_pulseclient_session_id() != 2054.toShort()) {
@@ -2030,7 +2030,12 @@ data class SdkConfig (
     var `apiKey`: kotlin.String, 
     var `storageDir`: kotlin.String, 
     var `flushBatchSize`: kotlin.UInt, 
-    var `flushIntervalMs`: kotlin.ULong
+    var `flushIntervalMs`: kotlin.ULong, 
+    /**
+     * Re-fetch flags in the background when they are older than this, so rollbacks and
+     * guardrail stops reach running apps. `0` fetches only on first use and `refresh_flags`.
+     */
+    var `flagsTtlMs`: kotlin.ULong = 300000uL
 ) {
     
     companion object
@@ -2047,6 +2052,7 @@ public object FfiConverterTypeSdkConfig: FfiConverterRustBuffer<SdkConfig> {
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -2055,7 +2061,8 @@ public object FfiConverterTypeSdkConfig: FfiConverterRustBuffer<SdkConfig> {
             FfiConverterString.allocationSize(value.`apiKey`) +
             FfiConverterString.allocationSize(value.`storageDir`) +
             FfiConverterUInt.allocationSize(value.`flushBatchSize`) +
-            FfiConverterULong.allocationSize(value.`flushIntervalMs`)
+            FfiConverterULong.allocationSize(value.`flushIntervalMs`) +
+            FfiConverterULong.allocationSize(value.`flagsTtlMs`)
     )
 
     override fun write(value: SdkConfig, buf: ByteBuffer) {
@@ -2064,6 +2071,7 @@ public object FfiConverterTypeSdkConfig: FfiConverterRustBuffer<SdkConfig> {
             FfiConverterString.write(value.`storageDir`, buf)
             FfiConverterUInt.write(value.`flushBatchSize`, buf)
             FfiConverterULong.write(value.`flushIntervalMs`, buf)
+            FfiConverterULong.write(value.`flagsTtlMs`, buf)
     }
 }
 

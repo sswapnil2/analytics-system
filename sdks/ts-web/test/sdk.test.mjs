@@ -13,6 +13,8 @@ import {
   flagVariantSlot,
   maskPiiText,
   xxh3_64,
+  holdoutSlot,
+  layerSlot,
 } from "../dist/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +42,26 @@ test("P2-03: TypeScript xxh3_64 and bucketing match shared Rust test vectors 100
       v.distinct_id,
     );
     assert.equal(chosen, v.variant_50_50);
+    assert.equal(holdoutSlot(v.flag_key, v.distinct_id), v.holdout_slot);
+    assert.equal(layerSlot(v.flag_key, v.distinct_id), v.layer_slot);
   }
+});
+
+test("Holdouts and layers: held-out users get nothing, layer ranges never overlap", () => {
+  const base = { key: "f", enabled: true, rollout_bps: 10000, variants: [{ key: "a", weight_bps: 10000 }] };
+  let held = 0;
+  for (let i = 0; i < 5000; i++) {
+    const id = `u${i}`;
+    const h = evaluateEdgeFlag({ ...base, holdout_id: "h", holdout_bps: 1000 }, id);
+    if (h === null) {
+      held++;
+      assert.ok(holdoutSlot("h", id) < 1000);
+    }
+    const a = evaluateEdgeFlag({ ...base, layer_id: "l", layer_start_bps: 0, layer_end_bps: 4000 }, id);
+    const b = evaluateEdgeFlag({ ...base, layer_id: "l", layer_start_bps: 4000, layer_end_bps: 10000 }, id);
+    assert.ok((a === null) !== (b === null), `${id} must be in exactly one layer range`);
+  }
+  assert.ok(held > 400 && held < 600, `10% holdout held ${held} of 5000`);
 });
 
 test("P2-02: evaluateEdgeFlag gates on hashed cohort members, never raw ids", () => {
@@ -738,5 +759,46 @@ test("Public replay API and incremental wireframe snapshot diffing", async () =>
   assert.ok(rageOp, "recordTap should detect rage tap");
   assert.ok(events.some((e) => e.event_name === "$rage_tap"));
 
+  sdk.shutdown();
+});
+
+test("Flag TTL: stale flags refresh in the background, so a rollback reaches a running app", async () => {
+  let weights = [5000, 5000];
+  let flagFetches = 0;
+  browserEnv({
+    fetchImpl: (url) => {
+      if (String(url).includes("/v1/flags/")) {
+        flagFetches += 1;
+        const body = {
+          flags: [
+            {
+              key: "checkout",
+              enabled: true,
+              rollout_bps: 10000,
+              variants: [
+                { key: "control", weight_bps: weights[0] },
+                { key: "treatment", weight_bps: weights[1] },
+              ],
+            },
+          ],
+        };
+        return Promise.resolve({ ok: true, status: 200, json: async () => body, headers: { get: () => null } });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}), headers: { get: () => null } });
+    },
+  });
+  const sdk = new PulseWebClient({ endpointUrl: "http://pulse.test", apiKey: "pk_ttl", flushIntervalMs: 0, flagsTtlMs: 30 });
+
+  await Promise.all([sdk.getVariant("checkout"), sdk.getVariant("checkout")]);
+  assert.equal(flagFetches, 1, "concurrent first calls share one request");
+  sdk.getVariantSync("checkout");
+  assert.equal(flagFetches, 1, "fresh flags are not refetched");
+
+  weights = [10000, 0];
+  await new Promise((r) => setTimeout(r, 40));
+  sdk.getVariantSync("checkout");
+  assert.equal(flagFetches, 2, "stale flags trigger a background refresh");
+  await sdk.refreshFlags();
+  assert.equal(sdk.getVariantSync("checkout"), "control", "rolled-back weights apply");
   sdk.shutdown();
 });

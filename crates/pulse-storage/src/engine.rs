@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parking_lot::{Mutex, RwLock};
 use pulse_identity::{open_once, IdentityRouter, OpenLocks, ProjectIdentityGraph};
 use pulse_wire::{PropValue, ReplayChunk, WireBatch, WireEvent};
@@ -70,12 +71,68 @@ impl Default for StorageConfig {
     }
 }
 
+/// Events that could not be turned into rows and were written to `wal_dead/` instead.
+pub static DEAD_LETTERED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+fn env_mb(name: &str, default_mb: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(default_mb)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Byte bounds on the event rows a node holds in memory, and the node-wide running total.
+pub struct NodeLoad {
+    l0_bytes: Arc<AtomicUsize>,
+    /// `PULSE_L0_PROJECT_MAX_MB` (512) / `PULSE_L0_MAX_MB` (1024): rows not yet in a segment.
+    l0_max_project: AtomicUsize,
+    l0_max_node: AtomicUsize,
+}
+
+impl NodeLoad {
+    fn from_env() -> Arc<Self> {
+        Arc::new(Self {
+            l0_bytes: Arc::new(AtomicUsize::new(0)),
+            l0_max_project: AtomicUsize::new(env_mb("PULSE_L0_PROJECT_MAX_MB", 512)),
+            l0_max_node: AtomicUsize::new(env_mb("PULSE_L0_MAX_MB", 1024)),
+        })
+    }
+}
+
+/// Grants one node at a time the right to write a project's event store (`P0-1`).
+#[async_trait::async_trait]
+pub trait WriterLeases: Send + Sync {
+    /// Takes or renews this node's lease on `project_id`. `Ok(Some(generation))` when this node
+    /// holds it; the generation grows every time the holder changes. `Ok(None)` when another
+    /// node holds an unexpired lease.
+    async fn acquire(&self, project_id: &str) -> std::result::Result<Option<u64>, String>;
+    /// How long a lease stays valid without renewal.
+    fn ttl(&self) -> Duration;
+}
+
+/// How long after the start of a successful `acquire` this node may keep acknowledging
+/// writes. Stops a third of the TTL early so a slow clock here cannot overlap a takeover.
+fn local_lease_validity(ttl: Duration) -> Duration {
+    ttl * 2 / 3
+}
+
+/// This node's hold on a project it opened for writing under a lease.
+struct WriterFence {
+    generation: u64,
+    valid_until: Mutex<Instant>,
+    fenced: AtomicBool,
+}
+
 /// Per-project storage state managing WALs, L0 `MemBucket`s, MVCC `Manifest`, and Compaction.
 pub struct ProjectStorage {
     project_id: String,
     config: StorageConfig,
     object_store: Arc<dyn ObjectStore>,
     id_graph: Arc<ProjectIdentityGraph>,
+    /// `None` when no lease is configured (embedded use, tests) or the project is read-only here.
+    writer: Option<WriterFence>,
     manifest_store: ManifestStore,
     manifest: RwLock<Arc<Manifest>>,
     manifest_commit_lock: AsyncMutex<()>,
@@ -84,6 +141,8 @@ pub struct ProjectStorage {
     mem_buckets: Vec<MemBucket>,
     /// Per-bucket append mutex serializing `wal_seq` allocation, durable `wal.append`, `l0_seq` assignment,
     /// `MemBucket` insertion, and `DedupRegistry` commit (`P1-01`, `P1-02`).
+    node_load: Arc<NodeLoad>,
+    l0_bytes: Arc<AtomicUsize>,
     bucket_append_locks: Vec<AsyncMutex<()>>,
     bucket_flush_locks: Vec<AsyncMutex<()>>,
     compaction_locks: DashMap<(NaiveDate, u8), Arc<AsyncMutex<()>>>,
@@ -136,9 +195,44 @@ impl ProjectStorage {
         object_store: Arc<dyn ObjectStore>,
         identity_router: &IdentityRouter,
     ) -> Result<Arc<Self>> {
-        let project_id = project_id.into();
+        Self::open_inner(
+            project_id.into(),
+            config,
+            object_store,
+            identity_router,
+            None,
+            NodeLoad::from_env(),
+        )
+        .await
+    }
+
+    async fn open_inner(
+        project_id: String,
+        config: StorageConfig,
+        object_store: Arc<dyn ObjectStore>,
+        identity_router: &IdentityRouter,
+        lease: Option<(u64, Instant)>,
+        node_load: Arc<NodeLoad>,
+    ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
-        let manifest = manifest_store.load_latest().await?;
+        let mut manifest = manifest_store.load_latest().await?;
+        if let Some((generation, _)) = lease {
+            // Publish our generation BEFORE replaying the WAL: from this commit on, the previous
+            // holder's manifest commits (and so its WAL purges) abort, so nothing we are about
+            // to replay can be flushed or deleted behind our back.
+            while manifest.writer_generation != generation {
+                if manifest.writer_generation > generation {
+                    return Err(StorageError::NotWriter { project_id });
+                }
+                let mut next = manifest.clone();
+                next.writer_generation = generation;
+                manifest = match manifest_store.commit_next(next).await {
+                    Ok(committed) => committed,
+                    Err(StorageError::ManifestConflict) => manifest_store.load_latest().await?,
+                    Err(e) => return Err(e),
+                };
+            }
+        }
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
         ));
@@ -153,6 +247,7 @@ impl ProjectStorage {
         let l0_seq = AtomicU64::new(max_committed_l0);
         let max_l0_rows_per_bucket = AtomicUsize::new(default_max_l0_rows_per_bucket(&config));
 
+        let l0_bytes = Arc::new(AtomicUsize::new(0));
         let mut wals = Vec::with_capacity(config.num_buckets as usize);
         let mut mem_buckets = Vec::with_capacity(config.num_buckets as usize);
         let mut bucket_append_locks = Vec::with_capacity(config.num_buckets as usize);
@@ -175,7 +270,10 @@ impl ProjectStorage {
             );
             wal.set_min_valid_epoch(manifest.fenced_wal_epoch);
             wals.push(wal);
-            mem_buckets.push(MemBucket::new(bucket_id));
+            mem_buckets.push(MemBucket::with_totals(
+                bucket_id,
+                vec![l0_bytes.clone(), node_load.l0_bytes.clone()],
+            ));
             bucket_append_locks.push(AsyncMutex::new(()));
             bucket_flush_locks.push(AsyncMutex::new(()));
             flush_in_flight.push(AtomicBool::new(false));
@@ -186,12 +284,19 @@ impl ProjectStorage {
             config: config.clone(),
             object_store: object_store.clone(),
             id_graph,
+            writer: lease.map(|(generation, valid_until)| WriterFence {
+                generation,
+                valid_until: Mutex::new(valid_until),
+                fenced: AtomicBool::new(false),
+            }),
             manifest_store,
             manifest: RwLock::new(Arc::new(manifest)),
             manifest_commit_lock: AsyncMutex::new(()),
             dictionary,
             wals,
             mem_buckets,
+            node_load,
+            l0_bytes,
             bucket_append_locks,
             bucket_flush_locks,
             compaction_locks: DashMap::new(),
@@ -255,7 +360,7 @@ impl ProjectStorage {
                     .unwrap_or(0);
                 let records = ps.wals[b as usize].recover(committed_wal).await?;
                 for (wal_seq, batch) in records {
-                    let mut rows = Vec::with_capacity(batch.len());
+                    let mut events = Vec::with_capacity(batch.len());
                     for ev in &batch.events {
                         let fp = event_uuid_fingerprint(&ev.event_uuid);
                         if !seen_replay_fps.insert(fp) {
@@ -263,8 +368,9 @@ impl ProjectStorage {
                         }
                         ps.recovered_uuid_fps.lock().push((bucket_id, fp));
                         let uid = ps.id_graph.get_or_intern(&ev.distinct_id, bucket_id);
-                        rows.push(ps.wire_event_to_row(ev, uid, wal_seq, fp)?);
+                        events.push((ev, uid, fp));
                     }
+                    let rows = ps.rows_or_dead_letter(bucket_id, wal_seq, &events).await?;
                     ps.mem_buckets[b as usize].append_batch(rows);
                 }
             }
@@ -372,44 +478,153 @@ impl ProjectStorage {
     }
 
     /// Acquires the per-bucket append mutex (`P1-01`, `P1-02`).
+    /// Fails unless this node may still acknowledge writes: no lease configured, or the lease
+    /// is held and was renewed recently enough.
+    pub fn check_writer(&self) -> Result<()> {
+        match &self.writer {
+            Some(w)
+                if w.fenced.load(Ordering::Acquire) || Instant::now() >= *w.valid_until.lock() =>
+            {
+                Err(self.not_writer())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn not_writer(&self) -> StorageError {
+        StorageError::NotWriter {
+            project_id: self.project_id.clone(),
+        }
+    }
+
+    fn is_fenced(&self) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|w| w.fenced.load(Ordering::Acquire))
+    }
+
+    fn fence(&self) {
+        if let Some(w) = &self.writer {
+            w.fenced.store(true, Ordering::Release);
+        }
+    }
+
     pub async fn lock_bucket_append(&self, bucket_id: u8) -> AsyncMutexGuard<'_, ()> {
         self.bucket_append_locks[bucket_id as usize].lock().await
     }
 
     /// Appends events while the caller holds `lock_bucket_append(bucket_id)` (`P1-01`, `P1-02`).
-    /// Guarantees `wal_seq` allocation, durable `BucketWal::append`, `l0_seq` allocation, and `MemBucket` insertion
-    /// execute in strict total order for `bucket_id`.
+    /// Guarantees `wal_seq` allocation, durable `BucketWal::append`, `l0_seq` allocation, and
+    /// `MemBucket` insertion execute in strict total order for `bucket_id`. Events that cannot
+    /// become rows are dead-lettered, so the count can be below `events.len()`.
     pub async fn append_bucket_events_locked(
         &self,
         _append_guard: &AsyncMutexGuard<'_, ()>,
         bucket_id: u8,
-        events: Vec<(WireEvent, u32)>,
+        events: &[(WireEvent, u32)],
     ) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
-        let b_idx = bucket_id as usize;
-        let wire_events: Vec<WireEvent> = events.iter().map(|(e, _)| e.clone()).collect();
-        let batch = WireBatch::new(wire_events);
-
+        let batch = WireBatch::new(events.iter().map(|(e, _)| e.clone()).collect());
+        self.check_writer()?;
         // 1. Durable WAL write BEFORE allocating l0_seq or mutating L0
-        let wal_seq = self.wals[b_idx].append(&batch).await?;
+        let wal_seq = match self.wals[bucket_id as usize].append(&batch).await {
+            Err(e @ StorageError::NotWriter { .. }) => {
+                self.fence();
+                return Err(e);
+            }
+            other => other?,
+        };
+        // Checked again AFTER the write: if the lease ran out while the PUT was in flight, a new
+        // holder may already have listed this log without the record, so it must not be acked.
+        self.check_writer()?;
 
-        // 2. Allocate monotonic `l0_seq`s and append into L0 MemBucket while still holding `bucket_append_locks[b_idx]`
-        let mut rows = Vec::with_capacity(events.len());
-        for (ev, uid) in &events {
-            let fp = event_uuid_fingerprint(&ev.event_uuid);
-            rows.push(self.wire_event_to_row(ev, *uid, wal_seq, fp)?);
-        }
+        // 2. Rows into L0 while still holding the bucket append lock. The record is durable, so
+        //    an event that cannot become a row is dead-lettered rather than failing the request.
+        let events: Vec<_> = events
+            .iter()
+            .map(|(ev, uid)| (ev, *uid, event_uuid_fingerprint(&ev.event_uuid)))
+            .collect();
+        let rows = self
+            .rows_or_dead_letter(bucket_id, wal_seq, &events)
+            .await?;
         let count = rows.len();
-        self.mem_buckets[b_idx].append_batch(rows);
+        self.mem_buckets[bucket_id as usize].append_batch(rows);
         Ok(count)
+    }
+
+    /// Converts events to rows. An event that cannot be converted (today: the project dictionary
+    /// is full) is written to `wal_dead/` and skipped, so one bad record never blocks the
+    /// project, live or during recovery.
+    async fn rows_or_dead_letter(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        events: &[(&WireEvent, u32, u64)],
+    ) -> Result<Vec<StoredRow>> {
+        let mut rows = Vec::with_capacity(events.len());
+        for &(ev, uid, fp) in events {
+            match self.wire_event_to_row(ev, uid, wal_seq, fp) {
+                Ok(row) => rows.push(row),
+                Err(reason) => {
+                    self.dead_letter(bucket_id, wal_seq, ev.clone(), fp, &reason)
+                        .await?
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Stores one event that will not be applied under
+    /// `wal_dead/{project}/bucket_{NNN}/seq_{wal_seq}_{fingerprint}.plsb` (a one-event `PLSB`
+    /// batch). The name is fixed by the record, so applying it again after a crash writes nothing
+    /// new. Fails only if the object store does; the caller must then retry, not skip.
+    pub async fn dead_letter(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        ev: WireEvent,
+        fp: u64,
+        reason: &(dyn std::fmt::Display + Sync),
+    ) -> Result<()> {
+        let path = ObjectPath::from(format!(
+            "wal_dead/{}/bucket_{:03}/seq_{:012}_{:016x}.plsb",
+            self.project_id, bucket_id, wal_seq, fp
+        ));
+        let payload = WireBatch::new(vec![ev]).encode_binary(1)?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from(payload), opts)
+            .await
+        {
+            Ok(_) => {
+                DEAD_LETTERED_EVENTS.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    project_id = %self.project_id,
+                    bucket_id,
+                    dead_letter_path = %path,
+                    %reason,
+                    "event could not be applied; moved to the dead-letter path"
+                );
+                Ok(())
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn should_flush_bucket(&self, bucket_id: u8) -> bool {
         self.mem_buckets.get(bucket_id as usize).is_some_and(|mb| {
             mb.should_flush(
                 self.config.l0_flush_row_threshold,
+                // Flush early enough that all buckets together sit near half the byte limit.
+                self.node_load.l0_max_project.load(Ordering::Relaxed)
+                    / (2 * self.config.num_buckets.max(1) as usize),
                 self.config.l0_flush_max_age,
             )
         })
@@ -443,6 +658,26 @@ impl ProjectStorage {
                 current_rows,
                 max_rows,
             });
+        }
+        let load = &self.node_load;
+        for (bytes, max_bytes) in [
+            (
+                self.l0_bytes.load(Ordering::Acquire),
+                load.l0_max_project.load(Ordering::Relaxed),
+            ),
+            (
+                load.l0_bytes.load(Ordering::Acquire),
+                load.l0_max_node.load(Ordering::Relaxed),
+            ),
+        ] {
+            if bytes >= max_bytes {
+                self.schedule_background_flush(bucket_id);
+                return Err(StorageError::Backpressure {
+                    project_id: self.project_id.clone(),
+                    bytes,
+                    max_bytes,
+                });
+            }
         }
         Ok(())
     }
@@ -487,7 +722,7 @@ impl ProjectStorage {
         }
         let count = {
             let guard = self.lock_bucket_append(bucket_id).await;
-            self.append_bucket_events_locked(&guard, bucket_id, events)
+            self.append_bucket_events_locked(&guard, bucket_id, &events)
                 .await?
         };
         if self.should_flush_bucket(bucket_id) {
@@ -583,6 +818,15 @@ impl ProjectStorage {
         let _commit_guard = self.manifest_commit_lock.lock().await;
         for attempt in 0..8u8 {
             let mut candidate = (**self.manifest.read()).clone();
+            if let Some(w) = &self.writer {
+                // A newer generation means another node took the lease and is replaying our WAL.
+                // Merging on top of it (as a compactor may) would flush rows it also replays and
+                // let us purge WAL objects it still needs: stop for good instead.
+                if w.fenced.load(Ordering::Acquire) || candidate.writer_generation > w.generation {
+                    self.fence();
+                    return Err(self.not_writer());
+                }
+            }
             if !apply(&mut candidate) {
                 return Ok(None);
             }
@@ -1094,6 +1338,8 @@ pub struct StorageEngine {
     projects: Arc<DashMap<String, Arc<ProjectStorage>>>,
     erased: Arc<DashMap<String, Arc<ErasedUids>>>,
     open_locks: OpenLocks,
+    writer_leases: OnceLock<Arc<dyn WriterLeases>>,
+    node_load: Arc<NodeLoad>,
 }
 
 impl StorageEngine {
@@ -1130,6 +1376,8 @@ impl StorageEngine {
             projects: Arc::default(),
             erased: Arc::default(),
             open_locks: OpenLocks::default(),
+            writer_leases: OnceLock::new(),
+            node_load: NodeLoad::from_env(),
         })
     }
 
@@ -1195,26 +1443,52 @@ impl StorageEngine {
         if let Some(p) = self.projects.get(project_id) {
             return Ok(p.clone());
         }
-        let (pid, config, store, router, erased) = (
+        let (pid, config, store, router, profiles, erased, leases, node_load) = (
             project_id.to_string(),
             self.config.clone(),
             self.object_store.clone(),
             self.identity_router.clone(),
+            self.profile_router.clone(),
             self.erased.clone(),
+            self.writer_leases.get().cloned(),
+            self.node_load.clone(),
         );
         let key = pid.clone();
-        // After the insert, so a concurrent `set_erased` is seen by one side or the other.
         let on_insert = move |ps: &Arc<ProjectStorage>| {
+            // After the insert, so a concurrent `set_erased` is seen by one side or the other.
             if let Some(e) = erased.get(&key) {
                 ps.set_erased(e.clone());
             }
+            // This node writes the project now: readers for it would only go stale.
+            router.evict_reader(&key);
+            profiles.evict_reader(&key);
         };
+        let router = self.identity_router.clone();
+        // The lease is taken inside the open task, under its per-project lock (#68).
         open_once(
             &self.projects,
             &self.open_locks,
             project_id,
             on_insert,
-            async move { ProjectStorage::open_and_recover(&pid, config, store, &router).await },
+            async move {
+                let lease = match leases {
+                    Some(leases) if !router.is_read_only() => {
+                        let started = Instant::now();
+                        match leases.acquire(&pid).await {
+                            Ok(Some(generation)) => {
+                                Some((generation, started + local_lease_validity(leases.ttl())))
+                            }
+                            Ok(None) => return Err(StorageError::NotWriter { project_id: pid }),
+                            Err(e) => {
+                                tracing::warn!(project_id = %pid, error = %e, "writer lease store unavailable");
+                                return Err(StorageError::NotWriter { project_id: pid });
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                ProjectStorage::open_inner(pid, config, store, &router, lease, node_load).await
+            },
         )
         .await
     }
@@ -1222,6 +1496,19 @@ impl StorageEngine {
     /// True once `project_id` has finished opening on this node.
     pub fn is_project_open(&self, project_id: &str) -> bool {
         self.projects.contains_key(project_id)
+    }
+
+    /// Overrides the L0 byte bounds read from the environment: `(per project, per node)`.
+    pub fn set_l0_byte_limits(&self, project: usize, node: usize) {
+        self.node_load
+            .l0_max_project
+            .store(project, Ordering::Relaxed);
+        self.node_load.l0_max_node.store(node, Ordering::Relaxed);
+    }
+
+    /// Bytes of event rows this node holds in L0.
+    pub fn l0_bytes(&self) -> usize {
+        self.node_load.l0_bytes.load(Ordering::Relaxed)
     }
 
     /// Sets a project's erasure tombstones without opening its storage; applied on open.
@@ -1259,6 +1546,105 @@ impl StorageEngine {
         Ok(res)
     }
 
+    /// Makes this engine take a writer lease before opening a project for writing. Read-only
+    /// engines (query and compactor nodes) never take one.
+    pub fn set_writer_leases(&self, leases: Arc<dyn WriterLeases>) {
+        let _ = self.writer_leases.set(leases);
+    }
+
+    /// Renews the lease of every project open for writing; call a few times per TTL. A project
+    /// whose lease went to another node is fenced and dropped, so the next request re-opens it
+    /// from storage once this node holds the lease again.
+    pub async fn renew_writer_leases(&self) {
+        let Some(leases) = self.writer_leases.get() else {
+            return;
+        };
+        for ps in self.open_projects() {
+            let Some(w) = &ps.writer else { continue };
+            if w.fenced.load(Ordering::Acquire) {
+                self.drop_fenced(&ps);
+                continue;
+            }
+            let started = Instant::now();
+            match leases.acquire(&ps.project_id).await {
+                Ok(Some(generation)) if generation == w.generation => {
+                    *w.valid_until.lock() = started + local_lease_validity(leases.ttl());
+                }
+                Ok(_) => {
+                    tracing::error!(project_id = %ps.project_id, "writer lease lost to another node; refusing writes");
+                    ps.fence();
+                    self.drop_fenced(&ps);
+                }
+                // Not extended: writes stop once the last renewal runs out, and resume on the
+                // next successful one.
+                Err(e) => {
+                    tracing::warn!(project_id = %ps.project_id, error = %e, "writer lease renewal failed");
+                }
+            }
+        }
+    }
+
+    /// Whether this node may write `project_id`'s identity and profile stores: always without
+    /// writer leases; with them, only while it holds the project open as its writer.
+    fn writes_project(&self, project_id: &str) -> bool {
+        if self.writer_leases.get().is_none() {
+            return true;
+        }
+        self.projects
+            .get(project_id)
+            .is_some_and(|p| !p.is_fenced())
+    }
+
+    /// The project's user-profile store. `write` takes the writer lease first (opening the
+    /// project), so a node that does not hold it gets `NotWriter` instead of taking the store
+    /// from the writer. A read on such a node gets a read-only store.
+    pub async fn profile_store(
+        &self,
+        project_id: &str,
+        write: bool,
+    ) -> Result<Arc<crate::ProjectProfileStore>> {
+        if self.profile_router.is_read_only() {
+            return self.profile_router.get_or_open(project_id).await;
+        }
+        if write {
+            self.get_or_open_project(project_id).await?;
+        } else if !self.writes_project(project_id) {
+            return Ok(self.profile_router.open_reader(project_id));
+        }
+        self.profile_router.get_or_open(project_id).await
+    }
+
+    /// The project's identity graph, on the same terms as `profile_store`.
+    pub async fn identity_graph(
+        &self,
+        project_id: &str,
+        write: bool,
+    ) -> Result<Arc<ProjectIdentityGraph>> {
+        let router = &self.identity_router;
+        if !router.is_read_only() {
+            if write {
+                self.get_or_open_project(project_id).await?;
+            } else if !self.writes_project(project_id) {
+                return router
+                    .open_reader(project_id)
+                    .await
+                    .map_err(StorageError::Identity);
+            }
+        }
+        router
+            .get_or_open(project_id)
+            .await
+            .map_err(StorageError::Identity)
+    }
+
+    fn drop_fenced(&self, ps: &Arc<ProjectStorage>) {
+        self.projects
+            .remove_if(&ps.project_id, |_, cur| Arc::ptr_eq(cur, ps));
+        // Their in-memory state is stale once another node has written the project.
+        self.identity_router.evict(&ps.project_id);
+        self.profile_router.evict(&ps.project_id);
+    }
+
     pub fn open_projects(&self) -> Vec<Arc<ProjectStorage>> {
         self.projects.iter().map(|e| e.value().clone()).collect()
     }
@@ -1270,7 +1656,11 @@ impl StorageEngine {
             .map_err(StorageError::Identity)?;
         let mut total = 0usize;
         for p in self.open_projects() {
-            total += p.flush_all().await?;
+            match p.flush_all().await {
+                // Its rows are in the WAL the new writer replays; do not hold up the others.
+                Err(StorageError::NotWriter { .. }) => {}
+                other => total += other?,
+            }
         }
         Ok(total)
     }
@@ -1393,6 +1783,214 @@ mod manifest_retention_tests {
         assert_eq!(rows, 20);
     }
 
+    /// An event that cannot become a row (here: the dictionary is full) used to fail the request
+    /// after its WAL record was durable, and then fail every later open of the project.
+    #[tokio::test]
+    async fn unappliable_event_is_dead_lettered_and_never_blocks_the_project() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let router = IdentityRouter::new(store.clone());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            ..StorageConfig::default()
+        };
+        let ev = |name: &str, i: i64| WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u", "s", name, i, i as u64),
+            routing_seed: "u".into(),
+            distinct_id: "u".into(),
+            session_id: "s".into(),
+            event_name: name.into(),
+            client_event_ts_ms: 1_790_000_000_000 + i,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        let dead_letters = || async {
+            use futures::TryStreamExt;
+            let prefix = ObjectPath::from("wal_dead/p");
+            let found: Vec<_> = store.list(Some(&prefix)).try_collect().await.unwrap();
+            found.len()
+        };
+
+        let ps = ProjectStorage::open_and_recover("p", cfg.clone(), store.clone(), &router)
+            .await
+            .unwrap();
+        ps.append_bucket_events(0, vec![(ev("known", 0), 1)])
+            .await
+            .unwrap();
+        let mut n = 0;
+        while ps
+            .dictionary()
+            .try_get_or_intern_event(&format!("filler_{n}"))
+            .is_ok()
+        {
+            n += 1;
+        }
+        // Persist the full dictionary so recovery starts from it too.
+        ps.flush_bucket(0).await.unwrap();
+
+        let applied = ps
+            .append_bucket_events(0, vec![(ev("one_too_many", 1), 1), (ev("known", 2), 1)])
+            .await
+            .expect("a record with an unappliable event is still accepted");
+        assert_eq!(applied, 1);
+        assert_eq!(ps.total_l0_rows(), 1);
+        assert_eq!(dead_letters().await, 1);
+        drop(ps);
+
+        // Crash before the flush: recovery meets the same record and must not stop on it.
+        let reopened = ProjectStorage::open_and_recover("p", cfg, store.clone(), &router)
+            .await
+            .expect("project opens despite the unappliable event in its WAL");
+        assert_eq!(reopened.total_l0_rows(), 1);
+        assert_eq!(
+            dead_letters().await,
+            1,
+            "replay dead-lettered the event twice"
+        );
+    }
+
+    /// Rows in L0 are bounded in bytes, per project and per node, until a flush moves them to a
+    /// segment.
+    #[tokio::test]
+    async fn l0_bytes_push_back_until_a_flush() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store)),
+        );
+        let ps = engine.get_or_open_project("p").await.unwrap();
+        let ev = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u", "s", "e", 1, 1),
+            routing_seed: "u".into(),
+            distinct_id: "u".into(),
+            session_id: "s".into(),
+            event_name: "e".into(),
+            client_event_ts_ms: 1_790_000_000_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        ps.append_bucket_events(0, vec![(ev, 1)]).await.unwrap();
+        assert!(engine.l0_bytes() > 0);
+        ps.check_l0_backpressure(0).unwrap();
+        for (project, node) in [(1, usize::MAX), (usize::MAX, 1)] {
+            engine.set_l0_byte_limits(project, node);
+            assert!(matches!(
+                ps.check_l0_backpressure(0),
+                Err(StorageError::Backpressure { .. })
+            ));
+        }
+        ps.flush_all().await.unwrap();
+        ps.check_l0_backpressure(0).unwrap();
+        assert_eq!(engine.l0_bytes(), 0);
+    }
+
+    struct FakeLeases {
+        me: &'static str,
+        holder: Arc<Mutex<(&'static str, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WriterLeases for FakeLeases {
+        async fn acquire(&self, _project_id: &str) -> std::result::Result<Option<u64>, String> {
+            let (holder, generation) = *self.holder.lock();
+            Ok((holder == self.me).then_some(generation))
+        }
+        fn ttl(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+    }
+
+    /// A standby that takes the lease replays the previous writer's WAL and loses nothing it
+    /// acknowledged; the previous writer, still alive, can no longer commit, purge or ack.
+    #[tokio::test]
+    async fn takeover_replays_the_old_writers_wal_and_fences_it() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let holder = Arc::new(Mutex::new(("a", 1u64)));
+        let engine = |me| {
+            let e = StorageEngine::new(
+                StorageConfig {
+                    num_buckets: 1,
+                    ..StorageConfig::default()
+                },
+                store.clone(),
+                Arc::new(IdentityRouter::new(store.clone())),
+            );
+            e.set_writer_leases(Arc::new(FakeLeases {
+                me,
+                holder: holder.clone(),
+            }));
+            e
+        };
+        let ev = |i: i64| {
+            let ts = 1_790_000_000_000 + i * 1_000;
+            WireEvent {
+                event_uuid: WireEvent::deterministic_uuid("u", "s", "e", ts, i as u64),
+                routing_seed: "u".into(),
+                distinct_id: "u".into(),
+                session_id: "s".into(),
+                event_name: "e".into(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: 0,
+                props: vec![],
+                replay_offset_kb: 0,
+            }
+        };
+        let is_not_writer = |r: Result<usize>| matches!(r, Err(StorageError::NotWriter { .. }));
+
+        let a = engine("a");
+        let ps_a = a.get_or_open_project("p").await.unwrap();
+        for i in 0..3 {
+            ps_a.append_bucket_events(0, vec![(ev(i), 1)])
+                .await
+                .unwrap();
+        }
+        ps_a.flush_bucket(0).await.unwrap();
+        // Acknowledged but only in the WAL when the writer "dies".
+        for i in 3..5 {
+            ps_a.append_bucket_events(0, vec![(ev(i), 1)])
+                .await
+                .unwrap();
+        }
+
+        let b = engine("b");
+        assert!(matches!(
+            b.get_or_open_project("p").await,
+            Err(StorageError::NotWriter { .. })
+        ));
+
+        *holder.lock() = ("b", 2);
+        let ps_b = b.get_or_open_project("p").await.unwrap();
+        assert_eq!(ps_b.snapshot().manifest.total_l1_rows(), 3);
+        assert_eq!(
+            ps_b.total_l0_rows(),
+            2,
+            "acknowledged WAL records were not replayed"
+        );
+
+        // The old writer is still running. Its flush must not publish the two rows a second
+        // time nor purge the WAL records the new writer has not flushed yet.
+        assert!(is_not_writer(ps_a.flush_bucket(0).await.map(|v| v.len())));
+        assert!(is_not_writer(
+            ps_a.append_bucket_events(0, vec![(ev(9), 1)]).await
+        ));
+        a.renew_writer_leases().await;
+        assert!(a.open_projects().is_empty());
+
+        // A third node taking over before `b` flushed still finds every acknowledged record.
+        *holder.lock() = ("c", 3);
+        let ps_c = engine("c").get_or_open_project("p").await.unwrap();
+        assert_eq!(ps_c.snapshot().manifest.total_l1_rows(), 3);
+        assert_eq!(ps_c.total_l0_rows(), 2);
+        ps_c.flush_bucket(0).await.unwrap();
+        assert_eq!(ps_c.snapshot().manifest.total_l1_rows(), 5);
+        assert!(is_not_writer(ps_b.flush_bucket(0).await.map(|v| v.len())));
+    }
+
     #[tokio::test]
     async fn flush_due_buckets_and_batched_compaction_coalesce_manifest_epochs() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1428,7 +2026,7 @@ mod manifest_retention_tests {
         // Wave 1: append 1 event to each of 10 buckets, flush all due buckets in ONE epoch.
         for b in 0..10u8 {
             let guard = ps.lock_bucket_append(b).await;
-            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 1), b as u32 + 1)])
+            ps.append_bucket_events_locked(&guard, b, &[(make_ev(b, 1), b as u32 + 1)])
                 .await
                 .unwrap();
         }
@@ -1445,7 +2043,7 @@ mod manifest_retention_tests {
         // Wave 2: append another event to each of 10 buckets, flush all due buckets in ONE epoch.
         for b in 0..10u8 {
             let guard = ps.lock_bucket_append(b).await;
-            ps.append_bucket_events_locked(&guard, b, vec![(make_ev(b, 2), b as u32 + 1)])
+            ps.append_bucket_events_locked(&guard, b, &[(make_ev(b, 2), b as u32 + 1)])
                 .await
                 .unwrap();
         }

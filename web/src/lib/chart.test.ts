@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cardInterval, chartKindBlocker, isAdditive, niceTicks, pctChange, stackBases } from "./chart.ts";
+import { cardInterval, chartKindBlocker, isAdditive, niceRange, niceTicks, pctChange, stackBases } from "./chart.ts";
 
 test("ticks land on round numbers and cover the max", () => {
   assert.deepEqual(niceTicks(3851), [0, 1000, 2000, 3000, 4000]);
@@ -41,4 +41,11 @@ test("dashboard cards keep the report's interval unless it gives too many points
   assert.equal(cardInterval("hour", 14), "day");
   assert.equal(cardInterval(undefined, 14), "day"); // older reports: from the range, as before
   assert.equal(cardInterval(undefined, 90), "week");
+});
+
+test("niceRange spans negatives and always includes zero", () => {
+  assert.deepEqual(niceRange(-12, 30), [-20, 0, 20, 40]);
+  assert.deepEqual(niceRange(3, 7), [0, 2, 4, 6, 8]);
+  assert.deepEqual(niceRange(-7, -3), [-8, -6, -4, -2, 0]);
+  assert.deepEqual(niceRange(0, 0), [0, 1]);
 });

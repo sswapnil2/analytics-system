@@ -174,10 +174,50 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
         ing.dropped_total.load(Ordering::Relaxed),
     );
     counter(
+        "pulse_ingest_dead_lettered_events_total",
+        "Events that could not be applied and were written to wal_dead/ instead.",
+        pulse_storage::DEAD_LETTERED_EVENTS.load(Ordering::Relaxed),
+    );
+    counter(
         "pulse_ingest_batches_total",
         "Ingest batches processed.",
         ing.batches_total.load(Ordering::Relaxed),
     );
+    let agent = p.control.agent_metrics();
+    for (name, help, v) in [
+        (
+            "pulse_agent_traces_ingested_total",
+            "Agent traces stored.",
+            &agent.traces_ingested,
+        ),
+        (
+            "pulse_agent_spans_ingested_total",
+            "Agent spans stored.",
+            &agent.spans_ingested,
+        ),
+        (
+            "pulse_agent_spans_dropped_trace_limit_total",
+            "Agent spans dropped because their trace reached its span or byte cap.",
+            &agent.spans_dropped_trace_limit,
+        ),
+        (
+            "pulse_agent_blobs_deduped_total",
+            "Agent payload blobs deduplicated.",
+            &agent.blobs_deduped,
+        ),
+        (
+            "pulse_agent_evals_executed_total",
+            "Agent evaluations executed.",
+            &agent.evals_executed,
+        ),
+        (
+            "pulse_agent_eval_queue_dropped_total",
+            "Agent eval jobs dropped because the queue was full.",
+            &agent.eval_queue_dropped,
+        ),
+    ] {
+        counter(name, help, v.load(Ordering::Relaxed));
+    }
     counter(
         "pulse_queries_executed_total",
         "Analytics queries completed.",
@@ -207,6 +247,11 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
     let mut gauge = |name: &str, help: &str, v: f64| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
     };
+    gauge(
+        "pulse_l0_bytes",
+        "Estimated bytes of rows buffered in memory, not yet flushed to segments.",
+        p.storage.l0_bytes() as f64,
+    );
     gauge(
         "pulse_l0_rows",
         "Rows buffered in memory, not yet flushed to segments.",

@@ -397,3 +397,37 @@ async fn revoked_api_key_stops_working_at_once() {
     let (s, _) = send_json(&app, "DELETE", &format!("{base}/key_missing"), root, None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
+
+/// Ingest and query nodes reload the key cache every few seconds. A lookup that lands
+/// mid-reload must still resolve: the cache has no database fallback, so a gap is a 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_key_stays_valid_while_caches_reload() {
+    use pulse_ingest::GovernanceProvider;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, ctrl, _meta) = setup_app(tmp.path()).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (ctrl, stop) = (ctrl.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut misses = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if ctrl
+                    .authenticate_api_key("pk_alpha_initial_key")
+                    .await
+                    .is_none()
+                {
+                    misses += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+            misses
+        })
+    };
+    for _ in 0..200 {
+        ctrl.reload_caches_from_db().await.unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(reader.await.unwrap(), 0, "key lookups failed during reload");
+}
