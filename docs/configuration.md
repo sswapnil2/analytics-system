@@ -41,7 +41,7 @@
 |---|---|---|
 | `DATABASE_URL` | `sqlite://<data_dir>/pulse_meta.db` | Metadata DB. Use `postgres://…` for multi-node |
 | `PULSE_OBJECT_STORE_URL` | `<data_dir>/object_store` (fsynced local files) | `s3://bucket`, `file:///path` or `memory://` |
-| `PULSE_HOT_STORE` | `local` | Where the event and agent-trace write-ahead logs live. (Identity and profile stores follow the same setting in a later release; today they stay in the object store.) `local`: fsynced files in `<data_dir>/wal`, so acknowledging a request writes nothing to the object store. `object`: in the object store, one PUT per acknowledged request. Use `object` (or put `<data_dir>` on a volume every ingest machine can mount) if another machine may take over a project's lease. See [limitations](limitations.md#operational-limitations) |
+| `PULSE_HOT_STORE` | `local` | Where the hot tier lives: event and agent-trace write-ahead logs (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) and the SlateDB identity graph and profile stores (`identity/`, `profiles/`). `local`: fsynced files in `<data_dir>/wal` and `<data_dir>/hot`, so acknowledging a request writes nothing to the object store. `object`: keeps all hot prefixes in the object store. The chosen mode is recorded in `<data_dir>/hot_store_mode` and switching modes on an initialized data directory (or starting `local` without its local `identity/` and `profiles/` stores) is refused at startup. Use `object` (or put `<data_dir>` on a volume every ingest machine can mount) if another machine may take over a project's lease. See [limitations](limitations.md#operational-limitations) |
 | `AWS_REGION`, `AWS_ENDPOINT` (+ standard `AWS_*` credentials) | region `ap-south-1` | S3-compatible region and endpoint (R2, MinIO, …) |
 | `PULSE_NUM_BUCKETS` | `16` (1–256) | Storage buckets per day partition. Choose before you ingest real data |
 | `PULSE_L0_PROJECT_MAX_MB` / `PULSE_L0_MAX_MB` | `512` / `1024` | Estimated bytes of in-memory rows, per project and per node, before ingest returns `429` (`l0_backpressure`). A bucket is flushed when it reaches the project limit ÷ (2 × buckets) |
@@ -74,8 +74,10 @@
 
 | Path | What it is |
 |---|---|
-| `object_store/` | Event data, identity graph, profiles, replays (unless `PULSE_OBJECT_STORE_URL` is set) |
-| `wal/` | Write-ahead logs for events and agent traces not yet flushed (with `PULSE_HOT_STORE=local`, the default). Must be on a persistent volume. Empty after a clean shutdown |
+| `object_store/` | Flushed event segments, manifests and replays (unless `PULSE_OBJECT_STORE_URL` is set; with `PULSE_HOT_STORE=object`, also holds WALs, identity graph and profiles) |
+| `wal/` | Write-ahead logs, dead-letter records and corrupt-WAL quarantine for events and agent traces (with `PULSE_HOT_STORE=local`, the default). Must be on a persistent volume. Empty after a clean shutdown |
+| `hot/` | Local SlateDB stores (`identity/` and `profiles/`) when `PULSE_HOT_STORE=local` (the default). Must be on a persistent volume |
+| `hot_store_mode` | Persistent mode marker (`local` or `object`) written at initialization to prevent silent mode switches or volume-loss UID reuse |
 | `pulse_meta.db` | SQLite metadata (unless `DATABASE_URL` is set) |
 | `root_admin_token` | Generated root token, mode `0600`. Rewritten on every start unless `PULSE_ADMIN_TOKEN` is set |
 | `.pulse_cluster.kek` | Generated key-encryption key, if `PULSE_VAULT_KEK` is unset |

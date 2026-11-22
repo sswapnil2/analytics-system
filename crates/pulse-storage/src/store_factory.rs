@@ -14,15 +14,99 @@ use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use url::Url;
 
 use crate::error::{Result, StorageError};
 
+#[cfg(test)]
+fn fsync_probe_map() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64)>>
+{
+    static PROBE: OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, u64)>>> =
+        OnceLock::new();
+    PROBE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fsync_dir_sync(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+}
+
+fn fsync_path_sync(target: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(target)?;
+    file.sync_data()?;
+    #[cfg(test)]
+    {
+        fsync_probe_map()
+            .lock()
+            .entry(target.to_path_buf())
+            .or_default()
+            .0 += 1;
+    }
+    if let Some(parent) = target.parent() {
+        fsync_dir_sync(parent)?;
+        #[cfg(test)]
+        {
+            fsync_probe_map()
+                .lock()
+                .entry(target.to_path_buf())
+                .or_default()
+                .1 += 1;
+        }
+    }
+    Ok(())
+}
+
+async fn fsync_path(target: PathBuf) -> OsResult<()> {
+    tokio::task::spawn_blocking(move || fsync_path_sync(&target))
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: "DurableLocalObjectStore",
+            source: Box::new(std::io::Error::other(e.to_string())),
+        })?
+        .map_err(|e| object_store::Error::Generic {
+            store: "DurableLocalObjectStore",
+            source: Box::new(e),
+        })
+}
+
+#[derive(Debug)]
+struct DurableMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    target: PathBuf,
+}
+
+#[async_trait]
+impl MultipartUpload for DurableMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> OsResult<PutResult> {
+        let res = self.inner.complete().await?;
+        fsync_path(self.target.clone()).await?;
+        Ok(res)
+    }
+
+    async fn abort(&mut self) -> OsResult<()> {
+        self.inner.abort().await
+    }
+}
+
 /// Durable wrapper around `object_store::local::LocalFileSystem` that issues `File::sync_data`
 /// on the written file AND `File::sync_all` on its parent directory after every `put_opts`,
-/// guaranteeing true RPO = 0 crash durability on local ext4/APFS/XFS filesystems.
+/// `put_multipart_opts` (`complete`), and `copy*`, guaranteeing true RPO = 0 crash durability on
+/// local ext4/APFS/XFS filesystems.
 #[derive(Debug)]
 pub struct DurableLocalObjectStore {
     root: PathBuf,
@@ -46,26 +130,7 @@ impl DurableLocalObjectStore {
     }
 
     async fn fsync_target(&self, location: &ObjectPath) -> OsResult<()> {
-        let target = self.fs_path_for(location);
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let file = std::fs::File::open(&target)?;
-            file.sync_data()?;
-            if let Some(parent) = target.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| object_store::Error::Generic {
-            store: "DurableLocalObjectStore",
-            source: Box::new(std::io::Error::other(e.to_string())),
-        })?
-        .map_err(|e| object_store::Error::Generic {
-            store: "DurableLocalObjectStore",
-            source: Box::new(e),
-        })
+        fsync_path(self.fs_path_for(location)).await
     }
 }
 
@@ -93,7 +158,11 @@ impl ObjectStore for DurableLocalObjectStore {
         location: &ObjectPath,
         opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(DurableMultipartUpload {
+            inner,
+            target: self.fs_path_for(location),
+        }))
     }
 
     async fn get_opts(&self, location: &ObjectPath, options: GetOptions) -> OsResult<GetResult> {
@@ -102,6 +171,14 @@ impl ObjectStore for DurableLocalObjectStore {
 
     async fn get_range(&self, location: &ObjectPath, range: Range<u64>) -> OsResult<Bytes> {
         self.inner.get_range(location, range).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> OsResult<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
     }
 
     async fn head(&self, location: &ObjectPath) -> OsResult<ObjectMeta> {
@@ -149,63 +226,279 @@ pub fn build_object_store(data_dir: &Path) -> Result<Arc<dyn ObjectStore>> {
 }
 
 /// Key prefixes written on the acknowledge path: the event WAL and the agent trace WAL.
-const WAL_PREFIXES: [&str; 4] = ["wal", "wal_corrupt", "wal_dead", "agent_wal"];
+const WAL_PREFIXES: [&str; 5] = [
+    "wal",
+    "wal_corrupt",
+    "wal_dead",
+    "agent_wal",
+    "agent_wal_corrupt",
+];
 
-/// P0-7: `PULSE_HOT_STORE=local` (default) keeps the WALs on local disk at `<data_dir>/wal`,
-/// fsync'd like `DurableLocalObjectStore`, so acknowledging a request makes no segment-store
-/// write. `object` keeps them in `segments`, for when another machine may take the lease.
-pub async fn with_hot_store(
-    segments: Arc<dyn ObjectStore>,
-    data_dir: &Path,
-) -> Result<Arc<dyn ObjectStore>> {
-    let local_dir = data_dir.join("wal");
-    match std::env::var("PULSE_HOT_STORE").as_deref().map(str::trim) {
-        Ok("object") => {
-            // A local-mode run that stopped uncleanly left WAL on disk that object mode would
-            // never replay.
-            if local_dir.exists() {
-                let local: Arc<dyn ObjectStore> =
-                    Arc::new(DurableLocalObjectStore::new_at(&local_dir)?);
-                refuse_over_wal(&local, "the local disk", "local", "object").await?;
-            }
-            return Ok(segments);
-        }
-        Ok("local") | Ok("") | Err(_) => {}
-        Ok(other) => {
-            return Err(config_error(format!(
-                "PULSE_HOT_STORE must be `local` or `object`, not `{other}`"
-            )))
-        }
-    }
-    // Unflushed WAL left in the segment store (an unclean stop under `object`) would never be
-    // replayed from local disk.
-    refuse_over_wal(&segments, "the object store", "object", "local").await?;
-    Ok(Arc::new(WalRouted {
-        wal: Arc::new(DurableLocalObjectStore::new_at(&data_dir.join("wal"))?),
-        segments,
-    }))
+/// Key prefixes for persistent hot SlateDB state (`identity/` and `profiles/`).
+const HOT_PREFIXES: [&str; 2] = ["identity", "profiles"];
+
+/// Union of all local hot-tier prefixes used for opposite-tier leftover detection.
+const ALL_HOT_PREFIXES: [&str; 7] = [
+    "wal",
+    "wal_corrupt",
+    "wal_dead",
+    "agent_wal",
+    "agent_wal_corrupt",
+    "identity",
+    "profiles",
+];
+
+const HOT_STORE_MODE_FILE: &str = "hot_store_mode";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotStoreMode {
+    Local,
+    Object,
 }
 
-/// Refuses to start rather than drop acknowledged data: `store` still holds WAL written in
-/// mode `was` that mode `now` would never replay. A LIST failure is reported as itself.
-// ponytail: replaced by the hot-store mode marker in the next PR.
-async fn refuse_over_wal(
+impl HotStoreMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Object => "object",
+        }
+    }
+}
+
+fn parse_hot_store_env() -> Result<HotStoreMode> {
+    match std::env::var("PULSE_HOT_STORE").as_deref().map(str::trim) {
+        Ok("local") | Ok("") | Err(_) => Ok(HotStoreMode::Local),
+        Ok("object") => Ok(HotStoreMode::Object),
+        Ok(other) => Err(config_error(format!(
+            "PULSE_HOT_STORE must be `local` or `object`, not `{other}`"
+        ))),
+    }
+}
+
+async fn read_mode_marker(marker_path: &Path) -> Result<Option<HotStoreMode>> {
+    let path = marker_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Option<HotStoreMode>> {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match raw.trim() {
+                "local" => Ok(Some(HotStoreMode::Local)),
+                "object" => Ok(Some(HotStoreMode::Object)),
+                other => Err(config_error(format!(
+                    "unrecognized hot-store mode marker in `{}`: `{other}`",
+                    path.display()
+                ))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(config_error(format!(
+                "corrupt hot-store mode marker in `{}`: {e}",
+                path.display()
+            ))),
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    })
+    .await
+    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
+}
+
+async fn write_mode_marker(data_dir: &Path, marker_path: &Path, mode: HotStoreMode) -> Result<()> {
+    let data_dir = data_dir.to_path_buf();
+    let marker_path = marker_path.to_path_buf();
+    let content = format!("{}\n", mode.as_str());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(&data_dir)?;
+        let tmp_path = data_dir.join(format!(".hot_store_mode.tmp.{}", uuid::Uuid::new_v4()));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_data()?;
+        }
+        std::fs::rename(&tmp_path, &marker_path)?;
+        fsync_dir_sync(&data_dir)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
+}
+
+async fn init_local_hot_dirs(data_dir: &Path, wal_dir: &Path, hot_dir: &Path) -> Result<()> {
+    let data_dir = data_dir.to_path_buf();
+    let wal_dir = wal_dir.to_path_buf();
+    let hot_dir = hot_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::fs::create_dir_all(&wal_dir)?;
+        std::fs::create_dir_all(hot_dir.join("identity"))?;
+        std::fs::create_dir_all(hot_dir.join("profiles"))?;
+        fsync_dir_sync(&hot_dir)?;
+        fsync_dir_sync(&data_dir)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
+}
+
+async fn first_object_under(
+    store: &Arc<dyn ObjectStore>,
+    prefixes: &[&str],
+) -> Result<Option<(&'static str, ObjectPath)>> {
+    // Only static prefixes are passed in; match directly.
+    for prefix in prefixes {
+        let mut objects = store.list(Some(&ObjectPath::from(*prefix)));
+        if let Some(found) = futures::StreamExt::next(&mut objects).await {
+            let meta = found?;
+            let matched = match *prefix {
+                "wal" => "wal",
+                "wal_corrupt" => "wal_corrupt",
+                "wal_dead" => "wal_dead",
+                "agent_wal" => "agent_wal",
+                "agent_wal_corrupt" => "agent_wal_corrupt",
+                "identity" => "identity",
+                "profiles" => "profiles",
+                "manifests" => "manifests",
+                "segments" => "segments",
+                "published" => "published",
+                _ => "other",
+            };
+            return Ok(Some((matched, meta.location)));
+        }
+    }
+    Ok(None)
+}
+
+async fn refuse_opposite_tier_objects(
     store: &Arc<dyn ObjectStore>,
     place: &str,
     was: &str,
     now: &str,
 ) -> Result<()> {
-    for prefix in ["wal", "agent_wal"] {
-        let mut objects = store.list(Some(&ObjectPath::from(prefix)));
-        if let Some(found) = futures::StreamExt::next(&mut objects).await {
+    if let Some((prefix, loc)) = first_object_under(store, &ALL_HOT_PREFIXES).await? {
+        if matches!(prefix, "wal" | "agent_wal") {
             return Err(config_error(format!(
-                "{place} still holds unflushed WAL ({}); start once with PULSE_HOT_STORE={was} \
-                 and stop cleanly, then switch to {now}",
-                found?.location
+                "{place} still holds unflushed WAL ({loc}); written with PULSE_HOT_STORE={was}, \
+                 cannot start with PULSE_HOT_STORE={now}"
+            )));
+        }
+        return Err(config_error(format!(
+            "{place} still holds {was}-mode hot state ({loc}); cannot start with PULSE_HOT_STORE={now}"
+        )));
+    }
+    Ok(())
+}
+
+/// P0-7: `PULSE_HOT_STORE=local` (default) keeps the WALs at `<data_dir>/wal` and the hot
+/// SlateDB stores (`identity/`, `profiles/`) at `<data_dir>/hot`, fsync'd like
+/// `DurableLocalObjectStore`, so acknowledging a request makes no segment-store call.
+/// `object` keeps them in `segments`. A persistent `<data_dir>/hot_store_mode` marker prevents
+/// silent mode switches or starting after losing local `identity/` / `profiles/`.
+pub async fn with_hot_store(
+    segments: Arc<dyn ObjectStore>,
+    data_dir: &Path,
+) -> Result<Arc<dyn ObjectStore>> {
+    let desired = parse_hot_store_env()?;
+    let wal_dir = data_dir.join("wal");
+    let hot_dir = data_dir.join("hot");
+    let marker_path = data_dir.join(HOT_STORE_MODE_FILE);
+
+    let marker = read_mode_marker(&marker_path).await?;
+    if let Some(existing) = marker {
+        if existing != desired {
+            return Err(config_error(format!(
+                "hot-store mode mismatch: data directory `{}` is initialized for \
+                 PULSE_HOT_STORE={}, cannot start with PULSE_HOT_STORE={}",
+                data_dir.display(),
+                existing.as_str(),
+                desired.as_str()
             )));
         }
     }
-    Ok(())
+
+    match desired {
+        HotStoreMode::Object => {
+            if wal_dir.exists() {
+                let local_wal: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
+                refuse_opposite_tier_objects(&local_wal, "the local disk", "local", "object")
+                    .await?;
+            }
+            if hot_dir.exists() {
+                let local_hot: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?);
+                refuse_opposite_tier_objects(&local_hot, "the local disk", "local", "object")
+                    .await?;
+            }
+            if marker.is_none() {
+                write_mode_marker(data_dir, &marker_path, HotStoreMode::Object).await?;
+            }
+            Ok(segments)
+        }
+        HotStoreMode::Local => {
+            refuse_opposite_tier_objects(&segments, "the object store", "object", "local").await?;
+
+            if marker == Some(HotStoreMode::Local) {
+                let id_dir = hot_dir.join("identity");
+                let prof_dir = hot_dir.join("profiles");
+                if !id_dir.is_dir() {
+                    return Err(config_error(format!(
+                        "hot-store mode is `local` but local identity store `{}` is missing; \
+                         refusing to start to prevent silent UID reuse \
+                         (recover with `pulse-node restore --from-published`)",
+                        id_dir.display()
+                    )));
+                }
+                if !prof_dir.is_dir() {
+                    return Err(config_error(format!(
+                        "hot-store mode is `local` but local profiles store `{}` is missing; \
+                         refusing to start (recover with `pulse-node restore --from-published`)",
+                        prof_dir.display()
+                    )));
+                }
+                let wal_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
+                let hot_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?);
+                if first_object_under(&hot_store, &["identity"])
+                    .await?
+                    .is_none()
+                {
+                    let has_segments =
+                        first_object_under(&segments, &["manifests", "segments", "published"])
+                            .await?
+                            .is_some();
+                    let has_wal = first_object_under(&wal_store, &["wal"]).await?.is_some();
+                    let has_profiles = first_object_under(&hot_store, &["profiles"])
+                        .await?
+                        .is_some();
+                    if has_segments || has_wal || has_profiles {
+                        return Err(config_error(format!(
+                            "hot-store mode is `local` and local identity store `{}` is empty \
+                             while existing project state was found; refusing to start to prevent \
+                             silent UID reuse (recover with `pulse-node restore --from-published`)",
+                            id_dir.display()
+                        )));
+                    }
+                }
+                Ok(Arc::new(HotRouted {
+                    wal: wal_store,
+                    hot: hot_store,
+                    segments,
+                }))
+            } else {
+                init_local_hot_dirs(data_dir, &wal_dir, &hot_dir).await?;
+                write_mode_marker(data_dir, &marker_path, HotStoreMode::Local).await?;
+                let wal_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
+                let hot_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?);
+                Ok(Arc::new(HotRouted {
+                    wal: wal_store,
+                    hot: hot_store,
+                    segments,
+                }))
+            }
+        }
+    }
 }
 
 /// A startup refusal or bad setting: not data corruption.
@@ -213,31 +506,38 @@ fn config_error(msg: String) -> StorageError {
     StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
 }
 
-/// Sends WAL keys to `wal` and every other key to `segments`. Sits below encryption, so the
-/// local WAL is encrypted like everything else.
+/// Sends WAL prefixes to `wal`, persistent hot SlateDB prefixes (`identity/`, `profiles/`) to
+/// `hot`, and every other key to `segments`. Sits below encryption, so local hot tiers are
+/// encrypted like everything else.
 #[derive(Debug)]
-struct WalRouted {
+struct HotRouted {
     wal: Arc<dyn ObjectStore>,
+    hot: Arc<dyn ObjectStore>,
     segments: Arc<dyn ObjectStore>,
 }
 
-impl WalRouted {
+impl HotRouted {
     fn route(&self, p: Option<&ObjectPath>) -> &Arc<dyn ObjectStore> {
         match p.and_then(|p| p.parts().next()) {
             Some(first) if WAL_PREFIXES.contains(&first.as_ref()) => &self.wal,
+            Some(first) if HOT_PREFIXES.contains(&first.as_ref()) => &self.hot,
             _ => &self.segments,
         }
     }
 }
 
-impl Display for WalRouted {
+impl Display for HotRouted {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WalRouted(wal={}, segments={})", self.wal, self.segments)
+        write!(
+            f,
+            "HotRouted(wal={}, hot={}, segments={})",
+            self.wal, self.hot, self.segments
+        )
     }
 }
 
 #[async_trait]
-impl ObjectStore for WalRouted {
+impl ObjectStore for HotRouted {
     async fn put_opts(&self, l: &ObjectPath, p: PutPayload, o: PutOptions) -> OsResult<PutResult> {
         self.route(Some(l)).put_opts(l, p, o).await
     }
@@ -254,6 +554,9 @@ impl ObjectStore for WalRouted {
     async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
         self.route(Some(l)).get_range(l, r).await
     }
+    async fn get_ranges(&self, l: &ObjectPath, rs: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
+        self.route(Some(l)).get_ranges(l, rs).await
+    }
     async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
         self.route(Some(l)).head(l).await
     }
@@ -261,31 +564,62 @@ impl ObjectStore for WalRouted {
         self.route(Some(l)).delete(l).await
     }
     fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+        let p = p.filter(|p| p.parts().next().is_some());
         match p {
             Some(_) => self.route(p).list(p),
-            // ponytail: a root listing walks both stores; only tests list the root.
             None => Box::pin(futures::StreamExt::chain(
                 self.segments.list(None),
-                self.wal.list(None),
+                futures::StreamExt::chain(self.wal.list(None), self.hot.list(None)),
             )),
         }
     }
     async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+        let p = p.filter(|p| p.parts().next().is_some());
         if p.is_some() {
             return self.route(p).list_with_delimiter(p).await;
         }
         let mut out = self.segments.list_with_delimiter(None).await?;
         let wal = self.wal.list_with_delimiter(None).await?;
+        let hot = self.hot.list_with_delimiter(None).await?;
         out.common_prefixes.extend(wal.common_prefixes);
+        out.common_prefixes.extend(hot.common_prefixes);
+        out.common_prefixes.sort();
+        out.common_prefixes.dedup();
         out.objects.extend(wal.objects);
+        out.objects.extend(hot.objects);
         Ok(out)
     }
-    // Copies stay within the WAL family (`wal` -> `wal_corrupt`) or outside it, so in one store.
     async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
-        self.route(Some(to)).copy(from, to).await
+        let src = self.route(Some(from));
+        let dst = self.route(Some(to));
+        if Arc::ptr_eq(src, dst) {
+            dst.copy(from, to).await
+        } else {
+            let data = src.get(from).await?.bytes().await?;
+            dst.put_opts(
+                to,
+                PutPayload::from_bytes(data),
+                PutOptions::from(object_store::PutMode::Overwrite),
+            )
+            .await?;
+            Ok(())
+        }
     }
     async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
-        self.route(Some(to)).copy_if_not_exists(from, to).await
+        let src = self.route(Some(from));
+        let dst = self.route(Some(to));
+        if Arc::ptr_eq(src, dst) {
+            dst.copy_if_not_exists(from, to).await
+        } else {
+            let data = src.get(from).await?.bytes().await?;
+            dst.put_opts(
+                to,
+                PutPayload::from_bytes(data),
+                PutOptions::from(object_store::PutMode::Create),
+            )
+            .await?;
+            Ok(())
+        }
     }
 }
 
@@ -643,5 +977,513 @@ mod ssrf_tests {
             .resolve(name("nonexistent.invalid"))
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod hot_store_and_multipart_tests {
+    use super::*;
+    use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct HotStoreEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl HotStoreEnvGuard {
+        fn set(val: Option<&str>) -> Self {
+            let prev = std::env::var("PULSE_HOT_STORE").ok();
+            match val {
+                Some(v) => std::env::set_var("PULSE_HOT_STORE", v),
+                None => std::env::remove_var("PULSE_HOT_STORE"),
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HotStoreEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("PULSE_HOT_STORE", v),
+                None => std::env::remove_var("PULSE_HOT_STORE"),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingStore {
+        inner: InMemory,
+        calls: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn reset(&self) {
+            self.calls.store(0, Ordering::SeqCst);
+        }
+    }
+
+    impl Display for CountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(l, o).await
+        }
+        async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_range(l, r).await
+        }
+        async fn get_ranges(&self, l: &ObjectPath, rs: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_ranges(l, rs).await
+        }
+        async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.head(l).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(l).await
+        }
+        fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn count_files(dir: &Path) -> usize {
+        let mut count = 0;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                count += count_files(&p);
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn multipart_complete_fsyncs_file_and_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new_at(tmp.path()).unwrap();
+        let loc = ObjectPath::from("identity/proj_1/compacted/01.sst");
+        let target = store.fs_path_for(&loc);
+
+        let mut upload = store
+            .put_multipart_opts(&loc, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"part1-"))
+            .await
+            .unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"part2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fsync_probe_map().lock().get(&target).copied(),
+            None,
+            "fsync must not run before complete()"
+        );
+
+        upload.complete().await.unwrap();
+        assert_eq!(
+            fsync_probe_map().lock().get(&target).copied(),
+            Some((1, 1)),
+            "complete() must fsync both target file and parent directory"
+        );
+        let got = store.get(&loc).await.unwrap().bytes().await.unwrap();
+        assert_eq!(got.as_ref(), b"part1-part2");
+        assert_eq!(count_files(tmp.path()), 1, "staging temp files cleaned up");
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_and_drop_cleanup_without_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new_at(tmp.path()).unwrap();
+
+        let loc_abort = ObjectPath::from("profiles/proj_1/wal/01.sst");
+        let target_abort = store.fs_path_for(&loc_abort);
+        let mut up1 = store
+            .put_multipart_opts(&loc_abort, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        up1.put_part(PutPayload::from_static(b"abc")).await.unwrap();
+        up1.abort().await.unwrap();
+        assert!(up1.complete().await.is_err(), "complete after abort fails");
+        assert!(!target_abort.exists());
+        assert_eq!(fsync_probe_map().lock().get(&target_abort).copied(), None);
+
+        let loc_drop = ObjectPath::from("profiles/proj_1/wal/02.sst");
+        let target_drop = store.fs_path_for(&loc_drop);
+        {
+            let mut up2 = store
+                .put_multipart_opts(&loc_drop, PutMultipartOptions::default())
+                .await
+                .unwrap();
+            up2.put_part(PutPayload::from_static(b"xyz")).await.unwrap();
+        }
+        assert!(!target_drop.exists());
+        assert_eq!(fsync_probe_map().lock().get(&target_drop).copied(), None);
+        assert_eq!(
+            count_files(tmp.path()),
+            0,
+            "staging files removed on abort and drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_routed_routes_prefixes_lists_copies_and_get_ranges() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = HotStoreEnvGuard::set(Some("local"));
+        let tmp = tempfile::tempdir().unwrap();
+        let segments = Arc::new(CountingStore::default());
+        let store = with_hot_store(segments.clone(), tmp.path()).await.unwrap();
+        segments.reset();
+
+        // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes route locally with 0 S3 calls.
+        for key in [
+            "wal/p1/bucket_000/seq_0.wal",
+            "wal_corrupt/p1/bucket_000/bad.wal",
+            "wal_dead/p1/bucket_000/dead.plsb",
+            "agent_wal/p1/w1/seq_0.ptwl",
+            "agent_wal_corrupt/p1/w1/seq_0.ptwl",
+            "identity/p1/manifest/000001.manifest",
+            "profiles/p1/wal/000001.sst",
+        ] {
+            let p = ObjectPath::from(key);
+            store
+                .put(&p, PutPayload::from_static(b"hello-world"))
+                .await
+                .unwrap();
+            let got = store.get(&p).await.unwrap().bytes().await.unwrap();
+            assert_eq!(got.as_ref(), b"hello-world");
+        }
+        assert_eq!(
+            segments.count(),
+            0,
+            "local WAL and hot prefixes must make zero calls to segments"
+        );
+
+        // get_ranges delegates properly.
+        let ranges = store
+            .get_ranges(
+                &ObjectPath::from("identity/p1/manifest/000001.manifest"),
+                &[0..5, 6..11],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ranges,
+            vec![Bytes::from_static(b"hello"), Bytes::from_static(b"world")]
+        );
+        assert_eq!(segments.count(), 0);
+
+        // Non-hot prefix goes to segments.
+        let seg_key = ObjectPath::from("segments/p1/20261122/bucket_000/seg_1.pvtx");
+        store
+            .put(&seg_key, PutPayload::from_static(b"seg-bytes"))
+            .await
+            .unwrap();
+        assert_eq!(segments.count(), 1);
+
+        // list(None) and list(Some("")) normalize and include all 3 tiers.
+        let all_none: Vec<_> = store.list(None).try_collect().await.unwrap();
+        let all_empty: Vec<_> = store
+            .list(Some(&ObjectPath::from("")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(all_none.len(), 8);
+        assert_eq!(all_empty.len(), 8);
+
+        // list_with_delimiter(None) and list_with_delimiter(Some("")) merge and dedup common_prefixes.
+        let delim_none = store.list_with_delimiter(None).await.unwrap();
+        let delim_empty = store
+            .list_with_delimiter(Some(&ObjectPath::from("")))
+            .await
+            .unwrap();
+        let expected_prefixes: Vec<ObjectPath> = [
+            "agent_wal",
+            "agent_wal_corrupt",
+            "identity",
+            "profiles",
+            "segments",
+            "wal",
+            "wal_corrupt",
+            "wal_dead",
+        ]
+        .into_iter()
+        .map(ObjectPath::from)
+        .collect();
+        assert_eq!(delim_none.common_prefixes, expected_prefixes);
+        assert_eq!(delim_empty.common_prefixes, expected_prefixes);
+
+        // Same-tier copy (wal -> wal_corrupt) and cross-tier copy (hot -> segments, segments -> hot).
+        store
+            .copy(
+                &ObjectPath::from("agent_wal/p1/w1/seq_0.ptwl"),
+                &ObjectPath::from("agent_wal_corrupt/p1/w1/copied.ptwl"),
+            )
+            .await
+            .unwrap();
+        let cross_dst = ObjectPath::from("manifests/p1/copied_from_hot.bin");
+        store
+            .copy(&ObjectPath::from("profiles/p1/wal/000001.sst"), &cross_dst)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&cross_dst)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello-world"
+        );
+        let err = store
+            .copy_if_not_exists(&ObjectPath::from("profiles/p1/wal/000001.sst"), &cross_dst)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, object_store::Error::AlreadyExists { .. }));
+        let cross_hot_dst = ObjectPath::from("profiles/p1/restored.bin");
+        store
+            .copy_if_not_exists(&seg_key, &cross_hot_dst)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&cross_hot_dst)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"seg-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_marker_and_startup_refusals() {
+        let _lock = ENV_LOCK.lock().await;
+
+        // 1. Invalid PULSE_HOT_STORE value refused.
+        {
+            let _env = HotStoreEnvGuard::set(Some("bogus"));
+            let tmp = tempfile::tempdir().unwrap();
+            let err = with_hot_store(Arc::new(InMemory::new()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+        }
+
+        // 2. Clean local init creates dirs & marker; same-mode restart works; object switch refused.
+        {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("hot_store_mode")).unwrap(),
+                "local\n"
+            );
+            assert!(tmp.path().join("wal").is_dir());
+            assert!(tmp.path().join("hot/identity").is_dir());
+            assert!(tmp.path().join("hot/profiles").is_dir());
+
+            // Empty restart succeeds.
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+
+            // Switching to object refused.
+            let _env_obj = HotStoreEnvGuard::set(Some("object"));
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            assert!(err.to_string().contains("PULSE_HOT_STORE=local"), "{err}");
+        }
+
+        // 3. Clean object init writes marker; local switch refused.
+        {
+            let _env = HotStoreEnvGuard::set(Some("object"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("hot_store_mode")).unwrap(),
+                "object\n"
+            );
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+
+            let _env_loc = HotStoreEnvGuard::set(Some("local"));
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            assert!(err.to_string().contains("PULSE_HOT_STORE=object"), "{err}");
+        }
+
+        // 4. Corrupt/unrecognized marker refused.
+        {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("hot_store_mode"), "invalid\n").unwrap();
+            let err = with_hot_store(Arc::new(InMemory::new()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+
+            std::fs::write(tmp.path().join("hot_store_mode"), [0xff, 0xfe]).unwrap();
+            let err = with_hot_store(Arc::new(InMemory::new()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+        }
+
+        // 5. Local marker with missing hot/identity, missing hot/profiles, or wiped identity/* with state.
+        {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+
+            // Delete hot/identity dir -> refused.
+            std::fs::remove_dir_all(tmp.path().join("hot/identity")).unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+
+            // Restore identity dir, delete hot/profiles dir -> refused.
+            std::fs::create_dir_all(tmp.path().join("hot/identity")).unwrap();
+            std::fs::remove_dir_all(tmp.path().join("hot/profiles")).unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+
+            // Restore profiles dir; agent_wal alone is allowed with empty identity.
+            std::fs::create_dir_all(tmp.path().join("hot/profiles")).unwrap();
+            let store = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+            store
+                .put(
+                    &ObjectPath::from("agent_wal/p1/w1/seq_0.ptwl"),
+                    PutPayload::from_static(b"a"),
+                )
+                .await
+                .unwrap();
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
+
+            // Put a manifest in segments while identity/ is empty -> refused!
+            seg.put(
+                &ObjectPath::from("manifests/p1/epoch_1.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+        }
+
+        // 6. Opposite-tier leftover checks (every WAL/HOT prefix in segments refused by local;
+        //    every WAL/HOT prefix in local wal/ or hot/ refused by object).
+        for prefix in ALL_HOT_PREFIXES {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            seg.put(
+                &ObjectPath::from(format!("{prefix}/p1/obj")),
+                PutPayload::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+            let err = with_hot_store(seg, tmp.path()).await.unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+        }
+
+        for prefix in ALL_HOT_PREFIXES {
+            let _env = HotStoreEnvGuard::set(Some("object"));
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = if WAL_PREFIXES.contains(&prefix) {
+                tmp.path().join("wal")
+            } else {
+                tmp.path().join("hot")
+            };
+            let local = DurableLocalObjectStore::new_at(&dir).unwrap();
+            local
+                .put(
+                    &ObjectPath::from(format!("{prefix}/p1/obj")),
+                    PutPayload::from_static(b"x"),
+                )
+                .await
+                .unwrap();
+            let err = with_hot_store(Arc::new(InMemory::new()), tmp.path())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+        }
     }
 }

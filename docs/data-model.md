@@ -87,15 +87,16 @@ Storage keeps the dense 32-bit id of `distinct_id`, never the string. The **iden
 
 | Object path | Contents |
 |---|---|
-| `wal/{proj}/bucket_NNN/epoch_E_seq_S.wal` | Events acknowledged but not yet in a segment |
+| `wal/{proj}/bucket_NNN/epoch_E_seq_S.wal` | Events acknowledged but not yet in a segment (`<data_dir>/wal/` in `local` mode) |
 | `segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Columnar events for one day and bucket, with an inverted index and a session index |
 | `manifests/{proj}/epoch_N.json` | Active segments and their footers (counts, blooms, HLL sketches) |
-| `identity/{proj}` | Identity graph (SlateDB) |
-| `profiles/{proj}` | User and group profiles (SlateDB) |
+| `identity/{proj}` | Identity graph (SlateDB; `<data_dir>/hot/identity/` in `local` mode) |
+| `profiles/{proj}` | User and group profiles (SlateDB; `<data_dir>/hot/profiles/` in `local` mode) |
 | `replays/{proj}/{session}/{seq}.plsr` | Replay chunks |
 
-These paths are under `<data_dir>/object_store/`, or at the root of your S3 bucket. The data directory also holds:
+With `PULSE_HOT_STORE=local` (the default), `wal/` (plus `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) lives under `<data_dir>/wal/` and `identity/` + `profiles/` live under `<data_dir>/hot/`, while `segments/`, `manifests/`, and `replays/` live in `<data_dir>/object_store/` or your S3 bucket (`PULSE_HOT_STORE=object` puts all paths in the object store). The data directory also holds:
 
+- `hot_store_mode`: persistent `local` / `object` mode marker
 - `pulse_meta.db`: the SQLite metadata DB
 - `foyer_cache/`: the query cache
 - `root_admin_token`

@@ -92,12 +92,12 @@ flowchart LR
     subgraph mem["Memory"]
         L0["L0 MemBucket<br/>per (project, bucket)"]
     end
-    subgraph os["Object store (local disk or S3)"]
-        WAL["wal/…/*.wal<br/>one object per append"]
+    subgraph os["Tiered store (local hot disk + object store / S3)"]
+        WAL["wal/…/*.wal<br/>local disk by default (&lt;data_dir&gt;/wal)"]
         SEG["segments/{proj}/{YYYYMMDD}/bucket_NNN/*.pvtx<br/>Vortex columnar + indexes"]
         MAN["manifests/{proj}/epoch_N.json<br/>active segments + footers"]
-        ID["identity/{proj} (SlateDB)"]
-        PROF["profiles/{proj} (SlateDB)"]
+        ID["identity/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
+        PROF["profiles/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
         REP["replays/{proj}/{session}/*.plsr"]
     end
     WAL -. replay on restart .-> L0
@@ -107,7 +107,7 @@ flowchart LR
     SEG -- "compaction: ≥ 4 segments per (day, bucket)" --> SEG
 ```
 
-All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). By default that is a local directory, `<data_dir>/object_store`, where every write is fsynced. `PULSE_OBJECT_STORE_URL` switches it to `s3://bucket` (any S3-compatible service, such as R2 or MinIO), `file://…` or `memory://`.
+All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and SlateDB hot state (`identity/`, `profiles/`) routes to `<data_dir>/hot`, while segments, manifests and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
 
 ### L0, flush and segments
 

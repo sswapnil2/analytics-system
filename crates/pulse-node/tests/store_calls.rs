@@ -1,6 +1,7 @@
-//! P0-7: which segment-store calls a request makes before it is acknowledged, and what an idle
-//! node costs. Counts calls by top-level key prefix in each window and prints a table; asserts
-//! that with the WAL on local disk no acknowledged request writes to the segment store.
+//! P0-7 (T0a + T0b): which segment-store calls a request makes before it is acknowledged, and what
+//! an idle node costs. Counts calls by top-level key prefix in each window and prints a table;
+//! asserts that with WAL, identity, and profiles on local disk (`PULSE_HOT_STORE=local`), no
+//! acknowledged request writes to or reads from the segment store.
 //! Own test binary: it sets `PULSE_HOT_STORE`.
 
 use async_trait::async_trait;
@@ -21,6 +22,37 @@ use std::time::Duration;
 
 const ADMIN: &str = "sk_root_storecallstest0000000000000000000000000000";
 type Calls = BTreeMap<(String, &'static str), u64>;
+
+const HOT_PREFIXES: [&str; 7] = [
+    "wal",
+    "wal_corrupt",
+    "wal_dead",
+    "agent_wal",
+    "agent_wal_corrupt",
+    "identity",
+    "profiles",
+];
+
+struct HotStoreEnvGuard {
+    prev: Option<String>,
+}
+
+impl HotStoreEnvGuard {
+    fn set(val: &str) -> Self {
+        let prev = std::env::var("PULSE_HOT_STORE").ok();
+        std::env::set_var("PULSE_HOT_STORE", val);
+        Self { prev }
+    }
+}
+
+impl Drop for HotStoreEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("PULSE_HOT_STORE", v),
+            None => std::env::remove_var("PULSE_HOT_STORE"),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Counting {
@@ -93,12 +125,18 @@ fn print(label: &str, calls: &Calls) {
     }
 }
 
-/// PUTs to the WAL prefixes. SlateDB identity PUTs are reported, not asserted: they are not
-/// awaited before the ack and are a separate decision (see the PR).
-fn puts(calls: &Calls) -> u64 {
+fn prefix_puts(calls: &Calls, target_prefix: &str) -> u64 {
     calls
         .iter()
-        .filter(|((prefix, op), _)| *op == "PUT" && matches!(prefix.as_str(), "wal" | "agent_wal"))
+        .filter(|((prefix, op), _)| *op == "PUT" && prefix == target_prefix)
+        .map(|(_, n)| n)
+        .sum()
+}
+
+fn hot_calls(calls: &Calls) -> u64 {
+    calls
+        .iter()
+        .filter(|((prefix, _), _)| HOT_PREFIXES.contains(&prefix.as_str()))
         .map(|(_, n)| n)
         .sum()
 }
@@ -154,9 +192,20 @@ fn trace(i: usize, now: i64) -> Value {
         "start_ts_ms": now}]})
 }
 
-/// Segment-store PUTs while `n` event and `n` trace requests were acknowledged.
-async fn run(mode: &str, n: usize, idle: Duration) -> (u64, u64) {
-    std::env::set_var("PULSE_HOT_STORE", mode);
+struct RunCalls {
+    events: Calls,
+    traces: Calls,
+    identifies: Calls,
+    engages: Calls,
+    idle_l0: Calls,
+    idle_flushed: Calls,
+    user_detail: Calls,
+    idle_ingest: Calls,
+}
+
+/// Segment-store calls across ingest/identify/engage/trace windows, user-detail reads, and idle.
+async fn run(mode: &str, n: usize, idle: Duration) -> RunCalls {
+    let _hot_store = HotStoreEnvGuard::set(mode);
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(Counting::default());
     let node = start_pulse_node_with_store(config(tmp.path(), NodeRole::All), store.clone())
@@ -187,6 +236,26 @@ async fn run(mode: &str, n: usize, idle: Duration) -> (u64, u64) {
         post(&node, "/v1/agent/traces", &key, trace(usize::MAX, now)).await,
         200
     );
+    assert_eq!(
+        post(
+            &node,
+            "/v1/identify",
+            &key,
+            json!({"anon_id": "warm_anon", "user_id": "warm_user"})
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        post(
+            &node,
+            "/v1/engage",
+            &key,
+            json!({"distinct_id": "warm_user", "$set": {"plan": "starter"}})
+        )
+        .await,
+        200
+    );
     print(&format!("{mode}: startup + warm-up"), &store.take());
 
     for i in 0..n {
@@ -208,18 +277,48 @@ async fn run(mode: &str, n: usize, idle: Duration) -> (u64, u64) {
         &format!("{mode}: {n} trace requests, one trace each"),
         &traces,
     );
+    for i in 0..20 {
+        assert_eq!(
+            post(
+                &node,
+                "/v1/identify",
+                &key,
+                json!({"anon_id": format!("anon_{i}"), "user_id": format!("user_{i}")})
+            )
+            .await,
+            200
+        );
+    }
+    let identifies = store.take();
+    print(&format!("{mode}: 20 identify requests"), &identifies);
+    for i in 0..20 {
+        assert_eq!(
+            post(
+                &node,
+                "/v1/engage",
+                &key,
+                json!({"distinct_id": format!("user_{i}"), "$set": {"tier": "pro", "seq": i}})
+            )
+            .await,
+            200
+        );
+    }
+    let engages = store.take();
+    print(&format!("{mode}: 20 engage requests"), &engages);
 
     tokio::time::sleep(idle).await;
-    print(&format!("{mode}: idle {idle:?}, data in L0"), &store.take());
+    let idle_l0 = store.take();
+    print(&format!("{mode}: idle {idle:?}, data in L0"), &idle_l0);
     assert_eq!(
         admin(&node, reqwest::Method::POST, "/v1/admin/flush").await,
         200
     );
     print(&format!("{mode}: POST /v1/admin/flush"), &store.take());
     tokio::time::sleep(idle).await;
+    let idle_flushed = store.take();
     print(
         &format!("{mode}: idle {idle:?}, after flush"),
-        &store.take(),
+        &idle_flushed,
     );
     node.shutdown().await;
     print(&format!("{mode}: shutdown"), &store.take());
@@ -242,7 +341,8 @@ async fn run(mode: &str, n: usize, idle: Duration) -> (u64, u64) {
         .await;
         assert_eq!(st, 200);
     }
-    print(&format!("{mode}: 10 x GET user detail"), &store.take());
+    let user_detail = store.take();
+    print(&format!("{mode}: 10 x GET user detail"), &user_detail);
     node.shutdown().await;
     store.take();
 
@@ -252,26 +352,87 @@ async fn run(mode: &str, n: usize, idle: Duration) -> (u64, u64) {
         .unwrap();
     store.take();
     tokio::time::sleep(idle).await;
+    let idle_ingest = store.take();
     print(
         &format!("{mode}: ingest role, idle {idle:?}, project not open"),
-        &store.take(),
+        &idle_ingest,
     );
     node.shutdown().await;
-    (puts(&events), puts(&traces))
+    RunCalls {
+        events,
+        traces,
+        identifies,
+        engages,
+        idle_l0,
+        idle_flushed,
+        user_detail,
+        idle_ingest,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn acknowledged_requests_write_nothing_to_the_segment_store_with_a_local_wal() {
+async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
     let idle = Duration::from_secs(30);
-    let (events, traces) = run("object", 1000, idle).await;
+    let obj = run("object", 1000, idle).await;
     assert!(
-        events > 0 && traces > 0,
-        "object mode keeps the WAL in the segment store"
+        prefix_puts(&obj.events, "wal") > 0 && prefix_puts(&obj.events, "identity") > 0,
+        "object mode writes wal and identity to the segment store: {:?}",
+        obj.events
     );
-    let (events, traces) = run("local", 1000, idle).await;
+    assert!(
+        prefix_puts(&obj.traces, "agent_wal") > 0,
+        "object mode writes agent_wal to the segment store: {:?}",
+        obj.traces
+    );
+    assert!(
+        prefix_puts(&obj.identifies, "identity") > 0,
+        "object mode writes identity on /v1/identify: {:?}",
+        obj.identifies
+    );
+    assert!(
+        prefix_puts(&obj.engages, "profiles") > 0,
+        "object mode writes profiles on /v1/engage: {:?}",
+        obj.engages
+    );
+
+    let loc = run("local", 1000, idle).await;
     assert_eq!(
-        (events, traces),
-        (0, 0),
-        "local mode: WAL PUTs to the segment store while (events, traces) were acknowledged"
+        hot_calls(&loc.events),
+        0,
+        "local mode: zero hot-tier calls during /v1/ingest new-user acks: {:?}",
+        loc.events
+    );
+    assert_eq!(
+        hot_calls(&loc.traces),
+        0,
+        "local mode: zero hot-tier calls during /v1/agent/traces acks: {:?}",
+        loc.traces
+    );
+    assert_eq!(
+        hot_calls(&loc.identifies),
+        0,
+        "local mode: zero hot-tier calls during /v1/identify acks: {:?}",
+        loc.identifies
+    );
+    assert_eq!(
+        hot_calls(&loc.engages),
+        0,
+        "local mode: zero hot-tier calls during /v1/engage acks: {:?}",
+        loc.engages
+    );
+    assert_eq!(
+        hot_calls(&loc.user_detail),
+        0,
+        "local mode: zero hot-tier calls during GET user detail: {:?}",
+        loc.user_detail
+    );
+    assert_eq!(
+        (
+            hot_calls(&loc.idle_l0),
+            hot_calls(&loc.idle_flushed),
+            hot_calls(&loc.idle_ingest),
+        ),
+        (0, 0, 0),
+        "local mode: zero hot-tier calls during idle"
     );
 }

@@ -1013,4 +1013,131 @@ mod tests {
                 .is_ok());
         }
     }
+
+    #[tokio::test]
+    async fn corrupt_agent_wal_quarantines_locally_under_hot_store() {
+        use futures::stream::BoxStream;
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutOptions,
+            PutResult,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Debug, Default)]
+        struct CountingSeg {
+            inner: InMemory,
+            calls: AtomicUsize,
+        }
+        impl std::fmt::Display for CountingSeg {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "CountingSeg")
+            }
+        }
+        #[async_trait::async_trait]
+        impl ObjectStore for CountingSeg {
+            async fn put_opts(
+                &self,
+                l: &ObjectPath,
+                p: PutPayload,
+                o: PutOptions,
+            ) -> object_store::Result<PutResult> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.put_opts(l, p, o).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                l: &ObjectPath,
+                o: PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.put_multipart_opts(l, o).await
+            }
+            async fn get_opts(
+                &self,
+                l: &ObjectPath,
+                o: GetOptions,
+            ) -> object_store::Result<GetResult> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.get_opts(l, o).await
+            }
+            async fn delete(&self, l: &ObjectPath) -> object_store::Result<()> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.delete(l).await
+            }
+            fn list(
+                &self,
+                p: Option<&ObjectPath>,
+            ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.list(p)
+            }
+            async fn list_with_delimiter(
+                &self,
+                p: Option<&ObjectPath>,
+            ) -> object_store::Result<ListResult> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.list_with_delimiter(p).await
+            }
+            async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.copy(from, to).await
+            }
+            async fn copy_if_not_exists(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+            ) -> object_store::Result<()> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.inner.copy_if_not_exists(from, to).await
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("PULSE_HOT_STORE").ok();
+        std::env::set_var("PULSE_HOT_STORE", "local");
+        let seg = Arc::new(CountingSeg::default());
+        let os = pulse_storage::with_hot_store(seg.clone(), tmp.path())
+            .await
+            .unwrap();
+        match prev {
+            Some(v) => std::env::set_var("PULSE_HOT_STORE", v),
+            None => std::env::remove_var("PULSE_HOT_STORE"),
+        }
+        seg.calls.store(0, AtomicOrdering::SeqCst);
+
+        let wal = AgentWalStore::new("proj_wal", os.clone()).unwrap();
+        let wid = uuid::Uuid::now_v7().to_string();
+        let mut corrupt = encode_ptwl_frame(1, 1_000, &sample_batch("tr_bad")).unwrap();
+        corrupt.truncate(corrupt.len() - 8);
+        os.put(
+            &wal_object_path("proj_wal", &wid, 1).unwrap(),
+            PutPayload::from_bytes(Bytes::from(corrupt)),
+        )
+        .await
+        .unwrap();
+
+        let mut applied = HashMap::new();
+        let replayed = wal
+            .replay_uncommitted(&BTreeMap::new(), &mut applied, true)
+            .await
+            .unwrap();
+        assert!(replayed.is_empty());
+        assert_eq!(
+            seg.calls.load(AtomicOrdering::SeqCst),
+            0,
+            "agent_wal_corrupt/ quarantine must make 0 calls to segments"
+        );
+        let qpath = wal_corrupt_path("proj_wal", &wid, "seq_000000000001.ptwl").unwrap();
+        assert!(os.head(&qpath).await.is_ok());
+        assert!(
+            tmp.path()
+                .join("wal")
+                .join("agent_wal_corrupt")
+                .join("proj_wal")
+                .join(&wid)
+                .join("seq_000000000001.ptwl")
+                .is_file(),
+            "quarantined agent WAL must reside on local disk under <data_dir>/wal"
+        );
+    }
 }

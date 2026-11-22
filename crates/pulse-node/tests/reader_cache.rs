@@ -124,8 +124,30 @@ async fn user_detail(node: &RunningNode, pid: &str) -> u16 {
         .as_u16()
 }
 
+struct HotStoreEnvGuard {
+    prev: Option<String>,
+}
+
+impl HotStoreEnvGuard {
+    fn set(val: &str) -> Self {
+        let prev = std::env::var("PULSE_HOT_STORE").ok();
+        std::env::set_var("PULSE_HOT_STORE", val);
+        Self { prev }
+    }
+}
+
+impl Drop for HotStoreEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("PULSE_HOT_STORE", v),
+            None => std::env::remove_var("PULSE_HOT_STORE"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_this_node_has_not_opened_is_read_through_cached_handles() {
+    let _hot_store = HotStoreEnvGuard::set("object");
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(Counting::default());
 

@@ -30,6 +30,26 @@ pub enum IdentityError {
     Closed,
 }
 
+impl IdentityError {
+    /// Returns `true` when the underlying SlateDB store failed due to I/O, object-store
+    /// unavailability, or writer fencing (transient/storage-unavailable -> HTTP 503).
+    pub fn is_store_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::SlateDb(
+                SlateDBError::IoError(_)
+                    | SlateDBError::ObjectStoreError(_)
+                    | SlateDBError::Fenced
+                    | SlateDBError::WalFlushChannelError
+                    | SlateDBError::MemtableFlushChannelError
+                    | SlateDBError::CheckpointChannelError
+                    | SlateDBError::ReadChannelError(_)
+                    | SlateDBError::BackgroundTaskShutdown
+            )
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, IdentityError>;
 
 /// 256-bit physical bucket presence mask (`buckets 0..=255`).
@@ -1529,5 +1549,29 @@ mod tests {
         );
 
         recovered.close().await.expect("close recovered");
+    }
+
+    #[test]
+    fn is_store_unavailable_classifies_transient_and_fenced_slatedb_errors() {
+        let io_err = IdentityError::SlateDb(SlateDBError::IoError(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ))));
+        assert!(io_err.is_store_unavailable());
+
+        let os_err = IdentityError::SlateDb(SlateDBError::ObjectStoreError(Arc::new(
+            object_store::Error::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::other("disk down")),
+            },
+        )));
+        assert!(os_err.is_store_unavailable());
+        assert!(IdentityError::SlateDb(SlateDBError::Fenced).is_store_unavailable());
+        assert!(IdentityError::SlateDb(SlateDBError::WalFlushChannelError).is_store_unavailable());
+        assert!(IdentityError::SlateDb(SlateDBError::BackgroundTaskShutdown).is_store_unavailable());
+
+        assert!(!IdentityError::IdentifiedMergeConflict.is_store_unavailable());
+        assert!(!IdentityError::CorruptedRecord("bad").is_store_unavailable());
+        assert!(!IdentityError::Closed.is_store_unavailable());
     }
 }

@@ -113,7 +113,7 @@ There are no macOS or Windows binaries, and nothing is published to npm unless t
 flowchart LR
     U["Browsers, apps, agents"] -- "HTTPS :443" --> PROXY["Reverse proxy<br/>(Caddy in deploy/Caddyfile)<br/>blocks /metrics"]
     PROXY -- "HTTP 127.0.0.1:8080" --> N["pulse-node --role all"]
-    N --> D[("PULSE_DATA_DIR<br/>object_store/ · pulse_meta.db<br/>foyer_cache/ · root_admin_token · outbox")]
+    N --> D[("PULSE_DATA_DIR<br/>wal/ · hot/ · object_store/ · hot_store_mode<br/>pulse_meta.db · foyer_cache/ · root_admin_token · outbox")]
 ```
 
 One process does ingest, queries, flushing, compaction and serves the Studio. The repo ships this setup in `deploy/`:
