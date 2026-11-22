@@ -14,6 +14,7 @@
 | `--seed` / `--no-seed` | `PULSE_SEED=1` | off | Load the synthetic demo dataset into an empty default project | `pulse-node/src/main.rs` |
 | `--role <role>` | `PULSE_NODE_ROLE` | `all` | `all`, `ingest`, `query` or `compactor`. See [node roles](architecture.md#node-roles-and-deployment) | `pulse-node/src/lib.rs` |
 | `--quic-addr <ip:port>` / `--no-quic` | `PULSE_QUIC_ADDR` | off | Optional QUIC/UDP ingest listener, with a self-signed certificate | `pulse-ingest/src/quic.rs` |
+| | `PULSE_WRITER_LEASE_TTL_SECS` | `15` (min `3`) | How long a project's writer lease lasts without renewal: the time a standby ingest node waits before taking over from a dead one. Renewed every third of it; node clocks must agree to within a third of it. See [limitations](limitations.md#operational-limitations) | `pulse-control/src/db.rs` |
 | | `PULSE_SHUTDOWN_DRAIN_MS` | `0` | Wait this long after `/readyz` turns `503` before closing the listener | `pulse-node/src/lib.rs` |
 | | `RUST_LOG` | `info,slatedb=warn` | Log filter | `pulse-node/src/main.rs` |
 

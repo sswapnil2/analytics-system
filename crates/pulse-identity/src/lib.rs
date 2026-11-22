@@ -1310,6 +1310,11 @@ impl IdentityRouter {
         Ok(g)
     }
 
+    /// Forgets a project's graph so the next `get_or_open` rebuilds it from storage.
+    pub fn evict(&self, project_id: &str) {
+        self.graphs.remove(project_id);
+    }
+
     pub async fn refresh_all(&self) -> Result<usize> {
         let graphs: Vec<Arc<ProjectIdentityGraph>> =
             self.graphs.iter().map(|e| e.value().clone()).collect();

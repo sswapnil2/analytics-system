@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use pulse_wire::WireBatch;
 
 use crate::error::{Result, StorageError};
@@ -95,10 +95,30 @@ impl BucketWal {
         frame.extend_from_slice(&payload);
 
         let path = self.object_path(epoch, seq);
-        self.object_store
-            .put(&path, PutPayload::from_bytes(Bytes::from(frame)))
-            .await?;
-        Ok(seq)
+        // Create-only: a second writer on this log fails loudly instead of replacing a record.
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from_bytes(Bytes::from(frame)), opts)
+            .await
+        {
+            Ok(_) => Ok(seq),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                tracing::error!(
+                    project_id = %self.project_id,
+                    bucket_id = self.bucket_id,
+                    wal_path = %path,
+                    "WAL object already exists: another node is writing this project"
+                );
+                Err(StorageError::NotWriter {
+                    project_id: self.project_id.clone(),
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn get_bytes_with_retry(&self, loc: &ObjectPath) -> Result<Option<Bytes>> {

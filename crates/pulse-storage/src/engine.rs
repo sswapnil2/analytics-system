@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use dashmap::DashMap;
@@ -70,12 +71,38 @@ impl Default for StorageConfig {
     }
 }
 
+/// Grants one node at a time the right to write a project's event store (`P0-1`).
+#[async_trait::async_trait]
+pub trait WriterLeases: Send + Sync {
+    /// Takes or renews this node's lease on `project_id`. `Ok(Some(generation))` when this node
+    /// holds it; the generation grows every time the holder changes. `Ok(None)` when another
+    /// node holds an unexpired lease.
+    async fn acquire(&self, project_id: &str) -> std::result::Result<Option<u64>, String>;
+    /// How long a lease stays valid without renewal.
+    fn ttl(&self) -> Duration;
+}
+
+/// How long after the start of a successful `acquire` this node may keep acknowledging
+/// writes. Stops a third of the TTL early so a slow clock here cannot overlap a takeover.
+fn local_lease_validity(ttl: Duration) -> Duration {
+    ttl * 2 / 3
+}
+
+/// This node's hold on a project it opened for writing under a lease.
+struct WriterFence {
+    generation: u64,
+    valid_until: Mutex<Instant>,
+    fenced: AtomicBool,
+}
+
 /// Per-project storage state managing WALs, L0 `MemBucket`s, MVCC `Manifest`, and Compaction.
 pub struct ProjectStorage {
     project_id: String,
     config: StorageConfig,
     object_store: Arc<dyn ObjectStore>,
     id_graph: Arc<ProjectIdentityGraph>,
+    /// `None` when no lease is configured (embedded use, tests) or the project is read-only here.
+    writer: Option<WriterFence>,
     manifest_store: ManifestStore,
     manifest: RwLock<Arc<Manifest>>,
     manifest_commit_lock: AsyncMutex<()>,
@@ -136,9 +163,42 @@ impl ProjectStorage {
         object_store: Arc<dyn ObjectStore>,
         identity_router: &IdentityRouter,
     ) -> Result<Arc<Self>> {
-        let project_id = project_id.into();
+        Self::open_inner(
+            project_id.into(),
+            config,
+            object_store,
+            identity_router,
+            None,
+        )
+        .await
+    }
+
+    async fn open_inner(
+        project_id: String,
+        config: StorageConfig,
+        object_store: Arc<dyn ObjectStore>,
+        identity_router: &IdentityRouter,
+        lease: Option<(u64, Instant)>,
+    ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
-        let manifest = manifest_store.load_latest().await?;
+        let mut manifest = manifest_store.load_latest().await?;
+        if let Some((generation, _)) = lease {
+            // Publish our generation BEFORE replaying the WAL: from this commit on, the previous
+            // holder's manifest commits (and so its WAL purges) abort, so nothing we are about
+            // to replay can be flushed or deleted behind our back.
+            while manifest.writer_generation != generation {
+                if manifest.writer_generation > generation {
+                    return Err(StorageError::NotWriter { project_id });
+                }
+                let mut next = manifest.clone();
+                next.writer_generation = generation;
+                manifest = match manifest_store.commit_next(next).await {
+                    Ok(committed) => committed,
+                    Err(StorageError::ManifestConflict) => manifest_store.load_latest().await?,
+                    Err(e) => return Err(e),
+                };
+            }
+        }
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
         ));
@@ -186,6 +246,11 @@ impl ProjectStorage {
             config: config.clone(),
             object_store: object_store.clone(),
             id_graph,
+            writer: lease.map(|(generation, valid_until)| WriterFence {
+                generation,
+                valid_until: Mutex::new(valid_until),
+                fenced: AtomicBool::new(false),
+            }),
             manifest_store,
             manifest: RwLock::new(Arc::new(manifest)),
             manifest_commit_lock: AsyncMutex::new(()),
@@ -372,6 +437,31 @@ impl ProjectStorage {
     }
 
     /// Acquires the per-bucket append mutex (`P1-01`, `P1-02`).
+    /// Fails unless this node may still acknowledge writes: no lease configured, or the lease
+    /// is held and was renewed recently enough.
+    pub fn check_writer(&self) -> Result<()> {
+        match &self.writer {
+            Some(w)
+                if w.fenced.load(Ordering::Acquire) || Instant::now() >= *w.valid_until.lock() =>
+            {
+                Err(self.not_writer())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn not_writer(&self) -> StorageError {
+        StorageError::NotWriter {
+            project_id: self.project_id.clone(),
+        }
+    }
+
+    fn fence(&self) {
+        if let Some(w) = &self.writer {
+            w.fenced.store(true, Ordering::Release);
+        }
+    }
+
     pub async fn lock_bucket_append(&self, bucket_id: u8) -> AsyncMutexGuard<'_, ()> {
         self.bucket_append_locks[bucket_id as usize].lock().await
     }
@@ -392,8 +482,18 @@ impl ProjectStorage {
         let wire_events: Vec<WireEvent> = events.iter().map(|(e, _)| e.clone()).collect();
         let batch = WireBatch::new(wire_events);
 
+        self.check_writer()?;
         // 1. Durable WAL write BEFORE allocating l0_seq or mutating L0
-        let wal_seq = self.wals[b_idx].append(&batch).await?;
+        let wal_seq = match self.wals[b_idx].append(&batch).await {
+            Err(e @ StorageError::NotWriter { .. }) => {
+                self.fence();
+                return Err(e);
+            }
+            other => other?,
+        };
+        // Checked again AFTER the write: if the lease ran out while the PUT was in flight, a new
+        // holder may already have listed this log without the record, so it must not be acked.
+        self.check_writer()?;
 
         // 2. Allocate monotonic `l0_seq`s and append into L0 MemBucket while still holding `bucket_append_locks[b_idx]`
         let mut rows = Vec::with_capacity(events.len());
@@ -583,6 +683,15 @@ impl ProjectStorage {
         let _commit_guard = self.manifest_commit_lock.lock().await;
         for attempt in 0..8u8 {
             let mut candidate = (**self.manifest.read()).clone();
+            if let Some(w) = &self.writer {
+                // A newer generation means another node took the lease and is replaying our WAL.
+                // Merging on top of it (as a compactor may) would flush rows it also replays and
+                // let us purge WAL objects it still needs: stop for good instead.
+                if w.fenced.load(Ordering::Acquire) || candidate.writer_generation > w.generation {
+                    self.fence();
+                    return Err(self.not_writer());
+                }
+            }
             if !apply(&mut candidate) {
                 return Ok(None);
             }
@@ -1094,6 +1203,7 @@ pub struct StorageEngine {
     projects: DashMap<String, Arc<ProjectStorage>>,
     erased: DashMap<String, Arc<ErasedUids>>,
     open_lock: AsyncMutex<()>,
+    writer_leases: OnceLock<Arc<dyn WriterLeases>>,
 }
 
 impl StorageEngine {
@@ -1130,6 +1240,7 @@ impl StorageEngine {
             projects: DashMap::new(),
             erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
+            writer_leases: OnceLock::new(),
         })
     }
 
@@ -1199,11 +1310,34 @@ impl StorageEngine {
         if let Some(p) = self.projects.get(project_id) {
             return Ok(p.clone());
         }
-        let ps = ProjectStorage::open_and_recover(
-            project_id,
+        let lease = match self.writer_leases.get() {
+            Some(leases) if !self.identity_router.is_read_only() => {
+                let started = Instant::now();
+                match leases.acquire(project_id).await {
+                    Ok(Some(generation)) => {
+                        Some((generation, started + local_lease_validity(leases.ttl())))
+                    }
+                    Ok(None) => {
+                        return Err(StorageError::NotWriter {
+                            project_id: project_id.to_string(),
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(project_id, error = %e, "writer lease store unavailable");
+                        return Err(StorageError::NotWriter {
+                            project_id: project_id.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
+        let ps = ProjectStorage::open_inner(
+            project_id.to_string(),
             self.config.clone(),
             self.object_store.clone(),
             &self.identity_router,
+            lease,
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
@@ -1249,6 +1383,52 @@ impl StorageEngine {
         Ok(res)
     }
 
+    /// Makes this engine take a writer lease before opening a project for writing. Read-only
+    /// engines (query and compactor nodes) never take one.
+    pub fn set_writer_leases(&self, leases: Arc<dyn WriterLeases>) {
+        let _ = self.writer_leases.set(leases);
+    }
+
+    /// Renews the lease of every project open for writing; call a few times per TTL. A project
+    /// whose lease went to another node is fenced and dropped, so the next request re-opens it
+    /// from storage once this node holds the lease again.
+    pub async fn renew_writer_leases(&self) {
+        let Some(leases) = self.writer_leases.get() else {
+            return;
+        };
+        for ps in self.open_projects() {
+            let Some(w) = &ps.writer else { continue };
+            if w.fenced.load(Ordering::Acquire) {
+                self.drop_fenced(&ps);
+                continue;
+            }
+            let started = Instant::now();
+            match leases.acquire(&ps.project_id).await {
+                Ok(Some(generation)) if generation == w.generation => {
+                    *w.valid_until.lock() = started + local_lease_validity(leases.ttl());
+                }
+                Ok(_) => {
+                    tracing::error!(project_id = %ps.project_id, "writer lease lost to another node; refusing writes");
+                    ps.fence();
+                    self.drop_fenced(&ps);
+                }
+                // Not extended: writes stop once the last renewal runs out, and resume on the
+                // next successful one.
+                Err(e) => {
+                    tracing::warn!(project_id = %ps.project_id, error = %e, "writer lease renewal failed");
+                }
+            }
+        }
+    }
+
+    fn drop_fenced(&self, ps: &Arc<ProjectStorage>) {
+        self.projects
+            .remove_if(&ps.project_id, |_, cur| Arc::ptr_eq(cur, ps));
+        // Their in-memory state is stale once another node has written the project.
+        self.identity_router.evict(&ps.project_id);
+        self.profile_router.evict(&ps.project_id);
+    }
+
     pub fn open_projects(&self) -> Vec<Arc<ProjectStorage>> {
         self.projects.iter().map(|e| e.value().clone()).collect()
     }
@@ -1260,7 +1440,11 @@ impl StorageEngine {
             .map_err(StorageError::Identity)?;
         let mut total = 0usize;
         for p in self.open_projects() {
-            total += p.flush_all().await?;
+            match p.flush_all().await {
+                // Its rows are in the WAL the new writer replays; do not hold up the others.
+                Err(StorageError::NotWriter { .. }) => {}
+                other => total += other?,
+            }
         }
         Ok(total)
     }
@@ -1381,6 +1565,108 @@ mod manifest_retention_tests {
             rows += reader.read_all_rows(seg).await.unwrap().len();
         }
         assert_eq!(rows, 20);
+    }
+
+    struct FakeLeases {
+        me: &'static str,
+        holder: Arc<Mutex<(&'static str, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WriterLeases for FakeLeases {
+        async fn acquire(&self, _project_id: &str) -> std::result::Result<Option<u64>, String> {
+            let (holder, generation) = *self.holder.lock();
+            Ok((holder == self.me).then_some(generation))
+        }
+        fn ttl(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+    }
+
+    /// A standby that takes the lease replays the previous writer's WAL and loses nothing it
+    /// acknowledged; the previous writer, still alive, can no longer commit, purge or ack.
+    #[tokio::test]
+    async fn takeover_replays_the_old_writers_wal_and_fences_it() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let holder = Arc::new(Mutex::new(("a", 1u64)));
+        let engine = |me| {
+            let e = StorageEngine::new(
+                StorageConfig {
+                    num_buckets: 1,
+                    ..StorageConfig::default()
+                },
+                store.clone(),
+                Arc::new(IdentityRouter::new(store.clone())),
+            );
+            e.set_writer_leases(Arc::new(FakeLeases {
+                me,
+                holder: holder.clone(),
+            }));
+            e
+        };
+        let ev = |i: i64| {
+            let ts = 1_790_000_000_000 + i * 1_000;
+            WireEvent {
+                event_uuid: WireEvent::deterministic_uuid("u", "s", "e", ts, i as u64),
+                routing_seed: "u".into(),
+                distinct_id: "u".into(),
+                session_id: "s".into(),
+                event_name: "e".into(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: 0,
+                props: vec![],
+                replay_offset_kb: 0,
+            }
+        };
+        let is_not_writer = |r: Result<usize>| matches!(r, Err(StorageError::NotWriter { .. }));
+
+        let a = engine("a");
+        let ps_a = a.get_or_open_project("p").await.unwrap();
+        for i in 0..3 {
+            ps_a.append_bucket_events(0, vec![(ev(i), 1)])
+                .await
+                .unwrap();
+        }
+        ps_a.flush_bucket(0).await.unwrap();
+        // Acknowledged but only in the WAL when the writer "dies".
+        for i in 3..5 {
+            ps_a.append_bucket_events(0, vec![(ev(i), 1)])
+                .await
+                .unwrap();
+        }
+
+        let b = engine("b");
+        assert!(matches!(
+            b.get_or_open_project("p").await,
+            Err(StorageError::NotWriter { .. })
+        ));
+
+        *holder.lock() = ("b", 2);
+        let ps_b = b.get_or_open_project("p").await.unwrap();
+        assert_eq!(ps_b.snapshot().manifest.total_l1_rows(), 3);
+        assert_eq!(
+            ps_b.total_l0_rows(),
+            2,
+            "acknowledged WAL records were not replayed"
+        );
+
+        // The old writer is still running. Its flush must not publish the two rows a second
+        // time nor purge the WAL records the new writer has not flushed yet.
+        assert!(is_not_writer(ps_a.flush_bucket(0).await.map(|v| v.len())));
+        assert!(is_not_writer(
+            ps_a.append_bucket_events(0, vec![(ev(9), 1)]).await
+        ));
+        a.renew_writer_leases().await;
+        assert!(a.open_projects().is_empty());
+
+        // A third node taking over before `b` flushed still finds every acknowledged record.
+        *holder.lock() = ("c", 3);
+        let ps_c = engine("c").get_or_open_project("p").await.unwrap();
+        assert_eq!(ps_c.snapshot().manifest.total_l1_rows(), 3);
+        assert_eq!(ps_c.total_l0_rows(), 2);
+        ps_c.flush_bucket(0).await.unwrap();
+        assert_eq!(ps_c.snapshot().manifest.total_l1_rows(), 5);
+        assert!(is_not_writer(ps_b.flush_bucket(0).await.map(|v| v.len())));
     }
 
     #[tokio::test]

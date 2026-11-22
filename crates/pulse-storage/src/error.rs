@@ -35,6 +35,9 @@ pub enum StorageError {
     #[error("mvcc manifest conflict after retries")]
     ManifestConflict,
 
+    #[error("this node does not hold the writer lease for project '{project_id}'")]
+    NotWriter { project_id: String },
+
     #[error("project dictionary capacity exceeded for {kind} (max 65536)")]
     DictionaryFull { kind: &'static str },
 

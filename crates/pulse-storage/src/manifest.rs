@@ -27,6 +27,8 @@ struct ManifestWire {
     epoch: u64,
     #[serde(default)]
     fenced_wal_epoch: u64,
+    #[serde(default)]
+    writer_generation: u64,
     partitions: Vec<PartitionEntry>,
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
@@ -38,6 +40,9 @@ struct ManifestWire {
 pub struct Manifest {
     pub epoch: u64,
     pub fenced_wal_epoch: u64,
+    /// Generation of the writer lease held by the node that last opened this project for
+    /// writing (0 = never leased). A writer whose own generation is older must stop committing.
+    pub writer_generation: u64,
     pub active_segments: HashMap<(NaiveDate, u8), Vec<SegmentMeta>>,
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
@@ -83,6 +88,7 @@ impl Manifest {
         ManifestWire {
             epoch: self.epoch,
             fenced_wal_epoch: self.fenced_wal_epoch,
+            writer_generation: self.writer_generation,
             partitions,
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -98,6 +104,7 @@ impl Manifest {
         Self {
             epoch: w.epoch,
             fenced_wal_epoch: w.fenced_wal_epoch,
+            writer_generation: w.writer_generation,
             active_segments,
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,

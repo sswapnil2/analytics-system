@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use pulse_storage::{event_uuid_fingerprint, route_bucket, StorageEngine, StorageError};
 use pulse_wire::{
@@ -149,7 +148,6 @@ pub struct IngestService {
     storage: Arc<StorageEngine>,
     governance: Arc<dyn GovernanceProvider>,
     dedup: DedupRegistry,
-    seeded_projects: DashMap<String, bool>,
     dict_registry: Arc<DictionaryRegistry>,
     metrics: IngestMetrics,
     rate_limit: crate::rate_limit::RateLimiter,
@@ -173,7 +171,6 @@ impl IngestService {
             storage,
             governance,
             dedup: DedupRegistry::new(),
-            seeded_projects: DashMap::new(),
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
             rate_limit,
@@ -209,12 +206,10 @@ impl IngestService {
         now_ms: i64,
     ) -> Result<Arc<pulse_storage::ProjectStorage>> {
         let ps = self.storage.get_or_open_project(project_id).await?;
-        if !self.seeded_projects.contains_key(project_id) {
-            let recovered = ps.take_recovered_uuid_fps();
-            if !recovered.is_empty() {
-                self.dedup.seed_recovered(project_id, &recovered, now_ms);
-            }
-            self.seeded_projects.insert(project_id.to_string(), true);
+        // Empty except right after an open, including a re-open after a writer-lease takeover.
+        let recovered = ps.take_recovered_uuid_fps();
+        if !recovered.is_empty() {
+            self.dedup.seed_recovered(project_id, &recovered, now_ms);
         }
         Ok(ps)
     }
