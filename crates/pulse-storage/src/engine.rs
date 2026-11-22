@@ -1479,6 +1479,9 @@ impl StorageEngine {
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
+        // This node writes the project now: readers for it would only go stale.
+        self.identity_router.evict_reader(project_id);
+        self.profile_router.evict_reader(project_id);
         // After the insert, so a concurrent `set_erased` is seen by one side or the other.
         if let Some(e) = self.erased.get(project_id) {
             ps.set_erased(e.clone());

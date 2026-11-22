@@ -232,6 +232,22 @@ pub struct ProjectProfileStore {
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
     db: tokio::sync::Mutex<Option<Arc<Db>>>,
+    /// Read-only stores keep one reader: it follows the writer by polling, and opening one per
+    /// read wrote (then deleted) a SlateDB checkpoint each time, two PUTs per read.
+    reader: tokio::sync::Mutex<Option<Arc<DbReader>>>,
+}
+
+// A SlateDB reader's poller panics if the reader is dropped without `close`, so close it on drop.
+impl Drop for ProjectProfileStore {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.get_mut().take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = reader.close().await;
+                });
+            }
+        }
+    }
 }
 
 impl ProjectProfileStore {
@@ -246,6 +262,7 @@ impl ProjectProfileStore {
             object_store,
             read_only: false,
             db: tokio::sync::Mutex::new(Some(Arc::new(db))),
+            reader: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -258,7 +275,19 @@ impl ProjectProfileStore {
             object_store,
             read_only: true,
             db: tokio::sync::Mutex::new(None),
+            reader: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// This read-only store's reader, opened on first use. `None` while the store does not exist.
+    async fn shared_reader(&self) -> Result<Option<Arc<DbReader>>> {
+        let mut guard = self.reader.lock().await;
+        if guard.is_none() {
+            *guard = open_profile_reader(&self.project_id, &self.object_store)
+                .await?
+                .map(Arc::new);
+        }
+        Ok(guard.clone())
     }
 
     /// Upserts a single user profile atomically, maintaining all secondary indexes.
@@ -336,15 +365,13 @@ impl ProjectProfileStore {
     pub async fn get_by_distinct_id(&self, distinct_id: &str) -> Result<Option<StoredUserProfile>> {
         let rk = record_key(distinct_id);
         if self.read_only {
-            let Some(reader) = open_profile_reader(&self.project_id, &self.object_store).await?
-            else {
+            let Some(reader) = self.shared_reader().await? else {
                 return Ok(None);
             };
             let res = match reader.get(&rk).await.map_err(slatedb_err)? {
                 Some(b) => Some(decode_profile(&b)?),
                 None => None,
             };
-            let _ = reader.close().await;
             return Ok(res);
         }
         let mut guard = self.db.lock().await;
@@ -366,11 +393,9 @@ impl ProjectProfileStore {
         let (start, end) = canonical_prefix_bounds(canonical_uid);
         let prefix_len = start.len();
         if self.read_only {
-            let Some(reader) = open_profile_reader(&self.project_id, &self.object_store).await?
-            else {
+            let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let reader = Arc::new(reader);
             let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
@@ -381,9 +406,6 @@ impl ProjectProfileStore {
                         }
                     }
                 }
-            }
-            if let Ok(r) = Arc::try_unwrap(reader) {
-                let _ = r.close().await;
             }
             return Ok(out);
         }
@@ -498,11 +520,9 @@ impl ProjectProfileStore {
         let max_keys = needle.is_none().then(|| offset.saturating_add(lim));
 
         if self.read_only {
-            let Some(reader) = open_profile_reader(&self.project_id, &self.object_store).await?
-            else {
+            let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let reader = Arc::new(reader);
             let keys = scan_reader_keys(reader.clone(), start, end, max_keys).await?;
             let mut out = Vec::with_capacity(lim);
             let mut matched = 0usize;
@@ -537,9 +557,6 @@ impl ProjectProfileStore {
                         matched += 1;
                     }
                 }
-            }
-            if let Ok(r) = Arc::try_unwrap(reader) {
-                let _ = r.close().await;
             }
             return Ok(out);
         }
@@ -598,11 +615,9 @@ impl ProjectProfileStore {
         let end = b"u0".to_vec();
 
         if self.read_only {
-            let Some(reader) = open_profile_reader(&self.project_id, &self.object_store).await?
-            else {
+            let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let reader = Arc::new(reader);
             let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
@@ -613,9 +628,6 @@ impl ProjectProfileStore {
                         }
                     }
                 }
-            }
-            if let Ok(r) = Arc::try_unwrap(reader) {
-                let _ = r.close().await;
             }
             return Ok(out);
         }
@@ -663,15 +675,10 @@ impl ProjectProfileStore {
         let start = b"r/".to_vec();
         let end = b"r0".to_vec();
         if self.read_only {
-            let Some(reader) = open_profile_reader(&self.project_id, &self.object_store).await?
-            else {
+            let Some(reader) = self.shared_reader().await? else {
                 return Ok(0);
             };
-            let reader = Arc::new(reader);
             let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
-            if let Ok(r) = Arc::try_unwrap(reader) {
-                let _ = r.close().await;
-            }
             return Ok(keys.len() as u64);
         }
         let mut guard = self.db.lock().await;
@@ -689,6 +696,10 @@ impl ProjectProfileStore {
 
     pub async fn close(&self) -> Result<()> {
         if self.read_only {
+            // Releases the reader's checkpoint now instead of letting it expire.
+            if let Some(reader) = self.reader.lock().await.take() {
+                let _ = reader.close().await;
+            }
             return Ok(());
         }
         let mut guard = self.db.lock().await;
@@ -726,6 +737,8 @@ pub struct ProfileRouter {
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
     stores: DashMap<String, Arc<ProjectProfileStore>>,
+    /// Read-only stores for projects this node does not write; each follows the writer itself.
+    readers: DashMap<String, Arc<ProjectProfileStore>>,
     init_lock: tokio::sync::Mutex<()>,
 }
 
@@ -735,6 +748,7 @@ impl ProfileRouter {
             object_store,
             read_only,
             stores: DashMap::new(),
+            readers: DashMap::new(),
             init_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -743,9 +757,23 @@ impl ProfileRouter {
         self.read_only
     }
 
-    /// A read-only store for a project this node does not write. Never fences the writer.
+    /// A read-only store for a project this node does not write, cached. Never fences the writer.
     pub fn open_reader(&self, project_id: &str) -> Arc<ProjectProfileStore> {
-        ProjectProfileStore::open_read_only(project_id.to_string(), self.object_store.clone())
+        self.readers
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                ProjectProfileStore::open_read_only(
+                    project_id.to_string(),
+                    self.object_store.clone(),
+                )
+            })
+            .clone()
+    }
+
+    /// Drops the cached reader, e.g. once this node opens the project for writing. Its SlateDB
+    /// reader is closed when the last handle to it goes.
+    pub fn evict_reader(&self, project_id: &str) {
+        self.readers.remove(project_id);
     }
 
     pub async fn get_or_open(&self, project_id: &str) -> Result<Arc<ProjectProfileStore>> {
@@ -768,6 +796,7 @@ impl ProfileRouter {
     /// Forgets a project's store so the next `get_or_open` reopens it from storage.
     pub fn evict(&self, project_id: &str) {
         self.stores.remove(project_id);
+        self.evict_reader(project_id);
     }
 
     pub async fn close_all(&self) -> Result<()> {
@@ -775,12 +804,15 @@ impl ProfileRouter {
             self.stores.iter().map(|e| e.value().clone()).collect();
         // Close every store even if one fails, and report the first failure.
         let mut first_err = None;
-        for s in stores {
+        let readers: Vec<Arc<ProjectProfileStore>> =
+            self.readers.iter().map(|e| e.value().clone()).collect();
+        for s in stores.into_iter().chain(readers) {
             if let Err(e) = s.close().await {
                 first_err.get_or_insert(e);
             }
         }
         self.stores.clear();
+        self.readers.clear();
         first_err.map_or(Ok(()), Err)
     }
 }

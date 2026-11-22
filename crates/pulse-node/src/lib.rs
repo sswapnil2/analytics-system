@@ -235,6 +235,9 @@ impl RunningNode {
                     tracing::warn!(error = %e, "releasing writer leases on shutdown failed");
                 }
             }
+        } else {
+            // Read-only profile stores hold SlateDB readers; close them so their pollers stop.
+            let _ = self.storage.profile_router().close_all().await;
         }
     }
 }
@@ -355,8 +358,16 @@ fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
 /// Boots the Pulse Analytics Node (`All`, `Ingest`, `Query`, or `Compactor` role).
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
+    let segment_store = build_object_store(&config.data_dir)?;
+    start_pulse_node_with_store(config, segment_store).await
+}
 
-    let raw_store = build_object_store(&config.data_dir)?;
+/// [`start_pulse_node`] on a given object store (tests count or share it).
+pub async fn start_pulse_node_with_store(
+    config: NodeConfig,
+    raw_store: Arc<dyn object_store::ObjectStore>,
+) -> anyhow::Result<RunningNode> {
+    std::fs::create_dir_all(&config.data_dir)?;
     let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
     let identity_router = Arc::new(if config.role.serves_ingest() {
         IdentityRouter::new(enc_store.as_object_store())
