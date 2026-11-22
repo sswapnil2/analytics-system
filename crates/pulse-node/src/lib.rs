@@ -1537,6 +1537,17 @@ mod tests {
         // The writer is unaffected by the refused attempt.
         let resp = post(node_a.http_addr, "a4").await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        // ...and by the second node having started: its profile store stays the writer's. SlateDB
+        // notices a fenced handle on its next poll (1 s), so give it time to.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let engaged = http
+            .post(format!("http://{}/v1/engage", node_a.http_addr))
+            .header("x-pulse-key", &key)
+            .json(&json!({ "distinct_id": "a1", "$set": { "tier": "gold" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(engaged.status(), reqwest::StatusCode::OK);
 
         // A clean shutdown flushes and releases the lease, so the standby takes over at once.
         node_a.shutdown().await;
@@ -1549,6 +1560,18 @@ mod tests {
             .unwrap();
         let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
         assert_eq!(rows, 5, "takeover lost or duplicated acknowledged events");
+        let profile = node_b
+            .storage
+            .profile_store("proj_lease", false)
+            .await
+            .unwrap()
+            .get_by_distinct_id("a1")
+            .await
+            .unwrap();
+        assert!(
+            profile.is_some(),
+            "the writer's profile update was lost: the second node took its profile store"
+        );
         node_b.shutdown().await;
     }
 

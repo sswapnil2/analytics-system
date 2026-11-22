@@ -497,6 +497,12 @@ impl ProjectStorage {
         }
     }
 
+    fn is_fenced(&self) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|w| w.fenced.load(Ordering::Acquire))
+    }
+
     fn fence(&self) {
         if let Some(w) = &self.writer {
             w.fenced.store(true, Ordering::Release);
@@ -1564,6 +1570,59 @@ impl StorageEngine {
                 }
             }
         }
+    }
+
+    /// Whether this node may write `project_id`'s identity and profile stores: always without
+    /// writer leases; with them, only while it holds the project open as its writer.
+    fn writes_project(&self, project_id: &str) -> bool {
+        if self.writer_leases.get().is_none() {
+            return true;
+        }
+        self.projects
+            .get(project_id)
+            .is_some_and(|p| !p.is_fenced())
+    }
+
+    /// The project's user-profile store. `write` takes the writer lease first (opening the
+    /// project), so a node that does not hold it gets `NotWriter` instead of taking the store
+    /// from the writer. A read on such a node gets a read-only store.
+    pub async fn profile_store(
+        &self,
+        project_id: &str,
+        write: bool,
+    ) -> Result<Arc<crate::ProjectProfileStore>> {
+        if self.profile_router.is_read_only() {
+            return self.profile_router.get_or_open(project_id).await;
+        }
+        if write {
+            self.get_or_open_project(project_id).await?;
+        } else if !self.writes_project(project_id) {
+            return Ok(self.profile_router.open_reader(project_id));
+        }
+        self.profile_router.get_or_open(project_id).await
+    }
+
+    /// The project's identity graph, on the same terms as `profile_store`.
+    pub async fn identity_graph(
+        &self,
+        project_id: &str,
+        write: bool,
+    ) -> Result<Arc<ProjectIdentityGraph>> {
+        let router = &self.identity_router;
+        if !router.is_read_only() {
+            if write {
+                self.get_or_open_project(project_id).await?;
+            } else if !self.writes_project(project_id) {
+                return router
+                    .open_reader(project_id)
+                    .await
+                    .map_err(StorageError::Identity);
+            }
+        }
+        router
+            .get_or_open(project_id)
+            .await
+            .map_err(StorageError::Identity)
     }
 
     fn drop_fenced(&self, ps: &Arc<ProjectStorage>) {

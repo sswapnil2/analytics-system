@@ -1255,7 +1255,14 @@ impl ProjectIdentityGraph {
         self.flush().await?;
         let mut db_guard = self.db.lock().await;
         if let Some(db) = db_guard.take() {
-            db.close().await?;
+            // See `ProjectProfileStore::close`: a fenced handle panics in SlateDB 0.6's `close`.
+            match tokio::spawn(async move { db.close().await }).await {
+                Ok(res) => res?,
+                Err(e) => {
+                    tracing::error!(project_id = %self.project_id, error = %e, "closing the identity store panicked (fenced by another writer?)");
+                    return Err(IdentityError::Closed);
+                }
+            }
         }
         Ok(())
     }
@@ -1290,6 +1297,15 @@ impl IdentityRouter {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// A read-only graph for a project this node does not write, opened fresh and not cached.
+    /// Never fences the writer.
+    // ponytail: loads the graph on every call; cache it if a node that is not the writer serves
+    // these reads often.
+    pub async fn open_reader(&self, project_id: &str) -> Result<Arc<ProjectIdentityGraph>> {
+        ProjectIdentityGraph::open_read_only(project_id.to_string(), self.object_store.clone())
+            .await
     }
 
     pub async fn get_or_open(&self, project_id: &str) -> Result<Arc<ProjectIdentityGraph>> {
@@ -1339,11 +1355,15 @@ impl IdentityRouter {
     pub async fn close_all(&self) -> Result<()> {
         let graphs: Vec<Arc<ProjectIdentityGraph>> =
             self.graphs.iter().map(|e| e.value().clone()).collect();
+        // Close every store even if one fails, and report the first failure.
+        let mut first_err = None;
         for g in graphs {
-            g.close().await?;
+            if let Err(e) = g.close().await {
+                first_err.get_or_insert(e);
+            }
         }
         self.graphs.clear();
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 }
 
