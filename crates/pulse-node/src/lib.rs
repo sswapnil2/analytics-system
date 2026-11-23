@@ -683,12 +683,26 @@ pub async fn start_pulse_node_with_store(
                 tokio::time::interval(Duration::from_secs(5))
             };
             let interval = bg_storage.upload_interval();
+            let cold_interval = bg_storage.cold_merge_interval();
+            let cold_on_publish =
+                role == NodeRole::Ingest && !interval.is_zero() && cold_interval == interval;
             let mut publish_ticker = (role == NodeRole::Ingest && !interval.is_zero()).then(|| {
                 let mut t =
                     tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
                 t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 t
             });
+            let mut cold_merge_ticker = (role == NodeRole::Ingest
+                && !cold_interval.is_zero()
+                && !cold_on_publish)
+                .then(|| {
+                    let mut t = tokio::time::interval_at(
+                        tokio::time::Instant::now() + cold_interval,
+                        cold_interval,
+                    );
+                    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    t
+                });
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -742,9 +756,26 @@ pub async fn start_pulse_node_with_store(
                             None => std::future::pending().await,
                         }
                     } => {
+                        if cold_on_publish {
+                            bg_storage.maintenance_errors().check(
+                                MaintenanceKind::Compaction,
+                                bg_storage.cold_merge_all_projects().await,
+                            );
+                        }
                         bg_storage
                             .maintenance_errors()
                             .check(MaintenanceKind::Publish, bg_storage.publish_all_projects().await);
+                    }
+                    _ = async {
+                        match cold_merge_ticker.as_mut() {
+                            Some(t) => t.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        bg_storage.maintenance_errors().check(
+                            MaintenanceKind::Compaction,
+                            bg_storage.cold_merge_all_projects().await,
+                        );
                     }
                     _ = bg_storage.upload_requested(), if role == NodeRole::Ingest => {
                         bg_storage
@@ -1028,6 +1059,9 @@ async fn restore_from_published_inner(
         )
         .await?;
         pulse_storage::UploadIntentStore::new(&project_id, enc_store.clone())
+            .clear()
+            .await?;
+        pulse_storage::ColdMergeIntentStore::new(&project_id, enc_store.clone())
             .clear()
             .await?;
 

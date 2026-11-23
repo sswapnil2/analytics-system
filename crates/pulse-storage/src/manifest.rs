@@ -45,6 +45,13 @@ pub struct PendingS3Delete {
     pub eligible_after_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionUploadTime {
+    pub date: NaiveDate,
+    pub bucket_id: u8,
+    pub last_upload_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestWire {
     epoch: u64,
@@ -56,6 +63,8 @@ struct ManifestWire {
     last_published_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_s3_deletes: Vec<PendingS3Delete>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    s3_partition_last_upload_ms: Vec<PartitionUploadTime>,
     partitions: Vec<PartitionEntry>,
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
@@ -74,6 +83,8 @@ pub struct Manifest {
     pub last_published_seq: Option<u64>,
     /// Superseded S3 segments and snapshot blobs awaiting the 2-publish-interval grace period.
     pub pending_s3_deletes: Vec<PendingS3Delete>,
+    /// Local-only last S3 upload timestamp (UTC ms) per multi-segment `(date, bucket_id)` S3 partition.
+    pub s3_partition_last_upload_ms: HashMap<(NaiveDate, u8), i64>,
     pub active_segments: HashMap<(NaiveDate, u8), Vec<SegmentMeta>>,
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
@@ -120,12 +131,25 @@ impl Manifest {
     }
 
     fn to_wire(&self) -> ManifestWire {
+        let mut s3_partition_last_upload_ms: Vec<PartitionUploadTime> = self
+            .s3_partition_last_upload_ms
+            .iter()
+            .map(
+                |(&(date, bucket_id), &last_upload_ms)| PartitionUploadTime {
+                    date,
+                    bucket_id,
+                    last_upload_ms,
+                },
+            )
+            .collect();
+        s3_partition_last_upload_ms.sort_by_key(|p| (p.date, p.bucket_id));
         ManifestWire {
             epoch: self.epoch,
             fenced_wal_epoch: self.fenced_wal_epoch,
             writer_generation: self.writer_generation,
             last_published_seq: self.last_published_seq,
             pending_s3_deletes: self.pending_s3_deletes.clone(),
+            s3_partition_last_upload_ms,
             partitions: self.to_sorted_partitions(),
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -138,12 +162,18 @@ impl Manifest {
         for p in w.partitions {
             active_segments.insert((p.date, p.bucket_id), p.segments);
         }
+        let mut s3_partition_last_upload_ms =
+            HashMap::with_capacity(w.s3_partition_last_upload_ms.len());
+        for entry in w.s3_partition_last_upload_ms {
+            s3_partition_last_upload_ms.insert((entry.date, entry.bucket_id), entry.last_upload_ms);
+        }
         Self {
             epoch: w.epoch,
             fenced_wal_epoch: w.fenced_wal_epoch,
             writer_generation: w.writer_generation,
             last_published_seq: w.last_published_seq,
             pending_s3_deletes: w.pending_s3_deletes,
+            s3_partition_last_upload_ms,
             active_segments,
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,
@@ -373,6 +403,7 @@ impl PublishedManifest {
             writer_generation: self.writer_generation,
             last_published_seq: Some(self.publish_seq),
             pending_s3_deletes: Vec::new(),
+            s3_partition_last_upload_ms: HashMap::new(),
             active_segments,
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -547,6 +578,79 @@ impl UploadIntentStore {
     }
 
     pub async fn save(&self, intent: &UploadIntent) -> Result<()> {
+        let path = self.path();
+        let payload = encode_json_zstd(intent)?;
+        self.object_store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from(payload)),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear(&self) -> Result<()> {
+        let path = self.path();
+        match self.object_store.delete(&path).await {
+            Ok(()) | Err(OsError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StorageError::ObjectStore(e)),
+        }
+    }
+}
+
+/// Local intent record written before cold S3 segment writes (`manifests/{project_id}/cold_merge_intent.json`).
+///
+/// Tracks pre-assigned `seg_cold_*` S3 target paths so crash recovery on open (or retry) can
+/// delete orphaned S3 objects if the process died before committing the local manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColdMergeIntent {
+    pub intent_id: String,
+    pub writer_generation: u64,
+    pub base_local_epoch: u64,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub target_object_paths: Vec<String>,
+}
+
+/// Durable local store for `manifests/{project_id}/cold_merge_intent.json`
+/// (excluded from `ManifestStore::list_epochs`).
+pub struct ColdMergeIntentStore {
+    project_id: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl ColdMergeIntentStore {
+    pub fn new(project_id: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            object_store,
+        }
+    }
+
+    pub fn path(&self) -> ObjectPath {
+        ObjectPath::from(format!(
+            "manifests/{}/cold_merge_intent.json",
+            self.project_id
+        ))
+    }
+
+    pub async fn load(&self) -> Result<Option<ColdMergeIntent>> {
+        let path = self.path();
+        match self.object_store.get(&path).await {
+            Ok(res) => {
+                let bytes = res.bytes().await?;
+                Ok(Some(decode_json_zstd(&bytes)?))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(StorageError::ObjectStore(e)),
+        }
+    }
+
+    pub async fn save(&self, intent: &ColdMergeIntent) -> Result<()> {
         let path = self.path();
         let payload = encode_json_zstd(intent)?;
         self.object_store
@@ -1027,5 +1131,48 @@ mod tests {
             reloaded.pending_s3_deletes[2].eligible_after_ms,
             Some(1_790_000_700_000)
         );
+    }
+
+    #[tokio::test]
+    async fn s3_partition_last_upload_ms_and_cold_merge_intent_roundtrip() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ms = ManifestStore::new("p_cold", store.clone());
+        let intent_store = ColdMergeIntentStore::new("p_cold", store.clone());
+
+        assert!(intent_store.load().await.unwrap().is_none());
+        let intent = ColdMergeIntent {
+            intent_id: "cmi_1".into(),
+            writer_generation: 3,
+            base_local_epoch: 1,
+            created_at_ms: 1_790_000_000_000,
+            target_object_paths: vec!["segments/p_cold/20261120/bucket_000/seg_cold_1.pvtx".into()],
+        };
+        intent_store.save(&intent).await.unwrap();
+        assert_eq!(intent_store.load().await.unwrap(), Some(intent));
+        // `ManifestStore::list_epochs` must ignore `cold_merge_intent.json`.
+        assert!(ms.list_epochs().await.unwrap().is_empty());
+
+        let d1 = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 11, 21).unwrap();
+        let mut mf = Manifest::default();
+        mf.s3_partition_last_upload_ms
+            .insert((d1, 2), 1_790_000_123_000);
+        mf.s3_partition_last_upload_ms
+            .insert((d2, 0), 1_790_086_400_000);
+        let committed = ms.commit_next(mf).await.unwrap();
+        assert_eq!(committed.epoch, 1);
+
+        let reloaded = ms.load_latest().await.unwrap();
+        assert_eq!(
+            reloaded.s3_partition_last_upload_ms.get(&(d1, 2)),
+            Some(&1_790_000_123_000)
+        );
+        assert_eq!(
+            reloaded.s3_partition_last_upload_ms.get(&(d2, 0)),
+            Some(&1_790_086_400_000)
+        );
+
+        intent_store.clear().await.unwrap();
+        assert!(intent_store.load().await.unwrap().is_none());
     }
 }

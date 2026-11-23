@@ -24,10 +24,10 @@ use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
 use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
 use crate::manifest::{
-    IdentitySnapshotRef, Manifest, ManifestStore, PartitionEntry, PendingS3Delete,
-    PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest, PublishedManifestStore,
-    ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent, UploadIntentBatch,
-    UploadIntentStore,
+    ColdMergeIntent, ColdMergeIntentStore, IdentitySnapshotRef, Manifest, ManifestStore,
+    PartitionEntry, PendingS3Delete, PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest,
+    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent,
+    UploadIntentBatch, UploadIntentStore,
 };
 use crate::mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
@@ -61,6 +61,12 @@ pub const DEFAULT_HOT_SEGMENTS_MAX_MB: u64 = 2048;
 pub const DEFAULT_FLUSH_CONCURRENCY: usize = 4;
 /// Default input-byte cap per cold S3 compaction merge pass (`64 MiB`).
 const DEFAULT_COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default idle duration after upload before a closed-date S3 partition is cold-merged (`PULSE_COLD_MERGE_IDLE_SECS`, 1 hour).
+pub const DEFAULT_COLD_MERGE_IDLE_SECS: u64 = 3600;
+/// Default background cadence for cold S3 merge checks (`PULSE_COLD_MERGE_INTERVAL_SECS`, 300 s; `0` = disabled).
+pub const DEFAULT_COLD_MERGE_INTERVAL_SECS: u64 = 300;
+/// Default input-byte cap per cold S3 merge batch (`PULSE_COLD_MERGE_MAX_INPUT_BYTES`, 64 MiB).
+pub const DEFAULT_COLD_MERGE_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// Minimum cooldown between upload retries triggered by `1x`/`2x` pressure after an S3 upload failure.
 const UPLOAD_FAILURE_COOLDOWN: Duration = Duration::from_secs(2);
 /// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback.
@@ -101,6 +107,33 @@ pub fn upload_merge_max_input_bytes_from_env() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&b| b > 0)
         .unwrap_or(DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES)
+}
+
+/// Reads `PULSE_COLD_MERGE_IDLE_SECS` (default `3600`).
+pub fn cold_merge_idle_from_env() -> Duration {
+    let secs = std::env::var("PULSE_COLD_MERGE_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COLD_MERGE_IDLE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Reads `PULSE_COLD_MERGE_INTERVAL_SECS` (default `300`, `0` = disable background cold merge).
+pub fn cold_merge_interval_from_env() -> Duration {
+    let secs = std::env::var("PULSE_COLD_MERGE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COLD_MERGE_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Reads `PULSE_COLD_MERGE_MAX_INPUT_BYTES` (falls back to `PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES` / `64 MiB`).
+pub fn cold_merge_max_input_bytes_from_env() -> u64 {
+    std::env::var("PULSE_COLD_MERGE_MAX_INPUT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or_else(upload_merge_max_input_bytes_from_env)
 }
 
 /// Deterministic entity-centric bucket router (`xxh3_64(routing_seed) % num_buckets`).
@@ -303,6 +336,7 @@ pub struct ProjectStorage {
     manifest: RwLock<Arc<Manifest>>,
     manifest_commit_lock: AsyncMutex<()>,
     publish_lock: AsyncMutex<()>,
+    cold_merge_lock: AsyncMutex<()>,
     refresh_lock: AsyncMutex<()>,
     gc_lock: AsyncMutex<()>,
     publish_enabled: AtomicBool,
@@ -311,6 +345,8 @@ pub struct ProjectStorage {
     closed_date_upload_ms: Arc<AtomicU64>,
     closed_date_max_bytes: Arc<AtomicU64>,
     upload_merge_max_input_bytes: Arc<AtomicU64>,
+    cold_merge_idle_ms: Arc<AtomicU64>,
+    cold_merge_max_input_bytes: Arc<AtomicU64>,
     upload_signal: Arc<UploadSignal>,
     last_published_seq: Mutex<Option<u64>>,
     last_published_epoch: Mutex<Option<u64>>,
@@ -318,10 +354,12 @@ pub struct ProjectStorage {
     last_snapshot_state: Mutex<LastSnapshotState>,
     restored_snapshot_paths: Mutex<(Option<String>, Option<String>)>,
     closed_date_pending_since_ms: Mutex<HashMap<NaiveDate, i64>>,
+    cold_merge_legacy_seen_ms: Mutex<HashMap<(NaiveDate, u8), i64>>,
     tracked_hot_segments: Mutex<HashMap<String, u64>>,
     hot_segment_bytes: AtomicU64,
     pending_local_deletes: Mutex<HashMap<String, u64>>,
     has_pending_upload_intent: AtomicBool,
+    has_pending_cold_merge_intent: AtomicBool,
     retired_profile_stores: Mutex<Vec<Arc<ProjectProfileStore>>>,
     dictionary: Arc<ProjectDictionary>,
     wals: Vec<BucketWal>,
@@ -519,6 +557,91 @@ async fn reconcile_upload_intent_with_stores(
 
     intent_store.clear().await?;
     Ok(unreferenced_local_sources)
+}
+
+fn prune_s3_partition_upload_time(manifest: &mut Manifest, key: (NaiveDate, u8)) {
+    let s3_count = manifest.active_segments.get(&key).map_or(0, |segs| {
+        segs.iter()
+            .filter(|s| !s.object_path.starts_with("hot/"))
+            .count()
+    });
+    if s3_count <= 1 {
+        manifest.s3_partition_last_upload_ms.remove(&key);
+    }
+}
+
+async fn reconcile_cold_merge_intent_with_stores(
+    project_id: &str,
+    object_store: &Arc<dyn ObjectStore>,
+    manifest: &Manifest,
+    latest_published: Option<&PublishedManifest>,
+) -> Result<()> {
+    let intent_store = ColdMergeIntentStore::new(project_id, object_store.clone());
+    let Some(intent) = intent_store.load().await? else {
+        return Ok(());
+    };
+
+    let mut referenced_segments: HashSet<&str> = manifest
+        .active_segments
+        .values()
+        .flat_map(|v| v.iter().map(|s| s.object_path.as_str()))
+        .collect();
+    if let Some(pub_m) = latest_published {
+        for part in &pub_m.partitions {
+            for seg in &part.segments {
+                referenced_segments.insert(seg.object_path.as_str());
+            }
+        }
+    }
+    for pending in &manifest.pending_s3_deletes {
+        if pending.kind == PendingS3DeleteKind::Segment {
+            referenced_segments.insert(pending.object_path.as_str());
+        }
+    }
+
+    for target_path in &intent.target_object_paths {
+        if !referenced_segments.contains(target_path.as_str()) {
+            let obj_path = ObjectPath::from(target_path.as_str());
+            match object_store.delete(&obj_path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(StorageError::ObjectStore(e)),
+            }
+        }
+    }
+
+    intent_store.clear().await?;
+    Ok(())
+}
+
+fn plan_cold_merge_batches(s3_segs: &[SegmentMeta], max_input_bytes: u64) -> Vec<Vec<SegmentMeta>> {
+    if s3_segs.len() < 2 {
+        return Vec::new();
+    }
+    let mut sorted = s3_segs.to_vec();
+    sorted.sort_by(|a, b| {
+        a.file_size
+            .cmp(&b.file_size)
+            .then_with(|| a.segment_id.cmp(&b.segment_id))
+    });
+    let cap = max_input_bytes.max(1);
+    let mut batches: Vec<Vec<SegmentMeta>> = Vec::new();
+    let mut cur: Vec<SegmentMeta> = Vec::new();
+    let mut cur_bytes: u64 = 0;
+    for seg in sorted {
+        if !cur.is_empty() && cur_bytes.saturating_add(seg.file_size) > cap {
+            if cur.len() >= 2 {
+                batches.push(cur);
+            }
+            cur = Vec::new();
+            cur_bytes = 0;
+        }
+        cur_bytes = cur_bytes.saturating_add(seg.file_size);
+        cur.push(seg);
+    }
+    if cur.len() >= 2 {
+        batches.push(cur);
+    }
+    batches
 }
 
 async fn sweep_local_hot_segments_for_project(
@@ -824,6 +947,10 @@ impl ProjectStorage {
         let closed_date_max_bytes = Arc::new(AtomicU64::new(closed_date_max_bytes_from_env()));
         let upload_merge_max_input_bytes =
             Arc::new(AtomicU64::new(upload_merge_max_input_bytes_from_env()));
+        let cold_merge_idle_ms =
+            Arc::new(AtomicU64::new(cold_merge_idle_from_env().as_millis() as u64));
+        let cold_merge_max_input_bytes =
+            Arc::new(AtomicU64::new(cold_merge_max_input_bytes_from_env()));
         let upload_signal = Arc::new(UploadSignal::default());
         Self::open_inner(
             project_id.into(),
@@ -840,6 +967,8 @@ impl ProjectStorage {
             closed_date_upload_ms,
             closed_date_max_bytes,
             upload_merge_max_input_bytes,
+            cold_merge_idle_ms,
+            cold_merge_max_input_bytes,
             upload_signal,
         )
         .await
@@ -861,6 +990,8 @@ impl ProjectStorage {
         closed_date_upload_ms: Arc<AtomicU64>,
         closed_date_max_bytes: Arc<AtomicU64>,
         upload_merge_max_input_bytes: Arc<AtomicU64>,
+        cold_merge_idle_ms: Arc<AtomicU64>,
+        cold_merge_max_input_bytes: Arc<AtomicU64>,
         upload_signal: Arc<UploadSignal>,
     ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
@@ -1030,14 +1161,21 @@ impl ProjectStorage {
                 last_snapshot_ref = Some(pub_m.snapshot_ref.clone());
             }
 
-            // Replay/discard any leftover UploadIntent (AFTER step-6 recovery, BEFORE dedup seeding)
-            // and sweep unreferenced local `hot/segments/{project_id}/` files.
+            // Replay/discard any leftover UploadIntent / ColdMergeIntent (AFTER step-6 recovery,
+            // BEFORE dedup seeding) and sweep unreferenced local `hot/segments/{project_id}/` files.
             let _ = reconcile_upload_intent_with_stores(
                 &project_id,
                 &object_store,
                 &manifest,
                 latest_published.as_ref(),
                 last_snapshot_ref.as_ref(),
+            )
+            .await?;
+            reconcile_cold_merge_intent_with_stores(
+                &project_id,
+                &object_store,
+                &manifest,
+                latest_published.as_ref(),
             )
             .await?;
             sweep_local_hot_segments_for_project(&project_id, &object_store, &manifest).await?;
@@ -1113,6 +1251,7 @@ impl ProjectStorage {
             manifest: RwLock::new(Arc::new(manifest)),
             manifest_commit_lock: AsyncMutex::new(()),
             publish_lock: AsyncMutex::new(()),
+            cold_merge_lock: AsyncMutex::new(()),
             refresh_lock: AsyncMutex::new(()),
             gc_lock: AsyncMutex::new(()),
             publish_enabled: AtomicBool::new(true),
@@ -1121,6 +1260,8 @@ impl ProjectStorage {
             closed_date_upload_ms,
             closed_date_max_bytes,
             upload_merge_max_input_bytes,
+            cold_merge_idle_ms,
+            cold_merge_max_input_bytes,
             upload_signal,
             last_published_seq: Mutex::new(initial_last_published_seq),
             last_published_epoch: Mutex::new(initial_last_published_epoch),
@@ -1132,10 +1273,12 @@ impl ProjectStorage {
             }),
             restored_snapshot_paths: Mutex::new(initial_restored_paths),
             closed_date_pending_since_ms: Mutex::new(HashMap::new()),
+            cold_merge_legacy_seen_ms: Mutex::new(HashMap::new()),
             tracked_hot_segments: Mutex::new(HashMap::new()),
             hot_segment_bytes: AtomicU64::new(0),
             pending_local_deletes: Mutex::new(HashMap::new()),
             has_pending_upload_intent: AtomicBool::new(false),
+            has_pending_cold_merge_intent: AtomicBool::new(false),
             retired_profile_stores: Mutex::new(Vec::new()),
             dictionary,
             wals,
@@ -1199,6 +1342,26 @@ impl ProjectStorage {
                         .entry(seg.date)
                         .and_modify(|cur| *cur = (*cur).min(ts_ms))
                         .or_insert(ts_ms);
+                }
+            }
+
+            // Seed in-memory fallback upload times for legacy/restored multi-segment S3 partitions (0 S3 calls).
+            {
+                let fallback_ms = latest_published
+                    .as_ref()
+                    .map_or(now_ms, |p| p.published_at_ms);
+                let mf = ps.manifest.read();
+                let mut legacy_guard = ps.cold_merge_legacy_seen_ms.lock();
+                for (&key, segs) in &mf.active_segments {
+                    if !mf.s3_partition_last_upload_ms.contains_key(&key) {
+                        let s3_count = segs
+                            .iter()
+                            .filter(|s| !s.object_path.starts_with("hot/"))
+                            .count();
+                        if s3_count >= 2 {
+                            legacy_guard.insert(key, fallback_ms);
+                        }
+                    }
                 }
             }
 
@@ -2019,15 +2182,23 @@ impl ProjectStorage {
             }
         }
 
+        let flush_ts_ms = Utc::now().timestamp_millis();
         // Atomically commit new MVCC Manifest epoch (without holding `publish_lock`) BEFORE evicting from L0 MemBucket!
         let committed_res = self
             .commit_manifest_cas(|next_manifest| {
                 for meta in &written_segments {
+                    let key = (meta.date, bucket_id);
                     next_manifest
                         .active_segments
-                        .entry((meta.date, bucket_id))
+                        .entry(key)
                         .or_default()
                         .push(meta.clone());
+                    if !meta.object_path.starts_with("hot/") {
+                        next_manifest
+                            .s3_partition_last_upload_ms
+                            .insert(key, flush_ts_ms);
+                        prune_s3_partition_upload_time(next_manifest, key);
+                    }
                 }
                 next_manifest
                     .committed_l0_seq
@@ -2195,6 +2366,10 @@ impl ProjectStorage {
             Some(published_parts) => *published_parts != cur_s3_parts,
             None => !cur_s3_parts.is_empty(),
         };
+        let has_unstamped_s3_deletes = cur_mf
+            .pending_s3_deletes
+            .iter()
+            .any(|d| d.eligible_after_ms.is_none());
 
         let id_dirty = id_graph.user_count() > 0
             && self.last_snapshot_state.lock().exported_id_epoch != Some(id_graph.mutation_epoch());
@@ -2208,7 +2383,12 @@ impl ProjectStorage {
                         != Some(ps.dirty_seq())
             });
 
-        if frozen_groups.is_empty() && !s3_state_dirty && !id_dirty && !prof_dirty {
+        if frozen_groups.is_empty()
+            && !s3_state_dirty
+            && !has_unstamped_s3_deletes
+            && !id_dirty
+            && !prof_dirty
+        {
             return Ok(None);
         }
 
@@ -2570,6 +2750,12 @@ impl ProjectStorage {
                                     next_manifest.active_segments.remove(&(date, bucket_id));
                                 }
                             }
+                            if !repl.new_metas.is_empty() {
+                                next_manifest
+                                    .s3_partition_last_upload_ms
+                                    .insert((date, bucket_id), now_ms);
+                            }
+                            prune_s3_partition_upload_time(next_manifest, (date, bucket_id));
                             maybe_accepted_paths.extend(repl.source_paths.iter().cloned());
                             any_accepted = true;
                         } else {
@@ -2599,6 +2785,8 @@ impl ProjectStorage {
                     .delete(&ObjectPath::from(rej_path.as_str()))
                     .await;
             }
+        } else {
+            committed_mf = (**self.manifest.read()).clone();
         }
 
         // ------------------------------------------------------------------
@@ -2863,14 +3051,22 @@ impl ProjectStorage {
             }
         }
 
+        let flush_ts_ms = Utc::now().timestamp_millis();
         let committed_res = self
             .commit_manifest_cas(|next_manifest| {
                 for meta in &written_segments {
+                    let key = (meta.date, meta.bucket_id);
                     next_manifest
                         .active_segments
-                        .entry((meta.date, meta.bucket_id))
+                        .entry(key)
                         .or_default()
                         .push(meta.clone());
+                    if !meta.object_path.starts_with("hot/") {
+                        next_manifest
+                            .s3_partition_last_upload_ms
+                            .insert(key, flush_ts_ms);
+                        prune_s3_partition_upload_time(next_manifest, key);
+                    }
                 }
                 for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
                     next_manifest
@@ -3120,6 +3316,12 @@ impl ProjectStorage {
                                 {
                                     entry.retain(|s| !item.source_ids.contains(&s.segment_id));
                                     entry.push(item.new_meta.clone());
+                                    if !item.new_meta.object_path.starts_with("hot/") {
+                                        prune_s3_partition_upload_time(
+                                            next_manifest,
+                                            (item.date, item.bucket_id),
+                                        );
+                                    }
                                     accepted_flags[idx] = true;
                                     any_accepted = true;
                                     queued_superseded.extend(item.superseded_paths.iter().cloned());
@@ -3222,6 +3424,332 @@ impl ProjectStorage {
 
         self.run_gc().await?;
         Ok(compacted_partitions)
+    }
+
+    fn partition_cold_merge_batches(
+        &self,
+        manifest: &Manifest,
+        date: NaiveDate,
+        bucket_id: u8,
+        now_ms: i64,
+    ) -> Option<Vec<Vec<SegmentMeta>>> {
+        if date >= date_from_ms(now_ms) {
+            return None;
+        }
+        let segs = manifest.active_segments.get(&(date, bucket_id))?;
+        if segs.iter().any(|s| s.object_path.starts_with("hot/")) {
+            return None;
+        }
+        if segs.len() < 2 {
+            return None;
+        }
+        let max_input_bytes = self
+            .cold_merge_max_input_bytes
+            .load(Ordering::Acquire)
+            .max(1);
+        let batches = plan_cold_merge_batches(segs, max_input_bytes);
+        if batches.is_empty() {
+            return None;
+        }
+        let cold_idle_ms = self.cold_merge_idle_ms.load(Ordering::Acquire) as i64;
+        let last_upload_ms = match manifest.s3_partition_last_upload_ms.get(&(date, bucket_id)) {
+            Some(&ts) => ts,
+            None => *self
+                .cold_merge_legacy_seen_ms
+                .lock()
+                .entry((date, bucket_id))
+                .or_insert(now_ms),
+        };
+        if now_ms.saturating_sub(last_upload_ms) < cold_idle_ms {
+            return None;
+        }
+        Some(batches)
+    }
+
+    /// Merges closed-date, idle (`>= PULSE_COLD_MERGE_IDLE_SECS`) multi-segment S3 `(date, bucket_id)`
+    /// partitions sequentially under the `PULSE_COLD_MERGE_MAX_INPUT_BYTES` (`64 MiB`) input cap,
+    /// using manifest CAS and T2 2-publish-interval deletion grace (`pending_s3_deletes`).
+    ///
+    /// Returns the number of partitions where at least one cold-merge batch committed, executing
+    /// **0 S3 calls** when idle or when no partition is eligible.
+    pub async fn cold_merge(&self) -> Result<usize> {
+        self.cold_merge_at(Utc::now().timestamp_millis()).await
+    }
+
+    /// Time-parameterized variant of [`Self::cold_merge`] for deterministic idle/grace testing.
+    pub async fn cold_merge_at(&self, now_ms: i64) -> Result<usize> {
+        if self.id_graph().is_read_only() || self.query_snapshot_store.is_some() || self.is_fenced()
+        {
+            return Ok(0);
+        }
+        self.check_writer()?;
+
+        // Fast in-memory eligibility scan so idle / ineligible projects execute 0 S3 calls.
+        let has_pending_intent = self.has_pending_cold_merge_intent.load(Ordering::Acquire);
+        let candidate_keys: Vec<(NaiveDate, u8)> = {
+            let mf = self.manifest.read();
+            let mut keys: Vec<(NaiveDate, u8)> = mf
+                .active_segments
+                .keys()
+                .copied()
+                .filter(|&(date, bucket_id)| {
+                    self.partition_cold_merge_batches(&mf, date, bucket_id, now_ms)
+                        .is_some()
+                })
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        if candidate_keys.is_empty() && !has_pending_intent {
+            return Ok(0);
+        }
+
+        let _cold_guard = self.cold_merge_lock.lock().await;
+        if self.id_graph().is_read_only() || self.query_snapshot_store.is_some() || self.is_fenced()
+        {
+            return Ok(0);
+        }
+        self.check_writer()?;
+
+        let intent_store = ColdMergeIntentStore::new(&self.project_id, self.object_store.clone());
+        if self.has_pending_cold_merge_intent.load(Ordering::Acquire) {
+            let cur_mf = (**self.manifest.read()).clone();
+            reconcile_cold_merge_intent_with_stores(
+                &self.project_id,
+                &self.object_store,
+                &cur_mf,
+                None,
+            )
+            .await?;
+            self.has_pending_cold_merge_intent
+                .store(false, Ordering::Release);
+        }
+
+        let candidates: Vec<(NaiveDate, u8)> = {
+            let mf = self.manifest.read();
+            let mut keys: Vec<(NaiveDate, u8)> = mf
+                .active_segments
+                .keys()
+                .copied()
+                .filter(|&(date, bucket_id)| {
+                    self.partition_cold_merge_batches(&mf, date, bucket_id, now_ms)
+                        .is_some()
+                })
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        struct PlannedColdBatch {
+            source_ids: HashSet<String>,
+            source_paths: Vec<String>,
+            sources: Vec<SegmentMeta>,
+            target_segment_id: String,
+            target_object_path: String,
+        }
+
+        let reader = VortexSegmentReader::new(self.object_store.clone());
+        let mut merged_partitions = 0usize;
+
+        for (date, bucket_id) in candidates {
+            let part_lock = self
+                .compaction_locks
+                .entry((date, bucket_id))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone();
+            let _part_guard = part_lock.lock_owned().await;
+
+            self.check_writer()?;
+
+            let (base_epoch, writer_generation, batches) = {
+                let mf = self.manifest.read();
+                let Some(raw_batches) =
+                    self.partition_cold_merge_batches(&mf, date, bucket_id, now_ms)
+                else {
+                    continue;
+                };
+                (mf.epoch, mf.writer_generation, raw_batches)
+            };
+
+            let yyyymmdd = date.format("%Y%m%d").to_string();
+            let planned: Vec<PlannedColdBatch> = batches
+                .into_iter()
+                .map(|sources| {
+                    let source_ids: HashSet<String> =
+                        sources.iter().map(|s| s.segment_id.clone()).collect();
+                    let source_paths: Vec<String> =
+                        sources.iter().map(|s| s.object_path.clone()).collect();
+                    let target_segment_id = format!("seg_cold_{}", Uuid::new_v4().simple());
+                    let target_object_path = format!(
+                        "segments/{}/{yyyymmdd}/bucket_{bucket_id:03}/{target_segment_id}.pvtx",
+                        self.project_id
+                    );
+                    PlannedColdBatch {
+                        source_ids,
+                        source_paths,
+                        sources,
+                        target_segment_id,
+                        target_object_path,
+                    }
+                })
+                .collect();
+
+            let intent = ColdMergeIntent {
+                intent_id: format!("cmi_{}", Uuid::new_v4().simple()),
+                writer_generation,
+                base_local_epoch: base_epoch,
+                created_at_ms: now_ms,
+                target_object_paths: planned
+                    .iter()
+                    .map(|b| b.target_object_path.clone())
+                    .collect(),
+            };
+            self.has_pending_cold_merge_intent
+                .store(true, Ordering::Release);
+            intent_store.save(&intent).await?;
+
+            // Execute each batch sequentially so RSS stays bounded to one <= 64 MiB batch.
+            let erased = self.erased_snapshot();
+            let mut uploaded_outputs: Vec<Option<SegmentMeta>> = Vec::with_capacity(planned.len());
+            for batch in &planned {
+                let mut merged_rows = Vec::new();
+                for seg in &batch.sources {
+                    let mut rows = reader.read_all_rows(seg).await?;
+                    merged_rows.append(&mut rows);
+                }
+                if !erased.is_empty() {
+                    merged_rows.retain(|r| !erased.hides(r.uid_internal, r.event_ts_ms));
+                }
+                let meta_opt = write_vortex_segment_opts(
+                    &self.object_store,
+                    "segments",
+                    &self.project_id,
+                    date,
+                    bucket_id,
+                    &batch.target_segment_id,
+                    merged_rows,
+                    PutMode::Create,
+                )
+                .await?;
+                uploaded_outputs.push(meta_opt);
+            }
+
+            let mut accepted_batches = 0usize;
+            let mut rejected_targets: Vec<String> = Vec::new();
+            let mut prune_legacy = false;
+            let committed_opt = {
+                let _publish_guard = self.publish_lock.lock().await;
+                self.commit_manifest_cas(|next_manifest| {
+                    accepted_batches = 0;
+                    rejected_targets.clear();
+                    prune_legacy = false;
+                    let mut queued_superseded: Vec<String> = Vec::new();
+                    let Some(entry) = next_manifest.active_segments.get_mut(&(date, bucket_id))
+                    else {
+                        for m in uploaded_outputs.iter().flatten() {
+                            rejected_targets.push(m.object_path.clone());
+                        }
+                        return false;
+                    };
+
+                    for (batch, new_meta_opt) in planned.iter().zip(uploaded_outputs.iter()) {
+                        let active_ids: HashSet<&str> =
+                            entry.iter().map(|s| s.segment_id.as_str()).collect();
+                        if batch
+                            .source_ids
+                            .iter()
+                            .all(|sid| active_ids.contains(sid.as_str()))
+                        {
+                            entry.retain(|s| !batch.source_ids.contains(&s.segment_id));
+                            if let Some(ref meta) = new_meta_opt {
+                                entry.push(meta.clone());
+                            }
+                            queued_superseded.extend(batch.source_paths.iter().cloned());
+                            accepted_batches += 1;
+                        } else if let Some(ref meta) = new_meta_opt {
+                            rejected_targets.push(meta.object_path.clone());
+                        }
+                    }
+
+                    if accepted_batches == 0 {
+                        return false;
+                    }
+                    if entry.is_empty() {
+                        next_manifest.active_segments.remove(&(date, bucket_id));
+                    }
+
+                    let cur_pub = next_manifest
+                        .last_published_seq
+                        .max(*self.last_published_seq.lock());
+                    let superseding_pub_seq = cur_pub.map_or(0, |s| s.saturating_add(1));
+                    let mut seen_pending: HashSet<String> = next_manifest
+                        .pending_s3_deletes
+                        .iter()
+                        .map(|e| e.object_path.clone())
+                        .collect();
+                    for path in &queued_superseded {
+                        if !path.starts_with("hot/") && seen_pending.insert(path.clone()) {
+                            next_manifest.pending_s3_deletes.push(PendingS3Delete {
+                                object_path: path.clone(),
+                                kind: PendingS3DeleteKind::Segment,
+                                superseding_pub_seq,
+                                superseded_at_ms: None,
+                                eligible_after_ms: None,
+                            });
+                        }
+                    }
+
+                    prune_s3_partition_upload_time(next_manifest, (date, bucket_id));
+                    prune_legacy = !next_manifest
+                        .s3_partition_last_upload_ms
+                        .contains_key(&(date, bucket_id));
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                })
+                .await?
+            };
+
+            if committed_opt.is_some() {
+                for rej_path in rejected_targets {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(rej_path.as_str()))
+                        .await;
+                }
+                if prune_legacy {
+                    self.cold_merge_legacy_seen_ms
+                        .lock()
+                        .remove(&(date, bucket_id));
+                }
+                merged_partitions += 1;
+            } else {
+                for out in uploaded_outputs.into_iter().flatten() {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(out.object_path.as_str()))
+                        .await;
+                }
+            }
+
+            intent_store.clear().await?;
+            self.has_pending_cold_merge_intent
+                .store(false, Ordering::Release);
+        }
+
+        drop(_cold_guard);
+
+        if merged_partitions > 0
+            && !self.id_graph().is_read_only()
+            && self.publish_enabled.load(Ordering::Acquire)
+            && self.upload_interval().is_zero()
+        {
+            self.upload_if_dirty_at(now_ms, false).await?;
+        }
+
+        Ok(merged_partitions)
     }
 
     /// Deletes superseded S3 segments and snapshot blobs whose superseding `PublishedManifest` has
@@ -3623,6 +4151,9 @@ pub struct StorageEngine {
     closed_date_upload_ms: Arc<AtomicU64>,
     closed_date_max_bytes: Arc<AtomicU64>,
     upload_merge_max_input_bytes: Arc<AtomicU64>,
+    cold_merge_idle_ms: Arc<AtomicU64>,
+    cold_merge_interval_ms: Arc<AtomicU64>,
+    cold_merge_max_input_bytes: Arc<AtomicU64>,
     upload_signal: Arc<UploadSignal>,
 }
 
@@ -3659,6 +4190,13 @@ impl StorageEngine {
         let closed_date_max_bytes = Arc::new(AtomicU64::new(closed_date_max_bytes_from_env()));
         let upload_merge_max_input_bytes =
             Arc::new(AtomicU64::new(upload_merge_max_input_bytes_from_env()));
+        let cold_merge_idle_ms =
+            Arc::new(AtomicU64::new(cold_merge_idle_from_env().as_millis() as u64));
+        let cold_merge_interval_ms = Arc::new(AtomicU64::new(
+            cold_merge_interval_from_env().as_millis() as u64,
+        ));
+        let cold_merge_max_input_bytes =
+            Arc::new(AtomicU64::new(cold_merge_max_input_bytes_from_env()));
         let upload_signal = Arc::new(UploadSignal::default());
         Arc::new(Self {
             maintenance_errors: MaintenanceErrors::default(),
@@ -3680,6 +4218,9 @@ impl StorageEngine {
             closed_date_upload_ms,
             closed_date_max_bytes,
             upload_merge_max_input_bytes,
+            cold_merge_idle_ms,
+            cold_merge_interval_ms,
+            cold_merge_max_input_bytes,
             upload_signal,
         })
     }
@@ -3739,6 +4280,24 @@ impl StorageEngine {
     pub fn set_upload_merge_max_input_bytes(&self, max_bytes: u64) {
         self.upload_merge_max_input_bytes
             .store(max_bytes.max(1), Ordering::Release);
+    }
+
+    pub fn cold_merge_idle(&self) -> Duration {
+        Duration::from_millis(self.cold_merge_idle_ms.load(Ordering::Acquire))
+    }
+
+    pub fn cold_merge_interval(&self) -> Duration {
+        Duration::from_millis(self.cold_merge_interval_ms.load(Ordering::Acquire))
+    }
+
+    /// Overrides cold S3 merge policy (`PULSE_COLD_MERGE_IDLE_SECS`, `PULSE_COLD_MERGE_INTERVAL_SECS`, `PULSE_COLD_MERGE_MAX_INPUT_BYTES`).
+    pub fn set_cold_merge_policy(&self, idle: Duration, interval: Duration, max_input_bytes: u64) {
+        self.cold_merge_idle_ms
+            .store(idle.as_millis() as u64, Ordering::Release);
+        self.cold_merge_interval_ms
+            .store(interval.as_millis() as u64, Ordering::Release);
+        self.cold_merge_max_input_bytes
+            .store(max_input_bytes.max(1), Ordering::Release);
     }
 
     /// Returns a future woken when `1x` `hot/segments/` bounds or closed-date `> 4 MiB` requests an early upload.
@@ -3849,6 +4408,8 @@ impl StorageEngine {
             self.closed_date_upload_ms.clone(),
             self.closed_date_max_bytes.clone(),
             self.upload_merge_max_input_bytes.clone(),
+            self.cold_merge_idle_ms.clone(),
+            self.cold_merge_max_input_bytes.clone(),
             self.upload_signal.clone(),
         )
         .await?;
@@ -4183,6 +4744,36 @@ impl StorageEngine {
         Ok(refreshed)
     }
 
+    /// Runs cold S3 `(date, bucket)` merge across all open writable projects (0 S3 calls when idle).
+    pub async fn cold_merge_all_projects(&self) -> Result<usize> {
+        self.cold_merge_all_projects_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// Time-parameterized cold S3 merge across all open writable projects.
+    pub async fn cold_merge_all_projects_at(&self, now_ms: i64) -> Result<usize> {
+        if self.identity_router.is_read_only() || self.is_published_reader() {
+            return Ok(0);
+        }
+        let mut merged = 0usize;
+        let mut first_err: Option<StorageError> = None;
+        for p in self.open_projects() {
+            match p.cold_merge_at(now_ms).await {
+                Ok(n) => merged += n,
+                Err(StorageError::NotWriter { .. }) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(merged)
+    }
+
     /// Spawns background L0 age-based flusher, late-data compactor, GC drain, and periodic upload/publish loop.
     pub fn spawn_background_maintenance(
         self: &Arc<Self>,
@@ -4192,9 +4783,19 @@ impl StorageEngine {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
             let interval = engine.upload_interval();
+            let cold_interval = engine.cold_merge_interval();
+            let cold_on_publish = !interval.is_zero() && cold_interval == interval;
             let mut publish_ticker = (!interval.is_zero()).then(|| {
                 let mut t =
                     tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                t
+            });
+            let mut cold_merge_ticker = (!cold_interval.is_zero() && !cold_on_publish).then(|| {
+                let mut t = tokio::time::interval_at(
+                    tokio::time::Instant::now() + cold_interval,
+                    cold_interval,
+                );
                 t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 t
             });
@@ -4221,9 +4822,24 @@ impl StorageEngine {
                             None => std::future::pending().await,
                         }
                     } => {
+                        if cold_on_publish {
+                            engine
+                                .maintenance_errors
+                                .check(MaintenanceKind::Compaction, engine.cold_merge_all_projects().await);
+                        }
                         engine
                             .maintenance_errors
                             .check(MaintenanceKind::Publish, engine.publish_all_projects().await);
+                    }
+                    _ = async {
+                        match cold_merge_ticker.as_mut() {
+                            Some(t) => t.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        engine
+                            .maintenance_errors
+                            .check(MaintenanceKind::Compaction, engine.cold_merge_all_projects().await);
                     }
                     _ = engine.upload_requested() => {
                         engine
@@ -6072,5 +6688,1230 @@ mod t3_tests {
             leftovers2.is_empty(),
             "leftover hot/segments: {leftovers2:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod t4_cold_merge_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutResult, Result as OsResult,
+    };
+    use std::fmt::{Display, Formatter};
+    use std::ops::Range;
+
+    #[derive(Debug, Default)]
+    struct ColdCountingStore {
+        inner: InMemory,
+        calls: Mutex<BTreeMap<(String, &'static str), u64>>,
+        put_modes: Mutex<Vec<(String, &'static str)>>,
+        fail_put_substring: Mutex<Option<String>>,
+        fail_delete_substring: Mutex<Option<String>>,
+    }
+
+    impl ColdCountingStore {
+        fn count(&self, op: &'static str, p: Option<&ObjectPath>) {
+            let prefix = p
+                .and_then(|p| p.parts().next())
+                .map_or("(root)".to_string(), |s| s.as_ref().to_string());
+            *self.calls.lock().entry((prefix, op)).or_default() += 1;
+        }
+
+        fn take(&self) -> BTreeMap<(String, &'static str), u64> {
+            std::mem::take(&mut *self.calls.lock())
+        }
+
+        fn take_put_modes(&self) -> Vec<(String, &'static str)> {
+            std::mem::take(&mut *self.put_modes.lock())
+        }
+
+        fn total_calls(calls: &BTreeMap<(String, &'static str), u64>) -> u64 {
+            calls.values().sum()
+        }
+    }
+
+    impl Display for ColdCountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ColdCountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ColdCountingStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.count("PUT", Some(l));
+            if let Some(ref sub) = *self.fail_put_substring.lock() {
+                if l.as_ref().contains(sub.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "ColdCountingStore",
+                        source: Box::new(std::io::Error::other(format!("injected PUT fail {l}"))),
+                    });
+                }
+            }
+            let mode = match o.mode {
+                PutMode::Create => "Create",
+                PutMode::Overwrite => "Overwrite",
+                PutMode::Update(_) => "Update",
+            };
+            self.put_modes.lock().push((l.as_ref().to_string(), mode));
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.count("PUT", Some(l));
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+            self.count("GET", Some(l));
+            self.inner.get_opts(l, o).await
+        }
+        async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
+            self.count("GET", Some(l));
+            self.inner.get_range(l, r).await
+        }
+        async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
+            self.count("HEAD", Some(l));
+            self.inner.head(l).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+            self.count("DELETE", Some(l));
+            if let Some(ref sub) = *self.fail_delete_substring.lock() {
+                if l.as_ref().contains(sub.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "ColdCountingStore",
+                        source: Box::new(std::io::Error::other(format!(
+                            "injected DELETE fail {l}"
+                        ))),
+                    });
+                }
+            }
+            self.inner.delete(l).await
+        }
+        fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.count("LIST", p);
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.count("LIST", p);
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.count("PUT", Some(to));
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.count("PUT", Some(to));
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn mk_event(did: &str, ts_ms: i64, seq: u64) -> WireEvent {
+        WireEvent {
+            event_uuid: WireEvent::deterministic_uuid(did, "s1", "click", ts_ms, seq),
+            routing_seed: did.into(),
+            distinct_id: did.into(),
+            session_id: "s1".into(),
+            event_name: "click".into(),
+            client_event_ts_ms: ts_ms,
+            client_sent_ts_ms: 0,
+            props: vec![("k".into(), PropValue::Str(format!("v_{seq}")))],
+            replay_offset_kb: 0,
+        }
+    }
+
+    fn dummy_seg(id: &str, size: u64) -> SegmentMeta {
+        SegmentMeta {
+            segment_id: id.into(),
+            object_path: format!("segments/p/20261120/bucket_000/{id}.pvtx"),
+            date: NaiveDate::from_ymd_opt(2026, 11, 20).unwrap(),
+            bucket_id: 0,
+            file_size: size,
+            vortex_len: size,
+            inverted_idx_offset: size,
+            session_idx_offset: size,
+            footer: crate::segment::SegmentFooterMeta {
+                row_count: 1,
+                session_count: 1,
+                min_ts_ms: 0,
+                max_ts_ms: 0,
+                segment_event_bloom_64: 0,
+                tier_c_bloom_64: 0,
+                has_tier_c_column: false,
+                tier_b_columns: vec![],
+                event_counts: vec![],
+                event_hlls: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn cold_merge_batch_planner_enforces_strict_cap() {
+        let cap = 64 * 1024 * 1024;
+        // [50 MiB, 50 MiB] -> 0 batches (never exceeds 64 MiB).
+        let pair_over = vec![
+            dummy_seg("a", 50 * 1024 * 1024),
+            dummy_seg("b", 50 * 1024 * 1024),
+        ];
+        assert!(plan_cold_merge_batches(&pair_over, cap).is_empty());
+
+        // 10 x 15 MiB -> [4, 4, 2] = [60, 60, 30] MiB; next pass [30, 60, 60] -> 0 batches.
+        let ten_15: Vec<_> = (0..10)
+            .map(|i| dummy_seg(&format!("s{i}"), 15 * 1024 * 1024))
+            .collect();
+        let batches = plan_cold_merge_batches(&ten_15, cap);
+        assert_eq!(batches.len(), 3);
+        let lens: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(lens, vec![4, 4, 2]);
+        for b in &batches {
+            let sum: u64 = b.iter().map(|s| s.file_size).sum();
+            assert!(sum <= cap);
+        }
+        let after_pass = vec![
+            dummy_seg("c1", 60 * 1024 * 1024),
+            dummy_seg("c2", 60 * 1024 * 1024),
+            dummy_seg("c3", 30 * 1024 * 1024),
+        ];
+        assert!(plan_cold_merge_batches(&after_pass, cap).is_empty());
+
+        // [70 MiB, 5 MiB, 5 MiB] -> 1 batch [5, 5].
+        let mixed = vec![
+            dummy_seg("big", 70 * 1024 * 1024),
+            dummy_seg("s1", 5 * 1024 * 1024),
+            dummy_seg("s2", 5 * 1024 * 1024),
+        ];
+        let b2 = plan_cold_merge_batches(&mixed, cap);
+        assert_eq!(b2.len(), 1);
+        assert_eq!(b2[0].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_merge_idle_today_single_pending_hot_and_late_upload_reset() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 2,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store)),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+
+        let ps = engine.get_or_open_project("p_cold_rules").await.unwrap();
+        let ig = engine.identity_graph("p_cold_rules", true).await.unwrap();
+        let u0 = ig.get_or_intern("u0", 0);
+        let u1 = ig.get_or_intern("u1", 1);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+        let single_ts = now_ms - 3 * 86_400_000;
+        let single_date = date_from_ms(single_ts);
+        let today_date = date_from_ms(now_ms);
+
+        let t_up = now_ms;
+        // Two separate flush + upload cycles produce 2 distinct S3 segments in today_date(b0),
+        // closed_date(b0), and closed_date(b1), and 1 S3 segment in single_date(b0).
+        for w in 0..2u64 {
+            ps.append_bucket_events(
+                0,
+                vec![
+                    (mk_event("u0", now_ms + w as i64 * 10, w + 1), u0),
+                    (mk_event("u0", closed_ts + w as i64 * 10, w + 10), u0),
+                ],
+            )
+            .await
+            .unwrap();
+            ps.append_bucket_events(
+                1,
+                vec![(mk_event("u1", closed_ts + w as i64 * 10, w + 20), u1)],
+            )
+            .await
+            .unwrap();
+            if w == 0 {
+                ps.append_bucket_events(0, vec![(mk_event("u0", single_ts, 30), u0)])
+                    .await
+                    .unwrap();
+            }
+            ps.flush_all().await.unwrap();
+            ps.upload_if_dirty_at(t_up, true).await.unwrap().unwrap();
+        }
+
+        // < 1h idle -> 0 merged, 0 S3 calls.
+        store.take();
+        assert_eq!(ps.cold_merge_at(t_up + 3_599_999).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+
+        // Pending `hot/segments/` in (closed_date, 0) blocks cold merge on bucket 0 even > 1h idle;
+        // also a late upload to bucket 0 resets bucket 0's 1h timer!
+        ps.append_bucket_events(0, vec![(mk_event("u0", closed_ts + 500, 40), u0)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+        assert!(ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap()
+            .iter()
+            .any(|s| s.object_path.starts_with("hot/")));
+
+        // Upload the late segment at t_up + 3_000_000 (50m after first upload).
+        let t_late = t_up + 3_000_000;
+        ps.upload_if_dirty_at(t_late, true).await.unwrap().unwrap();
+
+        // At t_up + 3_600_000 (1h after first upload, 10m after late upload):
+        // - bucket 1 merges (was uploaded at t_up, 2 segments -> 1 segment).
+        // - bucket 0 MUST NOT merge yet (late upload reset its timer to t_late)!
+        // - today_date (bucket 0) and single_date (bucket 0) MUST NOT merge!
+        store.take();
+        store.take_put_modes();
+        assert_eq!(ps.cold_merge_at(t_up + 3_600_000).await.unwrap(), 1);
+        let modes = store.take_put_modes();
+        assert!(modes
+            .iter()
+            .any(|(p, m)| p.contains("seg_cold_") && *m == "Create"));
+
+        let snap_mid = ps.snapshot();
+        assert_eq!(
+            snap_mid
+                .manifest
+                .active_segments
+                .get(&(closed_date, 1))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            snap_mid
+                .manifest
+                .active_segments
+                .get(&(closed_date, 0))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            snap_mid
+                .manifest
+                .active_segments
+                .get(&(today_date, 0))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            snap_mid
+                .manifest
+                .active_segments
+                .get(&(single_date, 0))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Still 0 S3 calls at t_late + 3_599_999.
+        store.take();
+        assert_eq!(ps.cold_merge_at(t_late + 3_599_999).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+
+        // At t_late + 3_600_000: bucket 0 merges 3 -> 1, preserving all 3 rows!
+        assert_eq!(ps.cold_merge_at(t_late + 3_600_000).await.unwrap(), 1);
+        let snap_done = ps.snapshot();
+        let b0_segs = snap_done
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap();
+        assert_eq!(b0_segs.len(), 1);
+        assert_eq!(b0_segs[0].footer.row_count, 3);
+        assert!(!snap_done
+            .manifest
+            .s3_partition_last_upload_ms
+            .contains_key(&(closed_date, 0)));
+        assert!(!snap_done
+            .manifest
+            .s3_partition_last_upload_ms
+            .contains_key(&(closed_date, 1)));
+        // Today's date still untouched even > 1h after upload.
+        assert_eq!(
+            snap_done
+                .manifest
+                .active_segments
+                .get(&(today_date, 0))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            snap_done
+                .manifest
+                .pending_s3_deletes
+                .iter()
+                .filter(|d| d.kind == PendingS3DeleteKind::Segment)
+                .count(),
+            5
+        );
+
+        // Subsequent idle tick executes 0 S3 calls!
+        store.take();
+        assert_eq!(ps.cold_merge_at(t_late + 7_200_000).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_merge_64mib_cap_erasure_and_100pct_erased_drop() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 3,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store)),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+
+        let ps = engine.get_or_open_project("p_cold_cap").await.unwrap();
+        let ig = engine.identity_graph("p_cold_cap", true).await.unwrap();
+        let u_keep = ig.get_or_intern("u_keep", 0);
+        let u_erase_b0 = ig.get_or_intern("u_erase_b0", 0);
+        let u_erase_b1 = ig.get_or_intern("u_erase_b1", 1);
+        let u_b2 = ig.get_or_intern("u_b2", 2);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+
+        // Bucket 0: 4 S3 segments across 4 upload cycles (two rows each: 1 kept, 1 erased).
+        // Bucket 1: 2 S3 segments (100% erased).
+        // Bucket 2: 2 larger S3 segments (too big to fit together under cap).
+        for w in 0..4u64 {
+            ps.append_bucket_events(
+                0,
+                vec![
+                    (
+                        mk_event("u_keep", closed_ts + w as i64 * 10, w * 10 + 1),
+                        u_keep,
+                    ),
+                    (
+                        mk_event("u_erase_b0", closed_ts + w as i64 * 10, w * 10 + 2),
+                        u_erase_b0,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+            if w < 2 {
+                ps.append_bucket_events(
+                    1,
+                    vec![(
+                        mk_event("u_erase_b1", closed_ts + w as i64 * 10, w + 100),
+                        u_erase_b1,
+                    )],
+                )
+                .await
+                .unwrap();
+                let mut big_b2 = Vec::new();
+                for j in 0..200u64 {
+                    big_b2.push((
+                        WireEvent {
+                            event_uuid: WireEvent::deterministic_uuid(
+                                "u_b2",
+                                "s1",
+                                "click",
+                                closed_ts + (w * 1000 + j) as i64,
+                                w * 1000 + j + 200,
+                            ),
+                            routing_seed: "u_b2".into(),
+                            distinct_id: "u_b2".into(),
+                            session_id: format!("sess_{w}_{j}"),
+                            event_name: format!("ev_{j}"),
+                            client_event_ts_ms: closed_ts + (w * 1000 + j) as i64,
+                            client_sent_ts_ms: 0,
+                            props: vec![(
+                                format!("prop_{}", j % 10),
+                                PropValue::Str(format!("payload_{w}_{j}_abcdef0123456789")),
+                            )],
+                            replay_offset_kb: 0,
+                        },
+                        u_b2,
+                    ));
+                }
+                ps.append_bucket_events(2, big_b2).await.unwrap();
+            }
+            ps.flush_all().await.unwrap();
+            ps.upload_if_dirty_at(now_ms, true).await.unwrap().unwrap();
+        }
+
+        let b0_sizes: Vec<u64> = ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap()
+            .iter()
+            .map(|s| s.file_size)
+            .collect();
+        let b2_sizes: Vec<u64> = ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 2))
+            .unwrap()
+            .iter()
+            .map(|s| s.file_size)
+            .collect();
+        // Set cap so 2 bucket-0 segments fit in 1 batch, 3 do not, and 2 bucket-2 segments do NOT fit!
+        let max_b0 = *b0_sizes.iter().max().unwrap();
+        let b1_sum: u64 = ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 1))
+            .unwrap()
+            .iter()
+            .map(|s| s.file_size)
+            .sum();
+        let min_b2_sum: u64 = b2_sizes.iter().sum();
+        let cap = (max_b0 * 2).max(b1_sum) + 64;
+        assert!(
+            cap < min_b2_sum,
+            "cap={cap} must be < b2 sum={min_b2_sum} (b0={b0_sizes:?}, b1_sum={b1_sum})"
+        );
+
+        let mut erased = ErasedUids::default();
+        erased.insert(u_erase_b0, closed_ts + 1_000);
+        erased.insert(u_erase_b1, closed_ts + 1_000);
+        engine.set_erased("p_cold_cap", erased);
+        engine.set_cold_merge_policy(Duration::from_secs(3600), Duration::from_secs(300), cap);
+
+        // Merge at +1h: bucket 0 (4 -> 2 batches) & bucket 1 (2 -> 0, partition removed!), bucket 2 skipped.
+        assert_eq!(ps.cold_merge_at(now_ms + 3_600_000).await.unwrap(), 2);
+
+        let snap = ps.snapshot();
+        let b0 = snap
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap();
+        assert_eq!(b0.len(), 2);
+        let b0_rows: u32 = b0.iter().map(|s| s.footer.row_count).sum();
+        assert_eq!(b0_rows, 4, "4 erased rows dropped, 4 kept rows remain");
+        assert!(
+            !snap
+                .manifest
+                .active_segments
+                .contains_key(&(closed_date, 1)),
+            "100%-erased partition must be removed cleanly"
+        );
+        assert_eq!(
+            snap.manifest
+                .active_segments
+                .get(&(closed_date, 2))
+                .unwrap()
+                .len(),
+            2,
+            "oversized pair > cap must remain unmerged"
+        );
+
+        // Next tick: bucket 0's 2 merged segments still fit under cap? If their sum > cap, 0 S3 calls!
+        // Either way, once stabilized, subsequent ticks make 0 S3 calls.
+        let _ = ps.cold_merge_at(now_ms + 7_200_000).await.unwrap();
+        store.take();
+        assert_eq!(ps.cold_merge_at(now_ms + 10_800_000).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_merge_t2_grace_pinning_eager_interval_and_legacy_fallback() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 10,
+        };
+        let engine = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+
+        let ps = engine.get_or_open_project("p_cold_grace").await.unwrap();
+        let ig = engine.identity_graph("p_cold_grace", true).await.unwrap();
+        let u0 = ig.get_or_intern("u0", 0);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+
+        for w in 0..2u64 {
+            ps.append_bucket_events(0, vec![(mk_event("u0", closed_ts + w as i64 * 10, w), u0)])
+                .await
+                .unwrap();
+            ps.flush_bucket(0).await.unwrap();
+            let pub_m = ps.upload_if_dirty_at(now_ms, true).await.unwrap().unwrap();
+            assert_eq!(pub_m.publish_seq, w);
+        }
+        let pub0 = ps.latest_published_manifest().await.unwrap().unwrap();
+        assert_eq!(pub0.publish_seq, 1);
+        let old_paths: Vec<String> = pub0.partitions[0]
+            .segments
+            .iter()
+            .map(|s| s.object_path.clone())
+            .collect();
+        assert_eq!(old_paths.len(), 2);
+
+        // Cold merge at +1h.
+        assert_eq!(ps.cold_merge_at(now_ms + 3_600_000).await.unwrap(), 1);
+        // Before superseding publish lands, run_gc_at deletes 0 old segments.
+        assert_eq!(ps.run_gc_at(now_ms + 100_000_000).await.unwrap(), 0);
+        for p in &old_paths {
+            assert!(dyn_store.head(&ObjectPath::from(p.as_str())).await.is_ok());
+        }
+
+        // Hold StorageSnapshot pinning old_paths across publish and beyond 2*interval.
+        let pin_paths = old_paths.clone();
+        ps.pin_tracker.pin_all(&pin_paths);
+
+        let pub_sup = ps
+            .upload_if_dirty_at(now_ms + 3_600_000, true)
+            .await
+            .unwrap()
+            .expect("cold merge must dirty s3_state and publish pub_2");
+        assert_eq!(pub_sup.publish_seq, 2);
+        let pub1_ts = pub_sup.published_at_ms;
+
+        // 1ms before 2 * 300s grace -> 0 deleted.
+        assert_eq!(ps.run_gc_at(pub1_ts + 599_999).await.unwrap(), 0);
+        // Past grace while pinned -> 0 deleted.
+        assert_eq!(ps.run_gc_at(pub1_ts + 600_000).await.unwrap(), 0);
+        // Unpin -> deleted!
+        ps.pin_tracker.unpin_all(&pin_paths);
+        assert_eq!(ps.run_gc_at(pub1_ts + 600_000).await.unwrap(), 2);
+        for p in &old_paths {
+            assert!(dyn_store.head(&ObjectPath::from(p.as_str())).await.is_err());
+        }
+
+        // Idle cycle after GC makes 0 S3 calls!
+        store.take();
+        assert_eq!(ps.cold_merge_at(pub1_ts + 700_000).await.unwrap(), 0);
+        assert!(ps
+            .upload_if_dirty_at(pub1_ts + 700_000, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(ps.run_gc_at(pub1_ts + 700_000).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+
+        // Verify legacy fallback: clear `s3_partition_last_upload_ms`, add 2 S3 segments, reopen.
+        ig.close().await.unwrap();
+        drop(ps);
+        drop(engine);
+
+        // Eager interval=0 test: cold_merge_at publishes immediately, retains old segments for +2 publishes.
+        let store2 = Arc::new(ColdCountingStore::default());
+        let dyn2: Arc<dyn ObjectStore> = store2.clone();
+        let eng2 = StorageEngine::new(
+            cfg.clone(),
+            dyn2.clone(),
+            Arc::new(IdentityRouter::new(dyn2.clone())),
+        );
+        eng2.set_local_segment_tier(true);
+        eng2.set_upload_interval(Duration::ZERO);
+        eng2.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+        let ps2 = eng2.get_or_open_project("p_eager").await.unwrap();
+        let ig2 = eng2.identity_graph("p_eager", true).await.unwrap();
+        let ue = ig2.get_or_intern("ue", 0);
+        // Disable publish during initial 2 flushes on closed date so we get 2 uncompacted S3 segments at pub_1.
+        ps2.set_publish_enabled(true);
+        ps2.append_bucket_events(0, vec![(mk_event("ue", closed_ts, 1), ue)])
+            .await
+            .unwrap();
+        ps2.flush_bucket(0).await.unwrap(); // pub_0
+        ps2.append_bucket_events(0, vec![(mk_event("ue", closed_ts + 10, 2), ue)])
+            .await
+            .unwrap();
+        // Temporarily disable compaction threshold (10) so 2 segments stay uncompacted on pub_1.
+        ps2.flush_bucket(0).await.unwrap(); // pub_1
+        assert_eq!(ps2.last_published_seq(), Some(1));
+        let eager_old: Vec<String> = ps2
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap()
+            .iter()
+            .map(|s| s.object_path.clone())
+            .collect();
+        assert_eq!(eager_old.len(), 2);
+
+        // Cold merge in eager mode publishes pub_2 immediately, does NOT delete eager_old yet!
+        let merge_ts = Utc::now().timestamp_millis() + 3_700_000;
+        assert_eq!(ps2.cold_merge_at(merge_ts).await.unwrap(), 1);
+        assert_eq!(ps2.last_published_seq(), Some(2));
+        assert_eq!(ps2.run_gc_at(merge_ts + 10_000_000).await.unwrap(), 0);
+        for p in &eager_old {
+            assert!(dyn2.head(&ObjectPath::from(p.as_str())).await.is_ok());
+        }
+
+        // Advance to pub_3 (+1) -> still retained; pub_4 (+2) -> flush_bucket's eager upload runs GC and deletes!
+        ps2.append_bucket_events(0, vec![(mk_event("ue", merge_ts, 3), ue)])
+            .await
+            .unwrap();
+        ps2.flush_bucket(0).await.unwrap(); // pub_3
+        assert_eq!(ps2.last_published_seq(), Some(3));
+        assert_eq!(ps2.run_gc_at(merge_ts + 10_000_000).await.unwrap(), 0);
+        for p in &eager_old {
+            assert!(dyn2.head(&ObjectPath::from(p.as_str())).await.is_ok());
+        }
+
+        ps2.append_bucket_events(0, vec![(mk_event("ue", merge_ts + 10, 4), ue)])
+            .await
+            .unwrap();
+        ps2.flush_bucket(0).await.unwrap(); // pub_4 (eager upload runs run_gc_at)
+        assert_eq!(ps2.last_published_seq(), Some(4));
+        let _ = ps2.run_gc_at(merge_ts + 10_000_000).await.unwrap();
+        assert!(ps2
+            .snapshot()
+            .manifest
+            .pending_s3_deletes
+            .iter()
+            .all(|d| d.kind != PendingS3DeleteKind::Segment));
+        for p in &eager_old {
+            assert!(dyn2.head(&ObjectPath::from(p.as_str())).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_merge_intent_crash_recovery_and_cas_conflict() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+
+        let pid = "p_cold_crash";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let ig = engine.identity_graph(pid, true).await.unwrap();
+        let u0 = ig.get_or_intern("u0", 0);
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+
+        for w in 0..2u64 {
+            ps.append_bucket_events(0, vec![(mk_event("u0", closed_ts + w as i64 * 10, w), u0)])
+                .await
+                .unwrap();
+            ps.flush_bucket(0).await.unwrap();
+            ps.upload_if_dirty_at(now_ms, true).await.unwrap().unwrap();
+        }
+
+        // Fail manifest epoch commit right AFTER seg_cold_* S3 PUT!
+        let next_epoch = ps.snapshot().manifest.epoch + 1;
+        *store.fail_put_substring.lock() = Some(format!("epoch_{next_epoch:012}.json"));
+        let err = ps
+            .cold_merge_at(now_ms + 3_600_000)
+            .await
+            .expect_err("manifest commit failure must surface");
+        assert!(matches!(err, StorageError::ObjectStore(_)));
+
+        let intent_store = ColdMergeIntentStore::new(pid, dyn_store.clone());
+        let intent = intent_store
+            .load()
+            .await
+            .unwrap()
+            .expect("ColdMergeIntent must be persisted");
+        assert_eq!(intent.target_object_paths.len(), 1);
+        let orphan_path = intent.target_object_paths[0].clone();
+        assert!(dyn_store
+            .head(&ObjectPath::from(orphan_path.as_str()))
+            .await
+            .is_ok());
+
+        // Restart node -> open_inner reconciles ColdMergeIntent, deletes orphan, keeps original 2 segments!
+        *store.fail_put_substring.lock() = None;
+        ig.close().await.unwrap();
+        drop(ps);
+        drop(engine);
+
+        let engine2 = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine2.set_local_segment_tier(true);
+        engine2.set_upload_interval(Duration::from_secs(300));
+        engine2.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+        let ps2 = engine2.get_or_open_project(pid).await.unwrap();
+        assert!(dyn_store
+            .head(&ObjectPath::from(orphan_path.as_str()))
+            .await
+            .is_err());
+        assert!(intent_store.load().await.unwrap().is_none());
+
+        // Legacy fallback + normal merge still completes after restart.
+        assert_eq!(ps2.cold_merge_at(now_ms + 3_600_000).await.unwrap(), 1);
+        let segs_after: Vec<_> = ps2
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(date_from_ms(closed_ts), 0))
+            .unwrap()
+            .clone();
+        assert_eq!(segs_after.len(), 1);
+        assert_eq!(segs_after[0].footer.row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn cold_merge_legacy_manifest_fallback_and_cas_reject_cleanup() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+
+        let pid = "p_cold_legacy_cas";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let ig = engine.identity_graph(pid, true).await.unwrap();
+        let u0 = ig.get_or_intern("u0", 0);
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+
+        for w in 0..2u64 {
+            ps.append_bucket_events(0, vec![(mk_event("u0", closed_ts + w as i64 * 10, w), u0)])
+                .await
+                .unwrap();
+            ps.flush_bucket(0).await.unwrap();
+            ps.upload_if_dirty_at(now_ms, true).await.unwrap().unwrap();
+        }
+        let pub_ts = ps
+            .latest_published_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .published_at_ms;
+
+        // Strip `s3_partition_last_upload_ms` to simulate a pre-M5 legacy manifest, then reopen.
+        let mut legacy_mf = (*ps.snapshot().manifest).clone();
+        legacy_mf.s3_partition_last_upload_ms.clear();
+        ManifestStore::new(pid, dyn_store.clone())
+            .commit_next(legacy_mf)
+            .await
+            .unwrap();
+        ig.close().await.unwrap();
+        drop(ps);
+        drop(engine);
+
+        let engine2 = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine2.set_local_segment_tier(true);
+        engine2.set_upload_interval(Duration::from_secs(300));
+        let ps2 = engine2.get_or_open_project(pid).await.unwrap();
+
+        // Legacy partition waits 1h from `latest_published.published_at_ms` with 0 S3 calls.
+        store.take();
+        assert_eq!(ps2.cold_merge_at(pub_ts + 3_599_999).await.unwrap(), 0);
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+
+        // Hold `publish_lock` so `cold_merge_at` writes `seg_cold_*` and parks before `commit_manifest_cas`.
+        let pub_guard = ps2.publish_lock.lock().await;
+        let ps2_task = ps2.clone();
+        let merge_ts = pub_ts + 3_600_000;
+        let merge_handle = tokio::spawn(async move { ps2_task.cold_merge_at(merge_ts).await });
+
+        let intent_store = ColdMergeIntentStore::new(pid, dyn_store.clone());
+        let target_path = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(intent) = intent_store.load().await.unwrap() {
+                    let p = intent.target_object_paths[0].clone();
+                    if dyn_store.head(&ObjectPath::from(p.as_str())).await.is_ok() {
+                        break p;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cold_merge_at must write seg_cold_* while publish_lock is held");
+
+        // Mutate the partition concurrently so `cold_merge_at`'s `source_ids` check rejects the batch.
+        ps2.commit_manifest_cas(|m| {
+            let entry = m.active_segments.get_mut(&(closed_date, 0)).unwrap();
+            entry.pop();
+            true
+        })
+        .await
+        .unwrap();
+        drop(pub_guard);
+
+        assert_eq!(merge_handle.await.unwrap().unwrap(), 0);
+        assert!(
+            dyn_store
+                .head(&ObjectPath::from(target_path.as_str()))
+                .await
+                .is_err(),
+            "CAS-rejected seg_cold_* target must be deleted immediately"
+        );
+        assert!(intent_store.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cold_merge_100pct_erased_after_step6_failure_publishes_and_gcs_without_stranding() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 10,
+        };
+        let engine = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+
+        let pid = "p_probe_3b";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let ig = engine.identity_graph(pid, true).await.unwrap();
+        let u_keep = ig.get_or_intern("u_keep", 0);
+        let u_erase = ig.get_or_intern("u_erase", 0);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+
+        // Publish pub_0 with today's segment for `u_keep` (so `u_erase` is also in pub_0's identity snapshot
+        // and `last_published_s3_partitions == Some(P)`).
+        ps.append_bucket_events(0, vec![(mk_event("u_keep", now_ms - 1_000, 1), u_keep)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+        let pub0 = ps.upload_if_dirty_at(now_ms, true).await.unwrap().unwrap();
+        assert_eq!(pub0.publish_seq, 0);
+
+        // Inject transient Step-6 publish failure on `pub_000000000001.json` and upload 2 closed-date
+        // segments for `u_erase` (Steps 4-5 commit them locally; Step 6 fails).
+        *store.fail_put_substring.lock() = Some("pub_000000000001.json".to_string());
+        for w in 0..2u64 {
+            ps.append_bucket_events(
+                0,
+                vec![(
+                    mk_event("u_erase", closed_ts + w as i64 * 10, w + 10),
+                    u_erase,
+                )],
+            )
+            .await
+            .unwrap();
+            ps.flush_bucket(0).await.unwrap();
+            let err = ps
+                .upload_if_dirty_at(now_ms, true)
+                .await
+                .expect_err("injected Step-6 pub_1 failure must error");
+            assert!(matches!(err, StorageError::ObjectStore(_)));
+        }
+        *store.fail_put_substring.lock() = None;
+
+        let unpublished_s3_paths: Vec<String> = ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap()
+            .iter()
+            .map(|s| s.object_path.clone())
+            .collect();
+        assert_eq!(unpublished_s3_paths.len(), 2);
+
+        // Erase `u_erase` before publish retries, then run cold_merge_at(+1h).
+        // 100% of rows in `(closed_date, 0)` are erased, so `cold_merge_at` removes the partition
+        // (returning `s3_partitions == P`) and queues both S3 paths with `eligible_after_ms = None`.
+        let mut erased = ErasedUids::default();
+        erased.insert(u_erase, closed_ts + 1_000);
+        engine.set_erased(pid, erased);
+        assert_eq!(ps.cold_merge_at(now_ms + 3_600_000).await.unwrap(), 1);
+
+        let mid_snap = ps.snapshot();
+        assert!(
+            !mid_snap
+                .manifest
+                .active_segments
+                .contains_key(&(closed_date, 0)),
+            "100%-erased closed partition must be removed"
+        );
+        assert_eq!(mid_snap.manifest.pending_s3_deletes.len(), 2);
+        assert!(mid_snap
+            .manifest
+            .pending_s3_deletes
+            .iter()
+            .all(|d| d.eligible_after_ms.is_none() && d.superseding_pub_seq == 1));
+        drop(mid_snap);
+
+        // `publish_if_dirty` MUST emit `pub_1` despite `s3_partitions == last_published_s3_partitions`,
+        // with 0 snapshot PUTs and 0 segment PUTs!
+        store.take();
+        store.take_put_modes();
+        let pub1 = ps
+            .publish_if_dirty()
+            .await
+            .unwrap()
+            .expect("unstamped pending_s3_deletes must trigger pub_1");
+        assert_eq!(pub1.publish_seq, 1);
+        let put_modes = store.take_put_modes();
+        assert_eq!(
+            put_modes
+                .iter()
+                .filter(|(p, _)| p.contains("/snapshots/"))
+                .count(),
+            0,
+            "unchanged identity/profiles must not emit snapshot PUTs: {put_modes:?}"
+        );
+        assert_eq!(
+            put_modes
+                .iter()
+                .filter(|(p, _)| p.starts_with("segments/"))
+                .count(),
+            0,
+            "no segment PUTs expected: {put_modes:?}"
+        );
+        assert!(put_modes
+            .iter()
+            .any(|(p, m)| p.ends_with("pub_000000000001.json") && *m == "Create"));
+
+        let stamped_snap = ps.snapshot();
+        assert_eq!(stamped_snap.manifest.pending_s3_deletes.len(), 2);
+        assert!(stamped_snap
+            .manifest
+            .pending_s3_deletes
+            .iter()
+            .all(|d| d.eligible_after_ms == Some(pub1.published_at_ms + 600_000)));
+        drop(stamped_snap);
+
+        // During the 2-interval grace window: GC deletes 0, and idle upload_if_dirty_at makes 0 calls.
+        assert_eq!(
+            ps.run_gc_at(pub1.published_at_ms + 599_999).await.unwrap(),
+            0
+        );
+        store.take();
+        assert!(ps
+            .upload_if_dirty_at(pub1.published_at_ms + 599_999, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+        for p in &unpublished_s3_paths {
+            assert!(dyn_store.head(&ObjectPath::from(p.as_str())).await.is_ok());
+        }
+
+        // After 2-interval grace: run_gc_at deletes both S3 segments cleanly.
+        assert_eq!(
+            ps.run_gc_at(pub1.published_at_ms + 600_000).await.unwrap(),
+            2
+        );
+        assert!(ps.snapshot().manifest.pending_s3_deletes.is_empty());
+        for p in &unpublished_s3_paths {
+            assert!(dyn_store.head(&ObjectPath::from(p.as_str())).await.is_err());
+        }
+
+        // Subsequent idle ticks execute 0 S3 calls.
+        store.take();
+        assert_eq!(
+            ps.cold_merge_at(pub1.published_at_ms + 700_000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(ps
+            .upload_if_dirty_at(pub1.published_at_ms + 700_000, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ps.run_gc_at(pub1.published_at_ms + 700_000).await.unwrap(),
+            0
+        );
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_merge_100pct_erased_before_pub0_publishes_pub0_and_gcs() {
+        let store = Arc::new(ColdCountingStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 10,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(false);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_cold_merge_policy(
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
+        );
+
+        let pid = "p_probe_3b_pub0";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let ig = engine.identity_graph(pid, true).await.unwrap();
+        let u0 = ig.get_or_intern("u0", 0);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 2 * 86_400_000;
+        let closed_date = date_from_ms(closed_ts);
+
+        // Flush 2 closed-date segments directly to S3 in object mode before any pub_0 exists.
+        for w in 0..2u64 {
+            ps.append_bucket_events(0, vec![(mk_event("u0", closed_ts + w as i64 * 10, w), u0)])
+                .await
+                .unwrap();
+            ps.flush_bucket(0).await.unwrap();
+        }
+        let after_flush_ms = Utc::now().timestamp_millis();
+        assert_eq!(ps.last_published_seq(), None);
+        let old_paths: Vec<String> = ps
+            .snapshot()
+            .manifest
+            .active_segments
+            .get(&(closed_date, 0))
+            .unwrap()
+            .iter()
+            .map(|s| s.object_path.clone())
+            .collect();
+        assert_eq!(old_paths.len(), 2);
+
+        // Erase `u0` and cold-merge before pub_0 ever existed -> `cur_s3_parts` becomes empty!
+        let mut erased = ErasedUids::default();
+        erased.insert(u0, closed_ts + 1_000);
+        engine.set_erased(pid, erased);
+        assert_eq!(
+            ps.cold_merge_at(after_flush_ms + 3_600_000).await.unwrap(),
+            1
+        );
+        assert!(ps.snapshot().manifest.active_segments.is_empty());
+        assert_eq!(ps.snapshot().manifest.pending_s3_deletes.len(), 2);
+
+        // Must publish pub_0, stamp grace, and GC after 2*300s.
+        let pub0 = ps
+            .publish_if_dirty()
+            .await
+            .unwrap()
+            .expect("unstamped pending_s3_deletes must trigger pub_0");
+        assert_eq!(pub0.publish_seq, 0);
+        assert_eq!(
+            ps.run_gc_at(pub0.published_at_ms + 599_999).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            ps.run_gc_at(pub0.published_at_ms + 600_000).await.unwrap(),
+            2
+        );
+        for p in &old_paths {
+            assert!(dyn_store.head(&ObjectPath::from(p.as_str())).await.is_err());
+        }
+
+        store.take();
+        assert_eq!(
+            ps.cold_merge_at(pub0.published_at_ms + 700_000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(ps
+            .upload_if_dirty_at(pub0.published_at_ms + 700_000, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ps.run_gc_at(pub0.published_at_ms + 700_000).await.unwrap(),
+            0
+        );
+        assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
     }
 }
