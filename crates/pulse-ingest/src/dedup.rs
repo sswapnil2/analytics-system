@@ -27,9 +27,14 @@ impl RotatingRing {
         if ep > self.window_epoch {
             if ep == self.window_epoch + 1 {
                 self.previous = std::mem::take(&mut self.current);
+                if self.previous.capacity() > self.previous.len().saturating_mul(4).max(4096) {
+                    self.previous.shrink_to_fit();
+                }
             } else {
                 self.previous.clear();
+                self.previous.shrink_to(0);
                 self.current.clear();
+                self.current.shrink_to(4096);
             }
             self.window_epoch = ep;
         }

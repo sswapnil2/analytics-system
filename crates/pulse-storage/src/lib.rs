@@ -22,13 +22,14 @@ pub use encrypted_store::{
     unseal_ephemeral_blob, ByokEncryptionStatus, EncryptedObjectStore,
 };
 pub use engine::{
-    closed_date_max_bytes_from_env, closed_date_upload_interval_from_env, event_uuid_fingerprint,
-    route_bucket, upload_interval_from_env, upload_merge_max_input_bytes_from_env,
+    closed_date_max_bytes_from_env, closed_date_upload_interval_from_env, decode_dead_letter,
+    encode_dead_letter, event_uuid_fingerprint, list_dead_letters, route_bucket,
+    upload_interval_from_env, upload_merge_max_input_bytes_from_env, DeadLetterEntry,
     MaintenanceErrors, MaintenanceKind, PreparedPublishedRefresh, ProjectStorage, StorageConfig,
-    StorageEngine, WriterLeases, DEAD_LETTERED_EVENTS, DEFAULT_CLOSED_DATE_MAX_BYTES,
-    DEFAULT_CLOSED_DATE_UPLOAD_SECS, DEFAULT_HOT_SEGMENTS_MAX_MB,
-    DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB, DEFAULT_NUM_BUCKETS, DEFAULT_UPLOAD_INTERVAL_SECS,
-    DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES,
+    StorageEngine, WriterLeases, DEAD_LETTERED_EVENTS, DEAD_LETTER_MAGIC, DEAD_LETTER_VERSION,
+    DEFAULT_CLOSED_DATE_MAX_BYTES, DEFAULT_CLOSED_DATE_UPLOAD_SECS, DEFAULT_FLUSH_CONCURRENCY,
+    DEFAULT_HOT_SEGMENTS_MAX_MB, DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB, DEFAULT_NUM_BUCKETS,
+    DEFAULT_UPLOAD_INTERVAL_SECS, DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES,
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
@@ -61,10 +62,10 @@ pub use snapshot::{
 };
 pub use store_factory::{
     allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
-    check_resolved_addrs, finalize_local_hot_store_marker, is_forbidden_ssrf_ip,
-    is_hot_routed_store, is_local_hot_store_mode, open_hot_store_for_restore,
-    validate_object_store_connection, validate_outbound_url_ssrf, with_hot_store,
-    with_hot_store_for_role, DurableLocalObjectStore,
+    build_object_store_for_inspect, check_resolved_addrs, finalize_local_hot_store_marker,
+    is_forbidden_ssrf_ip, is_hot_routed_store, is_local_hot_store_mode, open_hot_store_for_inspect,
+    open_hot_store_for_restore, validate_object_store_connection, validate_outbound_url_ssrf,
+    with_hot_store, with_hot_store_for_role, DurableLocalObjectStore,
 };
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 

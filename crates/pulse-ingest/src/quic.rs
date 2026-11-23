@@ -216,7 +216,7 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
     match op {
         QUIC_OP_INGEST => match WireBatch::decode_auto(&body, None, service.dict_registry()) {
             Ok(batch) => match service
-                .ingest_for_project(&project_id, batch, Utc::now().timestamp_millis())
+                .ingest_async_for_project(&project_id, batch, Utc::now().timestamp_millis())
                 .await
             {
                 Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
@@ -228,6 +228,46 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
                     "message": e.to_string(),
                 }))
                 .unwrap_or_default(),
+                Err(IngestError::Storage(
+                    ref e @ pulse_storage::StorageError::Backpressure { what, .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": format!("{what}_backpressure"),
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+                Err(IngestError::Storage(
+                    ref e @ pulse_storage::StorageError::L0Backpressure { .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": "l0_backpressure",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+                Err(IngestError::Storage(
+                    ref e @ pulse_storage::StorageError::NotWriter { .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": "not_writer",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+                Err(IngestError::Storage(
+                    ref e @ pulse_storage::StorageError::StaleWriter { .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": "stale_writer",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+                Err(e @ IngestError::RateLimited { .. }) => {
+                    serde_json::to_vec(&serde_json::json!({
+                        "status": "error",
+                        "code": "rate_limited",
+                        "message": e.to_string(),
+                    }))
+                    .unwrap_or_default()
+                }
                 Err(e) => serde_json::to_vec(&serde_json::json!({
                     "status": "error",
                     "message": e.to_string(),

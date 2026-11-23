@@ -275,13 +275,26 @@ fn full_restore_from_published_with_byok_erasure_reconciliation_hwm_and_restart(
         // - anon_0 (uid 0) + user_0 (uid 1) merged via identify, revenue 250
         // - user_keep (uid 2), revenue 40
         // - user_resign (uid 3), erased at (now_ms - 5000) then re-updated at (now_ms + 5000) before publish
+        // Ingest anon_0 first and flush so it deterministically receives UID 0 before
+        // multi-bucket parallel apply assigns UIDs to the remaining users.
         post_ingest(
             &node1,
             &key_a,
             "/v1/ingest",
             json!({
                 "events": [
-                    { "event": "App_Open", "distinct_id": "anon_0", "timestamp": now_ms - 10_000 },
+                    { "event": "App_Open", "distinct_id": "anon_0", "timestamp": now_ms - 10_000 }
+                ]
+            }),
+        )
+        .await;
+        node1.ingest.flush_all().await.unwrap();
+        post_ingest(
+            &node1,
+            &key_a,
+            "/v1/ingest",
+            json!({
+                "events": [
                     { "event": "App_Open", "distinct_id": "user_0", "timestamp": now_ms - 9_000 },
                     { "event": "App_Open", "distinct_id": "user_keep", "timestamp": now_ms - 8_000 },
                     { "event": "App_Open", "distinct_id": "user_resign", "timestamp": now_ms - 7_000 }
@@ -289,6 +302,7 @@ fn full_restore_from_published_with_byok_erasure_reconciliation_hwm_and_restart(
             }),
         )
         .await;
+        node1.ingest.flush_all().await.unwrap();
         post_ingest(
             &node1,
             &key_a,
@@ -325,6 +339,7 @@ fn full_restore_from_published_with_byok_erasure_reconciliation_hwm_and_restart(
         .unwrap();
 
         // Flush + publish -> writes encrypted PLSEAGM2 snapshots & PublishedManifest with HWM = 4.
+        node1.ingest.flush_all().await.unwrap();
         node1.storage.flush_all_projects().await.unwrap();
         node1.storage.publish_all_projects().await.unwrap();
         let pub_m = PublishedManifestStore::new(
@@ -513,6 +528,7 @@ fn full_restore_from_published_with_byok_erasure_reconciliation_hwm_and_restart(
             }),
         )
         .await;
+        node2.ingest.flush_all().await.unwrap();
         let ig2 = node2.storage.identity_graph("proj_a", false).await.unwrap();
         let new_uid = ig2.lookup_canonical("brand_new_after_restore").unwrap();
         assert!(

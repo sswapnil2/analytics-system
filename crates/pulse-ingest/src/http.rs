@@ -134,11 +134,14 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
-        if let IngestError::Storage(pulse_storage::StorageError::Backpressure { .. }) = &self.0 {
-            // Flushing is behind ingest.
+        if let IngestError::Storage(pulse_storage::StorageError::Backpressure { what, .. }) =
+            &self.0
+        {
+            // `l0_backpressure`: flushing is behind. `log_backpressure`: processor is behind.
+            // `ingest_buffer_backpressure`: writer memory buffer is full.
             let body = serde_json::json!({
                 "status": "error",
-                "code": "l0_backpressure",
+                "code": format!("{what}_backpressure"),
                 "message": self.0.to_string(),
             });
             return (

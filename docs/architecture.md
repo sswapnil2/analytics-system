@@ -81,7 +81,7 @@ The diagram shows the following boundaries:
 |---|---|---|---|---|---|---|---|
 | **Node runtime** | `crates/pulse-node` | Tokio, Axum, mimalloc | Parses flags and env, wires every component, serves HTTP, health, metrics, static Studio, graceful shutdown | Process config → running services | All crates below | `/readyz` turns `503` during drain (`PULSE_SHUTDOWN_DRAIN_MS`); flushes all projects on `SIGTERM` | `--role all\|ingest\|query\|compactor` |
 | **Wire formats** | `crates/pulse-wire` | serde, zstd, xxh3 | Event schema, JSON and binary `PLSB` batch codecs, `PLSR` replay frames, flag bucketing | Bytes ↔ `WireEvent`, replay ops | — | Bounded decompression (64 MiB), per-field caps | — |
-| **Ingest** | `crates/pulse-ingest` | Axum, quinn (QUIC) | Auth by ingest key, decode, rate limit, lexicon governance, dedup, schema caps, clock-skew fix | HTTP/QUIC requests → WAL + L0 rows | wire, identity, storage | `429` on rate limit, L0 backpressure, or `hot_segment_backpressure`; `200` only after durable WAL write; partial batch success | `PULSE_INGEST_EVENTS_PER_SEC`, `PULSE_INGEST_BURST_SECS` |
+| **Ingest** | `crates/pulse-ingest` | Axum, quinn (QUIC) | Auth by ingest key, decode, rate limit, lexicon governance, clock-skew fix, bounded W1 writer buffer (`20 ms` / `1 MiB`), per-bucket WAL group commit + dedup, per-bucket processor apply | HTTP/QUIC requests → writer buffer → WAL → L0 rows | wire, identity, storage | `429` on rate limit, `ingest_buffer_backpressure`, `l0_backpressure`, `log_backpressure`, or `hot_segment_backpressure`; `503` on sticky WAL failure; `200` on writer buffer queue (`deduped: 0`, exact dedup in metrics) | `PULSE_WRITER_FLUSH_MS`, `PULSE_WRITER_FLUSH_BYTES`, `PULSE_INGEST_BUFFER_*_MAX_MB`, `PULSE_INGEST_EVENTS_PER_SEC`, `PULSE_INGEST_BURST_SECS` |
 | **Storage engine** | `crates/pulse-storage` | object_store, Vortex, Roaring, SlateDB, ring | WAL, L0 buffers, local `hot/segments/` flush, 7-step S3 upload cycle, manifests (CAS), compaction, erasure, replay store, profile store, optional envelope encryption | Rows → segments; snapshots → readers | object_store backend | CRC-checked WAL replayed on start; corrupt WAL frames quarantined; intent replay & `hot/segments/` sweep; fail-closed dedup seeding (`503`); manifest CAS retries; maintenance errors counted in `/metrics` | `PULSE_NUM_BUCKETS`, `PULSE_L0_MAX_ROWS_PER_BUCKET`, `PULSE_UPLOAD_INTERVAL_SECS`, `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB`, `PULSE_HOT_SEGMENTS_MAX_MB`, `PULSE_OBJECT_STORE_URL` |
 | **Identity graph** | `crates/pulse-identity` | SlateDB, union-find, Roaring | `distinct_id` ↔ dense u32, anonymous → user merges | identify/alias calls → canonical map | object store | Flushed before events are written; recovery fails loudly on a missing chunk; `409` on merging two identified users | Read-only Candidate B snapshot copies (`<data_dir>/query_hot`) or `DbReader` on query nodes |
 | **Query engine** | `crates/pulse-exec` | Tokio, rayon, foyer, moka, DataFusion (custom properties only), DDSketch | Insights, funnels, retention, flows, cohorts, session search, export | Query AST + snapshot → result JSON | storage, identity | Deadline, row and memory budgets, admission semaphores; partial results discarded | `PULSE_QUERY_*`, `PULSE_AUTO_SAMPLE_MIN_ROWS`, `PULSE_CACHE_MEMORY_MB` |
@@ -168,11 +168,11 @@ Performance figures: the repo has a latency SLO test, `crates/pulse-exec/tests/s
 
 | Failure | What happens |
 |---|---|
-| Process crash after an ingest `200` | Events are in the fsynced WAL. On start the WAL is replayed into L0 and dedup windows are re-seeded, so a client retry is not double-counted. |
+| Process crash (`SIGKILL`) after an ingest `200` | Already-WALed events are replayed from the fsynced WAL into L0 and dedup windows are re-seeded; at most the un-WALed writer memory buffer (`<= PULSE_WRITER_FLUSH_MS` / `<= PULSE_WRITER_FLUSH_BYTES`, default `20 ms` / `1 MiB`) can be lost. Clean `SIGTERM` drains 100% of buffered events before exit. |
 | Crash during a segment flush or S3 upload cycle | The manifest commit is atomic (create-if-absent), and each upload cycle writes `upload_intent.json` before any S3 PUT. On restart, unreferenced S3 segments/snapshots from `upload_intent.json` and unreferenced `hot/segments/` files are swept cleanly; the WAL still holds uncommitted rows. |
 | S3 unreachable during open (dedup seeding) or sustained ingest | Opening a project fails closed with `503` if recent S3 segments cannot be read for dedup seeding (never seeding empty dedup rings). While S3 stays unreachable, ingest continues to local `hot/segments/` until `2x` `PULSE_HOT_SEGMENTS_*_MAX_MB`, then returns `429` (`hot_segment_backpressure`). |
 | Corrupt WAL object | It fails its CRC check, is moved to `wal_corrupt/`, and is logged. |
-| Ingest faster than flush | `429 Retry-After: 1` per bucket. The SDKs back off and retry. |
+| Ingest faster than processor or flush | `429 Retry-After: 1` (`ingest_buffer_backpressure`, `log_backpressure`, or `l0_backpressure`). The SDKs back off and retry. |
 | Too many events per second | `429 Retry-After`, from the per-project token bucket. |
 | Expensive query | Fails with timeout, too-large or memory-exceeded. It never takes the node down. |
 | Too many concurrent queries | Queued up to the deadline, then `Overloaded`. |
@@ -186,8 +186,12 @@ Performance figures: the repo has a latency SLO test, `crates/pulse-exec/tests/s
 - `GET /readyz`: checks drain state, a metadata DB ping and an object store `HEAD`, each with a 2 s timeout.
 - `GET /metrics` (Prometheus): protect it with `PULSE_METRICS_TOKEN`. It exposes:
   - `pulse_http_requests_total` and `pulse_http_request_duration_seconds`, by route template
-  - `pulse_ingest_events_{accepted,deduped,dropped}_total`
+  - `pulse_ingest_events_{accepted,deduped,dropped}_total` and `pulse_ingest_dead_lettered_events_total`
   - `pulse_ingest_batches_total`
+  - `pulse_writer_flush_bound_{ms,bytes}`, `pulse_writer_flushes_total{reason}`
+  - `pulse_writer_buffer_{bytes,capacity_bytes,events,batches}`
+  - `pulse_wal_bytes`, `pulse_ingest_log_lag_bytes`, `pulse_ingest_log_lag_limit_bytes`
+  - `pulse_ingest_apply_lag_seconds`, `pulse_ingest_apply_queue_{records,events}`
   - `pulse_queries_executed_total`
   - `pulse_maintenance_errors_total{kind}`
   - `pulse_l0_bytes` and `pulse_l0_rows`
@@ -195,6 +199,7 @@ Performance figures: the repo has a latency SLO test, `crates/pulse-exec/tests/s
   - `pulse_open_projects`
   - `pulse_last_query_latency_seconds`
   - `pulse_ready`
+- Alert rules: `deploy/prometheus-alerts.yml` (includes warning/critical apply-lag alerts well below the 15-minute `DEDUP_WINDOW_MS`, buffer saturation, log-lag, hot-segment, dead-letter, and maintenance-error rules).
 - Logs: `tracing` to stdout, filtered by `RUST_LOG` (default `info,slatedb=warn`).
 
 Pulse does not export OpenTelemetry traces of itself.

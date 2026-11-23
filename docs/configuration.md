@@ -47,12 +47,17 @@
 | `AWS_REGION`, `AWS_ENDPOINT` (+ standard `AWS_*` credentials) | region `ap-south-1` | S3-compatible region and endpoint (R2, MinIO, …) |
 | `PULSE_NUM_BUCKETS` | `16` (1–256) | Storage buckets per day partition. Choose before you ingest real data |
 | `PULSE_L0_PROJECT_MAX_MB` / `PULSE_L0_MAX_MB` | `512` / `1024` | Estimated bytes of in-memory rows, per project and per node, before ingest returns `429` (`l0_backpressure`). A bucket is flushed when it reaches the project limit ÷ (2 × buckets) |
+| `PULSE_LOG_LAG_PROJECT_MAX_MB` / `PULSE_LOG_LAG_MAX_MB` | `256` / `512` | Estimated bytes of WAL-logged events not yet applied by the per-bucket processor, per project and per node, before ingest returns `429` (`log_backpressure`) |
 | `PULSE_L0_MAX_ROWS_PER_BUCKET` | `1,000,000` (4 × the 250k flush threshold) | In-memory rows per bucket before ingest returns `429` |
+| `PULSE_FLUSH_CONCURRENCY` | `4` | Maximum concurrent background L0-to-segment flushes across the node |
 
 ## Ingest
 
 | Env var | Default | Meaning |
 |---|---|---|
+| `PULSE_WRITER_FLUSH_MS` | `20` | Max delay (ms) before the W1 writer memory buffer flushes queued `/v1/ingest` events to the WAL |
+| `PULSE_WRITER_FLUSH_BYTES` | `1048576` (1 MiB) | Byte threshold at which the W1 writer memory buffer flushes immediately to the WAL |
+| `PULSE_INGEST_BUFFER_PROJECT_MAX_MB` / `PULSE_INGEST_BUFFER_MAX_MB` | `64` / `256` | Per-project and node-wide bounds on queued W1 writer buffer bytes before `/v1/ingest` returns `429` (`ingest_buffer_backpressure`) |
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
 | `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |

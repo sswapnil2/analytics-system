@@ -638,6 +638,68 @@ pub async fn finalize_local_hot_store_marker(data_dir: &Path) -> Result<()> {
     write_mode_marker(data_dir, &marker_path, HotStoreMode::Local).await
 }
 
+/// Non-mutating object-store builder for read-only CLI inspection commands (`dead-letters`).
+/// Does NOT create `<data_dir>` or `<data_dir>/object_store` if missing.
+pub fn build_object_store_for_inspect(data_dir: &Path) -> Result<Arc<dyn ObjectStore>> {
+    if let Ok(raw_url) = std::env::var("PULSE_OBJECT_STORE_URL") {
+        let trimmed = raw_url.trim();
+        if !trimmed.is_empty() {
+            return build_from_url(trimmed);
+        }
+    }
+    let root = data_dir.join("object_store");
+    if root.is_dir() {
+        Ok(Arc::new(DurableLocalObjectStore::new_at(&root)?))
+    } else {
+        Ok(Arc::new(InMemory::new()))
+    }
+}
+
+/// Non-mutating [`HotRouted`] opener for read-only CLI inspection commands (`dead-letters`).
+/// Never creates `<data_dir>`, `hot_store_mode`, `wal/`, or `hot/` directories.
+pub async fn open_hot_store_for_inspect(
+    segments: Arc<dyn ObjectStore>,
+    data_dir: &Path,
+) -> Result<Arc<dyn ObjectStore>> {
+    let desired = parse_hot_store_env()?;
+    let marker_path = data_dir.join(HOT_STORE_MODE_FILE);
+    let marker = read_mode_marker(&marker_path).await?;
+    if let Some(existing) = marker {
+        if existing != desired {
+            return Err(config_error(format!(
+                "hot-store mode mismatch: data directory `{}` is initialized for \
+                 PULSE_HOT_STORE={}, cannot inspect with PULSE_HOT_STORE={}",
+                data_dir.display(),
+                existing.as_str(),
+                desired.as_str()
+            )));
+        }
+    }
+
+    match desired {
+        HotStoreMode::Object => Ok(segments),
+        HotStoreMode::Local => {
+            let wal_dir = data_dir.join("wal");
+            let hot_dir = data_dir.join("hot");
+            let wal_store: Arc<dyn ObjectStore> = if wal_dir.is_dir() {
+                Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?)
+            } else {
+                Arc::new(InMemory::new())
+            };
+            let hot_store: Arc<dyn ObjectStore> = if hot_dir.is_dir() {
+                Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?)
+            } else {
+                Arc::new(InMemory::new())
+            };
+            Ok(Arc::new(HotRouted {
+                wal: wal_store,
+                hot: hot_store,
+                segments,
+            }))
+        }
+    }
+}
+
 /// A startup refusal or bad setting: not data corruption.
 fn config_error(msg: String) -> StorageError {
     StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))

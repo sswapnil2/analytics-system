@@ -238,8 +238,12 @@ impl MemBucket {
         }
         if guard.rows.is_empty() {
             guard.oldest_unflushed_at = None;
+            guard.rows.shrink_to(0);
         } else {
             guard.oldest_unflushed_at = Some(Instant::now());
+            if guard.rows.capacity() > guard.rows.len().saturating_mul(4).max(1024) {
+                guard.rows.shrink_to_fit();
+            }
         }
     }
 
@@ -268,6 +272,9 @@ impl MemBucket {
             guard.cached_slice = None;
             if guard.rows.is_empty() {
                 guard.oldest_unflushed_at = None;
+                guard.rows.shrink_to(0);
+            } else if guard.rows.capacity() > guard.rows.len().saturating_mul(4).max(1024) {
+                guard.rows.shrink_to_fit();
             }
         }
         sessions.sort_unstable();

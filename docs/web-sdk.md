@@ -3,7 +3,7 @@
 A zero-dependency TypeScript client (`PulseWebClient`) for browsers. It batches events and persists identity,
 session, super properties and the unsent event queue in `localStorage`, so events tracked offline or
 just before the tab closes are sent by the next page load (they keep their ids, so ones that already
-arrived are deduplicated). It also captures uncaught errors, evaluates feature flags locally, and can
+arrived are deduplicated server-side by the WAL flusher; `/v1/ingest` acknowledges batches with `accepted` and `deduped: 0`). It also captures uncaught errors, evaluates feature flags locally, and can
 record privacy-masked DOM wireframes for session replay.
 
 ## Install

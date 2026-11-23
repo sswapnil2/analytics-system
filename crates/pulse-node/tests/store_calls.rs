@@ -268,6 +268,7 @@ async fn run(mode: &str, n: usize, idle: Duration) -> RunCalls {
     for i in 0..n {
         assert_eq!(post(&node, "/v1/ingest", &key, event(i, now)).await, 200);
     }
+    node.ingest.flush_all().await.unwrap();
     let events = store.take();
     print(
         &format!("{mode}: {n} event requests, one event each"),
@@ -382,9 +383,15 @@ async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
     let idle = Duration::from_secs(30);
     let obj = run("object", 1000, idle).await;
     assert!(
-        prefix_puts(&obj.events, "wal") > 0 && prefix_puts(&obj.events, "identity") > 0,
-        "object mode writes wal and identity to the segment store: {:?}",
-        obj.events
+        prefix_puts(&obj.events, "wal") > 0
+            && (prefix_puts(&obj.events, "identity")
+                + prefix_puts(&obj.traces, "identity")
+                + prefix_puts(&obj.idle_l0, "identity"))
+                > 0,
+        "object mode writes wal during ingest and identity during ingest/maintenance: events={:?} traces={:?} idle={:?}",
+        obj.events,
+        obj.traces,
+        obj.idle_l0
     );
     assert!(
         prefix_puts(&obj.traces, "agent_wal") > 0,

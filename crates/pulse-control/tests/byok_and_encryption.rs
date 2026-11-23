@@ -248,7 +248,8 @@ async fn test_full_encryption_and_byok_suite() {
         }],
     };
     let rep_res1 = storage.append_replay_chunk(&replay_k1).await.unwrap();
-    storage.flush_all_projects().await.unwrap();
+    let (st, _) = send_admin_json(&ctrl_app, "POST", "/v1/admin/flush", None).await;
+    assert_eq!(st, StatusCode::OK);
 
     // Verify raw bytes in object store are ENCRYPTED with AES-256-GCM envelope magic (PLSEAGM2, path-bound)
     let raw_store = enc_store.raw_inner();
@@ -321,7 +322,8 @@ async fn test_full_encryption_and_byok_suite() {
     let (st, ing2) = send_ingest(&ingest_app, "/v1/ingest", events_batch_2).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(ing2["accepted"], 2);
-    storage.flush_all_projects().await.unwrap();
+    let (st, _) = send_admin_json(&ctrl_app, "POST", "/v1/admin/flush", None).await;
+    assert_eq!(st, StatusCode::OK);
 
     // Query across both K1 and K2 segments: seamlessly decrypts both!
     let (st, funnel) = send_admin_json(

@@ -245,13 +245,89 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
 
     let projects = p.storage.open_projects();
     let l0_rows: usize = projects.iter().map(|ps| ps.total_l0_rows()).sum();
+    let (l0_bytes, log_lag_bytes) = p.storage.memory_load();
+    let (apply_queue_records, apply_queue_events) = p.storage.apply_queue_depth();
+    let buf = p.ingest.buffer_stats();
+
+    out.push_str(
+        "# HELP pulse_writer_flushes_total Writer buffer flushes to the WAL by trigger reason.\n\
+         # TYPE pulse_writer_flushes_total counter\n",
+    );
+    for (reason, c) in [
+        ("timer", buf.flushes_timer),
+        ("bytes", buf.flushes_bytes),
+        ("drain", buf.flushes_drain),
+    ] {
+        let _ = writeln!(out, "pulse_writer_flushes_total{{reason=\"{reason}\"}} {c}");
+    }
+
     let mut gauge = |name: &str, help: &str, v: f64| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
     };
     gauge(
+        "pulse_writer_flush_bound_ms",
+        "Configured writer buffer max flush delay in milliseconds.",
+        buf.flush_ms as f64,
+    );
+    gauge(
+        "pulse_writer_flush_bound_bytes",
+        "Configured writer buffer flush byte threshold.",
+        buf.flush_bytes as f64,
+    );
+    gauge(
+        "pulse_writer_buffer_bytes",
+        "Estimated bytes queued in the writer memory buffer awaiting WAL write.",
+        buf.buffer_bytes as f64,
+    );
+    gauge(
+        "pulse_writer_buffer_capacity_bytes",
+        "Configured node-wide writer memory buffer byte capacity.",
+        buf.capacity_bytes as f64,
+    );
+    gauge(
+        "pulse_writer_buffer_events",
+        "Events queued in the writer memory buffer awaiting WAL write.",
+        buf.buffer_events as f64,
+    );
+    gauge(
+        "pulse_writer_buffer_batches",
+        "Pending batch entries in the writer memory buffer awaiting WAL write.",
+        buf.buffer_batches as f64,
+    );
+    gauge(
+        "pulse_wal_bytes",
+        "Total bytes of active WAL files across open projects on this node.",
+        p.storage.wal_bytes() as f64,
+    );
+    gauge(
         "pulse_l0_bytes",
         "Estimated bytes of rows buffered in memory, not yet flushed to segments.",
-        p.storage.l0_bytes() as f64,
+        l0_bytes as f64,
+    );
+    gauge(
+        "pulse_ingest_log_lag_bytes",
+        "Estimated bytes of events written to the WAL and not yet applied by the processor.",
+        log_lag_bytes as f64,
+    );
+    gauge(
+        "pulse_ingest_log_lag_limit_bytes",
+        "Configured node-wide limit in bytes for unapplied WAL records.",
+        p.storage.log_lag_limit_bytes() as f64,
+    );
+    gauge(
+        "pulse_ingest_apply_lag_seconds",
+        "Age in seconds of the oldest unapplied WAL record across open projects.",
+        p.storage.max_apply_lag_seconds(),
+    );
+    gauge(
+        "pulse_ingest_apply_queue_records",
+        "Number of WAL records queued in per-bucket processor channels.",
+        apply_queue_records as f64,
+    );
+    gauge(
+        "pulse_ingest_apply_queue_events",
+        "Number of events queued in per-bucket processor channels.",
+        apply_queue_events as f64,
     );
     gauge(
         "pulse_hot_segment_bytes",

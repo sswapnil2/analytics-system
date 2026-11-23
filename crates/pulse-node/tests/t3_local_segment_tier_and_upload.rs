@@ -372,7 +372,8 @@ fn t3_1_local_segment_tier_query_equivalence_and_zero_idle_s3_calls() {
                     .status(),
                 200
             );
-            node.storage.flush_all_projects().await.unwrap();
+            node.ingest.flush_all().await.unwrap();
+        node.storage.flush_all_projects().await.unwrap();
         }
         let flush_calls = s3_fault.take_calls();
         assert_eq!(storage_engine_s3_calls(&flush_calls), 0, "{flush_calls:?}");
@@ -491,6 +492,7 @@ fn t3_1_local_segment_tier_query_equivalence_and_zero_idle_s3_calls() {
                 .status(),
             200
         );
+        node.ingest.flush_all().await.unwrap();
         node.storage.flush_all_projects().await.unwrap();
 
         // Idle ticks + upload cycle with only deferred closed-date segment -> 0 S3 calls!
@@ -845,6 +847,7 @@ fn t3_3_dedup_seeding_503_on_s3_unreachable_no_duplicate_on_retry() {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 200);
+            node.ingest.flush_all().await.unwrap();
             node.storage.flush_all_projects().await.unwrap();
             assert_eq!(node.storage.publish_all_projects().await.unwrap(), 1);
             node.shutdown().await;
@@ -895,8 +898,22 @@ fn t3_3_dedup_seeding_503_on_s3_unreachable_no_duplicate_on_retry() {
             .json()
             .await
             .unwrap();
-        assert_eq!(ok_resp["deduped"].as_u64(), Some(1));
-        assert_eq!(ok_resp["accepted"].as_u64(), Some(0));
+        assert_eq!(ok_resp["deduped"].as_u64(), Some(0));
+        assert_eq!(ok_resp["accepted"].as_u64(), Some(1));
+        node2.ingest.flush_all().await.unwrap();
+
+        let metrics_text = http
+            .get(format!("http://{}/metrics", node2.http_addr))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics_text.contains("pulse_ingest_events_deduped_total 1"),
+            "expected deduped retry counted in metrics:\n{metrics_text}"
+        );
 
         let ps2 = node2.storage.get_project(pid).unwrap();
         assert_eq!(ps2.snapshot().manifest.total_l1_rows(), 1);
@@ -982,6 +999,7 @@ fn t3_4_hot_segment_byte_bounds_1x_wake_2x_429_http_quic_and_recovery() {
                 .status(),
             200
         );
+        node.ingest.flush_all().await.unwrap();
         node.storage.flush_all_projects().await.unwrap();
         // Wait up to 4s (far less than 300s!) for upload_notify to drain hot_segment_bytes to 0.
         tokio::time::timeout(Duration::from_secs(4), async {
@@ -1028,7 +1046,8 @@ fn t3_4_hot_segment_byte_bounds_1x_wake_2x_429_http_quic_and_recovery() {
                 break;
             }
             assert_eq!(resp.status(), 200);
-            node.storage.flush_all_projects().await.unwrap();
+            node.ingest.flush_all().await.unwrap();
+        node.storage.flush_all_projects().await.unwrap();
         }
         assert!(got_429, "Project A must hit 429 hot_segment_backpressure past 2x");
 
@@ -1255,6 +1274,7 @@ fn t3_5_live_step5_to_step6_s3_failure_recovery_without_restart() {
                 .status(),
             200
         );
+        node.ingest.flush_all().await.unwrap();
         node.storage.flush_all_projects().await.unwrap();
         let ps = node.storage.get_project(pid).unwrap();
         assert!(ps.hot_segment_bytes() >= 200);

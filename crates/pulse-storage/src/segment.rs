@@ -462,16 +462,16 @@ pub async fn write_vortex_segment_opts(
         .await?
         .freeze();
 
-    let vortex_bytes = vortex_buf.as_slice();
-    let vortex_len = vortex_bytes.len() as u64;
+    let vortex_len = vortex_buf.len() as u64;
     let inverted_idx_offset = vortex_len;
     let session_idx_offset = inverted_idx_offset + built.inverted_bytes.len() as u64;
     let total_size = session_idx_offset + built.session_idx_bytes.len() as u64;
 
-    let mut container = Vec::with_capacity(total_size as usize);
-    container.extend_from_slice(vortex_bytes);
-    container.extend_from_slice(&built.inverted_bytes);
-    container.extend_from_slice(&built.session_idx_bytes);
+    let payload = PutPayload::from_iter([
+        vortex_buf.into_inner(),
+        Bytes::from(built.inverted_bytes),
+        Bytes::from(built.session_idx_bytes),
+    ]);
 
     let prefix_root = prefix_root.trim_end_matches('/');
     let yyyymmdd = date.format("%Y%m%d").to_string();
@@ -481,7 +481,7 @@ pub async fn write_vortex_segment_opts(
     object_store
         .put_opts(
             &obj_path,
-            PutPayload::from_bytes(Bytes::from(container)),
+            payload,
             PutOptions {
                 mode: put_mode,
                 ..PutOptions::default()
@@ -716,6 +716,31 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
         }
     }
 
+    // Build compact HLL sketches for up to the top `MAX_FOOTER_HLL_EVENTS` events in this segment,
+    // then drop `entries` BEFORE allocating Arrow `RecordBatch` / `BinaryBuilder` to bound peak RSS.
+    let mut top_hll_eids: Vec<(u16, u32)> = event_count_map.iter().map(|(&k, &c)| (k, c)).collect();
+    if top_hll_eids.len() > MAX_FOOTER_HLL_EVENTS {
+        top_hll_eids.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_hll_eids.truncate(MAX_FOOTER_HLL_EVENTS);
+    }
+    let mut hll_map: HashMap<u16, HllSketch> = top_hll_eids
+        .into_iter()
+        .map(|(eid, _)| (eid, HllSketch::new()))
+        .collect();
+    if !hll_map.is_empty() {
+        for e in &entries {
+            if let Some(sk) = hll_map.get_mut(&e.row.event_id) {
+                sk.observe_uid(e.row.uid_internal);
+            }
+        }
+    }
+    let mut event_hlls: Vec<(u16, CompactHll)> = hll_map
+        .into_iter()
+        .map(|(eid, sk)| (eid, sk.to_compact()))
+        .collect();
+    event_hlls.sort_unstable_by_key(|(eid, _)| *eid);
+    drop(entries);
+
     // Assemble Arrow Schema + Arrays -> Vortex Columnar File
     let mut fields: Vec<Field> = vec![
         Field::new("uid_internal", DataType::UInt32, false),
@@ -832,34 +857,12 @@ fn build_segment_payload_sync(rows: Vec<StoredRow>) -> Result<Option<BuiltSegmen
         fields.push(Field::new("tier_c_overflow", DataType::Binary, true));
         columns.push(Arc::new(bin_b.finish()));
     }
+    drop(tier_c_rows);
 
     let schema = Arc::new(Schema::new(fields));
     let record_batch = RecordBatch::try_new(schema, columns)?;
     let inverted_bytes = inverted_idx.encode()?;
     let session_idx_bytes = encode_session_index(&session_headers, &session_ids)?;
-
-    // Build compact HLL sketches for up to the top `MAX_FOOTER_HLL_EVENTS` events in this segment.
-    let mut top_hll_eids: Vec<(u16, u32)> = event_count_map.iter().map(|(&k, &c)| (k, c)).collect();
-    if top_hll_eids.len() > MAX_FOOTER_HLL_EVENTS {
-        top_hll_eids.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        top_hll_eids.truncate(MAX_FOOTER_HLL_EVENTS);
-    }
-    let mut hll_map: HashMap<u16, HllSketch> = top_hll_eids
-        .into_iter()
-        .map(|(eid, _)| (eid, HllSketch::new()))
-        .collect();
-    if !hll_map.is_empty() {
-        for e in &entries {
-            if let Some(sk) = hll_map.get_mut(&e.row.event_id) {
-                sk.observe_uid(e.row.uid_internal);
-            }
-        }
-    }
-    let mut event_hlls: Vec<(u16, CompactHll)> = hll_map
-        .into_iter()
-        .map(|(eid, sk)| (eid, sk.to_compact()))
-        .collect();
-    event_hlls.sort_unstable_by_key(|(eid, _)| *eid);
 
     let footer_meta = SegmentFooterMeta {
         row_count: n as u32,

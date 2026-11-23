@@ -125,17 +125,31 @@ async fn send_ingest(app: &Router, uri: &str, body: Value) -> (StatusCode, Value
 #[tokio::test]
 async fn all_profile_read_endpoints_and_catalog_filter_erased_uids() {
     let tmp = tempfile::tempdir().unwrap();
-    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let (admin_app, ingest_app, ctrl, ingest, meta, qengine) = setup_full(tmp.path()).await;
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    // Ingest events so UID 0 ("uid0_user"), UID 1/2 ("anon_1" -> "user_1"), UID 3 ("user_2"),
+    // Ingest "uid0_user" first and flush so it deterministically receives UID 0 before
+    // multi-bucket parallel apply assigns UIDs to the remaining users.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
+                { "event": "Page_View", "distinct_id": "uid0_user", "timestamp": now_ms - 60_000 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
+
+    // Ingest events so UID 1/2 ("anon_1" -> "user_1"), UID 3 ("user_2"),
     // UID 4 ("user_3"), and UID 5 ("user_4") exist in the identity graph and L0.
     let (s, _) = send_ingest(
         &ingest_app,
         "/v1/ingest",
         json!({
             "events": [
-                { "event": "Page_View", "distinct_id": "uid0_user", "timestamp": now_ms - 60_000 },
                 { "event": "Page_View", "distinct_id": "anon_1", "timestamp": now_ms - 50_000 },
                 { "event": "Page_View", "distinct_id": "user_1", "timestamp": now_ms - 40_000 },
                 { "event": "Page_View", "distinct_id": "user_2", "timestamp": now_ms - 30_000 },
@@ -146,6 +160,7 @@ async fn all_profile_read_endpoints_and_catalog_filter_erased_uids() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let (s, _) = send_ingest(
         &ingest_app,
@@ -448,7 +463,7 @@ async fn all_profile_read_endpoints_and_catalog_filter_erased_uids() {
 #[tokio::test]
 async fn apply_engage_and_on_identify_isolate_post_erasure_resignup_from_stale_snapshot_rows() {
     let tmp = tempfile::tempdir().unwrap();
-    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let (admin_app, ingest_app, ctrl, ingest, meta, qengine) = setup_full(tmp.path()).await;
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     // Pre-erasure user in pstore & identity graph.
@@ -463,6 +478,7 @@ async fn apply_engage_and_on_identify_isolate_post_erasure_resignup_from_stale_s
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let id_graph = qengine
         .storage()
@@ -541,7 +557,7 @@ async fn apply_engage_and_on_identify_isolate_post_erasure_resignup_from_stale_s
 #[tokio::test]
 async fn copilot_revenue_summary_does_not_clobber_expanded_erased_uids_for_merged_users() {
     let tmp = tempfile::tempdir().unwrap();
-    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let (admin_app, ingest_app, ctrl, ingest, meta, qengine) = setup_full(tmp.path()).await;
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     // Create merged user: anon_0 (raw UID 0) -> user_1 (canonical UID 1), plus non-erased user_2.
@@ -550,7 +566,19 @@ async fn copilot_revenue_summary_does_not_clobber_expanded_erased_uids_for_merge
         "/v1/ingest",
         json!({
             "events": [
-                { "event": "Landing", "distinct_id": "anon_0", "timestamp": now_ms - 40_000 },
+                { "event": "Landing", "distinct_id": "anon_0", "timestamp": now_ms - 40_000 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
+
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "events": [
                 { "event": "SecretEvent", "distinct_id": "user_1", "timestamp": now_ms - 30_000 },
                 { "event": "PublicEvent", "distinct_id": "user_2", "timestamp": now_ms - 20_000 }
             ]
@@ -558,6 +586,7 @@ async fn copilot_revenue_summary_does_not_clobber_expanded_erased_uids_for_merge
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let (s, _) = send_ingest(
         &ingest_app,
@@ -631,7 +660,7 @@ async fn copilot_revenue_summary_does_not_clobber_expanded_erased_uids_for_merge
 #[tokio::test]
 async fn export_cohort_preserves_post_erasure_event_only_resignup_and_filters_static_users() {
     let tmp = tempfile::tempdir().unwrap();
-    let (admin_app, ingest_app, ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let (admin_app, ingest_app, ctrl, ingest, meta, qengine) = setup_full(tmp.path()).await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let t_pre = now_ms - 60_000;
     let t_erase = now_ms - 30_000;
@@ -651,6 +680,7 @@ async fn export_cohort_preserves_post_erasure_event_only_resignup_and_filters_st
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let id_graph = qengine
         .storage()
@@ -678,6 +708,7 @@ async fn export_cohort_preserves_post_erasure_event_only_resignup_and_filters_st
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     // Confirm `ev_resign` genuinely has no ProfileStore row.
     let pstore = qengine
@@ -1393,7 +1424,7 @@ async fn mock_copilot_llm_handler() -> impl IntoResponse {
 async fn direct_run_byok_copilot_syncs_erased_uids_before_querying() {
     let _allow_priv = PrivateEndpointEnvGuard::allow();
     let tmp = tempfile::tempdir().unwrap();
-    let (_admin_app, ingest_app, _ctrl, _, meta, qengine) = setup_full(tmp.path()).await;
+    let (_admin_app, ingest_app, _ctrl, ingest, meta, qengine) = setup_full(tmp.path()).await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let t1 = now_ms - 50_000;
     let t2 = now_ms - 40_000;
@@ -1411,6 +1442,7 @@ async fn direct_run_byok_copilot_syncs_erased_uids_before_querying() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let (s, _) = send_ingest(
         &ingest_app,
@@ -1424,6 +1456,7 @@ async fn direct_run_byok_copilot_syncs_erased_uids_before_querying() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    ingest.flush_all().await.unwrap();
 
     let (s, _) = send_ingest(
         &ingest_app,

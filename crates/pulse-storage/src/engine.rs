@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -57,6 +57,10 @@ pub const DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB: u64 = 512;
 /// Default per-node `hot/segments/` `1x` limit in MiB (`PULSE_HOT_SEGMENTS_MAX_MB`).
 pub const DEFAULT_HOT_SEGMENTS_MAX_MB: u64 = 2048;
+/// Default shared flush concurrency (`PULSE_FLUSH_CONCURRENCY`, 4 concurrent segment builds/writes).
+pub const DEFAULT_FLUSH_CONCURRENCY: usize = 4;
+/// Default input-byte cap per cold S3 compaction merge pass (`64 MiB`).
+const DEFAULT_COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// Minimum cooldown between upload retries triggered by `1x`/`2x` pressure after an S3 upload failure.
 const UPLOAD_FAILURE_COOLDOWN: Duration = Duration::from_secs(2);
 /// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback.
@@ -156,24 +160,42 @@ fn env_mb_u64(name: &str, default_mb: u64) -> u64 {
         .saturating_mul(1024 * 1024)
 }
 
-/// Byte bounds on the event rows a node holds in memory and local `hot/segments/` awaiting upload.
+fn env_usize(name: &str, default_val: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default_val)
+}
+
+/// Byte bounds on what a node holds in memory for events and local `hot/segments/` awaiting upload.
 pub struct NodeLoad {
     l0_bytes: Arc<AtomicUsize>,
+    unapplied_bytes: AtomicUsize,
     /// `PULSE_L0_PROJECT_MAX_MB` (512) / `PULSE_L0_MAX_MB` (1024): rows not yet in a segment.
     l0_max_project: AtomicUsize,
     l0_max_node: AtomicUsize,
+    /// `PULSE_LOG_LAG_PROJECT_MAX_MB` (256) / `PULSE_LOG_LAG_MAX_MB` (512): events in the WAL
+    /// that the processor has not applied yet.
+    log_max_project: AtomicUsize,
+    log_max_node: AtomicUsize,
     hot_segment_bytes: Arc<AtomicU64>,
     /// `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB` (512) / `PULSE_HOT_SEGMENTS_MAX_MB` (2048): `1x` bounds.
     hot_seg_max_project: AtomicU64,
     hot_seg_max_node: AtomicU64,
+    wal_bytes: Arc<AtomicU64>,
+    flush_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl NodeLoad {
     fn from_env() -> Arc<Self> {
         Arc::new(Self {
             l0_bytes: Arc::new(AtomicUsize::new(0)),
+            unapplied_bytes: AtomicUsize::new(0),
             l0_max_project: AtomicUsize::new(env_mb("PULSE_L0_PROJECT_MAX_MB", 512)),
             l0_max_node: AtomicUsize::new(env_mb("PULSE_L0_MAX_MB", 1024)),
+            log_max_project: AtomicUsize::new(env_mb("PULSE_LOG_LAG_PROJECT_MAX_MB", 256)),
+            log_max_node: AtomicUsize::new(env_mb("PULSE_LOG_LAG_MAX_MB", 512)),
             hot_segment_bytes: Arc::new(AtomicU64::new(0)),
             hot_seg_max_project: AtomicU64::new(env_mb_u64(
                 "PULSE_HOT_SEGMENTS_PROJECT_MAX_MB",
@@ -183,6 +205,11 @@ impl NodeLoad {
                 "PULSE_HOT_SEGMENTS_MAX_MB",
                 DEFAULT_HOT_SEGMENTS_MAX_MB,
             )),
+            wal_bytes: Arc::new(AtomicU64::new(0)),
+            flush_semaphore: Arc::new(tokio::sync::Semaphore::new(env_usize(
+                "PULSE_FLUSH_CONCURRENCY",
+                DEFAULT_FLUSH_CONCURRENCY,
+            ))),
         })
     }
 }
@@ -303,6 +330,16 @@ pub struct ProjectStorage {
     /// `MemBucket` insertion, and `DedupRegistry` commit (`P1-01`, `P1-02`).
     node_load: Arc<NodeLoad>,
     l0_bytes: Arc<AtomicUsize>,
+    /// WAL records / events written vs applied to L0, and the bytes/ages in between (`log_events_locked`,
+    /// `apply_logged`). Per bucket: records are applied in order within a bucket, not across buckets.
+    logged_records: Vec<AtomicU64>,
+    applied_records: Vec<AtomicU64>,
+    logged_events: Vec<AtomicU64>,
+    applied_events: Vec<AtomicU64>,
+    unapplied_record_times: Vec<Mutex<VecDeque<(u64, i64, u64)>>>,
+    oldest_unapplied_ms: Vec<AtomicI64>,
+    unapplied_bytes: AtomicUsize,
+    applied_notify: tokio::sync::Notify,
     bucket_append_locks: Vec<AsyncMutex<()>>,
     bucket_flush_locks: Vec<AsyncMutex<()>>,
     compaction_locks: DashMap<(NaiveDate, u8), Arc<AsyncMutex<()>>>,
@@ -313,6 +350,9 @@ pub struct ProjectStorage {
     pin_tracker: Arc<ReaderPinTracker>,
     session_flags: Cache<u64, u16>,
     recovered_uuid_fps: Mutex<Vec<(u8, u64)>>,
+    /// Test hook: runs right before a flush stages L0 rows.
+    #[cfg(test)]
+    before_stage: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     erased: RwLock<Arc<ErasedUids>>,
 }
 
@@ -327,6 +367,13 @@ impl Drop for ProjectStorage {
                 .hot_segment_bytes
                 .fetch_sub(rem, Ordering::Relaxed);
             *self.hot_segment_bytes.get_mut() = 0;
+        }
+        let rem_unapplied = *self.unapplied_bytes.get_mut();
+        if rem_unapplied > 0 {
+            self.node_load
+                .unapplied_bytes
+                .fetch_sub(rem_unapplied, Ordering::Relaxed);
+            *self.unapplied_bytes.get_mut() = 0;
         }
     }
 }
@@ -1034,7 +1081,8 @@ impl ProjectStorage {
                 manifest.epoch,
                 committed_wal,
                 object_store.clone(),
-            );
+            )
+            .with_wal_bytes_counter(node_load.wal_bytes.clone());
             wal.set_min_valid_epoch(manifest.fenced_wal_epoch);
             wals.push(wal);
             mem_buckets.push(MemBucket::with_totals(
@@ -1046,6 +1094,7 @@ impl ProjectStorage {
             flush_in_flight.push(AtomicBool::new(false));
         }
 
+        let num_buckets = config.num_buckets as usize;
         let ps = Arc::new(Self {
             project_id: project_id.clone(),
             config: config.clone(),
@@ -1093,6 +1142,16 @@ impl ProjectStorage {
             mem_buckets,
             node_load,
             l0_bytes,
+            logged_records: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
+            applied_records: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
+            logged_events: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
+            applied_events: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
+            unapplied_record_times: (0..num_buckets)
+                .map(|_| Mutex::new(VecDeque::new()))
+                .collect(),
+            oldest_unapplied_ms: (0..num_buckets).map(|_| AtomicI64::new(0)).collect(),
+            unapplied_bytes: AtomicUsize::new(0),
+            applied_notify: tokio::sync::Notify::new(),
             bucket_append_locks,
             bucket_flush_locks,
             compaction_locks: DashMap::new(),
@@ -1106,6 +1165,8 @@ impl ProjectStorage {
                 .time_to_idle(Duration::from_secs(3600))
                 .build(),
             recovered_uuid_fps: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_stage: Mutex::new(None),
             erased: RwLock::new(Arc::new(ErasedUids::default())),
         });
 
@@ -1349,7 +1410,7 @@ impl ProjectStorage {
         }
     }
 
-    fn is_fenced(&self) -> bool {
+    pub fn is_fenced(&self) -> bool {
         self.writer
             .as_ref()
             .is_some_and(|w| w.fenced.load(Ordering::Acquire))
@@ -1365,13 +1426,11 @@ impl ProjectStorage {
         self.bucket_append_locks[bucket_id as usize].lock().await
     }
 
-    /// Appends events while the caller holds `lock_bucket_append(bucket_id)` (`P1-01`, `P1-02`).
-    /// Guarantees `wal_seq` allocation, durable `BucketWal::append`, `l0_seq` allocation, and
-    /// `MemBucket` insertion execute in strict total order for `bucket_id`. Events that cannot
-    /// become rows are dead-lettered, so the count can be below `events.len()`.
+    /// Logs and applies in one call, for callers that do not split the two (tests, embedded use).
+    /// Events that cannot become rows are dead-lettered, so the count can be below `events.len()`.
     pub async fn append_bucket_events_locked(
         &self,
-        _append_guard: &AsyncMutexGuard<'_, ()>,
+        append_guard: &AsyncMutexGuard<'_, ()>,
         bucket_id: u8,
         events: &[(WireEvent, u32)],
     ) -> Result<usize> {
@@ -1379,9 +1438,28 @@ impl ProjectStorage {
             return Ok(0);
         }
         let batch = WireBatch::new(events.iter().map(|(e, _)| e.clone()).collect());
+        let wal_seq = self
+            .log_events_locked(append_guard, bucket_id, &batch, 0)
+            .await?;
+        let events: Vec<_> = events
+            .iter()
+            .map(|(ev, uid)| (ev, *uid, event_uuid_fingerprint(&ev.event_uuid)))
+            .collect();
+        self.apply_logged(bucket_id, wal_seq, &events, 0).await
+    }
+
+    /// The appender half: one durable WAL record for `batch`, written while the caller holds
+    /// `lock_bucket_append(bucket_id)`, so there is one PUT in flight per bucket log and `wal_seq`
+    /// follows lock order. Every logged record must later go through `apply_logged`, in order.
+    pub async fn log_events_locked(
+        &self,
+        _append_guard: &AsyncMutexGuard<'_, ()>,
+        bucket_id: u8,
+        batch: &WireBatch,
+        approx_bytes: usize,
+    ) -> Result<u64> {
         self.check_writer()?;
-        // 1. Durable WAL write BEFORE allocating l0_seq or mutating L0
-        let wal_seq = match self.wals[bucket_id as usize].append(&batch).await {
+        let wal_seq = match self.wals[bucket_id as usize].append(batch).await {
             Err(e @ StorageError::NotWriter { .. }) => {
                 self.fence();
                 return Err(e);
@@ -1391,19 +1469,136 @@ impl ProjectStorage {
         // Checked again AFTER the write: if the lease ran out while the PUT was in flight, a new
         // holder may already have listed this log without the record, so it must not be acked.
         self.check_writer()?;
+        let b_idx = bucket_id as usize;
+        let now_ms = Utc::now().timestamp_millis();
+        let ev_count = batch.len() as u64;
+        {
+            let mut q = self.unapplied_record_times[b_idx].lock();
+            if q.is_empty() {
+                self.oldest_unapplied_ms[b_idx].store(now_ms, Ordering::Release);
+            }
+            q.push_back((wal_seq, now_ms, ev_count));
+        }
+        self.logged_events[b_idx].fetch_add(ev_count, Ordering::AcqRel);
+        self.logged_records[b_idx].fetch_add(1, Ordering::AcqRel);
+        self.unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        self.node_load
+            .unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        Ok(wal_seq)
+    }
 
-        // 2. Rows into L0 while still holding the bucket append lock. The record is durable, so
-        //    an event that cannot become a row is dead-lettered rather than failing the request.
-        let events: Vec<_> = events
-            .iter()
-            .map(|(ev, uid)| (ev, *uid, event_uuid_fingerprint(&ev.event_uuid)))
-            .collect();
-        let rows = self
-            .rows_or_dead_letter(bucket_id, wal_seq, &events)
-            .await?;
+    /// The processor half: turns a logged record's events (already deduplicated and interned by
+    /// the caller) into L0 rows. Call once per logged record, in `wal_seq` order per bucket,
+    /// with the same `approx_bytes`; an `Err` means nothing was applied and the call can be
+    /// repeated.
+    pub async fn apply_logged(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        events: &[(&WireEvent, u32, u64)],
+        approx_bytes: usize,
+    ) -> Result<usize> {
+        let rows = self.rows_or_dead_letter(bucket_id, wal_seq, events).await?;
         let count = rows.len();
-        self.mem_buckets[bucket_id as usize].append_batch(rows);
+        let b_idx = bucket_id as usize;
+        self.mem_buckets[b_idx].append_batch(rows);
+        self.unapplied_bytes
+            .fetch_sub(approx_bytes, Ordering::AcqRel);
+        self.node_load
+            .unapplied_bytes
+            .fetch_sub(approx_bytes, Ordering::AcqRel);
+        let applied_ev_count = {
+            let mut q = self.unapplied_record_times[b_idx].lock();
+            let mut ev_sum = 0u64;
+            while let Some(&(seq, _, ev_c)) = q.front() {
+                if seq <= wal_seq {
+                    q.pop_front();
+                    ev_sum += ev_c;
+                } else {
+                    break;
+                }
+            }
+            let next_oldest = q.front().map_or(0, |&(_, ts, _)| ts);
+            self.oldest_unapplied_ms[b_idx].store(next_oldest, Ordering::Release);
+            ev_sum
+        };
+        self.applied_events[b_idx].fetch_add(applied_ev_count, Ordering::AcqRel);
+        self.applied_records[b_idx].fetch_add(1, Ordering::AcqRel);
+        self.applied_notify.notify_waiters();
         Ok(count)
+    }
+
+    /// Waits, up to `timeout`, until every record logged before this call has been applied, so
+    /// a read or flush right after an acknowledged write sees it.
+    pub async fn wait_applied(&self, timeout: Duration) {
+        let targets: Vec<u64> = self
+            .logged_records
+            .iter()
+            .map(|n| n.load(Ordering::Acquire))
+            .collect();
+        let caught_up = || {
+            self.applied_records
+                .iter()
+                .zip(&targets)
+                .all(|(n, &t)| n.load(Ordering::Acquire) >= t)
+        };
+        if caught_up() {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.applied_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if caught_up() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+    }
+
+    /// Returns `(unapplied_records, unapplied_events)` queued across this project's buckets.
+    pub fn apply_queue_depth(&self) -> (u64, u64) {
+        let records: u64 = self
+            .logged_records
+            .iter()
+            .zip(&self.applied_records)
+            .map(|(l, a)| {
+                l.load(Ordering::Acquire)
+                    .saturating_sub(a.load(Ordering::Acquire))
+            })
+            .sum();
+        let events: u64 = self
+            .logged_events
+            .iter()
+            .zip(&self.applied_events)
+            .map(|(l, a)| {
+                l.load(Ordering::Acquire)
+                    .saturating_sub(a.load(Ordering::Acquire))
+            })
+            .sum();
+        (records, events)
+    }
+
+    /// Returns the age in milliseconds of the oldest unapplied WAL record across this project's
+    /// buckets (`0` when all buckets are caught up).
+    pub fn max_apply_lag_ms(&self, now_ms: i64) -> i64 {
+        self.oldest_unapplied_ms
+            .iter()
+            .map(|ts| {
+                let oldest = ts.load(Ordering::Acquire);
+                if oldest > 0 {
+                    now_ms.saturating_sub(oldest).max(0)
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Converts events to rows. An event that cannot be converted (today: the project dictionary
@@ -1429,9 +1624,10 @@ impl ProjectStorage {
     }
 
     /// Stores one event that will not be applied under
-    /// `wal_dead/{project}/bucket_{NNN}/seq_{wal_seq}_{fingerprint}.plsb` (a one-event `PLSB`
-    /// batch). The name is fixed by the record, so applying it again after a crash writes nothing
-    /// new. Fails only if the object store does; the caller must then retry, not skip.
+    /// `wal_dead/{project}/bucket_{NNN}/seq_{wal_seq}_{fingerprint}.plsd` (`PLSD` v1 envelope
+    /// containing `recorded_at_ms`, the UTF-8 refusal reason, and the single-event `PLSB` batch).
+    /// The name is fixed by the record, so applying it again after a crash writes nothing new.
+    /// Fails only if the object store does; the caller must then retry, not skip.
     pub async fn dead_letter(
         &self,
         bucket_id: u8,
@@ -1441,10 +1637,12 @@ impl ProjectStorage {
         reason: &(dyn std::fmt::Display + Sync),
     ) -> Result<()> {
         let path = ObjectPath::from(format!(
-            "wal_dead/{}/bucket_{:03}/seq_{:012}_{:016x}.plsb",
+            "wal_dead/{}/bucket_{:03}/seq_{:012}_{:016x}.plsd",
             self.project_id, bucket_id, wal_seq, fp
         ));
-        let payload = WireBatch::new(vec![ev]).encode_binary(1)?;
+        let reason_str = reason.to_string();
+        let now_ms = Utc::now().timestamp_millis();
+        let payload = encode_dead_letter(now_ms, &reason_str, &ev)?;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -1460,7 +1658,7 @@ impl ProjectStorage {
                     project_id = %self.project_id,
                     bucket_id,
                     dead_letter_path = %path,
-                    %reason,
+                    reason = %reason_str,
                     "event could not be applied; moved to the dead-letter path"
                 );
                 Ok(())
@@ -1512,20 +1710,36 @@ impl ProjectStorage {
             });
         }
         let load = &self.node_load;
-        for (bytes, max_bytes) in [
+        let checks = [
             (
+                "l0",
                 self.l0_bytes.load(Ordering::Acquire),
                 load.l0_max_project.load(Ordering::Relaxed),
             ),
             (
+                "l0",
                 load.l0_bytes.load(Ordering::Acquire),
                 load.l0_max_node.load(Ordering::Relaxed),
             ),
-        ] {
+            (
+                "log",
+                self.unapplied_bytes.load(Ordering::Acquire),
+                load.log_max_project.load(Ordering::Relaxed),
+            ),
+            (
+                "log",
+                load.unapplied_bytes.load(Ordering::Acquire),
+                load.log_max_node.load(Ordering::Relaxed),
+            ),
+        ];
+        for (what, bytes, max_bytes) in checks {
             if bytes >= max_bytes {
-                self.schedule_background_flush(bucket_id);
+                if what == "l0" {
+                    self.schedule_background_flush(bucket_id);
+                }
                 return Err(StorageError::Backpressure {
                     project_id: self.project_id.clone(),
+                    what,
                     bytes,
                     max_bytes,
                 });
@@ -1534,7 +1748,8 @@ impl ProjectStorage {
         Ok(())
     }
 
-    /// Schedules an asynchronous L0 -> L1 flush for `bucket_id`, deduplicated per bucket via `flush_in_flight`.
+    /// Schedules an asynchronous L0 -> L1 flush for `bucket_id`, deduplicated per bucket via `flush_in_flight`
+    /// and bounded across the node by `NodeLoad::flush_semaphore`.
     /// Returns `true` if a new background flush task was spawned.
     pub fn schedule_background_flush(self: &Arc<Self>, bucket_id: u8) -> bool {
         let b_idx = bucket_id as usize;
@@ -1548,10 +1763,14 @@ impl ProjectStorage {
             return false;
         }
         let ps_weak = Arc::downgrade(self);
+        let sem = self.node_load.flush_semaphore.clone();
         let handle = tokio::spawn(async move {
             let _reset_guard = FlushInFlightResetGuard {
                 ps: ps_weak.clone(),
                 b_idx,
+            };
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return;
             };
             if let Some(ps) = ps_weak.upgrade() {
                 let _ = ps.flush_bucket(bucket_id).await;
@@ -1750,9 +1969,6 @@ impl ProjectStorage {
         };
         let bucket_guard = flush_lock.lock().await;
 
-        // Guarantee interned u32 identities are durable in SlateDB BEFORE publishing any L1 segment.
-        self.id_graph().flush().await?;
-
         let floor_l0 = self
             .manifest
             .read()
@@ -1761,10 +1977,18 @@ impl ProjectStorage {
             .copied()
             .unwrap_or(0);
 
+        #[cfg(test)]
+        if let Some(hook) = self.before_stage.lock().take() {
+            hook();
+        }
         let Some((max_l0, max_wal, staged_rows)) = self.mem_buckets[b_idx].stage_flush(floor_l0)
         else {
             return Ok(Vec::new());
         };
+        // AFTER staging: every uid in the staged rows was interned before this point, so this
+        // flush makes all of them durable before any segment that holds them is published. The
+        // processor interns without flushing, so flushing first would miss ids interned between.
+        self.id_graph().flush().await?;
 
         let mut by_date: BTreeMap<NaiveDate, Vec<StoredRow>> = BTreeMap::new();
         for row in staged_rows {
@@ -2554,7 +2778,6 @@ impl ProjectStorage {
             return Ok(0);
         }
 
-        self.id_graph().flush().await?;
         let mut guards = Vec::with_capacity(sorted.len());
         for &b in &sorted {
             guards.push(self.bucket_flush_locks[b as usize].lock().await);
@@ -2595,13 +2818,15 @@ impl ProjectStorage {
         if staged_buckets.is_empty() {
             return Ok(0);
         }
+        // After staging, for the same reason as in `flush_bucket`.
+        self.id_graph().flush().await?;
 
         let prefix_root = if self.is_local_segment_tier() {
             "hot/segments"
         } else {
             "segments"
         };
-        let sem = Arc::new(tokio::sync::Semaphore::new(16));
+        let sem = self.node_load.flush_semaphore.clone();
         let mut join_set = tokio::task::JoinSet::new();
         let mut bucket_watermarks = Vec::with_capacity(staged_buckets.len());
         for sb in staged_buckets {
@@ -2716,6 +2941,8 @@ impl ProjectStorage {
     }
 
     pub async fn flush_all(&self) -> Result<usize> {
+        // Acknowledged records still on their way into L0 belong in this flush.
+        self.wait_applied(Duration::from_secs(10)).await;
         let all: Vec<u8> = (0..self.config.num_buckets).map(|b| b as u8).collect();
         self.flush_buckets(&all).await
     }
@@ -2729,14 +2956,14 @@ impl ProjectStorage {
 
     /// Merges any `(date, bucket)` partition with `>= min_segments` overlapping L1 segments into a
     /// single sorted Vortex segment (`EN-3`), compacting up to 32 partitions per manifest commit
-    /// with bounded concurrency to avoid O(P * M) manifest write amplification.
+    /// with bounded concurrency (`2`) and `64 MiB` per-partition input cap to bound RSS.
     pub async fn compact_min_segments(
         &self,
         reader: &VortexSegmentReader,
         min_segments: usize,
     ) -> Result<usize> {
         const COMPACTION_COMMIT_BATCH: usize = 32;
-        const COMPACTION_CONCURRENCY: usize = 8;
+        const COMPACTION_CONCURRENCY: usize = 2;
 
         if self.is_local_segment_tier() && !self.upload_interval().is_zero() {
             return Ok(0);
@@ -2778,7 +3005,23 @@ impl ProjectStorage {
                         mf.active_segments
                             .get(&(date, bucket_id))
                             .filter(|segs| segs.len() >= min_segments)
-                            .map(|segs| (date, bucket_id, segs.clone()))
+                            .map(|segs| {
+                                let mut by_size = segs.clone();
+                                by_size.sort_by_key(|s| s.file_size);
+                                let mut selected = Vec::with_capacity(by_size.len());
+                                let mut bytes = 0u64;
+                                for seg in by_size {
+                                    if selected.len() >= 2
+                                        && bytes.saturating_add(seg.file_size)
+                                            > DEFAULT_COMPACTION_MAX_INPUT_BYTES
+                                    {
+                                        break;
+                                    }
+                                    bytes = bytes.saturating_add(seg.file_size);
+                                    selected.push(seg);
+                                }
+                                (date, bucket_id, selected)
+                            })
                     })
                     .collect()
             };
@@ -3620,17 +3863,64 @@ impl StorageEngine {
         Ok(ps)
     }
 
-    /// Overrides the L0 byte bounds read from the environment: `(per project, per node)`.
-    pub fn set_l0_byte_limits(&self, project: usize, node: usize) {
-        self.node_load
-            .l0_max_project
-            .store(project, Ordering::Relaxed);
-        self.node_load.l0_max_node.store(node, Ordering::Relaxed);
+    /// Overrides the byte bounds read from the environment: rows held in L0 and logged events not
+    /// yet applied, each per project and per node.
+    pub fn set_byte_limits(&self, l0: (usize, usize), log_lag: (usize, usize)) {
+        let load = &self.node_load;
+        load.l0_max_project.store(l0.0, Ordering::Relaxed);
+        load.l0_max_node.store(l0.1, Ordering::Relaxed);
+        load.log_max_project.store(log_lag.0, Ordering::Relaxed);
+        load.log_max_node.store(log_lag.1, Ordering::Relaxed);
     }
 
-    /// Bytes of event rows this node holds in L0.
-    pub fn l0_bytes(&self) -> usize {
-        self.node_load.l0_bytes.load(Ordering::Relaxed)
+    /// Bytes of L0 rows and of logged-but-unapplied events held by this node.
+    pub fn memory_load(&self) -> (usize, usize) {
+        (
+            self.node_load.l0_bytes.load(Ordering::Relaxed),
+            self.node_load.unapplied_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Total bytes of active WAL files across open projects on this node.
+    pub fn wal_bytes(&self) -> u64 {
+        self.node_load.wal_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Configured node-wide byte limit for unapplied WAL records (`PULSE_LOG_LAG_MAX_MB`).
+    pub fn log_lag_limit_bytes(&self) -> usize {
+        self.node_load.log_max_node.load(Ordering::Relaxed)
+    }
+
+    /// Sum of `(unapplied_records, unapplied_events)` queued across open projects on this node.
+    pub fn apply_queue_depth(&self) -> (u64, u64) {
+        let mut recs = 0u64;
+        let mut evs = 0u64;
+        for p in self.open_projects() {
+            let (r, e) = p.apply_queue_depth();
+            recs = recs.saturating_add(r);
+            evs = evs.saturating_add(e);
+        }
+        (recs, evs)
+    }
+
+    /// Age in seconds of the oldest unapplied WAL record across open projects (`0.0` when caught up).
+    pub fn max_apply_lag_seconds(&self) -> f64 {
+        let now_ms = Utc::now().timestamp_millis();
+        let max_ms = self
+            .open_projects()
+            .into_iter()
+            .map(|p| p.max_apply_lag_ms(now_ms))
+            .max()
+            .unwrap_or(0);
+        max_ms as f64 / 1_000.0
+    }
+
+    /// Opens a project for a query: like `get_or_open_project`, then waits briefly for events
+    /// this node has acknowledged but not yet applied, so a read right after a write sees it.
+    pub async fn open_for_read(&self, project_id: &str) -> Result<Arc<ProjectStorage>> {
+        let ps = self.get_or_open_project(project_id).await?;
+        ps.wait_applied(Duration::from_millis(250)).await;
+        Ok(ps)
     }
 
     /// Overrides the `1x` `hot/segments/` byte bounds read from the environment: `(per project, per node)`.
@@ -3951,6 +4241,188 @@ impl StorageEngine {
     }
 }
 
+/// Magic bytes for dead-lettered event envelopes (`PLSD` v1).
+pub const DEAD_LETTER_MAGIC: [u8; 4] = *b"PLSD";
+pub const DEAD_LETTER_VERSION: u8 = 1;
+const MAX_DEAD_LETTER_REASON_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct DeadLetterEntry {
+    pub object_path: String,
+    pub bucket_id: u8,
+    pub wal_seq: u64,
+    pub recorded_at_ms: i64,
+    pub reason: Option<String>,
+    pub event: WireEvent,
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Encodes a dead-lettered `WireEvent` alongside its timestamp and refusal reason into `PLSD` v1.
+pub fn encode_dead_letter(recorded_at_ms: i64, reason: &str, ev: &WireEvent) -> Result<Vec<u8>> {
+    let reason_bytes = truncate_utf8(reason, MAX_DEAD_LETTER_REASON_BYTES).as_bytes();
+    let plsb_bytes = WireBatch::new(vec![ev.clone()]).encode_binary(1)?;
+    let reason_len = u32::try_from(reason_bytes.len())
+        .map_err(|_| StorageError::Corrupted("dead-letter reason exceeds u32".into()))?;
+    let plsb_len = u32::try_from(plsb_bytes.len())
+        .map_err(|_| StorageError::Corrupted("dead-letter payload exceeds u32".into()))?;
+
+    let mut out = Vec::with_capacity(4 + 1 + 8 + 4 + reason_bytes.len() + 4 + plsb_bytes.len());
+    out.extend_from_slice(&DEAD_LETTER_MAGIC);
+    out.push(DEAD_LETTER_VERSION);
+    out.extend_from_slice(&recorded_at_ms.to_le_bytes());
+    out.extend_from_slice(&reason_len.to_le_bytes());
+    out.extend_from_slice(reason_bytes);
+    out.extend_from_slice(&plsb_len.to_le_bytes());
+    out.extend_from_slice(&plsb_bytes);
+    Ok(out)
+}
+
+fn parse_dead_letter_path(object_path: &str) -> (u8, u64) {
+    let mut bucket_id = 0u8;
+    let mut wal_seq = 0u64;
+    for part in object_path.split('/') {
+        if let Some(b_str) = part.strip_prefix("bucket_") {
+            if let Ok(b) = b_str.parse::<u8>() {
+                bucket_id = b;
+            }
+        } else if let Some(rest) = part.strip_prefix("seq_") {
+            if let Some((seq_str, _)) = rest.split_once('_') {
+                if let Ok(s) = seq_str.parse::<u64>() {
+                    wal_seq = s;
+                }
+            }
+        }
+    }
+    (bucket_id, wal_seq)
+}
+
+/// Decodes either a `PLSD` v1 dead-letter envelope or a legacy `PLSB` single-event file.
+pub fn decode_dead_letter(
+    bytes: &[u8],
+    object_path: &str,
+    fallback_ts_ms: i64,
+) -> Result<DeadLetterEntry> {
+    let (bucket_id, wal_seq) = parse_dead_letter_path(object_path);
+    if bytes.starts_with(&DEAD_LETTER_MAGIC) {
+        if bytes.len() < 21 {
+            return Err(StorageError::Corrupted(format!(
+                "dead-letter `{object_path}` shorter than 21-byte PLSD header"
+            )));
+        }
+        let version = bytes[4];
+        if version != DEAD_LETTER_VERSION {
+            return Err(StorageError::Corrupted(format!(
+                "unsupported PLSD dead-letter version {version} at `{object_path}`"
+            )));
+        }
+        let recorded_at_ms = i64::from_le_bytes(bytes[5..13].try_into().unwrap());
+        let reason_len = u32::from_le_bytes(bytes[13..17].try_into().unwrap()) as usize;
+        if reason_len > MAX_DEAD_LETTER_REASON_BYTES || 17 + reason_len + 4 > bytes.len() {
+            return Err(StorageError::Corrupted(format!(
+                "invalid PLSD reason length {reason_len} at `{object_path}`"
+            )));
+        }
+        let reason_raw = std::str::from_utf8(&bytes[17..17 + reason_len]).map_err(|_| {
+            StorageError::Corrupted(format!("non-UTF-8 PLSD reason at `{object_path}`"))
+        })?;
+        let reason = if reason_raw.is_empty() {
+            None
+        } else {
+            Some(reason_raw.to_string())
+        };
+        let plsb_off = 17 + reason_len;
+        let plsb_len =
+            u32::from_le_bytes(bytes[plsb_off..plsb_off + 4].try_into().unwrap()) as usize;
+        let payload_off = plsb_off + 4;
+        if payload_off.checked_add(plsb_len) != Some(bytes.len()) {
+            return Err(StorageError::Corrupted(format!(
+                "PLSD payload length mismatch at `{object_path}`"
+            )));
+        }
+        let batch = WireBatch::decode_binary(&bytes[payload_off..])?;
+        if batch.events.len() != 1 {
+            return Err(StorageError::Corrupted(format!(
+                "PLSD `{object_path}` expected 1 event, found {}",
+                batch.events.len()
+            )));
+        }
+        Ok(DeadLetterEntry {
+            object_path: object_path.to_string(),
+            bucket_id,
+            wal_seq,
+            recorded_at_ms,
+            reason,
+            event: batch.events.into_iter().next().unwrap(),
+        })
+    } else if bytes.starts_with(b"PLSB") {
+        let batch = WireBatch::decode_binary(bytes)?;
+        if batch.events.len() != 1 {
+            return Err(StorageError::Corrupted(format!(
+                "legacy PLSB dead-letter `{object_path}` expected 1 event, found {}",
+                batch.events.len()
+            )));
+        }
+        Ok(DeadLetterEntry {
+            object_path: object_path.to_string(),
+            bucket_id,
+            wal_seq,
+            recorded_at_ms: fallback_ts_ms,
+            reason: None,
+            event: batch.events.into_iter().next().unwrap(),
+        })
+    } else {
+        Err(StorageError::Corrupted(format!(
+            "unrecognized dead-letter magic at `{object_path}`"
+        )))
+    }
+}
+
+/// Lists and decodes dead-lettered events under `wal_dead/{project_id}/` (optionally scoped to one bucket).
+pub async fn list_dead_letters(
+    object_store: &Arc<dyn ObjectStore>,
+    project_id: &str,
+    bucket_filter: Option<u8>,
+) -> Result<Vec<DeadLetterEntry>> {
+    crate::replay_store::validate_replay_identifier("project_id", project_id)?;
+    let prefix = match bucket_filter {
+        Some(b) => ObjectPath::from(format!("wal_dead/{project_id}/bucket_{b:03}/")),
+        None => ObjectPath::from(format!("wal_dead/{project_id}/")),
+    };
+    let metas: Vec<_> = object_store.list(Some(&prefix)).try_collect().await?;
+    let mut parsed: Vec<(u8, u64, String, i64, ObjectPath)> = metas
+        .into_iter()
+        .map(|meta| {
+            let loc_str = meta.location.to_string();
+            let (b, seq) = parse_dead_letter_path(&loc_str);
+            (
+                b,
+                seq,
+                loc_str,
+                meta.last_modified.timestamp_millis(),
+                meta.location,
+            )
+        })
+        .collect();
+    parsed.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+
+    let mut out = Vec::with_capacity(parsed.len());
+    for (_, _, loc_str, last_mod_ms, loc) in parsed {
+        let bytes = object_store.get(&loc).await?.bytes().await?;
+        out.push(decode_dead_letter(&bytes, &loc_str, last_mod_ms)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod manifest_retention_tests {
     use super::*;
@@ -4004,6 +4476,56 @@ mod manifest_retention_tests {
             rows += reader.read_all_rows(seg).await.unwrap().len();
         }
         assert_eq!(rows, 20);
+    }
+
+    /// A uid interned after the flush decided what is durable, but before it staged the rows,
+    /// must still be durable before the segment holding it is published. Otherwise a crash
+    /// there can hand the uid to a different distinct_id after restart.
+    #[tokio::test]
+    async fn ids_interned_just_before_staging_are_durable_when_the_segment_is_published() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            ..StorageConfig::default()
+        };
+        let router = IdentityRouter::new(store.clone());
+        let ps = ProjectStorage::open_and_recover("p", cfg, store.clone(), &router)
+            .await
+            .unwrap();
+        let ev = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("late_user", "s", "e", 1, 1),
+            routing_seed: "late_user".into(),
+            distinct_id: "late_user".into(),
+            session_id: "s".into(),
+            event_name: "e".into(),
+            client_event_ts_ms: 1_790_000_000_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        // What the processor does: intern and insert, with no identity flush of its own.
+        let uid = Arc::new(AtomicU64::new(0));
+        let (hook_ps, hook_uid) = (ps.clone(), uid.clone());
+        *ps.before_stage.lock() = Some(Box::new(move || {
+            let id = hook_ps.id_graph().get_or_intern(&ev.distinct_id, 0);
+            hook_uid.store(u64::from(id), Ordering::SeqCst);
+            let fp = event_uuid_fingerprint(&ev.event_uuid);
+            let row = hook_ps.wire_event_to_row(&ev, id, 1, fp).unwrap();
+            hook_ps.mem_buckets[0].append_batch(vec![row]);
+        }));
+        let published = ps.flush_bucket(0).await.unwrap();
+        assert!(!published.is_empty(), "the row was not flushed");
+
+        // Crash here, then restart: read the identity store as it is in object storage (no
+        // close, which would flush).
+        let fresh = IdentityRouter::new_read_only(store.clone());
+        let graph = fresh.get_or_open("p").await.unwrap();
+        let uid = uid.load(Ordering::SeqCst) as u32;
+        assert_eq!(
+            graph.external_id(uid).as_deref(),
+            Some("late_user"),
+            "a published segment holds uid {uid}, which is not durable"
+        );
     }
 
     /// An event that cannot become a row (here: the dictionary is full) used to fail the request
@@ -4070,12 +4592,89 @@ mod manifest_retention_tests {
             1,
             "replay dead-lettered the event twice"
         );
+        let entries = list_dead_letters(&store, "p", None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event.event_name, "one_too_many");
+        assert!(
+            entries[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("dictionary capacity exceeded")),
+            "expected persisted reason, got {:?}",
+            entries[0].reason
+        );
     }
 
-    /// Rows in L0 are bounded in bytes, per project and per node, until a flush moves them to a
-    /// segment.
     #[tokio::test]
-    async fn l0_bytes_push_back_until_a_flush() {
+    async fn list_dead_letters_supports_plsd_v1_and_legacy_plsb() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ev1 = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u1", "s1", "e1", 100, 1),
+            routing_seed: "u1".into(),
+            distinct_id: "u1".into(),
+            session_id: "s1".into(),
+            event_name: "e1".into(),
+            client_event_ts_ms: 1_790_000_000_001,
+            client_sent_ts_ms: 0,
+            props: vec![("k".into(), PropValue::Str("v".into()))],
+            replay_offset_kb: 0,
+        };
+        let ev2 = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u2", "s2", "e2", 200, 2),
+            routing_seed: "u2".into(),
+            distinct_id: "u2".into(),
+            session_id: "s2".into(),
+            event_name: "e2".into(),
+            client_event_ts_ms: 1_790_000_000_002,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        let plsd =
+            encode_dead_letter(1_790_000_111_000, "project schema cap reached", &ev1).unwrap();
+        let plsb = WireBatch::new(vec![ev2.clone()]).encode_binary(1).unwrap();
+        store
+            .put(
+                &ObjectPath::from(
+                    "wal_dead/proj/bucket_000/seq_000000000001_0000000000000001.plsd",
+                ),
+                plsd.into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &ObjectPath::from(
+                    "wal_dead/proj/bucket_002/seq_000000000003_0000000000000002.plsb",
+                ),
+                plsb.into(),
+            )
+            .await
+            .unwrap();
+
+        let all = list_dead_letters(&store, "proj", None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].bucket_id, 0);
+        assert_eq!(all[0].wal_seq, 1);
+        assert_eq!(all[0].recorded_at_ms, 1_790_000_111_000);
+        assert_eq!(all[0].reason.as_deref(), Some("project schema cap reached"));
+        assert_eq!(all[0].event.distinct_id, "u1");
+        assert_eq!(all[0].event.client_event_ts_ms, 1_790_000_000_001);
+
+        assert_eq!(all[1].bucket_id, 2);
+        assert_eq!(all[1].wal_seq, 3);
+        assert_eq!(all[1].reason, None);
+        assert_eq!(all[1].event.distinct_id, "u2");
+
+        let only_b2 = list_dead_letters(&store, "proj", Some(2)).await.unwrap();
+        assert_eq!(only_b2.len(), 1);
+        assert_eq!(only_b2[0].event.event_name, "e2");
+    }
+
+    /// Events written to the WAL and not yet applied are bounded in bytes: the appender is
+    /// refused until the processor catches up.
+    #[tokio::test]
+    async fn unapplied_log_bytes_push_back_until_the_record_is_applied() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let engine = StorageEngine::new(
             StorageConfig {
@@ -4085,6 +4684,7 @@ mod manifest_retention_tests {
             store.clone(),
             Arc::new(IdentityRouter::new(store)),
         );
+        engine.set_byte_limits((usize::MAX, usize::MAX), (1_000, usize::MAX));
         let ps = engine.get_or_open_project("p").await.unwrap();
         let ev = WireEvent {
             event_uuid: WireEvent::deterministic_uuid("u", "s", "e", 1, 1),
@@ -4097,19 +4697,39 @@ mod manifest_retention_tests {
             props: vec![],
             replay_offset_kb: 0,
         };
-        ps.append_bucket_events(0, vec![(ev, 1)]).await.unwrap();
-        assert!(engine.l0_bytes() > 0);
         ps.check_l0_backpressure(0).unwrap();
-        for (project, node) in [(1, usize::MAX), (usize::MAX, 1)] {
-            engine.set_l0_byte_limits(project, node);
-            assert!(matches!(
-                ps.check_l0_backpressure(0),
-                Err(StorageError::Backpressure { .. })
-            ));
-        }
+        let batch = WireBatch::new(vec![ev.clone()]);
+        let wal_seq = {
+            let guard = ps.lock_bucket_append(0).await;
+            ps.log_events_locked(&guard, 0, &batch, 1_000)
+                .await
+                .unwrap()
+        };
+        assert!(matches!(
+            ps.check_l0_backpressure(0),
+            Err(StorageError::Backpressure { what: "log", .. })
+        ));
+        assert_eq!(engine.memory_load().1, 1_000);
+        assert_eq!(engine.apply_queue_depth(), (1, 1));
+        assert!(engine.wal_bytes() > 0);
+        ps.apply_logged(0, wal_seq, &[(&ev, 1, 7)], 1_000)
+            .await
+            .unwrap();
+        ps.check_l0_backpressure(0).unwrap();
+        assert_eq!(engine.memory_load().1, 0);
+        assert_eq!(engine.apply_queue_depth(), (0, 0));
+        assert!(engine.memory_load().0 > 0);
+
+        // Rows in L0 are bounded in bytes too, until a flush moves them to a segment.
+        engine.set_byte_limits((1, usize::MAX), (usize::MAX, usize::MAX));
+        assert!(matches!(
+            ps.check_l0_backpressure(0),
+            Err(StorageError::Backpressure { what: "l0", .. })
+        ));
         ps.flush_all().await.unwrap();
         ps.check_l0_backpressure(0).unwrap();
-        assert_eq!(engine.l0_bytes(), 0);
+        assert_eq!(engine.memory_load().0, 0);
+        assert_eq!(engine.wal_bytes(), 0);
     }
 
     struct FakeLeases {

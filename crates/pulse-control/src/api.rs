@@ -2284,7 +2284,7 @@ async fn handle_status(
         let ps = ctrl
             .qengine
             .storage()
-            .get_or_open_project(&pid)
+            .open_for_read(&pid)
             .await
             .map_err(CtrlError::internal)?;
         let snap = ps.snapshot();
@@ -2343,6 +2343,17 @@ async fn handle_admin_flush(
         return Err(CtrlError::forbidden(
             "cluster flush requires root admin token",
         ));
+    }
+    if let Some(ing) = ctrl.ingest.read().await.clone() {
+        ing.flush_all().await.map_err(|e| match &e {
+            pulse_ingest::IngestError::Storage(
+                pulse_storage::StorageError::Io(_)
+                | pulse_storage::StorageError::ObjectStore(_)
+                | pulse_storage::StorageError::NotWriter { .. }
+                | pulse_storage::StorageError::StaleWriter { .. },
+            ) => CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+            _ => CtrlError::internal(e),
+        })?;
     }
     let flushed = ctrl
         .qengine

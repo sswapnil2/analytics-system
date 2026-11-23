@@ -16,11 +16,11 @@ Two tools help with almost everything below:
 | `401` | Missing or unknown ingest key | Send `x-pulse-key: pk_live_…` from *this* node and project |
 | `409` | `identify` tried to merge two ids that are both already identified users | Expected protection. Don't call `identify(B)` while still identified as `A`; call `reset()` on logout |
 | `413` | Request body over 8 MiB | Send smaller batches |
-| `422` | Schema cap hit: more than 128 new event names or 256 new property keys in one batch, or the project is at 8,192 event names or 16,384 property keys | You are probably putting ids or timestamps into event or property *names*. Put them in property *values* |
+| `422` | Schema cap hit on sync import or dictionary full on `/v1/identify` / `/v1/engage` | You are probably putting ids or timestamps into event or property *names*. Put them in property *values* |
 | `503` with `code: "not_writer"` | Another node holds this project's writer lease, this node restarted after a crash and its old lease has not expired yet, or it cannot reach the metadata database | Retry after `Retry-After` (the SDKs do). Clears within `PULSE_WRITER_LEASE_TTL_SECS` (15 s) of the other writer stopping. After a crash (no clean shutdown) the restarted node itself answers this for up to 15 s: each process has a new node id, so it waits out the lease its previous run held. With `--seed` it waits at startup instead (up to the TTL plus 2 s) and then starts. Route ingest to one node per project |
-| `429` | The response `code` says which: `rate_limited` (default 20,000 events/s per project per node), `l0_backpressure` (ingest is ahead of flushing), or `hot_segment_backpressure` (local `hot/segments/` awaiting S3 upload reached 2x `PULSE_HOT_SEGMENTS_*_MAX_MB`) | Retry after `Retry-After`. The SDKs do this. Raise `PULSE_INGEST_EVENTS_PER_SEC` if the load is legitimate; watch `pulse_l0_bytes` and `pulse_hot_segment_bytes` in `/metrics` (for `hot_segment_backpressure`, check S3 reachability and `pulse_maintenance_errors_total{kind="publish"}`). On agent trace ingest, `l0_backpressure` means unflushed traces reached `PULSE_AGENT_L0_MAX_MB` or `PULSE_AGENT_L0_PROJECT_MAX_MB`; it clears when the flush catches up |
-| `pulse_ingest_dead_lettered_events_total` grows | Events could not be stored, usually because the project reached 8,192 event names or 16,384 property keys | Find what is generating new names (ids or timestamps in event or property names). The events are under `wal_dead/<project>/` in the object store |
-| `5xx` | Storage write failed | Check the node log and `/readyz`. Events in that request were **not** acknowledged; retry them |
+| `429` | The response `code` says which: `rate_limited` (default 20,000 events/s per project per node), `ingest_buffer_backpressure` (W1 writer buffer full), `l0_backpressure` (ingest is ahead of flushing), `log_backpressure` (ingest is ahead of the processor that applies logged events), or `hot_segment_backpressure` (local `hot/segments/` awaiting S3 upload reached 2x `PULSE_HOT_SEGMENTS_*_MAX_MB`) | Retry after `Retry-After`. The SDKs do this. Raise `PULSE_INGEST_EVENTS_PER_SEC` if the load is legitimate; watch `pulse_writer_buffer_bytes`, `pulse_l0_bytes`, `pulse_ingest_log_lag_bytes`, `pulse_ingest_apply_lag_seconds`, and `pulse_hot_segment_bytes` in `/metrics` (for `hot_segment_backpressure`, check S3 reachability and `pulse_maintenance_errors_total{kind="publish"}`). On agent trace ingest, `l0_backpressure` means unflushed traces reached `PULSE_AGENT_L0_MAX_MB` or `PULSE_AGENT_L0_PROJECT_MAX_MB`; it clears when the flush catches up |
+| `pulse_ingest_dead_lettered_events_total` grows | Events could not be stored, usually because the project reached 8,192 event names or 16,384 property keys | Run `pulse-node dead-letters --project-id <id>` to inspect stored refusal reasons and events (`wal_dead/<project>/` under `<data_dir>/wal/` in `local` mode, or object store in `object` mode) |
+| `5xx` | Storage or WAL write failed | Check the node log and `/readyz`. Events in a `503` response were **not** buffered; retry them. (Once a WAL write fails, `/v1/ingest` returns `503` until WAL writes recover) |
 
 ## Events don't show up
 
@@ -35,9 +35,9 @@ Two tools help with almost everything below:
 | The user opted out | `pulse.hasOptedOut()` | `optIn()`, or check `optOutByDefault` |
 | `beforeSend` returned `null`, or the event is `dropped` in the lexicon | `debug: true` shows the drop; check Events & privacy | Fix the hook or the lexicon status |
 | The time range excludes the event | Device clock far off, or a backfill via `/import` | `/v1/ingest` corrects skew over 5 s using `sentAt`. For `/import`, check the timestamps you sent |
-| Counted as a duplicate | The response shows `deduped > 0` | Send a distinct `messageId` per real event. Same id or same content within 15–30 min counts as a retry |
+| Counted as a duplicate | `pulse_ingest_events_deduped_total` in `/metrics` increments (note: `/v1/ingest` always returns `deduped: 0` because dedup runs in the async WAL flusher) | Send a distinct `messageId` per real event. Same id or same content within 15–30 min counts as a retry |
 
-Events are queryable as soon as ingest returns `200`. You don't need to wait for a flush.
+Events are normally applied and queryable within milliseconds of `/v1/ingest` returning `200` (queries on the same node wait up to 250 ms). You don't need to wait for a segment flush.
 
 ## Numbers look wrong
 

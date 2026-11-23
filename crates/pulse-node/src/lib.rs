@@ -226,6 +226,8 @@ impl RunningNode {
             tracing::error!(error = %e, "closing agent trace store on shutdown failed");
         }
         if !self.storage.identity_router().is_read_only() {
+            // Drain W1 ingest buffers to WAL and finish applying queued WAL records before final L0 flush.
+            self.ingest.shutdown().await;
             // Losing these would lose acknowledged data from memory: say so loudly.
             if let Err(e) = self.storage.flush_all_projects().await {
                 tracing::error!(error = %e, "final flush on shutdown failed");
@@ -1093,6 +1095,130 @@ async fn restore_from_published_inner(
     Ok(reports)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeadLetterItem {
+    pub object_path: String,
+    pub bucket_id: u8,
+    pub wal_seq: u64,
+    pub recorded_at_ms: i64,
+    pub reason: String,
+    pub event: pulse_wire::WireEvent,
+}
+
+/// Lists dead-lettered events for `project_id` under `wal_dead/{project_id}/` without mutating
+/// `<data_dir>` or fencing an active writer, filtering out events belonging to erased users
+/// (`client_event_ts_ms <= erased_at_ms`).
+pub async fn inspect_dead_letters(
+    data_dir: &std::path::Path,
+    project_id: &str,
+    bucket_filter: Option<u8>,
+    limit: Option<usize>,
+) -> anyhow::Result<Vec<DeadLetterItem>> {
+    let raw_s3 = pulse_storage::build_object_store_for_inspect(data_dir)?;
+    let db_url = std::env::var("DATABASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let meta = if let Some(url) = db_url {
+        Some(MetaStore::connect_url(&url).await?)
+    } else if data_dir.join("pulse_meta.db").is_file() {
+        Some(MetaStore::connect_auto(data_dir).await?)
+    } else {
+        None
+    };
+    inspect_dead_letters_inner(
+        data_dir,
+        project_id,
+        bucket_filter,
+        limit,
+        raw_s3,
+        meta.as_ref(),
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn inspect_dead_letters_with_store_and_meta_for_test(
+    data_dir: &std::path::Path,
+    project_id: &str,
+    bucket_filter: Option<u8>,
+    limit: Option<usize>,
+    raw_s3: Arc<dyn object_store::ObjectStore>,
+    meta: Option<&MetaStore>,
+) -> anyhow::Result<Vec<DeadLetterItem>> {
+    inspect_dead_letters_inner(data_dir, project_id, bucket_filter, limit, raw_s3, meta).await
+}
+
+async fn inspect_dead_letters_inner(
+    data_dir: &std::path::Path,
+    project_id: &str,
+    bucket_filter: Option<u8>,
+    limit: Option<usize>,
+    raw_s3: Arc<dyn object_store::ObjectStore>,
+    meta: Option<&MetaStore>,
+) -> anyhow::Result<Vec<DeadLetterItem>> {
+    let routed = pulse_storage::open_hot_store_for_inspect(raw_s3, data_dir).await?;
+    let enc = Arc::new(pulse_storage::EncryptedObjectStore::new(routed));
+    if let Some(m) = meta {
+        if !m.list_system_keyring().await?.is_empty() {
+            pulse_control::restore_encryption_keyring_to_store(m, &enc)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+    }
+    let enc_store = enc.as_object_store();
+
+    let entries = pulse_storage::list_dead_letters(&enc_store, project_id, bucket_filter).await?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let erased: pulse_storage::ErasedUids = if let Some(m) = meta {
+        m.list_erased_uids(project_id).await?.into_iter().collect()
+    } else {
+        pulse_storage::ErasedUids::default()
+    };
+
+    let (id_graph_opt, expanded) = if !erased.is_empty() {
+        let g = pulse_identity::ProjectIdentityGraph::open_read_only(project_id, enc_store.clone())
+            .await?;
+        let exp = pulse_storage::expand_erased_with_identity(&erased, Some(&g));
+        (Some(g), exp)
+    } else {
+        (None, erased)
+    };
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(ref g) = id_graph_opt {
+            let raw_uid = g.lookup_raw(&entry.event.distinct_id);
+            let canon_uid = g.lookup_canonical(&entry.event.distinct_id);
+            let hidden = raw_uid.is_some_and(|u| expanded.hides(u, entry.event.client_event_ts_ms))
+                || canon_uid.is_some_and(|u| expanded.hides(u, entry.event.client_event_ts_ms));
+            if hidden {
+                continue;
+            }
+        }
+        out.push(DeadLetterItem {
+            object_path: entry.object_path,
+            bucket_id: entry.bucket_id,
+            wal_seq: entry.wal_seq,
+            recorded_at_ms: entry.recorded_at_ms,
+            reason: entry
+                .reason
+                .unwrap_or_else(|| "unknown (legacy PLSB)".to_string()),
+            event: entry.event,
+        });
+        if let Some(lim) = limit {
+            if out.len() >= lim {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -1603,6 +1729,7 @@ mod tests {
         assert_eq!(post_login.status(), reqwest::StatusCode::OK);
 
         // 4. Flush Ingest node and refresh Query node manifests + read-only identity graph
+        ingest_node.ingest.flush_all().await.unwrap();
         ingest_node.storage.flush_all_projects().await.unwrap();
         query_node.storage.refresh_all_manifests().await.unwrap();
 
@@ -1667,6 +1794,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(post_query_ingest.status(), reqwest::StatusCode::OK);
+        ingest_node.ingest.flush_all().await.unwrap();
         ingest_node.storage.flush_all_projects().await.unwrap();
 
         // 7. A profile written through the ingest node reaches the query node's catalog on its
@@ -1760,6 +1888,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            ingest_node.ingest.flush_all().await.unwrap();
             ingest_node.storage.flush_all_projects().await.unwrap();
         }
         let ps = ingest_node
@@ -1853,11 +1982,8 @@ mod tests {
         node_a.shutdown().await;
         let resp = post(node_b.http_addr, "b1").await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let ps = node_b
-            .storage
-            .get_or_open_project("proj_lease")
-            .await
-            .unwrap();
+        node_b.ingest.flush_all().await.unwrap();
+        let ps = node_b.storage.open_for_read("proj_lease").await.unwrap();
         let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
         assert_eq!(rows, 5, "takeover lost or duplicated acknowledged events");
         let profile = node_b

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +7,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use parking_lot::Mutex;
 use pulse_wire::WireBatch;
 
 use crate::error::{Result, StorageError};
@@ -23,6 +25,19 @@ pub struct BucketWal {
     min_valid_epoch: AtomicU64,
     next_seq: AtomicU64,
     object_store: Arc<dyn ObjectStore>,
+    node_wal_bytes: Option<Arc<AtomicU64>>,
+    live_file_sizes: Mutex<HashMap<ObjectPath, u64>>,
+}
+
+impl Drop for BucketWal {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.node_wal_bytes {
+            let rem: u64 = self.live_file_sizes.get_mut().values().sum();
+            if rem > 0 {
+                counter.fetch_sub(rem, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl BucketWal {
@@ -40,6 +55,34 @@ impl BucketWal {
             min_valid_epoch: AtomicU64::new(0),
             next_seq: AtomicU64::new(committed_seq + 1),
             object_store,
+            node_wal_bytes: None,
+            live_file_sizes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_wal_bytes_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.node_wal_bytes = Some(counter);
+        self
+    }
+
+    fn record_live_file(&self, path: ObjectPath, size: u64) {
+        let mut sizes = self.live_file_sizes.lock();
+        let prev = sizes.insert(path, size).unwrap_or(0);
+        if let Some(counter) = &self.node_wal_bytes {
+            if size >= prev {
+                counter.fetch_add(size - prev, Ordering::Relaxed);
+            } else {
+                counter.fetch_sub(prev - size, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn unrecord_live_file(&self, path: &ObjectPath) {
+        let mut sizes = self.live_file_sizes.lock();
+        if let Some(prev) = sizes.remove(path) {
+            if let Some(counter) = &self.node_wal_bytes {
+                counter.fetch_sub(prev, Ordering::Relaxed);
+            }
         }
     }
 
@@ -95,6 +138,7 @@ impl BucketWal {
         frame.extend_from_slice(&payload);
 
         let path = self.object_path(epoch, seq);
+        let frame_len = frame.len() as u64;
         // Create-only: a second writer on this log fails loudly instead of replacing a record.
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -105,7 +149,10 @@ impl BucketWal {
             .put_opts(&path, PutPayload::from_bytes(Bytes::from(frame)), opts)
             .await
         {
-            Ok(_) => Ok(seq),
+            Ok(_) => {
+                self.record_live_file(path, frame_len);
+                Ok(seq)
+            }
             Err(object_store::Error::AlreadyExists { .. }) => {
                 tracing::error!(
                     project_id = %self.project_id,
@@ -155,8 +202,9 @@ impl BucketWal {
             .put(&qpath, PutPayload::from_bytes(Bytes::copy_from_slice(raw)))
             .await
             .is_ok()
+            && self.object_store.delete(loc).await.is_ok()
         {
-            let _ = self.object_store.delete(loc).await;
+            self.unrecord_live_file(loc);
         }
     }
 
@@ -173,6 +221,7 @@ impl BucketWal {
 
         for meta in metas {
             if let Some((ep, seq)) = parse_epoch_and_seq_from_wal_path(meta.location.as_ref()) {
+                self.record_live_file(meta.location.clone(), meta.size);
                 if ep >= min_epoch && seq > committed_seq {
                     candidates.push((ep, seq, meta.location));
                 }
@@ -229,7 +278,9 @@ impl BucketWal {
         for meta in metas {
             if let Some((ep, seq)) = parse_epoch_and_seq_from_wal_path(meta.location.as_ref()) {
                 if seq <= flushed_seq || ep < min_epoch {
-                    let _ = self.object_store.delete(&meta.location).await;
+                    if self.object_store.delete(&meta.location).await.is_ok() {
+                        self.unrecord_live_file(&meta.location);
+                    }
                     deleted += 1;
                 }
             }

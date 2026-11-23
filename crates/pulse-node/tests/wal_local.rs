@@ -71,7 +71,7 @@ async fn post_event(node: &RunningNode, key: &str, user: &str) -> u16 {
 }
 
 async fn rows(node: &RunningNode) -> usize {
-    let ps = node.storage.get_or_open_project(PID).await.unwrap();
+    let ps = node.storage.open_for_read(PID).await.unwrap();
     ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows()
 }
 
@@ -113,6 +113,7 @@ fn a_crash_loses_no_acknowledged_event_with_the_wal_on_local_disk() {
             for i in 0..50 {
                 assert_eq!(post_event(&node, &key, &format!("u{i}")).await, 200);
             }
+            node.ingest.flush_all().await.unwrap();
             std::mem::forget(node);
             key
         });
@@ -150,6 +151,7 @@ async fn a_clean_shutdown_leaves_the_local_wal_empty_and_the_object_store_comple
     for i in 0..20 {
         assert_eq!(post_event(&node, &key, &format!("u{i}")).await, 200);
     }
+    node.ingest.flush_all().await.unwrap();
     let wal_dir = tmp.path().join("node").join("wal");
     assert!(
         !files_under(&wal_dir).is_empty(),
@@ -210,9 +212,24 @@ async fn an_unwritable_wal_directory_answers_503_and_acknowledges_nothing() {
     let store = Arc::new(InMemory::new());
     let (node, key) = start(tmp.path(), &store).await;
     assert_eq!(post_event(&node, &key, "ok").await, 200);
+    node.ingest.flush_all().await.unwrap();
+    assert_eq!(rows(&node).await, 1);
+
     let wal_dir = tmp.path().join("node").join("wal");
     set_mode_recursive(&wal_dir, 0o555);
-    let refused = post_event(&node, &key, "refused").await;
+    // First async event queues in W1 buffer and trips the sticky wal_error when the flusher hits EACCES.
+    assert_eq!(post_event(&node, &key, "buffered_before_error").await, 200);
+    let mut tripped = false;
+    for _ in 0..20 {
+        let status = post_event(&node, &key, "refused").await;
+        if status == 503 {
+            tripped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(tripped, "expected 503 once sticky wal_error tripped");
+    let refused = post_event(&node, &key, "refused_2").await;
     let trace = reqwest::Client::new()
         .post(format!("http://{}/v1/agent/traces", node.http_addr))
         .header("x-pulse-key", &key)
@@ -232,8 +249,17 @@ async fn an_unwritable_wal_directory_answers_503_and_acknowledges_nothing() {
         (503, 503),
         "(event, trace) with an unwritable WAL"
     );
-    assert_eq!(rows(&node).await, 1, "the refused event was not applied");
+    // Once WAL permissions recover, the previously 200-acked batch drains cleanly without loss,
+    // while the 503-refused batches were never queued.
+    node.ingest.flush_all().await.unwrap();
+    assert_eq!(
+        rows(&node).await,
+        2,
+        "only the 200-acked events (initial + pre-error buffered) were applied; 503 requests were refused"
+    );
     assert_eq!(post_event(&node, &key, "again").await, 200);
+    node.ingest.flush_all().await.unwrap();
+    assert_eq!(rows(&node).await, 3);
     node.shutdown().await;
 }
 
@@ -419,34 +445,48 @@ fn crash_recovery_preserves_local_identity_and_profiles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unwritable_hot_directory_answers_503_on_new_user_ingest() {
+async fn unwritable_hot_directory_answers_503_on_sync_profile_calls() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(InMemory::new());
     let (node, key) = start(tmp.path(), &store).await;
     assert_eq!(post_event(&node, &key, "seed_user").await, 200);
+    node.ingest.flush_all().await.unwrap();
 
     let hot_dir = tmp.path().join("node").join("hot");
     set_mode_recursive(&hot_dir, 0o555);
-    let resp = reqwest::Client::new()
-        .post(format!("http://{}/v1/ingest", node.http_addr))
+    let http = reqwest::Client::new();
+    // Under PR #98 + W1, /v1/ingest writes only to wal/ (still writable) and returns 200,
+    // while synchronous /v1/identify and /v1/engage touch hot/identity and hot/profiles and return 503.
+    let id_resp = http
+        .post(format!("http://{}/v1/identify", node.http_addr))
         .header("x-pulse-key", &key)
-        .json(&json!({ "events": [{
-            "distinct_id": "brand_new_user_while_unwritable",
-            "event_name": "App_Open",
-            "client_event_ts_ms": chrono::Utc::now().timestamp_millis(),
-        }]}))
+        .json(&json!({"anon_id": "anon_unwritable", "user_id": "user_unwritable"}))
         .send()
         .await
         .unwrap();
-    let refused = resp.status().as_u16();
-    let refused_body = resp.text().await.unwrap_or_default();
+    let id_status = id_resp.status().as_u16();
+    let id_body = id_resp.text().await.unwrap_or_default();
+
+    let eng_resp = http
+        .post(format!("http://{}/v1/engage", node.http_addr))
+        .header("x-pulse-key", &key)
+        .json(&json!({"distinct_id": "seed_user", "$set": {"tier": "gold"}}))
+        .send()
+        .await
+        .unwrap();
+    let eng_status = eng_resp.status().as_u16();
+    let eng_body = eng_resp.text().await.unwrap_or_default();
     set_mode_recursive(&hot_dir, 0o755);
 
     assert_eq!(
-        refused, 503,
-        "unwritable local hot/ directory must answer 503 on new-user ingest; body={refused_body}"
+        id_status, 503,
+        "unwritable local hot/ directory must answer 503 on /v1/identify; body={id_body}"
     );
-    assert_eq!(rows(&node).await, 1, "refused event must not be applied");
+    assert_eq!(
+        eng_status, 503,
+        "unwritable local hot/ directory must answer 503 on /v1/engage; body={eng_body}"
+    );
+    assert_eq!(rows(&node).await, 1);
     assert_eq!(post_event(&node, &key, "recovered_user").await, 200);
     node.shutdown().await;
 }

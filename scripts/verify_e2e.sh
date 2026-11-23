@@ -149,13 +149,17 @@ IDENTIFY_RES="$(curl -fsS -X POST "${BASE_URL}/v1/identify" \
   -H "x-pulse-key: ${API_KEY}" \
   -d '{"anon_id":"anon_e2e_verify_01","user_id":"+919899900001","routing_seed":"dev_e2e_verify_01"}')"
 
-python3 - "$INGEST_1" "$INGEST_2" "$IDENTIFY_RES" <<'PY'
-import json, sys
-r1, r2, ident = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3])
+METRICS_TEXT="$(curl -fsS "${BASE_URL}/metrics")"
+
+python3 - "$INGEST_1" "$INGEST_2" "$IDENTIFY_RES" "$METRICS_TEXT" <<'PY'
+import json, re, sys
+r1, r2, ident, metrics = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4]
 assert r1["accepted"] == 2 and r1["deduped"] == 0, f"expected 2 accepted on first send, got {r1}"
-assert r2["accepted"] == 0 and r2["deduped"] == 2, f"expected 2 deduped on retry, got {r2}"
+assert r2["accepted"] == 2 and r2["deduped"] == 0, f"expected W1 async ack (accepted=2, deduped=0) on retry, got {r2}"
+m = re.search(r"^pulse_ingest_events_deduped_total\s+(\d+(?:\.\d+)?)$", metrics, re.M)
+assert m and float(m.group(1)) >= 2, f"expected pulse_ingest_events_deduped_total >= 2 in /metrics:\n{metrics}"
 assert ident["status"] == "ok" and int(ident["canonical_uid"]) >= 0, f"identify failed: {ident}"
-print(f"      ✓ First batch accepted=2, retry deduped=2, identify canonical_uid={ident['canonical_uid']}")
+print(f"      ✓ First batch accepted=2, W1 retry acked with deduped=0 (metrics deduped_total={m.group(1)}), identify canonical_uid={ident['canonical_uid']}")
 PY
 
 # 3. Verify POST /v1/query across all 4 core report types (Insights, Funnel, Retention, Flows)

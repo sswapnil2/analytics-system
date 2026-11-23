@@ -2,7 +2,9 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use chrono::{DateTime, SecondsFormat};
-use pulse_node::{restore_from_published, start_pulse_node, NodeConfig, NodeRole};
+use pulse_node::{
+    inspect_dead_letters, restore_from_published, start_pulse_node, NodeConfig, NodeRole,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -11,16 +13,27 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,slatedb=warn")),
-        )
-        .init();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let is_cli_subcommand = matches!(
+        args.first().map(|s| s.as_str()),
+        Some("restore" | "dead-letters")
+    );
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,slatedb=warn"));
+    if is_cli_subcommand {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+
     if args.first().map(|s| s.as_str()) == Some("restore") {
         return run_restore_cli(&args[1..]).await;
+    }
+    if args.first().map(|s| s.as_str()) == Some("dead-letters") {
+        return run_dead_letters_cli(&args[1..]).await;
     }
 
     let mut cfg = NodeConfig::default();
@@ -136,10 +149,12 @@ fn print_usage() {
          USAGE:\n\
          \tpulse-node [OPTIONS]\n\
          \tpulse-node restore --from-published [--data-dir <PATH>] [--project-id <ID>]\n\
+         \tpulse-node dead-letters --project-id <ID> [--data-dir <PATH>] [--bucket <N>] [--limit <N>] [--json]\n\
          \n\
          SUBCOMMANDS:\n\
          \trestore --from-published   Restore local hot state from newest S3 published manifest(s)\n\
          \t                           (requires external Postgres DATABASE_URL; refuses SQLite)\n\
+         \tdead-letters               List dead-lettered events for a project (filtering erased users)\n\
          \n\
          OPTIONS:\n\
          \t--host <IP>          HTTP bind address (default: 127.0.0.1, env: PULSE_HOST)\n\
@@ -228,5 +243,96 @@ async fn run_restore_cli(args: &[String]) -> anyhow::Result<()> {
             r.project_id, ts_iso, r.published_at_ms
         );
     }
+    Ok(())
+}
+
+async fn run_dead_letters_cli(args: &[String]) -> anyhow::Result<()> {
+    let mut data_dir = std::env::var("PULSE_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./pulse_data"));
+    let mut project_id: Option<String> = None;
+    let mut bucket: Option<u8> = None;
+    let mut limit: Option<usize> = None;
+    let mut json_output = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let next_val = |flag: &str, idx: &mut usize| -> anyhow::Result<&str> {
+            *idx += 1;
+            args.get(*idx)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+        };
+        match arg {
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            "--data-dir" => {
+                data_dir = PathBuf::from(next_val("--data-dir", &mut i)?);
+            }
+            "--project-id" => {
+                let pid = next_val("--project-id", &mut i)?.trim().to_string();
+                if pid.is_empty() {
+                    anyhow::bail!("--project-id cannot be empty");
+                }
+                project_id = Some(pid);
+            }
+            "--bucket" => {
+                let raw = next_val("--bucket", &mut i)?;
+                bucket = Some(
+                    raw.parse::<u8>()
+                        .map_err(|e| anyhow::anyhow!("invalid --bucket '{raw}': {e}"))?,
+                );
+            }
+            "--limit" => {
+                let raw = next_val("--limit", &mut i)?;
+                limit = Some(
+                    raw.parse::<usize>()
+                        .map_err(|e| anyhow::anyhow!("invalid --limit '{raw}': {e}"))?,
+                );
+            }
+            "--json" => {
+                json_output = true;
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown dead-letters argument '{other}' (run with --help for usage)"
+                );
+            }
+        }
+        i += 1;
+    }
+
+    let pid =
+        project_id.ok_or_else(|| anyhow::anyhow!("dead-letters requires --project-id <ID>"))?;
+    let items = inspect_dead_letters(&data_dir, &pid, bucket, limit).await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+
+    for item in &items {
+        let ts_iso = DateTime::from_timestamp_millis(item.recorded_at_ms)
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_else(|| format!("{}ms", item.recorded_at_ms));
+        println!(
+            "{ts_iso}\tbucket={}\twal_seq={}\tevent={}\tdistinct_id={}\tevent_ts_ms={}\treason={}\tpath={}",
+            item.bucket_id,
+            item.wal_seq,
+            item.event.event_name,
+            item.event.distinct_id,
+            item.event.client_event_ts_ms,
+            item.reason,
+            item.object_path
+        );
+    }
+    eprintln!(
+        "Total dead-lettered events for `{pid}` (excluding erased users): {}",
+        items.len()
+    );
     Ok(())
 }

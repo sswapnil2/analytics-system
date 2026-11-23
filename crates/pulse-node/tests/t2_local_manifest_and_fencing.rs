@@ -541,6 +541,7 @@ fn t2_15_dense_publish_seq_fencing_and_step6_self_crash_recovery() {
                     .status(),
                 200
             );
+            node_a.ingest.flush_all().await.unwrap();
             node_a.storage.flush_all_projects().await.unwrap();
             node_a.storage.publish_all_projects().await.unwrap();
 
@@ -556,7 +557,8 @@ fn t2_15_dense_publish_seq_fencing_and_step6_self_crash_recovery() {
                         .status(),
                     200
                 );
-                node_a.storage.flush_all_projects().await.unwrap();
+                node_a.ingest.flush_all().await.unwrap();
+            node_a.storage.flush_all_projects().await.unwrap();
             }
             let ps_a = node_a.storage.get_or_open_project(pid).await.unwrap();
             let a_local_epoch = ps_a.snapshot().epoch();

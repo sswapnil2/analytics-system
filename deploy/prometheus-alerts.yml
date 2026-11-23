@@ -1,0 +1,82 @@
+groups:
+  - name: pulse-ingest-and-storage
+    rules:
+      - alert: PulseIngestApplyLagHigh
+        expr: pulse_ingest_apply_lag_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse WAL-to-L0 apply lag is above 60s"
+          description: >-
+            Per-bucket background processor apply lag (pulse_ingest_apply_lag_seconds)
+            has exceeded 60s for 2 minutes. Same-node read-your-writes (250ms wait) and
+            flush throughput may degrade if lag continues to grow.
+
+      - alert: PulseIngestApplyLagApproachingDedupWindow
+        expr: pulse_ingest_apply_lag_seconds > 600
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pulse WAL-to-L0 apply lag is approaching the 15-minute dedup window"
+          description: >-
+            pulse_ingest_apply_lag_seconds exceeded 600s (10m) against the 15-minute
+            DEDUP_WINDOW_MS (15-30m effective retention). Investigate storage or dead-letter
+            I/O errors immediately to avoid duplicate inflation on client retries or restarts.
+
+      - alert: PulseIngestLogLagHigh
+        expr: (pulse_ingest_log_lag_bytes / clamp_min(pulse_ingest_log_lag_limit_bytes, 1)) > 0.75
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse unapplied WAL lag bytes exceed 75% of node limit"
+          description: >-
+            pulse_ingest_log_lag_bytes is above 75% of pulse_ingest_log_lag_limit_bytes.
+            Ingest will begin returning HTTP 429 (log_backpressure) at 100%.
+
+      - alert: PulseWriterBufferSaturation
+        expr: (pulse_writer_buffer_bytes / clamp_min(pulse_writer_buffer_capacity_bytes, 1)) > 0.80
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse writer memory buffer exceeds 80% capacity"
+          description: >-
+            pulse_writer_buffer_bytes is above 80% of pulse_writer_buffer_capacity_bytes.
+            Check WAL disk latency or S3 health; if WAL writes are failing, /v1/ingest
+            returns HTTP 503; otherwise buffer saturation triggers HTTP 429 (ingest_buffer_backpressure).
+
+      - alert: PulseHotSegmentBackpressureRisk
+        expr: pulse_hot_segment_bytes > 3221225472
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse local hot/segments/ exceeds 3 GiB (1.5x default 1x limit)"
+          description: >-
+            Local hot/segments/ waiting for S3 upload has exceeded 3 GiB.
+            Ingest returns HTTP 429 (hot_segment_backpressure) at 2x the configured limit
+            (4 GiB default). Verify S3 connectivity and pulse_maintenance_errors_total{kind="publish"}.
+
+      - alert: PulseDeadLetteredEventsDetected
+        expr: increase(pulse_ingest_dead_lettered_events_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse dead-lettered events written to wal_dead/"
+          description: >-
+            One or more events could not be applied (typically due to per-project schema
+            caps of 8,192 event names or 16,384 property keys) and were written to wal_dead/.
+            Inspect with `pulse-node dead-letters --project-id <ID>`.
+
+      - alert: PulseMaintenanceErrorsDetected
+        expr: increase(pulse_maintenance_errors_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse background storage maintenance errors detected"
+          description: >-
+            pulse_maintenance_errors_total increased in the last 5 minutes (check kind label:
+            identity_flush, flush, compaction, manifest_refresh, or publish).

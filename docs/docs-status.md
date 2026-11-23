@@ -17,13 +17,13 @@ Every architecture page was written from the source on `main`, not from older do
 | `/healthz`, `/readyz` | `ok`, `ready` |
 | Ingest key printed on first boot; `POST /v1/projects/:id/api-keys` | Returns `plaintext_key` once |
 | Quickstart `curl` to `/v1/ingest` | `{"status":"ok","accepted":1,…}` |
-| Server-side example in [Integrations](integrations.md#server-side-events-over-http), sent twice with the same `messageId` | First `accepted: 1`, retry `deduped: 1` |
+| Server-side example in [Integrations](integrations.md#server-side-events-over-http), sent twice with the same `messageId` | Both `/v1/ingest` responses return `accepted: 1, deduped: 0` (W1 async ack); `pulse_ingest_events_deduped_total` increments by `1` after the 20 ms WAL flush |
 | Batch with one invalid event | `200` with `rejected: [{index: 1, error: "missing event name…"}]` |
 | Unknown ingest key / ingest key on an admin route / 9 MiB body | `401` / `403` / `413` |
 | Insights query from the Integrations page; `sampling` set to `"exact"`, `"auto"`, `{"rate":0.25}` | Returns series and a `sampling` object |
 | `/v1/identify` merging two identified users | `409` with the documented message |
 | `DELETE /v1/projects/:id/users/:distinct_id`, then `GET …/deletions` | Erasure recorded with `events_purged` |
-| `/metrics` | `pulse_ingest_events_*`, `pulse_l0_rows`, `pulse_ready` present |
+| `/metrics` | `pulse_ingest_events_*`, `pulse_writer_*`, `pulse_wal_bytes`, `pulse_ingest_apply_*`, `pulse_l0_rows`, `pulse_ready` present |
 | MCP `tools/list` | The 9 tools listed in [MCP](mcp.md) |
 | `GET /v1/flags/:key` | `200` with a weak `ETag` |
 

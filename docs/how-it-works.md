@@ -52,36 +52,37 @@ sequenceDiagram
     autonumber
     participant SDK as SDK / HTTP client
     participant H as Ingest HTTP handler<br/>(pulse-ingest/http.rs)
-    participant S as IngestService<br/>(pulse-ingest/service.rs)
+    participant S as IngestService + Writer Buffer<br/>(pulse-ingest/service.rs)
+    participant P as Per-bucket Processor<br/>(pulse-ingest/service.rs)
     participant ID as Identity graph<br/>(pulse-identity, SlateDB)
     participant W as Bucket WAL<br/>(object store)
     participant L0 as L0 MemBucket<br/>(memory)
     SDK->>H: POST /v1/ingest (x-pulse-key)
     H->>S: authenticate key → project
     S->>S: decode JSON / PLSB, per-project rate limit
-    S->>S: per event: lexicon rules (drop / PII-mask),<br/>route to bucket, dedup check, schema caps,<br/>clock-skew fix, intern distinct_id → u32
-    S->>S: L0 backpressure check (429 if a bucket is full)
-    S->>ID: durable flush of new ids / aliases
+    S->>S: per event: lexicon rules (drop / PII-mask),<br/>route to bucket, clock-skew fix
+    S->>S: check sticky WAL error (503),<br/>hot-segment/L0/log/buffer backpressure (429)
+    S->>S: queue in writer buffer (20 ms / 1 MiB)
+    S-->>SDK: 200 {accepted, deduped: 0, dropped, rejected[]}
+    Note over S,W: Flusher runs asynchronously (every 20 ms or 1 MiB):
     par for each touched bucket
-        S->>W: durable WAL append (one object PUT)
-        S->>L0: insert rows
-        S->>S: commit dedup fingerprints
+        S->>W: dedup check + WAL append + commit dedup
+        S->>P: send LoggedRecord (bounded mpsc(256))
+        P->>ID: intern distinct_id → u32 (dead-letter schema cap overflows)
+        P->>L0: insert rows
     end
-    S-->>SDK: 200 {accepted, deduped, dropped, rejected[]}
-    Note over L0: queryable immediately
+    Note over L0: queryable after apply (queries wait up to 250 ms)
 ```
 
 Steps 3 to 9 run in `IngestService` (`crates/pulse-ingest/src/service.rs`):
 
 1. **Authenticate and decode.** The ingest key selects the project. The batch is decoded, and a per-project token bucket limits ingest to 20,000 events/s with a 5 s burst by default (`PULSE_INGEST_EVENTS_PER_SEC`, `PULSE_INGEST_BURST_SECS`). Over the limit, the node answers `429` with `Retry-After`.
 2. **Apply governance.** [Lexicon](concepts.md#lexicon) rules can drop an event, drop properties, or mask PII properties *before* storage (`crates/pulse-ingest/src/governance.rs`).
-3. **Route to a bucket.** Each event goes to bucket `xxh3_64(routing_seed) % num_buckets` (16 by default). All of a device's events land in the same bucket. Per-user work then never crosses buckets, and sampling can take whole users at a time.
-4. **Deduplicate.** The server fingerprints each event: its id if it has one, otherwise a hash of its whole content. It checks that fingerprint against two rotating 15-minute windows per bucket. The windows are re-seeded from the WAL on restart.
-5. **Apply schema caps.** One batch may add at most 128 new event names or 256 new property keys. A project may hold at most 8,192 event names and 16,384 property keys. Going over a cap rejects the **whole batch** with `422`.
-6. **Correct the clock.** If the device's `sent_at` differs from server time by more than 5 s, the event time is shifted by that difference. `/import` never does this, because backfills are old on purpose.
-7. **Write the identity graph first.** New distinct ids and aliases are flushed durably before any event that refers to them is written.
-8. **Write the WAL, then memory.** For each bucket, under that bucket's append lock, the rows go to a write-ahead-log object (`wal/{project}/bucket_NNN/epoch_E_seq_S.wal`, CRC-checked), then into the in-memory **L0** buffer. Dedup fingerprints are committed only after the WAL write succeeds.
-9. **Respond.** The node replies `200` only after the WAL write has succeeded. On the default local store, every object write is `fsync`ed, and so is its directory. An acknowledged event therefore survives a crash.
+3. **Route to a bucket and normalize timestamps.** Each event goes to bucket `xxh3_64(routing_seed) % num_buckets` (16 by default). All of a device's events land in the same bucket. If the device's `sent_at` differs from server time by more than 5 s, the event time is shifted by that difference (`/import` never does this).
+4. **Check backpressure and WAL health.** If a recent WAL write failed, `/v1/ingest` returns `503` immediately until the background flusher recovers. If L0 (`l0_backpressure`), unapplied WAL lag (`log_backpressure`), local `hot/segments/` (`hot_segment_backpressure`), or the writer memory buffer (`ingest_buffer_backpressure`) is over its cap, it returns `429 Retry-After: 1`.
+5. **Queue in the writer memory buffer and respond `200`.** Events enter a bounded per-project memory buffer (`PULSE_INGEST_BUFFER_PROJECT_MAX_MB` = 64 MiB, `PULSE_INGEST_BUFFER_MAX_MB` = 256 MiB). For mixed batches containing `identify`/`alias` calls, the prior project buffer is flushed and applied (`wait_applied(1s)`) and the profile calls run synchronously before the batch's events are committed to the buffer. The node replies `200` with `accepted` equal to the queued event count and `deduped: 0`.
+6. **Group-commit to the WAL (`20 ms` / `1 MiB`).** A background flusher drains each project's buffer every `PULSE_WRITER_FLUSH_MS` (default `20` ms) or when buffered bytes reach `PULSE_WRITER_FLUSH_BYTES` (default `1 MiB`). Under the bucket append lock, it deduplicates against two rotating 15-minute windows (`pulse_ingest_events_deduped_total`), appends a CRC-checked `PWL2` WAL frame (`wal/{project}/bucket_NNN/epoch_E_seq_S.wal`, `fsync`ed on local disk), commits the dedup fingerprints, and hands the record to the bucket's processor task. If a WAL write fails, the batch stays at the front of the queue and retries with backoff while tripping the `503` circuit-breaker.
+7. **Apply in WAL order off the request path.** A bounded per-bucket processor task enforces the per-project schema caps (8,192 event names, 16,384 property keys — dead-lettering overflows to `wal_dead/` with the refusal reason), interns `distinct_id`s in `identity/{proj}`, inserts L0 rows, and schedules L0-to-segment flushes (`stage_flush` before `id_graph.flush()`). Same-node queries wait up to 250 ms (`open_for_read`) for acknowledged records to be applied.
 
 Response codes are listed in [Troubleshooting](troubleshooting.md#ingest-errors).
 
@@ -116,7 +117,7 @@ All persistent state goes through one `object_store` interface (`crates/pulse-st
 ### L0, flush and segments
 
 - **L0 buffer.** L0 is an in-memory buffer per `(project, bucket)`. A bucket is flushed when it reaches 250,000 rows or turns 60 seconds old. A background loop checks every 5 s.
-- **Backpressure.** If a bucket grows past its high-water mark (`PULSE_L0_MAX_ROWS_PER_BUCKET`, default 1,000,000), or in-memory rows exceed their byte limit (`PULSE_L0_PROJECT_MAX_MB`, `PULSE_L0_MAX_MB`), ingest answers `429 Retry-After: 1` (`l0_backpressure`) until the flush catches up. Local `hot/segments/` bytes are bounded by `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB` / `PULSE_HOT_SEGMENTS_MAX_MB` (default `512` / `2048` MiB `1x`): crossing `1x` triggers an early upload cycle, and reaching `2x` answers `429 Retry-After: 1` (`hot_segment_backpressure`).
+- **Backpressure.** If a bucket grows past its high-water mark (`PULSE_L0_MAX_ROWS_PER_BUCKET`, default 1,000,000), in-memory rows exceed their byte limit (`PULSE_L0_PROJECT_MAX_MB`, `PULSE_L0_MAX_MB`), unapplied WAL records exceed `PULSE_LOG_LAG_PROJECT_MAX_MB` / `PULSE_LOG_LAG_MAX_MB` (`log_backpressure`), or the writer memory buffer exceeds `PULSE_INGEST_BUFFER_PROJECT_MAX_MB` / `PULSE_INGEST_BUFFER_MAX_MB` (`ingest_buffer_backpressure`), ingest answers `429 Retry-After: 1` until the background work catches up. Local `hot/segments/` bytes are bounded by `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB` / `PULSE_HOT_SEGMENTS_MAX_MB` (default `512` / `2048` MiB `1x`): crossing `1x` triggers an early upload cycle, and reaching `2x` answers `429 Retry-After: 1` (`hot_segment_backpressure`).
 - **Flush.** A flush groups rows by day and writes one **segment** per `(day, bucket)`: `hot/segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` on local disk under `PULSE_HOT_STORE=local` (zero S3 PUTs per flush), or directly to `segments/` under `PULSE_HOT_STORE=object`. It then commits a new **manifest** with compare-and-swap, then drops those rows from L0 and deletes the WAL objects it covered.
 - **Segment contents.** A segment holds [Vortex](https://github.com/spiraldb/vortex) columnar data, a Roaring-bitmap inverted index for low-cardinality properties, and a session index (`crates/pulse-storage/src/segment.rs`). Inside a segment, rows are sorted by user and time, so per-user scans such as funnels and retention read data in order.
 - **Footers in the manifest.** Each segment's **footer** is stored in the manifest, not in the segment file. It holds row and session counts, min and max time, a 64-bit event bloom filter, exact per-event counts, and HyperLogLog sketches (p = 10, about 3.25 % error) for the top 32 events. Many queries are answered, or have segments ruled out, from footers alone, without reading a segment.

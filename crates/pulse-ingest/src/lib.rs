@@ -15,8 +15,8 @@ pub use quic::{
     QUIC_OP_INGEST, QUIC_OP_REPLAY,
 };
 pub use service::{
-    IdentifyRequest, IdentifyResponse, IngestError, IngestMetrics, IngestResponse, IngestService,
-    ReplayIngestResponse, Result,
+    BufferStats, IdentifyRequest, IdentifyResponse, IngestError, IngestMetrics, IngestResponse,
+    IngestService, ReplayIngestResponse, Result,
 };
 
 #[cfg(test)]
@@ -147,9 +147,14 @@ mod tests {
                     retry_sample_batch = Some(WireBatch::new(wire_batch.events[0..1_000].to_vec()));
                 }
 
-                let bin = wire_batch.encode_binary(1).expect("encode PLSB");
+                let batch = WireBatch::decode_auto(
+                    &wire_batch.encode_binary(1).expect("encode PLSB"),
+                    Some("application/x-pulse-frame"),
+                    ingest.dict_registry(),
+                )
+                .unwrap();
                 let resp = ingest
-                    .ingest_raw("pk_gate2", Some("application/x-pulse-frame"), &bin)
+                    .ingest_for_project("proj_gate2", batch, chrono::Utc::now().timestamp_millis())
                     .await
                     .expect("ingest batch");
 
@@ -160,7 +165,7 @@ mod tests {
             assert_eq!(total_accepted, 500_000);
             assert_eq!(total_deduped, 100_000);
 
-            let ps = storage.get_or_open_project("proj_gate2").await.unwrap();
+            let ps = storage.open_for_read("proj_gate2").await.unwrap();
             assert_eq!(ps.total_l0_rows(), 500_000);
             assert_eq!(ps.snapshot().manifest.total_segments(), 0);
             // Simulate ABRUPT NODE CRASH here: drop `ingest` and `storage` WITHOUT flushing L0 to L1!
@@ -196,8 +201,18 @@ mod tests {
 
         // Retry a pre-crash batch AFTER restart and assert 100% deduplicated (0 duplicate inflation!)
         let retry_bin = retry_sample_batch.unwrap().encode_binary(1).unwrap();
+        let retry_batch = WireBatch::decode_auto(
+            &retry_bin,
+            Some("application/x-pulse-frame"),
+            ingest2.dict_registry(),
+        )
+        .unwrap();
         let retry_resp = ingest2
-            .ingest_raw("pk_gate2", Some("application/x-pulse-frame"), &retry_bin)
+            .ingest_for_project(
+                "proj_gate2",
+                retry_batch,
+                chrono::Utc::now().timestamp_millis(),
+            )
             .await
             .unwrap();
         assert_eq!(retry_resp.accepted, 0);
@@ -239,6 +254,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(r.accepted, 200);
+            ingest2.flush_all().await.unwrap();
             storage2.flush_all_projects().await.unwrap();
         }
 
@@ -371,7 +387,8 @@ mod tests {
         assert_eq!(resp.accepted, 1);
         assert_eq!(resp.dropped, 1);
 
-        let ps = storage.get_or_open_project("proj_quic").await.unwrap();
+        service.flush_all().await.unwrap();
+        let ps = storage.open_for_read("proj_quic").await.unwrap();
         let snap = ps.snapshot();
         let mut found_masked = false;
         for b in 0..ps.config().num_buckets {

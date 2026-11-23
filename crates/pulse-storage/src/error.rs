@@ -42,10 +42,12 @@ pub enum StorageError {
         high_water_mark: u64,
     },
 
-    /// Rows held in memory and not yet in a segment reached their byte limit.
-    #[error("l0 backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
+    /// `what` is `"l0"` (rows in memory not yet in a segment), `"log"` (events written to the
+    /// WAL and not yet applied), or `"ingest_buffer"` (queued events awaiting WAL write).
+    #[error("{what} backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
     Backpressure {
         project_id: String,
+        what: &'static str,
         bytes: usize,
         max_bytes: usize,
     },

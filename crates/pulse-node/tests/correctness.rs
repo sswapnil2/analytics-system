@@ -661,7 +661,22 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
         .ingest("/v1/ingest", json!({"events": ecommerce_events()}))
         .await;
     assert_eq!(st, 200, "{res}");
-    assert_eq!(res["deduped"].as_u64(), Some(15), "{res}");
+    assert_eq!(res["deduped"].as_u64(), Some(0), "{res}");
+    let (fl_st, fl_res) = api.admin("/v1/admin/flush", json!({})).await;
+    assert_eq!(fl_st, 200, "{fl_res}");
+    let metrics_text = api
+        .http
+        .get(format!("{}/metrics", api.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics_text.contains("pulse_ingest_events_deduped_total 15"),
+        "expected 15 deduped events in /metrics:\n{metrics_text}"
+    );
     for i in 60..70 {
         let (st, r) = api
             .ingest(
@@ -810,6 +825,8 @@ async fn analytics_answers_match_known_dataset_before_and_after_restart() {
         json!({"events": [{"event": "Seg Probe", "anonymousId": "seg_anon", "timestamp": t}]}),
     )
     .await;
+    let (st, fl) = api.admin("/v1/admin/flush", json!({})).await;
+    assert_eq!(st, 200, "flush: {fl}");
     let seg = json!([{"prop_name": "user.segment_plan", "filter": {"op": "eq", "val": "pro"}}]);
     assert_eq!(
         api.total("Seg Probe", json!("uniques"), seg).await,

@@ -271,6 +271,7 @@ fn t2_17_remote_query_node_reads_published_state_with_byok_and_live_erasure() {
                 .status(),
             200
         );
+        ingest_node.ingest.flush_all().await.unwrap();
         ingest_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(ingest_node.storage.publish_all_projects().await.unwrap(), 1);
 
@@ -408,6 +409,7 @@ fn t2_17_remote_query_node_reads_published_state_with_byok_and_live_erasure() {
                 .status(),
             200
         );
+        ingest_node.ingest.flush_all().await.unwrap();
         ingest_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(ingest_node.storage.publish_all_projects().await.unwrap(), 1);
 
@@ -715,6 +717,7 @@ fn t2_17_remote_query_node_dynamic_byok_rotation_and_profile_index_single_tick()
             200
         );
 
+        writer_node.ingest.flush_all().await.unwrap();
         writer_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(writer_node.storage.publish_all_projects().await.unwrap(), 1);
 
@@ -845,6 +848,7 @@ fn t2_17_remote_query_node_dynamic_byok_rotation_and_profile_index_single_tick()
                 .status(),
             200
         );
+        writer_node.ingest.flush_all().await.unwrap();
         writer_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(writer_node.storage.publish_all_projects().await.unwrap(), 1);
 
@@ -978,6 +982,7 @@ fn t2_17_remote_query_node_dynamic_byok_rotation_and_profile_index_single_tick()
                 .status(),
             200
         );
+        writer_node.ingest.flush_all().await.unwrap();
         writer_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(writer_node.storage.publish_all_projects().await.unwrap(), 1);
         s3_counting.take();
@@ -1013,6 +1018,7 @@ fn t2_17_remote_query_node_dynamic_byok_rotation_and_profile_index_single_tick()
                 .status(),
             200
         );
+        writer_node.ingest.flush_all().await.unwrap();
         writer_node.storage.flush_all_projects().await.unwrap();
         assert_eq!(writer_node.storage.publish_all_projects().await.unwrap(), 1);
         s3_counting.take();

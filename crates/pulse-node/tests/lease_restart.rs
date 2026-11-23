@@ -57,6 +57,7 @@ fn node_restarted_after_a_crash_waits_out_its_old_lease_and_starts() {
                 .clone()
                 .unwrap();
             assert_eq!(post_event(node.http_addr, &key, "before").await, 200);
+            node.ingest.flush_all().await.unwrap();
             std::mem::forget(node);
             key
         });
@@ -74,16 +75,13 @@ fn node_restarted_after_a_crash_waits_out_its_old_lease_and_starts() {
             .await
             .expect("a restarted node starts once its old lease expires");
         assert_eq!(post_event(node.http_addr, &key, "after").await, 200);
+        node.ingest.flush_all().await.unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(3 + 2),
             "took {:?}",
             started.elapsed()
         );
-        let ps = node
-            .storage
-            .get_or_open_project("proj_restart")
-            .await
-            .unwrap();
+        let ps = node.storage.open_for_read("proj_restart").await.unwrap();
         let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
         assert_eq!(
             rows, 2,

@@ -174,15 +174,20 @@ async fn wal_put_failure_does_not_poison_dedup_on_retry() {
     let ingest = IngestService::new(storage.clone(), gov);
 
     let batch = WireBatch::new(vec![make_event(0xAA, "seed1", "u1", 1_762_000_000_000)]);
-    let raw = batch.encode_binary(1).unwrap();
 
-    // First attempt fails at WAL put
+    // First attempt fails at WAL put (synchronous WAL test)
     hook.fail_wal_puts.store(true, Ordering::SeqCst);
-    assert!(ingest.ingest_raw("pk_test", None, &raw).await.is_err());
+    assert!(ingest
+        .ingest_for_project("proj_p1_01", batch.clone(), 1_762_000_000_000)
+        .await
+        .is_err());
 
     // Client retries exact same batch after S3 recovers — MUST be accepted, NOT deduped!
     hook.fail_wal_puts.store(false, Ordering::SeqCst);
-    let retry = ingest.ingest_raw("pk_test", None, &raw).await.unwrap();
+    let retry = ingest
+        .ingest_for_project("proj_p1_01", batch, 1_762_000_000_000)
+        .await
+        .unwrap();
     assert_eq!(
         retry.accepted, 1,
         "retry after WAL error was falsely deduped!"
@@ -605,7 +610,8 @@ async fn json_backfill_timestamps_and_distinct_prop_uuids_preserved() {
     );
     assert_eq!(resp.deduped, 0);
 
-    let ps = storage.get_or_open_project("proj_p1_13_14").await.unwrap();
+    ingest.flush_all().await.unwrap();
+    let ps = storage.open_for_read("proj_p1_13_14").await.unwrap();
     let snap = ps.snapshot();
     let rows = ps.snapshot_l0_bucket(&snap, 0);
     assert_eq!(rows.len(), 2);
@@ -811,6 +817,7 @@ async fn ha_01_ingest_does_not_block_on_slow_l1_segment_flush_and_enforces_l0_ba
         .await
         .unwrap();
     assert_eq!(r2.accepted, 2);
+    ps.wait_applied(Duration::from_secs(5)).await;
 
     // Direct service call must reject with StorageError::L0Backpressure while L0 is at high-water mark
     let err = ingest
@@ -982,14 +989,14 @@ async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
     // Warm the project so the delayed PUT below is the first of the concurrent wave.
     let warm = WireBatch::new(vec![make_event(0xF0, "s", "warm", 1_762_000_000_000)]);
     ingest
-        .ingest_raw("pk_test", None, &warm.encode_binary(1).unwrap())
+        .ingest_for_project("proj_group", warm, 1_762_000_000_000)
         .await
         .unwrap();
     hook.wal_put_counter.store(0, Ordering::SeqCst);
     hook.delay_first_wal_ms.store(200, Ordering::SeqCst);
 
     // 32 requests with one distinct event each, plus two that repeat request 0's event.
-    let bodies: Vec<Vec<u8>> = (0..34u8)
+    let batches: Vec<WireBatch> = (0..34u8)
         .map(|i| {
             let id = if i >= 32 { 0 } else { i };
             WireBatch::new(vec![make_event(
@@ -998,14 +1005,12 @@ async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
                 &format!("u{id}"),
                 1_762_000_000_000 + i64::from(id),
             )])
-            .encode_binary(1)
-            .unwrap()
         })
         .collect();
     let results = futures::future::join_all(
-        bodies
-            .iter()
-            .map(|raw| ingest.ingest_raw("pk_test", None, raw)),
+        batches
+            .into_iter()
+            .map(|b| ingest.ingest_for_project("proj_group", b, 1_762_000_000_000)),
     )
     .await;
 
@@ -1021,7 +1026,7 @@ async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
     assert!(puts <= 3, "34 concurrent requests made {puts} WAL writes");
 
     // What was acknowledged is in the WAL: a second engine on the same store replays all of it.
-    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    let ps = storage.open_for_read("proj_group").await.unwrap();
     assert_eq!(ps.total_l0_rows(), 33);
     let store: Arc<dyn ObjectStore> = hook.clone();
     let recovered = StorageEngine::new(
@@ -1040,19 +1045,21 @@ async fn concurrent_requests_on_a_bucket_share_one_wal_write() {
 #[tokio::test]
 async fn dropping_the_request_that_writes_a_group_does_not_fail_the_others() {
     let (hook, storage, ingest) = group_commit_fixture();
-    let body = |i: u8| {
+    let batch = |i: u8| {
         WireBatch::new(vec![make_event(
             i,
             "s",
             &format!("u{i}"),
             1_762_000_000_000,
         )])
-        .encode_binary(1)
-        .unwrap()
     };
     let send = |i: u8| {
-        let (ingest, raw) = (ingest.clone(), body(i));
-        tokio::spawn(async move { ingest.ingest_raw("pk_test", None, &raw).await })
+        let (ingest, b) = (ingest.clone(), batch(i));
+        tokio::spawn(async move {
+            ingest
+                .ingest_for_project("proj_group", b, 1_762_000_000_000)
+                .await
+        })
     };
     send(0xF0).await.unwrap().unwrap();
     hook.delay_every_wal_ms.store(300, Ordering::SeqCst);
@@ -1083,7 +1090,7 @@ async fn dropping_the_request_that_writes_a_group_does_not_fail_the_others() {
     }
     a.await.unwrap().unwrap();
     // warm + A + seven others, and B's own event if its record completed: each at most once.
-    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    let ps = storage.open_for_read("proj_group").await.unwrap();
     let rows = ps.total_l0_rows();
     assert!((9..=10).contains(&rows), "{rows} rows");
 }
@@ -1093,7 +1100,7 @@ async fn dropping_the_request_that_writes_a_group_does_not_fail_the_others() {
 #[tokio::test]
 async fn failed_group_write_acknowledges_nothing_and_retries_are_stored() {
     let (hook, storage, ingest) = group_commit_fixture();
-    let bodies: Vec<Vec<u8>> = (0..8u8)
+    let batches: Vec<WireBatch> = (0..8u8)
         .map(|i| {
             WireBatch::new(vec![make_event(
                 i,
@@ -1101,24 +1108,597 @@ async fn failed_group_write_acknowledges_nothing_and_retries_are_stored() {
                 &format!("u{i}"),
                 1_762_000_000_000,
             )])
-            .encode_binary(1)
-            .unwrap()
         })
         .collect();
     let send_all = || {
         futures::future::join_all(
-            bodies
+            batches
                 .iter()
-                .map(|raw| ingest.ingest_raw("pk_test", None, raw)),
+                .cloned()
+                .map(|b| ingest.ingest_for_project("proj_group", b, 1_762_000_000_000)),
         )
     };
     hook.fail_wal_puts.store(true, Ordering::SeqCst);
     assert!(send_all().await.iter().all(|r| r.is_err()));
-    let ps = storage.get_or_open_project("proj_group").await.unwrap();
+    let ps = storage.open_for_read("proj_group").await.unwrap();
     assert_eq!(ps.total_l0_rows(), 0);
 
     hook.fail_wal_puts.store(false, Ordering::SeqCst);
     let retried = send_all().await;
     assert!(retried.iter().all(|r| r.as_ref().unwrap().accepted == 1));
+    ps.wait_applied(Duration::from_secs(5)).await;
     assert_eq!(ps.total_l0_rows(), 8);
+}
+
+#[tokio::test]
+async fn w1_async_ack_flushes_on_20ms_timer_and_counts_dedup_in_metrics() {
+    let (_hook, storage, ingest) = group_commit_fixture();
+    let batch = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)]);
+    let raw = batch.encode_binary(1).unwrap();
+
+    let r1 = ingest.ingest_raw("pk_test", None, &raw).await.unwrap();
+    let r2 = ingest.ingest_raw("pk_test", None, &raw).await.unwrap();
+    assert_eq!(r1.accepted, 1);
+    assert_eq!(r1.deduped, 0);
+    assert_eq!(r2.accepted, 1);
+    assert_eq!(r2.deduped, 0, "W1 async ack always returns deduped=0");
+
+    // Without manual flush, the 20ms timer flushes to WAL and counts exact duplicates in metrics.
+    let mut flushed = false;
+    for _ in 0..50 {
+        if ingest.buffer_stats().buffer_bytes == 0
+            && ingest.metrics().deduped_total.load(Ordering::Relaxed) == 1
+        {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(flushed, "20ms timer flusher did not flush & dedup in time");
+    assert_eq!(ingest.metrics().accepted_total.load(Ordering::Relaxed), 1);
+    assert!(ingest.buffer_stats().flushes_timer >= 1);
+
+    let ps = storage.open_for_read("proj_group").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 1);
+}
+
+#[tokio::test]
+async fn w1_async_buffer_flushes_on_byte_threshold_and_enforces_429_backpressure() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::build_ingest_router;
+    use tower::ServiceExt;
+
+    let (hook, _storage, ingest) = group_commit_fixture();
+    // 1) Byte-threshold trigger (`flushes_bytes >= 1`).
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 60_000, 300);
+    let batch = WireBatch::new(vec![
+        make_event(1, "s1", "u1", 1_762_000_000_000),
+        make_event(2, "s1", "u2", 1_762_000_001_000),
+    ]);
+    ingest
+        .ingest_raw("pk_test", None, &batch.encode_binary(1).unwrap())
+        .await
+        .unwrap();
+    let mut byte_flushed = false;
+    for _ in 0..50 {
+        if ingest.buffer_stats().flushes_bytes >= 1 && ingest.buffer_stats().buffer_bytes == 0 {
+            byte_flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(byte_flushed, "byte threshold did not trigger flush");
+
+    // 2) Buffer saturation returns HTTP 429 `ingest_buffer_backpressure`.
+    hook.delay_every_wal_ms.store(300, Ordering::SeqCst);
+    ingest.set_buffer_limits_for_test(512, 512, 1, 256);
+    let app = build_ingest_router(ingest.clone());
+    let b1 = WireBatch::new(vec![make_event(10, "s1", "u10", 1_762_000_002_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_test")
+                .body(Body::from(b1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Fill past 512 bytes while the slow WAL write keeps the buffer occupied.
+    let mut got_429 = false;
+    for i in 11..20u8 {
+        let bi = WireBatch::new(vec![make_event(
+            i,
+            "s1",
+            &format!("u{i}"),
+            1_762_000_003_000,
+        )])
+        .encode_binary(1)
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("x-pulse-key", "pk_test")
+                    .body(Body::from(bi))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(v["code"], "ingest_buffer_backpressure");
+            got_429 = true;
+            break;
+        }
+    }
+    assert!(
+        got_429,
+        "expected 429 ingest_buffer_backpressure when buffer full"
+    );
+    hook.delay_every_wal_ms.store(0, Ordering::SeqCst);
+    ingest.flush_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn w1_async_wal_error_circuit_breaker_returns_503_before_429_and_recovers_zero_loss() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::build_ingest_router;
+    use tower::ServiceExt;
+
+    let (hook, storage, ingest) = group_commit_fixture();
+    // Tight buffer cap (600 B): normally 2nd/3rd event would hit 429, but wal_error MUST take
+    // precedence and return 503!
+    ingest.set_buffer_limits_for_test(600, 600, 5, 128);
+    let app = build_ingest_router(ingest.clone());
+
+    hook.fail_wal_puts.store(true, Ordering::SeqCst);
+    let b1 = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_test")
+                .body(Body::from(b1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Wait for flusher to attempt WAL write and trip sticky wal_error.
+    let mut got_503 = false;
+    for i in 2..15u8 {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let bi = WireBatch::new(vec![make_event(
+            i,
+            "s1",
+            &format!("u{i}"),
+            1_762_000_001_000,
+        )])
+        .encode_binary(1)
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("x-pulse-key", "pk_test")
+                    .body(Body::from(bi))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+            got_503 = true;
+            break;
+        }
+    }
+    assert!(got_503, "expected 503 once sticky wal_error tripped");
+
+    // Once WAL recovers, all previously 200-acked events drain with zero data loss.
+    hook.fail_wal_puts.store(false, Ordering::SeqCst);
+    let expected_accepted = ingest.buffer_stats().buffer_events;
+    assert!(expected_accepted >= 1);
+    let mut recovered = false;
+    for _ in 0..80 {
+        if ingest.buffer_stats().buffer_bytes == 0 {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        recovered,
+        "sticky wal_error did not drain after WAL recovery"
+    );
+    let ps = storage.open_for_read("proj_group").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), expected_accepted);
+}
+
+#[tokio::test]
+async fn w1_async_mixed_batch_identify_failure_is_atomic_with_zero_events_queued() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::{build_ingest_router, IdentifyRequest};
+    use tower::ServiceExt;
+
+    let (_hook, storage, ingest) = group_commit_fixture();
+    // Create two already-identified users so aliasing them triggers 409 IdentifiedMergeConflict.
+    ingest
+        .identify_for_project(
+            "proj_group",
+            IdentifyRequest {
+                anon_id: "a1".into(),
+                user_id: "real_user_1".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    ingest
+        .identify_for_project(
+            "proj_group",
+            IdentifyRequest {
+                anon_id: "a2".into(),
+                user_id: "real_user_2".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = build_ingest_router(ingest.clone());
+    let mixed = serde_json::json!({
+        "batch": [
+            { "type": "track", "userId": "real_user_1", "event": "Checkout", "messageId": "m_mix_1" },
+            { "type": "identify", "userId": "real_user_1", "anonymousId": "real_user_2" }
+        ]
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_test")
+                .header("content-type", "application/json")
+                .body(Body::from(mixed.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(ingest.buffer_stats().buffer_bytes, 0);
+    assert_eq!(ingest.buffer_stats().buffer_events, 0);
+    ingest.flush_all().await.unwrap();
+    let ps = storage.open_for_read("proj_group").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 0, "mixed-batch failure leaked events");
+}
+
+#[tokio::test]
+async fn w1_async_drops_per_batch_422_and_dead_letters_project_cap_with_reason() {
+    let (hook, storage, ingest) = group_commit_fixture();
+    let store: Arc<dyn ObjectStore> = hook.clone();
+
+    // 1) > MAX_NEW_EVENTS_PER_BATCH (128) in a single batch succeeds on async /v1/ingest (no 422).
+    let many_events: Vec<WireEvent> = (0..150u64)
+        .map(|i| WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u", "s", &format!("ev_{i}"), 100, i),
+            routing_seed: "u".into(),
+            distinct_id: "u".into(),
+            session_id: "s".into(),
+            event_name: format!("ev_{i}"),
+            client_event_ts_ms: 1_762_000_000_000 + i as i64,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        })
+        .collect();
+    let raw_many = WireBatch::new(many_events).encode_binary(1).unwrap();
+    let resp = ingest.ingest_raw("pk_test", None, &raw_many).await.unwrap();
+    assert_eq!(resp.accepted, 150);
+    ingest.flush_all().await.unwrap();
+
+    // 2) Fill dictionary to MAX_EVENTS_PER_PROJECT (8192), then send one more new event via ingest_raw.
+    let ps = storage.open_for_read("proj_group").await.unwrap();
+    let mut idx = 0usize;
+    while ps.dictionary().event_count() < pulse_ingest::service::MAX_EVENTS_PER_PROJECT {
+        let _ = ps
+            .dictionary()
+            .try_get_or_intern_event(&format!("fill_cap_{idx}"));
+        idx += 1;
+    }
+    let over_cap = WireBatch::new(vec![WireEvent {
+        event_uuid: WireEvent::deterministic_uuid("u_dl", "s_dl", "over_cap_ev", 999, 999),
+        routing_seed: "u_dl".into(),
+        distinct_id: "u_dl".into(),
+        session_id: "s_dl".into(),
+        event_name: "over_cap_ev".into(),
+        client_event_ts_ms: 1_762_000_009_000,
+        client_sent_ts_ms: 0,
+        props: vec![],
+        replay_offset_kb: 0,
+    }])
+    .encode_binary(1)
+    .unwrap();
+    let dl_resp = ingest.ingest_raw("pk_test", None, &over_cap).await.unwrap();
+    assert_eq!(dl_resp.accepted, 1);
+    ingest.flush_all().await.unwrap();
+
+    let dead = pulse_storage::list_dead_letters(&store, "proj_group", None)
+        .await
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].event.event_name, "over_cap_ev");
+    assert_eq!(
+        dead[0].reason.as_deref(),
+        Some("project schema cap reached (event names or property keys)")
+    );
+}
+
+#[derive(Debug)]
+struct ToggleLeases {
+    ttl: Duration,
+    available: AtomicBool,
+    fenced_away: AtomicBool,
+    generation: u64,
+}
+
+#[async_trait]
+impl pulse_storage::WriterLeases for ToggleLeases {
+    async fn acquire(&self, _project_id: &str) -> std::result::Result<Option<u64>, String> {
+        if self.fenced_away.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if self.available.load(Ordering::SeqCst) {
+            Ok(Some(self.generation))
+        } else {
+            Err("transient metastore outage".to_string())
+        }
+    }
+
+    fn ttl(&self) -> Duration {
+        self.ttl
+    }
+}
+
+#[tokio::test]
+async fn w1_shutdown_returns_promptly_on_persistent_wal_io_error() {
+    let (hook, _storage, ingest) = group_commit_fixture();
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5, 128);
+    hook.fail_wal_puts.store(true, Ordering::SeqCst);
+
+    let b1 = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r1 = ingest.ingest_raw("pk_test", None, &b1).await.unwrap();
+    assert_eq!(r1.accepted, 1);
+
+    // Wait until the background flusher trips sticky `wal_error`.
+    let mut tripped = false;
+    for i in 2..20u8 {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let bi = WireBatch::new(vec![make_event(
+            i,
+            "s1",
+            &format!("u{i}"),
+            1_762_000_001_000,
+        )])
+        .encode_binary(1)
+        .unwrap();
+        if ingest.ingest_raw("pk_test", None, &bi).await.is_err() {
+            tripped = true;
+            break;
+        }
+    }
+    assert!(tripped, "expected sticky wal_error to trip");
+    assert!(ingest.buffer_stats().buffer_batches >= 1);
+
+    // Shutdown MUST return promptly without spinning indefinitely in `project_flusher_loop`.
+    tokio::time::timeout(Duration::from_secs(2), ingest.shutdown())
+        .await
+        .expect("IngestService::shutdown hung on persistent WAL error");
+
+    let stats = ingest.buffer_stats();
+    assert_eq!(stats.buffer_bytes, 0);
+    assert_eq!(stats.buffer_events, 0);
+    assert_eq!(stats.buffer_batches, 0);
+}
+
+#[tokio::test]
+async fn w1_shutdown_returns_promptly_when_writer_fenced() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let leases = Arc::new(ToggleLeases {
+        ttl: Duration::from_millis(90),
+        available: AtomicBool::new(true),
+        fenced_away: AtomicBool::new(false),
+        generation: 1,
+    });
+    storage.set_writer_leases(leases.clone());
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_test", "proj_fence_sd");
+    let ingest = IngestService::new(storage.clone(), gov);
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5, 128);
+
+    // Open project while lease is held.
+    let b1 = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)])
+        .encode_binary(1)
+        .unwrap();
+    ingest.ingest_raw("pk_test", None, &b1).await.unwrap();
+    ingest.flush_all().await.unwrap();
+
+    // Queue another batch with slow flush_ms, then fence the writer before the flusher runs.
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 500, 64 * 1024);
+    let b2 = WireBatch::new(vec![make_event(2, "s1", "u2", 1_762_000_001_000)])
+        .encode_binary(1)
+        .unwrap();
+    ingest.ingest_raw("pk_test", None, &b2).await.unwrap();
+
+    leases.fenced_away.store(true, Ordering::SeqCst);
+    storage.renew_writer_leases().await;
+    assert!(ingest.buffer_stats().buffer_batches >= 1);
+
+    tokio::time::timeout(Duration::from_secs(2), ingest.shutdown())
+        .await
+        .expect("IngestService::shutdown hung on fenced NotWriter");
+
+    let stats = ingest.buffer_stats();
+    assert_eq!(stats.buffer_bytes, 0);
+    assert_eq!(stats.buffer_events, 0);
+    assert_eq!(stats.buffer_batches, 0);
+}
+
+#[tokio::test]
+async fn w1_transient_not_writer_recovers_after_lease_renewal() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::build_ingest_router;
+    use tower::ServiceExt;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let leases = Arc::new(ToggleLeases {
+        ttl: Duration::from_millis(90), // local_lease_validity = 60ms
+        available: AtomicBool::new(true),
+        fenced_away: AtomicBool::new(false),
+        generation: 1,
+    });
+    storage.set_writer_leases(leases.clone());
+
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_test", "proj_lease_recover");
+    let ingest = IngestService::new(storage.clone(), gov);
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5, 128);
+    let app = build_ingest_router(ingest.clone());
+
+    // 1) Initial batch succeeds while lease is valid.
+    let b1 = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_test")
+                .body(Body::from(b1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    ingest.flush_all().await.unwrap();
+
+    // 2) Simulate transient MetaStore outage exceeding local_lease_validity (60ms) without fencing.
+    leases.available.store(false, Ordering::SeqCst);
+    storage.renew_writer_leases().await;
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    // Queue a batch and poll until the flusher hits `NotWriter` and trips sticky `wal_error` (503).
+    let mut got_503_not_writer = false;
+    for i in 2..20u8 {
+        let bi = WireBatch::new(vec![make_event(
+            i,
+            "s1",
+            &format!("u{i}"),
+            1_762_000_001_000,
+        )])
+        .encode_binary(1)
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("x-pulse-key", "pk_test")
+                    .body(Body::from(bi))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(v["code"], "not_writer");
+            got_503_not_writer = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert!(
+        got_503_not_writer,
+        "expected 503 not_writer once local lease validity lapsed"
+    );
+    let buffered_during_outage = ingest.buffer_stats().buffer_events;
+    assert!(buffered_during_outage >= 1);
+
+    // 3) MetaStore recovers and renews the lease on the same ProjectStorage.
+    leases.available.store(true, Ordering::SeqCst);
+    storage.renew_writer_leases().await;
+
+    // Background flusher must retry with backoff, drain buffered slices, and clear `wal_error`.
+    let mut drained = false;
+    for _ in 0..80 {
+        if ingest.buffer_stats().buffer_bytes == 0 {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        drained,
+        "transient NotWriter wedged flusher after lease renewal"
+    );
+
+    // 4) Subsequent /v1/ingest resumes 200 OK (no permanent 503 wedge).
+    let b_after = WireBatch::new(vec![make_event(99, "s1", "u_after", 1_762_000_002_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r_after = app
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_test")
+                .body(Body::from(b_after))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_after.status(), StatusCode::OK);
+
+    ingest.flush_all().await.unwrap();
+    let ps = storage.open_for_read("proj_lease_recover").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 1 + buffered_during_outage + 1);
+
+    tokio::time::timeout(Duration::from_secs(2), ingest.shutdown())
+        .await
+        .expect("IngestService::shutdown hung after lease recovery");
 }

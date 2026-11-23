@@ -87,7 +87,8 @@ Storage keeps the dense 32-bit id of `distinct_id`, never the string. The **iden
 
 | Object path | Contents |
 |---|---|
-| `wal/{proj}/bucket_NNN/epoch_E_seq_S.wal` | Events acknowledged but not yet in a segment (`<data_dir>/wal/` in `local` mode) |
+| `wal/{proj}/bucket_NNN/epoch_E_seq_S.wal` | Events logged to WAL and not yet in a segment (`<data_dir>/wal/` in `local` mode) |
+| `wal_dead/{proj}/bucket_NNN/seq_S_{fp}.plsd` | Dead-lettered events (`PLSD` v1 binary envelope with timestamp, refusal reason, and single-event `PLSB` payload; inspectable via `pulse-node dead-letters`, filtering erased users) |
 | `hot/segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Local L0-flushed columnar segments awaiting the 7-step upload cycle (`<data_dir>/hot/` in `local` mode) |
 | `segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Uploaded S3 columnar events for one day and bucket, with an inverted index and a session index |
 | `manifests/{proj}/epoch_N.json` | Authoritative local manifest: active segments, footers, and persisted `pending_s3_deletes` (`<data_dir>/hot/manifests/` in `local` mode) |

@@ -56,7 +56,8 @@ Rules for server callers:
 
 - **Always send `messageId` (or `event_uuid` / `insert_id`) or a `timestamp`.** A retry is only recognised as a duplicate if it carries the same id or the same content and timestamp. With neither, a retried event is counted twice.
 - **Send `session_id` if you care about sessions.** Without it, all of a user's server events fall into one session.
-- **Treat `429` as "slow down".** Wait for `Retry-After`, then retry the same body; the ids make the retry safe. Treat `400` and `422` as permanent errors for that batch. Treat `5xx` as retryable.
+- **Treat `429` as "slow down".** Wait for `Retry-After`, then retry the same body; the ids make the retry safe. Treat `400` and `422` (on sync endpoints like `/import`) as permanent errors for that batch. Treat `5xx` as retryable.
+- **Note on `/v1/ingest` response counts.** Under W1 async acknowledgement, `accepted` counts valid events queued into the writer buffer and `deduped` in the HTTP response is `0` (exact duplicate counts are exposed on `GET /metrics` as `pulse_ingest_events_deduped_total`).
 - **Use the same `userId` as your frontend's `identify()`.** Then server and browser events belong to the same person.
 
 **Verify.** Check the response's `accepted` count first. Then run a query, or open Trends in the Studio and pick the event:
