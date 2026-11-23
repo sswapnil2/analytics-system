@@ -45,31 +45,35 @@ Ingest does privacy redaction and pricing, appends to the WAL, and returns. It m
 ## Storage
 
 Traces and spans are not stored in SQL. There are no `agent_traces` or `agent_spans` tables (removed in
-favour of the store below). The store uses the node's object store (`PULSE_DATA_DIR` locally, or
-`PULSE_OBJECT_STORE_URL`), encrypted at rest like event segments.
+favour of the store below). Under the default `PULSE_HOT_STORE=local` (`crates/pulse-storage/src/store_factory.rs`),
+WALs, L0-flushed segments, and authoritative manifests live on local disk (`<data_dir>/wal` and `<data_dir>/hot`)
+and upload/publish to `PULSE_OBJECT_STORE_URL` (`PULSE_DATA_DIR/object_store` locally, or S3) on
+`PULSE_UPLOAD_INTERVAL_SECS`, encrypted at rest like event segments (`PLSEAGM2`). Idle projects make zero S3 calls.
 
 | Layer | Object path | What it is |
 |---|---|---|
-| **PTWL** write-ahead log | `agent_wal/{project}/{writer}/seq_{n}.ptwl` | Group-committed frames (10 ms default) with a 32-byte header `"PTWL" \| ver \| flags \| seq \| ts \| len \| crc32` around a PLST payload. Replayed on start; a torn tail frame is skipped. |
+| **PTWL** write-ahead log | `agent_wal/{project}/{writer}/seq_{n}.ptwl` | Group-committed frames (10 ms default) with a 32-byte header `"PTWL" \| ver \| flags \| seq \| ts \| len \| crc32` around a PLST payload (`<data_dir>/wal/agent_wal/` in `local` mode). Replayed on start; a torn tail frame is skipped. |
 | **L0** memtable | memory | Sharded by trace; merges partial spans. Flushed when a shard is 4 s old or full. |
-| **PLSS** segments | `agent_segments/{project}/{date}/shard_{nn}/…plss` | Immutable, trace-clustered columnar files. Tags: 0x01 strings, 0x02 trace summaries, 0x03 span metrics, 0x04 span tree + events, 0x05 64 KiB-aligned payload packs, 0x06 split-block Bloom filters + zone maps (pruning), 0x07 session rollups. |
-| Manifest | `agent_manifests/{project}/epoch_{n}.json` | MVCC list of live segments, swapped by compare-and-set. Replaced segments wait in `pending_gc` for a 15-minute grace period so running reads never 404. |
+| **PLSS** local hot segments | `hot/agent_segments/{project}/{date}/shard_{nn}/…plss` | Local L0-flushed segments in `local` mode (`<data_dir>/hot/hot/agent_segments/`, zero S3 PUTs on L0 flush). Merged per `(date, shard)` and uploaded create-only to S3 `agent_segments/` on the upload cycle (`PULSE_UPLOAD_INTERVAL_SECS`, or eagerly when `0`). |
+| **PLSS** S3 segments | `agent_segments/{project}/{date}/shard_{nn}/…plss` | Immutable, trace-clustered columnar files in S3 (`segments` tier). Tags: 0x01 strings, 0x02 trace summaries, 0x03 span metrics, 0x04 span tree + events, 0x05 64 KiB-aligned payload packs, 0x06 split-block Bloom filters + zone maps (pruning), 0x07 session rollups. Closed-date multi-segment S3 partitions cold-merge once idle for `PULSE_COLD_MERGE_IDLE_SECS` (3600 s). |
+| Local manifest & intent | `agent_manifests/{project}/epoch_{n}.json`, `upload_intent.json` | Authoritative local MVCC manifest (`<data_dir>/hot/agent_manifests/` in `local` mode) plus crash-recovery upload intent. Superseded S3 segments enter `pending_s3_deletes` and delete after a superseding publish + 2 publish intervals (or sooner when accelerated by a finite-TTL erasure) and once unpinned. |
+| Published manifest | `agent_published/{project}/pub_{publish_seq:012}.json` | Dense-sequence create-only S3 manifest (with `head(publish_seq - 1)` GC guard) listing S3 `agent_segments/` for `query` nodes and `pulse-node restore --from-published`. |
 
 Queries merge unflushed L0 with pruned PLSS segments, so a run is readable as soon as ingest returns.
-Background compaction merges small segments. Run summaries leave out large fields (`input`, `output`,
+Background compaction merges small segments (disabled on local `hot/agent_segments/` when `PULSE_UPLOAD_INTERVAL_SECS > 0`, except for physical erasure and closed-date S3 cold merge). Run summaries leave out large fields (`input`, `output`,
 `metadata`, `error_message`) to stay small; trace detail reads them from the payload packs.
 
-Node roles: `all` and `ingest` write the store (WAL, L0 flush every 5 s, compaction and GC every minute);
-`query` and `compactor` open it read-only. The eval worker runs on every role except `compactor`.
+Node roles: `all` and `ingest` write the store (WAL, L0 flush every 5 s, upload/publish on `PULSE_UPLOAD_INTERVAL_SECS`, compaction/cold-merge/GC every minute, physical erasure sweep on notify / 5 s poll / urgent deadline);
+`query` and `compactor` open it read-only (in `local` mode, `query` reads S3 `agent_published/` and `agent_segments/` on demand and never prunes tombstones). The eval worker runs on every role except `compactor`.
 
-### SQL (`MetaStore`, migration `0011_agent_observability.sql`)
+### SQL (`MetaStore`, migrations `0011_agent_observability.sql`, `0101_agent_erasure_physical_purge.sql`)
 
 SQL holds configuration and small derived data only:
 
 - `agent_evaluations` and `agent_eval_rollups` (per trace, span and session averages, used for score filters)
 - `agent_evaluator_configs`, `agent_datasets`, `agent_dataset_items`, `agent_experiments`, `agent_experiment_runs`
 - `agent_alert_rules`, `agent_alert_events`, `agent_privacy_policies`, `agent_model_pricing`
-- `agent_erasure_tombstones` (trace, session or user erasure, applied at read time and purged on compaction)
+- `agent_erasure_tombstones` (trace, session or user erasure with optional `expires_at_ms` and `physically_purged_at_ms`, applied at read time and physically purged across L0, `agent_wal/`, local/S3 `agent_segments/`, `agent_published/`, and `pending_gc` / `pending_s3_deletes` before expiry or SQL pruning)
 
 ## Evaluations
 
@@ -87,7 +91,9 @@ The per-project privacy policy controls what is captured (inputs, outputs, tool 
 prompts, `user_id`), redacts PII and keys (emails, card numbers, `sk-…`/`pk_…`/`ghp_…`, and a key
 blocklist such as `password`, `authorization`, `token`) to `"[REDACTED]"`, sets sampling, and sets
 `retention_days` (default 30, pruned by trace date). Erasure by trace, session or user writes a tombstone
-that hides data immediately.
+(with optional `expires_at` epoch ms) that hides data immediately and triggers physical removal from L0,
+`agent_wal/`, local hot segments, S3 segments, `agent_published/`, and `pending_gc` / `pending_s3_deletes`
+before `expires_at` expires (and SQL pruning is blocked until `physically_purged_at_ms` is recorded).
 
 | Limit | Value |
 |---|---|

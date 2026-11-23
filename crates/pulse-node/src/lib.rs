@@ -33,6 +33,12 @@ use tracing::info;
 
 pub use seeder::{seed_indian_fintech_dataset, SeedSummary};
 
+const URGENT_GC_MIN_RETRY_MS: u64 = 250;
+
+pub(crate) fn urgent_gc_wait_ms(deadline_ms: i64, now_ms: i64) -> u64 {
+    (deadline_ms.saturating_sub(now_ms).max(0) as u64).max(URGENT_GC_MIN_RETRY_MS)
+}
+
 /// Horizontal scaling role for a `pulse-node` process (`--role` / `PULSE_NODE_ROLE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -573,7 +579,6 @@ pub async fn start_pulse_node_with_store(
                     _ = ticker.tick() => {
                         alerts_control.evaluate_alerts().await;
                         alerts_control.evaluate_agent_alerts().await;
-                        alerts_control.prune_expired_agent_data().await;
                     }
                     changed = alerts_shutdown.changed() => {
                         if changed.is_err() || *alerts_shutdown.borrow() { break; }
@@ -617,31 +622,74 @@ pub async fn start_pulse_node_with_store(
         });
         let agent_control = control.clone();
         let mut agent_shutdown = shutdown_bg_rx.clone();
-        // On `all` the alerts loop above already prunes; a query node's store is read-only,
-        // so with split roles the ingest node is the only one that can delete expired segments.
-        let prunes_here = config.role == NodeRole::Ingest;
+        // Both `All` and `Ingest` own writable agent stores; `Query` never prunes tombstones.
+        let prunes_here = config.role.serves_ingest();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut compact_ticker = tokio::time::interval(Duration::from_secs(60));
+            compact_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut erasure_ticker = tokio::time::interval(Duration::from_secs(5));
+            erasure_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let upload_interval = agent_control.agent_store().upload_interval();
+            let mut publish_ticker = (!upload_interval.is_zero()).then(|| {
+                let mut t = tokio::time::interval_at(
+                    tokio::time::Instant::now() + upload_interval,
+                    upload_interval,
+                );
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                t
+            });
+            let mut next_urgent_gc_deadline_ms: Option<i64> = None;
             let mut ticks: u64 = 0;
             loop {
+                let urgent_sleep = async {
+                    match next_urgent_gc_deadline_ms {
+                        Some(dl) => {
+                            let wait_ms =
+                                urgent_gc_wait_ms(dl, chrono::Utc::now().timestamp_millis());
+                            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
-                    _ = ticker.tick() => {
-                        // ponytail: compaction every minute on each writer; the manifest CAS
-                        // settles races between ingest nodes. Elect one compactor if that churns.
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
-                            Ok(tombstones) => {
-                                if let Err(e) = agent_control.agent_store().compact_and_gc(None, &tombstones).await {
-                                    tracing::warn!(error = %e, "agent compaction failed");
+                    _ = compact_ticker.tick() => {
+                        let store = agent_control.agent_store();
+                        if !store.is_local_hot_tier() || store.has_dirty_projects_for_compact() {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
+                                Ok(tombstones) => {
+                                    if let Err(e) = store.compact_and_gc(None, &tombstones).await {
+                                        tracing::warn!(error = %e, "agent compaction failed");
+                                    }
                                 }
+                                Err(e) => tracing::warn!(error = %e, "loading agent erasure tombstones failed"),
                             }
-                            Err(e) => tracing::warn!(error = %e, "loading agent erasure tombstones failed"),
+                        } else if let Err(e) = store.compact_and_gc(None, &[]).await {
+                            tracing::warn!(error = %e, "agent compaction/cold-merge failed");
                         }
                         ticks += 1;
                         if prunes_here && ticks % 5 == 0 {
                             agent_control.prune_expired_agent_data().await;
                         }
+                    }
+                    _ = async {
+                        match publish_ticker.as_mut() {
+                            Some(t) => t.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Err(e) = agent_control.agent_store().publish_all_projects().await {
+                            tracing::warn!(error = %e, "agent upload/publish cycle failed");
+                        }
+                    }
+                    _ = erasure_ticker.tick() => {
+                        next_urgent_gc_deadline_ms = agent_control.sweep_pending_agent_erasures().await;
+                    }
+                    _ = agent_control.agent_erasure_notified() => {
+                        next_urgent_gc_deadline_ms = agent_control.sweep_pending_agent_erasures().await;
+                    }
+                    _ = urgent_sleep => {
+                        next_urgent_gc_deadline_ms = agent_control.sweep_pending_agent_erasures().await;
                     }
                     changed = agent_shutdown.changed() => {
                         if changed.is_err() || *agent_shutdown.borrow() { break; }
@@ -1039,14 +1087,18 @@ async fn restore_from_published_inner(
     let project_ids: Vec<String> = if let Some(pid) = project_id_filter {
         vec![pid.to_string()]
     } else {
-        let listing = enc_store
-            .list_with_delimiter(Some(&object_store::path::Path::from("published")))
-            .await?;
-        let mut ids: Vec<String> = listing
-            .common_prefixes
-            .into_iter()
-            .filter_map(|p| p.parts().nth(1).map(|seg| seg.as_ref().to_string()))
-            .collect();
+        let mut ids: Vec<String> = Vec::new();
+        for root in ["published", "agent_published"] {
+            let listing = enc_store
+                .list_with_delimiter(Some(&object_store::path::Path::from(root)))
+                .await?;
+            ids.extend(
+                listing
+                    .common_prefixes
+                    .into_iter()
+                    .filter_map(|p| p.parts().nth(1).map(|seg| seg.as_ref().to_string())),
+            );
+        }
         ids.sort();
         ids.dedup();
         ids
@@ -1054,14 +1106,50 @@ async fn restore_from_published_inner(
 
     let mut reports = Vec::new();
     for project_id in project_ids {
-        let Some(pub_m) =
+        let event_pub_opt =
             pulse_storage::PublishedManifestStore::new(&project_id, enc_store.clone())
                 .load_latest()
-                .await?
-        else {
+                .await?;
+        let agent_pub_opt =
+            pulse_agent::PublishedAgentManifestStore::new(&project_id, enc_store.clone())?
+                .load_latest()
+                .await?;
+        if event_pub_opt.is_none() && agent_pub_opt.is_none() {
             if project_id_filter.is_some() {
                 anyhow::bail!("no published manifest found for project `{project_id}`");
             }
+            continue;
+        }
+
+        // Clear any stale local agent WAL, hot segments, and manifests before restoring.
+        pulse_storage::delete_objects_with_prefix(&enc_store, &format!("agent_wal/{project_id}"))
+            .await?;
+        pulse_storage::delete_objects_with_prefix(
+            &enc_store,
+            &format!("hot/agent_segments/{project_id}"),
+        )
+        .await?;
+        pulse_storage::delete_objects_with_prefix(
+            &enc_store,
+            &format!("agent_manifests/{project_id}"),
+        )
+        .await?;
+        if let Some(ref agent_pub) = agent_pub_opt {
+            pulse_agent::install_restored_agent_manifest(&project_id, agent_pub, enc_store.clone())
+                .await?;
+        }
+
+        let Some(pub_m) = event_pub_opt else {
+            let agent_pub = agent_pub_opt.expect("checked non-none above");
+            reports.push(RestoredProjectReport {
+                project_id,
+                publish_seq: agent_pub.publish_seq,
+                published_at_ms: agent_pub.published_at_ms,
+                high_water_mark: 0,
+                identity_user_count: 0,
+                erased_profiles_purged: 0,
+                erased_tombstones_deleted: 0,
+            });
             continue;
         };
 
@@ -1144,7 +1232,9 @@ async fn restore_from_published_inner(
     }
 
     if reports.is_empty() {
-        anyhow::bail!("no published manifests found under `published/` in object store");
+        anyhow::bail!(
+            "no published manifests found under `published/` or `agent_published/` in object store"
+        );
     }
 
     pulse_storage::finalize_local_hot_store_marker(data_dir).await?;
@@ -2276,5 +2366,13 @@ mod tests {
         );
 
         node.shutdown().await;
+    }
+
+    #[test]
+    fn urgent_gc_wait_ms_enforces_non_zero_floor_when_due_or_overdue() {
+        assert_eq!(urgent_gc_wait_ms(1_000, 1_000), URGENT_GC_MIN_RETRY_MS);
+        assert_eq!(urgent_gc_wait_ms(500, 1_000), URGENT_GC_MIN_RETRY_MS);
+        assert_eq!(urgent_gc_wait_ms(1_050, 1_000), URGENT_GC_MIN_RETRY_MS);
+        assert_eq!(urgent_gc_wait_ms(2_500, 1_000), 1_500);
     }
 }

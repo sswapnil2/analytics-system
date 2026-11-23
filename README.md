@@ -76,7 +76,7 @@ See [limitations](docs/limitations.md#operational-limitations) for per-node stat
 - `all` *(default)*: Full ingest, query/Studio API, L0 -> L1 flushing, and background compaction in one process.
 - `ingest`: Serves `/v1/ingest` (HTTP + optional QUIC), `/healthz`, and public flag evaluation; runs background L0 -> L1 flushes and identity graph commits.
 - `query`: Serves admin/analytics queries, Studio UI, public flags, and `/healthz`; opens storage and SlateDB identity graphs in read-only (`DbReader`) refresh mode without blocking ingest.
-- `compactor`: Refreshes manifests and runs background L1 segment compaction (`--role compactor`, exposing `/healthz`).
+- `compactor`: Refreshes manifests and runs background L1 segment compaction (`--role compactor`, exposing `/healthz`; idle under `PULSE_HOT_STORE=local` when `PULSE_UPLOAD_INTERVAL_SECS > 0`).
 
 ```bash
 # Example: one ingest node, one query node, one compactor (single host, shared data directory)

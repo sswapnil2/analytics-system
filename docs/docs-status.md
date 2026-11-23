@@ -2,7 +2,7 @@
 
 This page records how these docs were checked, what is still unverified, and what to write next. Update it whenever you verify or change a page.
 
-*Last verification: 2026-11-21, against `main` at `95a13e5`.*
+*Last verification: 2026-11-24, against `fix/scalability-review-quick-wins` (`af317f3` + M5b2 workspace suite, `scripts/check_docs_links.py`, and `scripts/verify_e2e.sh`).*
 
 ## How the docs were built
 
@@ -23,6 +23,7 @@ Every architecture page was written from the source on `main`, not from older do
 | Insights query from the Integrations page; `sampling` set to `"exact"`, `"auto"`, `{"rate":0.25}` | Returns series and a `sampling` object |
 | `/v1/identify` merging two identified users | `409` with the documented message |
 | `/v1/engage`, `/v1/identify`, `/v1/groups`, `/v1/replay/chunk` (W2 sync durability) | `/v1/identify` and `/v1/engage` flush identity before writing profiles, return `canonical_uid` (`canonical_uids` on batches), read back immediately on the next request, survive `SIGKILL`, and return `503` on `ProfileStore` / `hot/profiles/` unavailability |
+| Agent local hot tier, cycle upload (`agent_segments/`, `agent_published/`), `NodeRole::Query` reads, and physical erasure before `expires_at` (#27b, #27c) | Verified in `store_calls` (0 S3 calls on `/v1/agent/traces` and idle ticks) and `t4_agent_local_tier` (`SIGKILL` recovery, BYOK `PLSEAGM2` + key rotation, `503` on local WAL write failure, `restore --from-published`, and 3-level pre-expiry physical erasure) |
 | `DELETE /v1/projects/:id/users/:distinct_id`, then `GET …/deletions` | Erasure recorded with `events_purged` |
 | `/metrics` | `pulse_ingest_events_*`, `pulse_writer_*`, `pulse_wal_bytes`, `pulse_ingest_apply_*`, `pulse_l0_rows`, `pulse_ready` present |
 | MCP `tools/list` | The 9 tools listed in [MCP](mcp.md) |

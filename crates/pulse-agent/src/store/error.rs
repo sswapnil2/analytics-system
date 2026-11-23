@@ -38,6 +38,19 @@ pub enum StoreError {
     },
     #[error("agent trace store is shutting down")]
     Shutdown,
+    #[error("node is not the active agent writer for project '{project_id}'")]
+    NotWriter { project_id: String },
+    #[error(
+        "stale agent writer for project '{project_id}' \
+         (published seq={pub_seq} gen={pub_gen}, local seq={local_last_pub_seq:?} gen={local_gen})"
+    )]
+    StaleWriter {
+        project_id: String,
+        pub_seq: u64,
+        pub_gen: u64,
+        local_last_pub_seq: Option<u64>,
+        local_gen: u64,
+    },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;

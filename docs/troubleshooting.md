@@ -91,7 +91,8 @@ Events are normally applied and queryable within milliseconds of `/v1/ingest` re
 | The node panics on start with an encryption error | `PULSE_BYOK_MASTER_KEY` is neither 64 hex characters nor a passphrase of 16+ characters | Fix the value |
 | The Studio shows a placeholder page | `PULSE_WEB_DIST_DIR` has no `index.html` | `npm --prefix web ci && npm --prefix web run build`, or pass `--web-dir` |
 | `/readyz` returns `503` | The node is draining, or the metadata DB or object store is unreachable | The JSON body lists the failing check |
-| `pulse_maintenance_errors_total` keeps rising | Background flushes or compactions are failing | Check the logs for the `kind`; usually storage permissions or space |
+| `pulse_maintenance_errors_total` keeps rising | Background flushes, compactions, or S3 publish/upload cycles (`kind="publish"` for events, replays, or agent uploads) are failing | Check the logs for the `kind`; usually S3/object-store reachability, storage permissions, or disk space |
+| Node refuses startup: `hot_store_mode` or `restore --from-published` | Mode mismatch between `PULSE_HOT_STORE` and `<data_dir>/hot_store_mode`, opposite-tier leftovers, or missing local stores while S3 `published/` / `agent_published/` exists | Restore the matching `PULSE_HOT_STORE` setting, or run `pulse-node restore --from-published --data-dir <path>` with PostgreSQL `DATABASE_URL` |
 | The first release build takes ~15 min | Thin LTO with one codegen unit | Use `cargo build -p pulse-node` (debug) while you develop |
 
 Still stuck? Open an issue with the Pulse commit, how you ran the node, and the smallest request that reproduces the problem (see [Contributing](contributing.md)).

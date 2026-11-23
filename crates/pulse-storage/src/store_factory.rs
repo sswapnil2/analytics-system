@@ -268,13 +268,14 @@ const WAL_PREFIXES: [&str; 5] = [
     "agent_wal_corrupt",
 ];
 
-/// Key prefixes for persistent hot state (`identity/`, `profiles/`, and `manifests/`).
-const HOT_PREFIXES: [&str; 3] = ["identity", "profiles", "manifests"];
+/// Key prefixes for persistent hot state (`identity/`, `profiles/`, `manifests/`, and `agent_manifests/`).
+const HOT_PREFIXES: [&str; 4] = ["identity", "profiles", "manifests", "agent_manifests"];
 
 /// Union of all local hot-tier prefixes used for opposite-tier leftover detection.
-/// Note: `"replays"` is intentionally excluded because uploaded S3 replay chunks live there
-/// permanently; un-uploaded local chunks live under `"hot/replay"` and cursors under `"hot/replay_cursors"`.
-const ALL_HOT_PREFIXES: [&str; 11] = [
+/// Note: `"replays"`, `"segments"`, `"agent_segments"`, and `"agent_published"` are intentionally
+/// excluded because long-lived S3 objects live there permanently; un-uploaded local chunks/segments
+/// live under `"hot/replay"`, `"hot/replay_cursors"`, `"hot/segments"`, and `"hot/agent_segments"`.
+const ALL_HOT_PREFIXES: [&str; 13] = [
     "wal",
     "wal_corrupt",
     "wal_dead",
@@ -283,7 +284,9 @@ const ALL_HOT_PREFIXES: [&str; 11] = [
     "identity",
     "profiles",
     "manifests",
+    "agent_manifests",
     "hot/segments",
+    "hot/agent_segments",
     "hot/replay",
     "hot/replay_cursors",
 ];
@@ -377,7 +380,9 @@ async fn init_local_hot_dirs(data_dir: &Path, wal_dir: &Path, hot_dir: &Path) ->
         std::fs::create_dir_all(hot_dir.join("identity"))?;
         std::fs::create_dir_all(hot_dir.join("profiles"))?;
         std::fs::create_dir_all(hot_dir.join("manifests"))?;
+        std::fs::create_dir_all(hot_dir.join("agent_manifests"))?;
         std::fs::create_dir_all(hot_dir.join("hot/segments"))?;
+        std::fs::create_dir_all(hot_dir.join("hot/agent_segments"))?;
         std::fs::create_dir_all(hot_dir.join("hot/replay"))?;
         std::fs::create_dir_all(hot_dir.join("hot/replay_cursors"))?;
         fsync_dir_sync(&hot_dir)?;
@@ -406,11 +411,14 @@ async fn first_object_under(
                 "identity" => "identity",
                 "profiles" => "profiles",
                 "manifests" => "manifests",
+                "agent_manifests" => "agent_manifests",
                 "hot/segments" => "hot/segments",
+                "hot/agent_segments" => "hot/agent_segments",
                 "hot/replay" => "hot/replay",
                 "hot/replay_cursors" => "hot/replay_cursors",
                 "segments" => "segments",
                 "published" => "published",
+                "agent_published" => "agent_published",
                 _ => "other",
             };
             return Ok(Some((matched, meta.location)));
@@ -574,7 +582,9 @@ pub async fn with_hot_store_for_role(
                     segments,
                 }))
             } else {
-                if let Some((_, loc)) = first_object_under(&segments, &["published"]).await? {
+                if let Some((_, loc)) =
+                    first_object_under(&segments, &["published", "agent_published"]).await?
+                {
                     return Err(config_error(format!(
                         "hot-store mode is `local` and data directory `{}` is uninitialized \
                          (missing `{}`), while published state exists in the object store ({loc}); \
@@ -720,8 +730,9 @@ pub fn is_hot_routed_store(store: &dyn ObjectStore) -> bool {
 }
 
 /// Sends WAL prefixes to `wal`, persistent hot prefixes (`identity/`, `profiles/`, `manifests/`,
-/// `hot/segments/`, `hot/replay/`, and `hot/replay_cursors/`) to `hot`, and every other key
-/// (including `segments/`, `published/`, and uploaded `replays/`) to `segments`. Sits below
+/// `agent_manifests/`, `hot/segments/`, `hot/agent_segments/`, `hot/replay/`, and
+/// `hot/replay_cursors/`) to `hot`, and every other key (including `segments/`, `published/`,
+/// `agent_segments/`, `agent_published/`, and uploaded `replays/`) to `segments`. Sits below
 /// encryption, so local hot tiers are encrypted like everything else.
 #[derive(Debug)]
 struct HotRouted {
@@ -741,7 +752,10 @@ impl HotRouted {
             (Some(first), _) if HOT_PREFIXES.contains(&first.as_ref()) => &self.hot,
             (Some(first), Some(second))
                 if first.as_ref() == "hot"
-                    && matches!(second.as_ref(), "segments" | "replay" | "replay_cursors") =>
+                    && matches!(
+                        second.as_ref(),
+                        "segments" | "agent_segments" | "replay" | "replay_cursors"
+                    ) =>
             {
                 &self.hot
             }
@@ -1437,7 +1451,8 @@ mod hot_store_and_multipart_tests {
         segments.reset();
 
         // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes (including manifests,
-        // hot/segments, hot/replay, hot/replay_cursors) route locally with 0 S3 calls.
+        // agent_manifests, hot/segments, hot/agent_segments, hot/replay, hot/replay_cursors)
+        // route locally with 0 S3 calls.
         for key in [
             "wal/p1/bucket_000/seq_0.wal",
             "wal_corrupt/p1/bucket_000/bad.wal",
@@ -1447,7 +1462,9 @@ mod hot_store_and_multipart_tests {
             "identity/p1/manifest/000001.manifest",
             "profiles/p1/wal/000001.sst",
             "manifests/p1/epoch_000000000001.json",
+            "agent_manifests/p1/epoch_000000000001.json",
             "hot/segments/p1/20261122/bucket_000/seg_0.pvtx",
+            "hot/agent_segments/p1/2026-11-22/shard_00/seg_0.plss",
             "hot/replay/p1/s1/0000000000.plsr",
             "hot/replay_cursors/p1/s1.json",
         ] {
@@ -1510,8 +1527,8 @@ mod hot_store_and_multipart_tests {
             .try_collect()
             .await
             .unwrap();
-        assert_eq!(all_none.len(), 13);
-        assert_eq!(all_empty.len(), 13);
+        assert_eq!(all_none.len(), 15);
+        assert_eq!(all_empty.len(), 15);
 
         // list_with_delimiter(None) and list_with_delimiter(Some("")) merge and dedup common_prefixes.
         let delim_none = store.list_with_delimiter(None).await.unwrap();
@@ -1520,6 +1537,7 @@ mod hot_store_and_multipart_tests {
             .await
             .unwrap();
         let expected_prefixes: Vec<ObjectPath> = [
+            "agent_manifests",
             "agent_wal",
             "agent_wal_corrupt",
             "hot",
@@ -1563,6 +1581,7 @@ mod hot_store_and_multipart_tests {
         assert_eq!(
             hot_listed,
             vec![
+                "hot/agent_segments/p1/2026-11-22/shard_00/seg_0.plss".to_string(),
                 "hot/other/sub.txt".to_string(),
                 "hot/replay/p1/s1/0000000000.plsr".to_string(),
                 "hot/replay_cursors/p1/s1.json".to_string(),
@@ -1576,6 +1595,7 @@ mod hot_store_and_multipart_tests {
         assert_eq!(
             hot_delim.common_prefixes,
             vec![
+                ObjectPath::from("hot/agent_segments"),
                 ObjectPath::from("hot/other"),
                 ObjectPath::from("hot/replay"),
                 ObjectPath::from("hot/replay_cursors"),
@@ -1583,6 +1603,24 @@ mod hot_store_and_multipart_tests {
             ]
         );
         store.delete(&hot_other).await.unwrap();
+
+        // Uploaded S3 `agent_segments/` and `agent_published/` route to segments (S3).
+        let cnt_before_agent_s3 = segments.count();
+        store
+            .put(
+                &ObjectPath::from("agent_segments/p1/2026-11-22/shard_00/s3_seg.plss"),
+                PutPayload::from_static(b"s3-agent-seg"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &ObjectPath::from("agent_published/p1/pub_000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(segments.count(), cnt_before_agent_s3 + 2);
 
         // Cross-tier copy from hot/replay/ to replays/ routes to segments.
         let s3_replay_copied = ObjectPath::from("replays/p1/s1/0000000001.plsr");
@@ -1684,7 +1722,9 @@ mod hot_store_and_multipart_tests {
             assert!(tmp.path().join("hot/identity").is_dir());
             assert!(tmp.path().join("hot/profiles").is_dir());
             assert!(tmp.path().join("hot/manifests").is_dir());
+            assert!(tmp.path().join("hot/agent_manifests").is_dir());
             assert!(tmp.path().join("hot/hot/segments").is_dir());
+            assert!(tmp.path().join("hot/hot/agent_segments").is_dir());
             assert!(tmp.path().join("hot/hot/replay").is_dir());
             assert!(tmp.path().join("hot/hot/replay_cursors").is_dir());
 
@@ -1778,9 +1818,9 @@ mod hot_store_and_multipart_tests {
                 "{err}"
             );
 
-            // Restore manifests dir; agent_wal alone and hot/replay alone (replay-only project)
-            // are allowed with empty identity. Uploaded S3 `replays/` also does NOT trigger
-            // opposite-tier refusal in local mode.
+            // Restore manifests dir; agent_wal, hot/replay, agent_manifests, hot/agent_segments,
+            // and S3 agent_segments/agent_published/ are allowed with empty identity (agent-only or
+            // replay-only projects). Uploaded S3 `replays/` also does NOT trigger opposite-tier refusal.
             std::fs::create_dir_all(tmp.path().join("hot/manifests")).unwrap();
             let store = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
             store
@@ -1790,6 +1830,32 @@ mod hot_store_and_multipart_tests {
                 )
                 .await
                 .unwrap();
+            store
+                .put(
+                    &ObjectPath::from("agent_manifests/p1/epoch_000000000001.json"),
+                    PutPayload::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+            store
+                .put(
+                    &ObjectPath::from("hot/agent_segments/p1/2026-11-22/shard_00/s.plss"),
+                    PutPayload::from_static(b"a"),
+                )
+                .await
+                .unwrap();
+            seg.put(
+                &ObjectPath::from("agent_segments/p1/2026-11-22/shard_00/s3.plss"),
+                PutPayload::from_static(b"s3a"),
+            )
+            .await
+            .unwrap();
+            seg.put(
+                &ObjectPath::from("agent_published/p1/pub_000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
             store
                 .put(
                     &ObjectPath::from("hot/replay/p1/s1/0000000000.plsr"),
@@ -1907,6 +1973,32 @@ mod hot_store_and_multipart_tests {
                 .unwrap();
             finalize_local_hot_store_marker(tmp.path()).await.unwrap();
             let _ = with_hot_store(seg, tmp.path()).await.unwrap();
+        }
+
+        // 5c. Uninitialized / wiped <data_dir> with S3 `agent_published/` -> refused for writer,
+        //     succeeds for read_only (NodeRole::Query).
+        {
+            let _env = HotStoreEnvGuard::set(Some("local"));
+            let tmp = tempfile::tempdir().unwrap();
+            let seg: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            seg.put(
+                &ObjectPath::from("agent_published/p1/pub_000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+            let q_tmp = tempfile::tempdir().unwrap();
+            let _query_store = with_hot_store_for_role(seg, q_tmp.path(), true)
+                .await
+                .expect("read-only query node must start with empty data_dir over agent_published");
         }
 
         // 6. Opposite-tier leftover checks (every WAL/HOT prefix in segments refused by local;

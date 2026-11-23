@@ -12,7 +12,7 @@ This is every way to get data into Pulse or out of it, and how well each one is 
 | Backfill from another tool (JSON, NDJSON, CSV) | **Supported.** `POST /v1/projects/:id/import`, deduplicated for 30 days | [REST API](rest-api.md#lexicon-cohorts-data-management-bearer-token) |
 | iOS / Android (native) | **Beta.** A Rust core with UniFFI Swift/Kotlin bindings that you build yourself. No packaged SDK. The Android demo is marked *not yet verified* | [Mobile core](mobile-core.md) |
 | React Native | **Experimental, undocumented.** `sdks/react-native` wraps the Web SDK with native recorder modules. It is not in CI or releases | `sdks/react-native/README.md` |
-| OpenTelemetry (OTLP traces, metrics, logs) | **Not supported** | — |
+| General OpenTelemetry (OTLP service traces, metrics, logs) | **Not supported** (OTLP GenAI spans only, row below) | — |
 | Python, Java, Go, Ruby SDKs | **Not available.** Use HTTP | — |
 | LLM / agent tracing | **Supported.** `POST /v1/agent/traces`, OTLP GenAI spans at `/v1/otel/v1/traces`, or the `sdks/ts-agent` and `sdks/py-agent` SDKs | [AI agent observability](agent-observability-architecture.md) |
 

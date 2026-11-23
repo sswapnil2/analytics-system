@@ -27,7 +27,10 @@ pub use pricing::*;
 pub use privacy::*;
 pub use protocol::*;
 pub use stats::*;
-pub use store::{AgentTraceStore, AgentTraceStoreConfig, StoreError};
+pub use store::manifest::{
+    install_restored_agent_manifest, PublishedAgentManifest, PublishedAgentManifestStore,
+};
+pub use store::{AgentTraceStore, AgentTraceStoreConfig, ProjectErasureOutcome, StoreError};
 
 /// Hard operational limits to guarantee bounded memory and predictable query latency.
 pub const MAX_SPANS_PER_TRACE: usize = 512;

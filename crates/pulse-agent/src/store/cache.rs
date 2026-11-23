@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy, PsyncIoEngineConfig, S3FifoConfig,
@@ -24,6 +26,7 @@ pub struct AgentSegmentCache {
     summaries_cache: Cache<String, Arc<Vec<TraceSummaryRow>>>,
     span_metrics_cache: Cache<String, Arc<Vec<SpanMetricRow>>>,
     session_rollups_cache: Cache<String, Arc<Vec<SessionRollupRow>>>,
+    segment_hybrid_keys: DashMap<String, HashSet<String>>,
 }
 
 impl AgentSegmentCache {
@@ -128,6 +131,7 @@ impl AgentSegmentCache {
             summaries_cache,
             span_metrics_cache,
             session_rollups_cache,
+            segment_hybrid_keys: DashMap::new(),
         }))
     }
 
@@ -147,12 +151,39 @@ impl AgentSegmentCache {
         if val.len() > MAX_HYBRID_DISK_ENTRY_BYTES {
             return;
         }
+        if let Some(seg_id) = key.split(':').nth(1) {
+            self.segment_hybrid_keys
+                .entry(seg_id.to_string())
+                .or_default()
+                .insert(key.clone());
+        }
         if let Some(es) = &self.enc_store {
             if let Ok(sealed) = es.seal_cache_blob(val) {
                 self.hybrid.insert(key, sealed);
             }
         } else {
             self.hybrid.insert(key, val.to_vec());
+        }
+    }
+
+    /// Invalidates all RAM (`moka`) and hybrid disk/memory (`foyer`) entries for `segment_id`.
+    pub(crate) fn invalidate_segment(&self, segment_id: &str) {
+        self.tail_cache.invalidate(segment_id);
+        self.strings_cache.invalidate(segment_id);
+        self.summaries_cache.invalidate(segment_id);
+        self.span_metrics_cache.invalidate(segment_id);
+        self.session_rollups_cache.invalidate(segment_id);
+
+        self.hybrid.remove(&format!("eof:{segment_id}"));
+        self.hybrid.remove(&format!("p4idx:{segment_id}"));
+        self.hybrid.remove(&format!("p5dir:{segment_id}"));
+        for tag in 1u16..=7u16 {
+            self.hybrid.remove(&format!("sec:{segment_id}:{tag:02x}"));
+        }
+        if let Some((_, keys)) = self.segment_hybrid_keys.remove(segment_id) {
+            for k in keys {
+                self.hybrid.remove(&k);
+            }
         }
     }
 

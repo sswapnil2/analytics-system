@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use serde_json::Value;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -2879,11 +2879,21 @@ pub fn segment_object_path(
     shard_id: u16,
     segment_id: &str,
 ) -> StoreResult<ObjectPath> {
+    segment_object_path_with_prefix("agent_segments", project_id, date, shard_id, segment_id)
+}
+
+pub fn segment_object_path_with_prefix(
+    prefix_root: &str,
+    project_id: &str,
+    date: &str,
+    shard_id: u16,
+    segment_id: &str,
+) -> StoreResult<ObjectPath> {
     validate_identifier("project_id", project_id)?;
     validate_identifier("date", date)?;
     validate_identifier("segment_id", segment_id)?;
     Ok(ObjectPath::from(format!(
-        "agent_segments/{project_id}/{date}/shard_{shard_id:02}/{segment_id}.plss"
+        "{prefix_root}/{project_id}/{date}/shard_{shard_id:02}/{segment_id}.plss"
     )))
 }
 
@@ -3357,6 +3367,34 @@ impl SegmentWriter {
         max_segment_bytes: usize,
         object_store: &Arc<dyn ObjectStore>,
     ) -> StoreResult<Vec<SegmentDescriptor>> {
+        Self::write_segments_split_ranked_with_prefix_and_mode(
+            "agent_segments",
+            project_id,
+            date,
+            shard_id,
+            level,
+            entries,
+            max_segment_bytes,
+            object_store,
+            PutMode::Overwrite,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_segments_split_ranked_with_prefix_and_mode(
+        prefix_root: &str,
+        project_id: &str,
+        date: &str,
+        shard_id: u16,
+        level: u8,
+        entries: Vec<RankedTraceEntry>,
+        max_segment_bytes: usize,
+        object_store: &Arc<dyn ObjectStore>,
+        put_mode: PutMode,
+        id_prefix: Option<&str>,
+    ) -> StoreResult<Vec<SegmentDescriptor>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -3400,13 +3438,25 @@ impl SegmentWriter {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut descriptors = Vec::with_capacity(built_segments.len());
-        for (bytes, tail_offset, zone_map) in built_segments {
-            let seg_id = Uuid::now_v7().to_string();
-            let path = segment_object_path(project_id, date, shard_id, &seg_id)?;
+        let opts = PutOptions {
+            mode: put_mode,
+            ..PutOptions::default()
+        };
+        for (part_idx, (bytes, tail_offset, zone_map)) in built_segments.into_iter().enumerate() {
+            let seg_id = match id_prefix {
+                Some(prefix) => format!("{prefix}_{part_idx:04}"),
+                None => Uuid::now_v7().to_string(),
+            };
+            let path =
+                segment_object_path_with_prefix(prefix_root, project_id, date, shard_id, &seg_id)?;
             let file_size = bytes.len() as u64;
             let trace_count = zone_map.trace_count;
             object_store
-                .put(&path, PutPayload::from_bytes(Bytes::from(bytes)))
+                .put_opts(
+                    &path,
+                    PutPayload::from_bytes(Bytes::from(bytes)),
+                    opts.clone(),
+                )
                 .await?;
             descriptors.push(SegmentDescriptor {
                 segment_id: seg_id,

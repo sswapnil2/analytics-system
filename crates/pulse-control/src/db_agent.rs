@@ -1565,13 +1565,14 @@ impl MetaStore {
             self,
             r#"
             INSERT INTO agent_erasure_tombstones (
-                id, project_id, level, target_id, created_at_ms, expires_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, project_id, level, target_id, created_at_ms, expires_at_ms, physically_purged_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 level = excluded.level,
                 target_id = excluded.target_id,
                 created_at_ms = excluded.created_at_ms,
-                expires_at_ms = excluded.expires_at_ms
+                expires_at_ms = excluded.expires_at_ms,
+                physically_purged_at_ms = NULL
             WHERE agent_erasure_tombstones.project_id = excluded.project_id
             "#,
             &tb.id,
@@ -1598,9 +1599,17 @@ impl MetaStore {
         let rows = a_map_all!(
             self,
             "SELECT * FROM agent_erasure_tombstones \
-             WHERE project_id = ? AND (expires_at_ms IS NULL OR expires_at_ms > ?) \
+             WHERE project_id = ? \
+               AND (physically_purged_at_ms IS NULL OR expires_at_ms IS NULL OR expires_at_ms > ?) \
              ORDER BY created_at_ms DESC",
-            |r| { tombstone_from_row!(r) },
+            |r| {
+                let purged: Option<i64> = r.get("physically_purged_at_ms");
+                let mut tb = tombstone_from_row!(r);
+                if purged.is_none() && tb.expires_at.is_some_and(|exp| exp <= now_ms) {
+                    tb.expires_at = None;
+                }
+                tb
+            },
             project_id,
             now_ms
         );
@@ -1614,12 +1623,90 @@ impl MetaStore {
         let rows = a_map_all!(
             self,
             "SELECT * FROM agent_erasure_tombstones \
-             WHERE expires_at_ms IS NULL OR expires_at_ms > ? \
+             WHERE physically_purged_at_ms IS NULL OR expires_at_ms IS NULL OR expires_at_ms > ? \
              ORDER BY created_at_ms DESC",
-            |r| { tombstone_from_row!(r) },
+            |r| {
+                let purged: Option<i64> = r.get("physically_purged_at_ms");
+                let mut tb = tombstone_from_row!(r);
+                if purged.is_none() && tb.expires_at.is_some_and(|exp| exp <= now_ms) {
+                    tb.expires_at = None;
+                }
+                tb
+            },
             now_ms
         );
         Ok(rows)
+    }
+
+    pub async fn list_unpurged_erasure_tombstones(
+        &self,
+    ) -> Result<Vec<AgentErasureTombstone>, MetaError> {
+        let rows = a_map_all!(
+            self,
+            "SELECT * FROM agent_erasure_tombstones \
+             WHERE physically_purged_at_ms IS NULL \
+             ORDER BY COALESCE(expires_at_ms, 9223372036854775807) ASC, created_at_ms ASC",
+            |r| { tombstone_from_row!(r) }
+        );
+        Ok(rows)
+    }
+
+    pub async fn list_expired_purged_erasure_tombstones(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(AgentErasureTombstone, i64)>, MetaError> {
+        let rows = a_map_all!(
+            self,
+            "SELECT * FROM agent_erasure_tombstones \
+             WHERE physically_purged_at_ms IS NOT NULL \
+               AND expires_at_ms IS NOT NULL \
+               AND expires_at_ms <= ? \
+             ORDER BY created_at_ms ASC",
+            |r| {
+                let purged_at: i64 = r.get("physically_purged_at_ms");
+                (tombstone_from_row!(r), purged_at)
+            },
+            now_ms
+        );
+        Ok(rows)
+    }
+
+    pub async fn mark_erasure_tombstones_purged(
+        &self,
+        ids: &[String],
+        purged_at_ms: i64,
+    ) -> Result<u64, MetaError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut updated = 0u64;
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE agent_erasure_tombstones \
+                 SET physically_purged_at_ms = ? \
+                 WHERE id IN ({placeholders}) AND physically_purged_at_ms IS NULL"
+            );
+            let n = match self {
+                MetaStore::Sqlite(pool) => {
+                    let mut q = sqlx::query(&sql).bind(purged_at_ms);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q.execute(pool).await?.rows_affected()
+                }
+                MetaStore::Postgres(pool) => {
+                    let pg = pg_rewrite(&sql);
+                    let mut q = sqlx::query(&pg).bind(purged_at_ms);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q.execute(pool).await?.rows_affected()
+                }
+            };
+            updated += n;
+        }
+        Ok(updated)
     }
 
     pub async fn prune_expired_erasure_tombstones(
@@ -1631,18 +1718,153 @@ impl MetaStore {
             Some(pid) => a_exec!(
                 self,
                 "DELETE FROM agent_erasure_tombstones \
-                 WHERE project_id = ? AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?",
+                 WHERE project_id = ? \
+                   AND physically_purged_at_ms IS NOT NULL \
+                   AND expires_at_ms IS NOT NULL \
+                   AND expires_at_ms <= ?",
                 pid,
                 now_ms
             ),
             None => a_exec!(
                 self,
                 "DELETE FROM agent_erasure_tombstones \
-                 WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ?",
+                 WHERE physically_purged_at_ms IS NOT NULL \
+                   AND expires_at_ms IS NOT NULL \
+                   AND expires_at_ms <= ?",
                 now_ms
             ),
         };
         Ok(n)
+    }
+
+    pub async fn list_purged_finite_erasure_tombstones(
+        &self,
+        project_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<AgentErasureTombstone>, MetaError> {
+        let rows = a_map_all!(
+            self,
+            "SELECT * FROM agent_erasure_tombstones \
+             WHERE project_id = ? \
+               AND physically_purged_at_ms IS NOT NULL \
+               AND expires_at_ms IS NOT NULL \
+               AND expires_at_ms > ?",
+            |r| { tombstone_from_row!(r) },
+            project_id,
+            now_ms
+        );
+        Ok(rows)
+    }
+
+    pub async fn reopen_purged_finite_erasure_tombstones(
+        &self,
+        project_id: &str,
+        now_ms: i64,
+    ) -> Result<u64, MetaError> {
+        let has_any = a_map_opt!(
+            self,
+            "SELECT 1 AS hit FROM agent_erasure_tombstones \
+             WHERE project_id = ? \
+               AND physically_purged_at_ms IS NOT NULL \
+               AND expires_at_ms IS NOT NULL \
+               AND expires_at_ms > ? \
+             LIMIT 1",
+            |r| { r.get::<i32, _>("hit") },
+            project_id,
+            now_ms
+        )
+        .is_some();
+        if !has_any {
+            return Ok(0);
+        }
+        let n = a_exec!(
+            self,
+            "UPDATE agent_erasure_tombstones \
+             SET physically_purged_at_ms = NULL \
+             WHERE project_id = ? \
+               AND physically_purged_at_ms IS NOT NULL \
+               AND expires_at_ms IS NOT NULL \
+               AND expires_at_ms > ?",
+            project_id,
+            now_ms
+        );
+        Ok(n)
+    }
+
+    pub async fn reset_erasure_tombstones_purged(&self, ids: &[String]) -> Result<u64, MetaError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut updated = 0u64;
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE agent_erasure_tombstones \
+                 SET physically_purged_at_ms = NULL \
+                 WHERE id IN ({placeholders}) AND physically_purged_at_ms IS NOT NULL"
+            );
+            let n = match self {
+                MetaStore::Sqlite(pool) => {
+                    let mut q = sqlx::query(&sql);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q.execute(pool).await?.rows_affected()
+                }
+                MetaStore::Postgres(pool) => {
+                    let pg = pg_rewrite(&sql);
+                    let mut q = sqlx::query(&pg);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q.execute(pool).await?.rows_affected()
+                }
+            };
+            updated += n;
+        }
+        Ok(updated)
+    }
+
+    pub async fn prune_erasure_tombstones_by_ids(
+        &self,
+        ids: &[String],
+        now_ms: i64,
+    ) -> Result<u64, MetaError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut deleted = 0u64;
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM agent_erasure_tombstones \
+                 WHERE id IN ({placeholders}) \
+                   AND physically_purged_at_ms IS NOT NULL \
+                   AND expires_at_ms IS NOT NULL \
+                   AND expires_at_ms <= ?"
+            );
+            let n = match self {
+                MetaStore::Sqlite(pool) => {
+                    let mut q = sqlx::query(&sql);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q = q.bind(now_ms);
+                    q.execute(pool).await?.rows_affected()
+                }
+                MetaStore::Postgres(pool) => {
+                    let pg = pg_rewrite(&sql);
+                    let mut q = sqlx::query(&pg);
+                    for id in chunk {
+                        q = q.bind(id);
+                    }
+                    q = q.bind(now_ms);
+                    q.execute(pool).await?.rows_affected()
+                }
+            };
+            deleted += n;
+        }
+        Ok(deleted)
     }
 
     /// Purges SQL evaluations & rollups for `Trace` or `Session` level erasures.
@@ -2237,6 +2459,40 @@ mod tests {
             meta.insert_erasure_tombstone(tb).await.unwrap();
         }
 
+        // Before physical purge is confirmed, expired tombstone `tb_3` stays active (with
+        // normalized `expires_at = None`) and cannot be pruned from SQL.
+        let active_before_purge = meta
+            .list_active_erasure_tombstones("p1", 2000)
+            .await
+            .unwrap();
+        assert_eq!(active_before_purge.len(), 3);
+        let tb3_active = active_before_purge.iter().find(|t| t.id == "tb_3").unwrap();
+        assert_eq!(tb3_active.expires_at, None);
+        assert_eq!(
+            meta.list_all_active_erasure_tombstones(2000)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            meta.list_unpurged_erasure_tombstones().await.unwrap().len(),
+            3
+        );
+        assert_eq!(
+            meta.prune_expired_erasure_tombstones(Some("p1"), 2000)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Once marked physically purged, `tb_3` becomes inactive past expiry and is pruned.
+        assert_eq!(
+            meta.mark_erasure_tombstones_purged(&["tb_3".to_string()], 1900)
+                .await
+                .unwrap(),
+            1
+        );
         let active = meta
             .list_active_erasure_tombstones("p1", 2000)
             .await

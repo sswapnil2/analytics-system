@@ -185,6 +185,7 @@ pub struct ControlPlaneService {
     /// Owner-only file that sign-up, reset and invite links go to (Pulse has no mailer).
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
     agent_rate_limit: RateLimiter,
+    pub(crate) agent_erasure_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ControlPlaneService {
@@ -318,6 +319,7 @@ impl ControlPlaneService {
             auth_state: auth::AuthState::default(),
             outbox_path: parking_lot::RwLock::new(None),
             agent_rate_limit: RateLimiter::from_env(),
+            agent_erasure_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let generated_ingest = svc

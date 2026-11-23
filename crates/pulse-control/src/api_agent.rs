@@ -454,6 +454,8 @@ async fn ingest_canonical_batch(
     let sanitize_stats = sanitize_batch(&mut batch, &policy);
     let blobs_deduped = count_intra_batch_deduped_blobs(&batch);
     let eval_candidates = collect_eval_candidates(&batch);
+    let batch_match_keys = collect_batch_match_keys(&batch);
+    let ingest_started_ms = Utc::now().timestamp_millis();
 
     let mut resp = ctrl
         .agent_store()
@@ -464,13 +466,44 @@ async fn ingest_canonical_batch(
             StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
                 IngestError::RateLimited(1, "l0_backpressure")
             }
-            StoreError::Shutdown => IngestError::ServiceUnavailable("store shutting down".into()),
+            StoreError::Shutdown
+            | StoreError::NotWriter { .. }
+            | StoreError::StaleWriter { .. } => IngestError::ServiceUnavailable(e.to_string()),
             // The WAL write failed (disk full, unwritable directory, store down): nothing acked.
             e @ (StoreError::Io(_) | StoreError::ObjectStore(_)) => {
                 IngestError::ServiceUnavailable(e.to_string())
             }
             other => IngestError::Internal(other.to_string()),
         })?;
+
+    if let Ok(purged_finite) = ctrl
+        .meta()
+        .list_purged_finite_erasure_tombstones(project_id, ingest_started_ms)
+        .await
+    {
+        if !purged_finite.is_empty() {
+            let matching_ids: Vec<String> = purged_finite
+                .into_iter()
+                .filter(|tb| batch_match_keys.may_match(tb))
+                .map(|tb| tb.id)
+                .collect();
+            if !matching_ids.is_empty() {
+                match ctrl
+                    .meta()
+                    .reset_erasure_tombstones_purged(&matching_ids)
+                    .await
+                {
+                    Ok(n) if n > 0 => ctrl.notify_agent_erasure(),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
+                        project_id = %project_id,
+                        error = %err,
+                        "failed to reopen matching purged finite erasure tombstones on ingest"
+                    ),
+                }
+            }
+        }
+    }
 
     resp.truncated_payloads = sanitize_stats.truncated_payloads;
     resp.redacted_fields = sanitize_stats.redacted_fields;
@@ -557,6 +590,59 @@ fn count_intra_batch_deduped_blobs(batch: &TraceIngestBatch) -> u64 {
     deduped
 }
 
+struct BatchMatchKeys {
+    trace_ids: HashSet<String>,
+    session_ids: HashSet<String>,
+    user_ids: HashSet<String>,
+    has_orphan_spans: bool,
+}
+
+impl BatchMatchKeys {
+    fn may_match(&self, tb: &AgentErasureTombstone) -> bool {
+        match tb.level {
+            ErasureLevel::Trace => self.trace_ids.contains(&tb.target_id),
+            ErasureLevel::Session => {
+                self.session_ids.contains(&tb.target_id) || self.has_orphan_spans
+            }
+            ErasureLevel::User => self.user_ids.contains(&tb.target_id) || self.has_orphan_spans,
+        }
+    }
+}
+
+fn collect_batch_match_keys(batch: &TraceIngestBatch) -> BatchMatchKeys {
+    let mut trace_ids = HashSet::with_capacity(batch.traces.len() + batch.spans.len());
+    let mut session_ids = HashSet::new();
+    let mut user_ids = HashSet::new();
+    let mut trace_header_ids = HashSet::with_capacity(batch.traces.len());
+    for tr in &batch.traces {
+        trace_ids.insert(tr.trace_id.clone());
+        trace_header_ids.insert(tr.trace_id.as_str());
+        if let Some(ref sid) = tr.session_id {
+            if !sid.is_empty() {
+                session_ids.insert(sid.clone());
+            }
+        }
+        if let Some(ref uid) = tr.user_id {
+            if !uid.is_empty() {
+                user_ids.insert(uid.clone());
+            }
+        }
+    }
+    let mut has_orphan_spans = false;
+    for sp in &batch.spans {
+        trace_ids.insert(sp.trace_id.clone());
+        if !trace_header_ids.contains(sp.trace_id.as_str()) {
+            has_orphan_spans = true;
+        }
+    }
+    BatchMatchKeys {
+        trace_ids,
+        session_ids,
+        user_ids,
+        has_orphan_spans,
+    }
+}
+
 fn collect_eval_candidates(batch: &TraceIngestBatch) -> Vec<(String, Option<String>)> {
     let mut session_by_trace: HashMap<&str, Option<String>> = HashMap::new();
     let mut ready_traces: HashSet<String> = HashSet::new();
@@ -590,7 +676,9 @@ fn map_store_err(err: StoreError) -> CtrlError {
         StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
             CtrlError::new(StatusCode::TOO_MANY_REQUESTS, err.to_string())
         }
-        StoreError::Shutdown => CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        StoreError::Shutdown | StoreError::NotWriter { .. } | StoreError::StaleWriter { .. } => {
+            CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
         other => CtrlError::internal(other),
     }
 }
@@ -910,6 +998,14 @@ async fn execute_erasure(
         .insert_erasure_tombstone(&tb)
         .await
         .map_err(CtrlError::meta)?;
+
+    if !ctrl.agent_store().is_read_only() {
+        let _ = ctrl
+            .agent_store()
+            .purge_erased_in_l0(project_id, std::slice::from_ref(&tb))
+            .await;
+    }
+    ctrl.notify_agent_erasure();
 
     let purged_evaluations = match user_targets {
         Some((sids, tids)) => ctrl
@@ -3247,59 +3343,238 @@ impl ControlPlaneService {
         }
     }
 
-    /// Prunes expired daily `.plss` agent segments, expired control-plane evaluations, and
-    /// expired 3-level erasure tombstones across all projects using each project's
-    /// `AgentPrivacyPolicy.retention_days`.
-    pub async fn prune_expired_agent_data(&self) -> AgentRetentionStats {
-        let mut stats = AgentRetentionStats::default();
-        let now = Utc::now();
-        let now_ms = now.timestamp_millis();
-        let Ok(projects) = self.meta().list_projects().await else {
-            return stats;
-        };
+    pub fn notify_agent_erasure(&self) {
+        self.agent_erasure_notify.notify_one();
+    }
 
+    pub async fn agent_erasure_notified(&self) {
+        self.agent_erasure_notify.notified().await;
+    }
+
+    /// Physically purges all unpurged `agent_erasure_tombstones` across writable agent storage
+    /// and marks confirmed tombstones `physically_purged_at_ms`. Returns the earliest urgent
+    /// pending-GC deadline (if any S3 segment is awaiting its pre-expiry deletion grace).
+    pub async fn sweep_pending_agent_erasures(&self) -> Option<i64> {
         let store = self.agent_store();
-        for proj in projects {
-            stats.projects_checked += 1;
-            let policy = self
-                .meta()
-                .get_agent_privacy_policy(&proj.id)
-                .await
-                .unwrap_or_else(|_| AgentPrivacyPolicy::default_for_project(&proj.id));
-            let days = policy.retention_days.clamp(1, 3650);
-            let cutoff = now - chrono::Duration::days(days);
-            let cutoff_date = cutoff.date_naive();
-            let cutoff_ms = cutoff.timestamp_millis();
-
-            match store.prune_expired_segments(&proj.id, cutoff_date).await {
-                Ok(n) => stats.segments_pruned += n,
-                Err(err) => tracing::warn!(
-                    project_id = %proj.id,
-                    error = %err,
-                    "failed to prune expired agent segments"
-                ),
+        if store.is_read_only() {
+            return None;
+        }
+        let unpurged = match self.meta().list_unpurged_erasure_tombstones().await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load unpurged agent erasure tombstones");
+                return None;
             }
-            match self
-                .meta()
-                .prune_expired_agent_evaluations(&proj.id, cutoff_ms)
-                .await
-            {
-                Ok(n) => stats.evaluations_pruned += n,
-                Err(err) => tracing::warn!(
-                    project_id = %proj.id,
-                    error = %err,
-                    "failed to prune expired agent evaluations"
-                ),
+        };
+        if unpurged.is_empty() {
+            return store.next_urgent_gc_deadline_ms().await;
+        }
+
+        let mut by_project: HashMap<String, Vec<AgentErasureTombstone>> = HashMap::new();
+        for tb in unpurged {
+            by_project
+                .entry(tb.project_id.clone())
+                .or_default()
+                .push(tb);
+        }
+
+        let mut next_deadline: Option<i64> = None;
+        let mut any_concurrent_ingest = false;
+
+        for (pid, tbs) in by_project {
+            match store.purge_erased_in_project(&pid, &tbs).await {
+                Ok(outcome) => {
+                    if let Some(dl) = outcome.next_urgent_gc_deadline_ms {
+                        next_deadline = Some(next_deadline.map_or(dl, |m| m.min(dl)));
+                    }
+                    if outcome.purged_tombstone_ids.is_empty() {
+                        continue;
+                    }
+                    if store
+                        .last_ingest_ms(&pid)
+                        .is_some_and(|ts| ts >= outcome.pass_started_at_ms)
+                    {
+                        any_concurrent_ingest = true;
+                        continue;
+                    }
+                    match self
+                        .meta()
+                        .mark_erasure_tombstones_purged(
+                            &outcome.purged_tombstone_ids,
+                            outcome.pass_started_at_ms,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            if store
+                                .last_ingest_ms(&pid)
+                                .is_some_and(|ts| ts >= outcome.pass_started_at_ms)
+                            {
+                                let _ = self
+                                    .meta()
+                                    .reset_erasure_tombstones_purged(&outcome.purged_tombstone_ids)
+                                    .await;
+                                any_concurrent_ingest = true;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                project_id = %pid,
+                                error = %err,
+                                "failed to mark agent erasure tombstones physically purged"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        project_id = %pid,
+                        error = %err,
+                        "failed to physically purge erased agent traces"
+                    );
+                }
             }
         }
 
-        match self
+        if any_concurrent_ingest {
+            self.notify_agent_erasure();
+        }
+
+        next_deadline
+    }
+
+    /// Prunes expired daily `.plss` agent segments, expired control-plane evaluations, and
+    /// expired 3-level erasure tombstones across writable projects using each project's
+    /// `AgentPrivacyPolicy.retention_days`.
+    pub async fn prune_expired_agent_data(&self) -> AgentRetentionStats {
+        let mut stats = AgentRetentionStats::default();
+        let store = self.agent_store();
+        if store.is_read_only() {
+            return stats;
+        }
+
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+
+        // 1. Ensure all unpurged tombstones (including any whose `expires_at` passed while offline)
+        //    are physically purged BEFORE SQL tombstone pruning can ever run.
+        let _ = self.sweep_pending_agent_erasures().await;
+
+        // 2. Unconditionally re-verify ALL expired-and-purged tombstones across storage (never
+        //    gating on volatile in-memory `last_ingest_ms` which resets to 0 across restarts) and
+        //    ONLY permanently delete tombstone IDs explicitly confirmed in `purged_tombstone_ids`.
+        let mut confirmed_prunable_ids: Vec<String> = Vec::new();
+        let mut unconfirmed_reopen_ids: Vec<String> = Vec::new();
+        if let Ok(expired_purged) = self
             .meta()
-            .prune_expired_erasure_tombstones(None, now_ms)
+            .list_expired_purged_erasure_tombstones(now_ms)
             .await
         {
-            Ok(n) => stats.tombstones_pruned += n,
-            Err(err) => tracing::warn!(error = %err, "failed to prune expired erasure tombstones"),
+            let mut by_project: HashMap<String, Vec<AgentErasureTombstone>> = HashMap::new();
+            for (tb, _purged_at) in expired_purged {
+                by_project
+                    .entry(tb.project_id.clone())
+                    .or_default()
+                    .push(tb);
+            }
+            for (pid, tbs) in by_project {
+                match store.purge_erased_in_project(&pid, &tbs).await {
+                    Ok(outcome) => {
+                        let concurrent_ingest = store
+                            .last_ingest_ms(&pid)
+                            .is_some_and(|ts| ts >= outcome.pass_started_at_ms);
+                        let confirmed_set: HashSet<String> = if concurrent_ingest {
+                            HashSet::new()
+                        } else {
+                            outcome.purged_tombstone_ids.into_iter().collect()
+                        };
+                        for tb in tbs {
+                            if confirmed_set.contains(&tb.id) {
+                                confirmed_prunable_ids.push(tb.id);
+                            } else {
+                                unconfirmed_reopen_ids.push(tb.id);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            project_id = %pid,
+                            error = %err,
+                            "failed to re-verify expired agent erasure tombstones before pruning"
+                        );
+                    }
+                }
+            }
+        }
+        if !unconfirmed_reopen_ids.is_empty() {
+            let _ = self
+                .meta()
+                .reset_erasure_tombstones_purged(&unconfirmed_reopen_ids)
+                .await;
+            self.notify_agent_erasure();
+        }
+
+        // 3. Prune expired `.plss` segments ONLY for known agent projects (never opening event-only projects).
+        if let Ok(agent_pids) = store.known_project_ids().await {
+            for pid in agent_pids {
+                let policy = self
+                    .meta()
+                    .get_agent_privacy_policy(&pid)
+                    .await
+                    .unwrap_or_else(|_| AgentPrivacyPolicy::default_for_project(&pid));
+                let days = policy.retention_days.clamp(1, 3650);
+                let cutoff = now - chrono::Duration::days(days);
+                let cutoff_date = cutoff.date_naive();
+                match store.prune_expired_segments(&pid, cutoff_date).await {
+                    Ok(n) => stats.segments_pruned += n,
+                    Err(err) => tracing::warn!(
+                        project_id = %pid,
+                        error = %err,
+                        "failed to prune expired agent segments"
+                    ),
+                }
+            }
+        }
+
+        // 4. Prune expired SQL evaluations across projects (pure SQL, 0 S3 calls).
+        if let Ok(projects) = self.meta().list_projects().await {
+            for proj in projects {
+                stats.projects_checked += 1;
+                let policy = self
+                    .meta()
+                    .get_agent_privacy_policy(&proj.id)
+                    .await
+                    .unwrap_or_else(|_| AgentPrivacyPolicy::default_for_project(&proj.id));
+                let days = policy.retention_days.clamp(1, 3650);
+                let cutoff = now - chrono::Duration::days(days);
+                let cutoff_ms = cutoff.timestamp_millis();
+
+                match self
+                    .meta()
+                    .prune_expired_agent_evaluations(&proj.id, cutoff_ms)
+                    .await
+                {
+                    Ok(n) => stats.evaluations_pruned += n,
+                    Err(err) => tracing::warn!(
+                        project_id = %proj.id,
+                        error = %err,
+                        "failed to prune expired agent evaluations"
+                    ),
+                }
+            }
+        }
+
+        if !confirmed_prunable_ids.is_empty() {
+            match self
+                .meta()
+                .prune_erasure_tombstones_by_ids(&confirmed_prunable_ids, now_ms)
+                .await
+            {
+                Ok(n) => stats.tombstones_pruned += n,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to prune expired erasure tombstones")
+                }
+            }
         }
 
         stats

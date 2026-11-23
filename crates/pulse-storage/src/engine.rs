@@ -7036,7 +7036,12 @@ mod t4_cold_merge_tests {
         let u0 = ig.get_or_intern("u0", 0);
         let u1 = ig.get_or_intern("u1", 1);
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
         let closed_ts = now_ms - 2 * 86_400_000;
         let closed_date = date_from_ms(closed_ts);
         let single_ts = now_ms - 3 * 86_400_000;

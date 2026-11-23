@@ -30,7 +30,7 @@ These are decisions that exist in the code but have no recorded reasoning, or qu
 - **Vortex vs. Parquet for segments.** Why Vortex was chosen, and the plan for format upgrades.
 - **Bucket count migration.** How to change `PULSE_NUM_BUCKETS` on existing data.
 - **Experiment statistics.** Fixed-horizon versus sequential testing (in review in separate pull requests).
-- **OpenTelemetry and agent tracing.** Whether Pulse will ingest traces. Not on `main`.
+- **OpenTelemetry and agent tracing.** Design rationale for `pulse-agent` (`PTWL`/`PLSS` and OTLP GenAI ingestion).
 - **Server SDKs.** Whether to ship language SDKs or keep HTTP-only.
 
 ## Writing a new ADR

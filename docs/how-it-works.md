@@ -2,7 +2,7 @@
 
 This page follows data through Pulse. It starts with an SDK call, then covers what happens on disk, how a query turns stored segments into a chart, and how replay and flags fit in. Each section names the source files it describes, so you can check any claim. For the map of components, start with [System architecture](architecture.md).
 
-Pulse is **product analytics**: events, users, sessions, funnels, retention, flows, replay, flags and experiments. It does not ingest OpenTelemetry traces or spans, and it does not trace LLM or agent executions (see [Limitations](limitations.md#not-supported)). AI agents use Pulse as a *client*: they query your analytics over [MCP](mcp.md).
+Pulse is **product analytics** (events, users, sessions, funnels, retention, flows, replay, flags and experiments) plus **AI agent observability** ([AI agent observability](agent-observability-architecture.md)). It does not ingest general OpenTelemetry metrics, logs, or service traces, though it does accept OTLP GenAI spans at `POST /v1/otel/v1/traces` (see [Limitations](limitations.md#not-supported)). AI agents also use Pulse as a *client* over [MCP](mcp.md).
 
 ## 1. How events enter Pulse
 
@@ -101,7 +101,9 @@ flowchart LR
         PUB["published/{proj}/pub_*.json + snapshots/<br/>S3 / object store on publish interval"]
         ID["identity/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
         PROF["profiles/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
-        REP["replays/{proj}/{session}/*.plsr"]
+        HREP["hot/replay/ &amp; hot/replay_cursors/<br/>local disk by default (&lt;data_dir&gt;/hot)"]
+        REP["replays/{proj}/{session}/*.plsr<br/>S3 / object store (uploaded on cycle)"]
+        AGH["agent_wal/ · hot/agent_segments/ · agent_manifests/<br/>local disk by default; uploads to agent_segments/ &amp; agent_published/"]
     end
     WAL -. replay on restart .-> L0
     L0 -- "flush: 250k rows or 60 s" --> HSEG
@@ -109,10 +111,11 @@ flowchart LR
     MAN -- "then purge" --> WAL
     HSEG -- "7-step upload (<= 64 MiB/part)" --> SEG
     MAN -- "publish cycle (PULSE_UPLOAD_INTERVAL_SECS)" --> PUB
-    SEG -- "compaction (when interval = 0)" --> SEG
+    HREP -- "upload cycle (copy_if_not_exists)" --> REP
+    SEG -- "cold merge (> 1 h idle) or interval = 0" --> SEG
 ```
 
-All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and hot state (`identity/`, `profiles/`, `manifests/`, `hot/segments/`) routes to `<data_dir>/hot`, while `segments/`, `published/` manifests/snapshots, and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
+All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and hot state (`identity/`, `profiles/`, `manifests/`, `agent_manifests/`, `hot/segments/`, `hot/agent_segments/`, `hot/replay/`, `hot/replay_cursors/`) routes to `<data_dir>/hot`, while `segments/`, `published/` manifests/snapshots, uploaded `replays/`, `agent_segments/`, and `agent_published/` route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
 
 ### L0, flush and segments
 
@@ -134,7 +137,7 @@ All persistent state goes through one `object_store` interface (`crates/pulse-st
   5. **Commit local manifest:** atomically replace frozen local segment IDs with the new S3 segment metas (preserving concurrent L0 flushes).
   6. **Publish:** write a create-only `PublishedManifest` (listing S3 `segments/` only) at dense `publish_seq` with `head(publish_seq - 1)` GC guard, record `last_published_seq`, and run `pending_s3_deletes` GC.
   7. **Clean up:** delete uploaded local `hot/segments/` once unpinned by local `StorageSnapshot`s and clear `upload_intent.json`.
-  When `PULSE_UPLOAD_INTERVAL_SECS=0`, flushes upload eagerly and count-based compaction (merging `>= 4` segments per `(day, bucket)`) stays active on S3 `segments/`. On startup, `upload_intent.json` cleans up any orphaned S3 upload/snapshot objects and unreferenced `hot/segments/` files are swept; dedup seeding fails closed (`503`) if recent S3 segments cannot be read.
+  The same `PULSE_UPLOAD_INTERVAL_SECS` cycle uploads pending `hot/replay/` chunks to S3 `replays/` (`copy_if_not_exists` with `AlreadyExists` sequence-shift recovery) and merges/publishes local `hot/agent_segments/` -> `agent_segments/` and `agent_manifests/` -> `agent_published/` (with 0 S3 calls when idle). Once a closed-date (`date < today_utc`) multi-segment S3 partition has no pending local segments and has been idle for `PULSE_COLD_MERGE_IDLE_SECS` (`3600` s), background cold S3 merge consolidates it in bounded `<= 64 MiB` batches under the 2-publish-interval S3 deletion grace rule. When `PULSE_UPLOAD_INTERVAL_SECS=0`, flushes and replay chunks upload eagerly and count-based compaction (merging `>= 4` segments per `(day, bucket)`) stays active on S3 `segments/`. On startup, `upload_intent.json` cleans up any orphaned S3 upload/snapshot objects and unreferenced `hot/segments/` and `hot/agent_segments/` files are swept; dedup seeding fails closed (`503`) if recent S3 segments cannot be read.
 
 ### Encryption at rest (optional)
 
@@ -222,7 +225,7 @@ Replay is **not** video and not an HTML recording:
 
 - **What is recorded.** The SDK records a *wireframe*: element boxes, kinds and colours, and labels that are masked to `████` on the device unless you unmask them. Inputs, textareas, selects and `contenteditable` elements are always masked. Images become placeholders.
 - **How it is sent.** Ops (full snapshot, node upsert or remove, pointer, network) are batched into `PLSR` frames: zstd-compressed and self-delimiting, at most 100,000 ops per chunk. They go to `POST /v1/replay/chunk` (`crates/pulse-wire/src/replay.rs`).
-- **How it is stored.** Lexicon masking is applied again on the server. Chunks are then stored as immutable objects at `replays/{proj}/{session}/{seq}.plsr`.
+- **How it is stored.** Lexicon masking is applied again on the server. Under `PULSE_HOT_STORE=local`, chunks stage synchronously on local disk at `hot/replay/{proj}/{session}/{seq}.plsr` (with cursor state in `hot/replay_cursors/{proj}/{session}.json`, 0 S3 calls on `/v1/replay/chunk`) and upload to S3 `replays/{proj}/{session}/{seq}.plsr` on `PULSE_UPLOAD_INTERVAL_SECS` (or eagerly when `0`). Readers seamlessly combine local hot chunks and S3 chunks.
 - **How it is played.** `GET /v1/replay/:session_id` streams the chunks back, with `Range` support, and the Studio's `WireframePlayer` draws them. Events link to replay through `replay_offset_kb`. Rage taps (3 or more taps within 800 ms and 40 px), dead taps, errors and network calls appear on the timeline.
 
 ## 7. How feature flags and experiments work

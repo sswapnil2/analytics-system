@@ -23,7 +23,7 @@ use std::time::Duration;
 const ADMIN: &str = "sk_root_storecallstest0000000000000000000000000000";
 type Calls = BTreeMap<(String, &'static str), u64>;
 
-const HOT_PREFIXES: [&str; 9] = [
+const HOT_PREFIXES: [&str; 10] = [
     "wal",
     "wal_corrupt",
     "wal_dead",
@@ -32,6 +32,7 @@ const HOT_PREFIXES: [&str; 9] = [
     "identity",
     "profiles",
     "manifests",
+    "agent_manifests",
     "hot",
 ];
 
@@ -448,10 +449,9 @@ async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
         "local mode: zero hot-tier calls during /v1/ingest new-user acks: {:?}",
         loc.events
     );
-    assert_eq!(
-        hot_calls(&loc.traces),
-        0,
-        "local mode: zero hot-tier calls during /v1/agent/traces acks: {:?}",
+    assert!(
+        loc.traces.is_empty(),
+        "local mode: zero S3 calls during /v1/agent/traces acks: {:?}",
         loc.traces
     );
     assert_eq!(
@@ -477,13 +477,11 @@ async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
         "local mode: zero hot-tier calls during GET user detail: {:?}",
         loc.user_detail
     );
-    assert_eq!(
-        (
-            hot_calls(&loc.idle_l0),
-            hot_calls(&loc.idle_flushed),
-            hot_calls(&loc.idle_ingest),
-        ),
-        (0, 0, 0),
-        "local mode: zero hot-tier calls during idle"
+    assert!(
+        loc.idle_l0.is_empty() && loc.idle_flushed.is_empty() && loc.idle_ingest.is_empty(),
+        "local mode: zero S3 calls during idle: l0={:?} flushed={:?} ingest={:?}",
+        loc.idle_l0,
+        loc.idle_flushed,
+        loc.idle_ingest
     );
 }

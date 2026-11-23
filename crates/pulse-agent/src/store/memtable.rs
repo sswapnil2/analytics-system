@@ -1020,6 +1020,8 @@ struct MemTableInner {
     trace_route: HashMap<String, (NaiveDate, u16)>,
     max_inserted_wal_seq: BTreeMap<String, u64>,
     blocked_erased_wal_seq: BTreeMap<String, u64>,
+    /// Dead local-tier foreign writer WAL sequences recovered on startup (`local_hot_tier` only).
+    recovered_foreign_wal_seq: BTreeMap<String, u64>,
     has_purged_wal: bool,
 }
 
@@ -1041,6 +1043,7 @@ impl ShardedMemTable {
                 trace_route: HashMap::new(),
                 max_inserted_wal_seq: BTreeMap::new(),
                 blocked_erased_wal_seq: BTreeMap::new(),
+                recovered_foreign_wal_seq: BTreeMap::new(),
                 has_purged_wal: false,
             }),
         }
@@ -1373,6 +1376,12 @@ impl ShardedMemTable {
                     .or_insert(max_s);
             }
         }
+        for (wid, &max_s) in &inner.recovered_foreign_wal_seq {
+            flushed_max
+                .entry(wid.clone())
+                .and_modify(|m| *m = (*m).max(max_s))
+                .or_insert(max_s);
+        }
         let mut min_remaining: HashMap<String, u64> = HashMap::new();
         for (&shard_key, shard) in &inner.shards {
             let staged_opt = staged_by_shard.get(&shard_key).copied();
@@ -1405,7 +1414,7 @@ impl ShardedMemTable {
                 Some(&min_rem) => min_rem.saturating_sub(1).max(prev),
                 None => fmax.max(prev),
             };
-            if wid != self_writer_id {
+            if wid != self_writer_id && !inner.recovered_foreign_wal_seq.contains_key(wid) {
                 if let Some(&blocked_seq) = inner.blocked_erased_wal_seq.get(wid) {
                     safe = safe.min(blocked_seq.saturating_sub(1)).max(prev);
                 }
@@ -1671,6 +1680,26 @@ impl ShardedMemTable {
             .and_modify(|m| *m = (*m).min(wal_seq))
             .or_insert(wal_seq);
         inner.has_purged_wal = true;
+    }
+
+    pub(crate) fn record_recovered_foreign_wal_seq(
+        &self,
+        writer_id: &str,
+        wal_seq: u64,
+        mark_purged: bool,
+    ) {
+        if wal_seq == 0 || writer_id.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write();
+        inner
+            .recovered_foreign_wal_seq
+            .entry(writer_id.to_string())
+            .and_modify(|m| *m = (*m).max(wal_seq))
+            .or_insert(wal_seq);
+        if mark_purged {
+            inner.has_purged_wal = true;
+        }
     }
 
     pub(crate) fn has_purged_wal(&self) -> bool {

@@ -254,7 +254,7 @@ body cap is 8 MiB, and other methods return `405`.
 | GET | `/agent/sessions`, `/agent/sessions/:session_id` | Runs grouped by `session_id`, with cost, errors and eval score |
 | GET | `/agent/analytics` | Runs, success rate, latency percentiles, tokens, cost, failure sources, a daily series, and breakdowns by agent, version, model, tool and environment. Same filters as traces. |
 | GET | `/agent/compare` | Baseline vs candidate (Welch t-test on latency, cost and eval score): `baseline_agent_version` and `candidate_agent_version` (or `_prompt_version`, `_model`, `_environment`) |
-| POST | `/agent/erasure` | `{"level": "trace" \| "session" \| "user", "target_id"}`. Hides the data at once; compaction purges it. Admin. |
+| POST | `/agent/erasure` | `{"level": "trace" \| "session" \| "user", "target_id", "expires_at"?}` (`expires_at` optional epoch ms). Hides the data at once and physically purges local hot + S3 segments before `expires_at` expires (tombstone stays active and unpruned until physically purged). Admin. |
 | GET, POST | `/agent/evaluators` | List / create or update (same `id`) an evaluator: `{"name", "kind", "target_type": "trace" \| "span" \| "session", "config", "sample_rate", "enabled", "agent_name"?}` |
 | DELETE | `/agent/evaluators/:eval_id` | Delete an evaluator; its past results stay |
 | POST | `/agent/evaluate` | Queue evaluators for one target: `{"trace_id"?, "session_id"?, "span_id"?}` (a trace or session id is required). `202`, or `503` when the queue is full. |

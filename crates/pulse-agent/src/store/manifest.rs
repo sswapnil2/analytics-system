@@ -36,6 +36,47 @@ pub struct PendingGcEntry {
     pub segment_id: String,
     pub superseded_at_ms: i64,
     pub eligible_after_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent_erasure_deadline_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub erasure_tombstone_ids: Vec<String>,
+}
+
+/// Deferred S3 `.plss` deletion persisted in the local [`AgentManifest`].
+///
+/// An S3 segment may only be deleted after a superseding `PublishedAgentManifest` has been
+/// written to `agent_published/`, plus 2 publish intervals (or an accelerated pre-expiry
+/// deadline when urgent agent erasure tombstones are waiting), and once unpinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAgentS3Delete {
+    pub object_path: String,
+    pub segment_id: String,
+    pub superseding_pub_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_after_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent_erasure_deadline_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub erasure_tombstone_ids: Vec<String>,
+}
+
+/// Computes the accelerated deletion grace window when an urgent finite-TTL agent erasure
+/// tombstone (`deadline_ms`) requires physical removal from S3 before expiry.
+pub fn compute_urgent_grace_ms(pub_ts_ms: i64, deadline_ms: i64, normal_grace_ms: i64) -> i64 {
+    let remaining = deadline_ms.saturating_sub(pub_ts_ms);
+    if remaining >= normal_grace_ms.saturating_add(30_000) {
+        normal_grace_ms
+    } else if remaining <= 0 {
+        0
+    } else {
+        normal_grace_ms.min((remaining / 3).max(10_000.min(remaining / 2)))
+    }
+}
+
+pub(crate) fn partition_upload_key(date: &str, shard_id: u16) -> String {
+    format!("{date}/{shard_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -43,11 +84,21 @@ pub struct AgentManifest {
     pub epoch: u64,
     pub updated_at_ms: i64,
     #[serde(default)]
+    pub writer_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_published_seq: Option<u64>,
+    #[serde(default)]
+    pub fenced: bool,
+    #[serde(default)]
     pub segments: Vec<SegmentDescriptor>,
     #[serde(default)]
     pub committed_wal_seq: BTreeMap<String, u64>,
     #[serde(default)]
     pub pending_gc: Vec<PendingGcEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_s3_deletes: Vec<PendingAgentS3Delete>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub s3_partition_last_upload_ms: BTreeMap<String, i64>,
     #[serde(default)]
     pub erased_traces: BTreeMap<String, i64>,
 }
@@ -236,7 +287,7 @@ impl ManifestStore {
     /// not referenced by active manifest `segments`, and not pinned by any active reader.
     pub async fn run_gc(&self, now_ms: i64, pin_tracker: &ReaderPinTracker) -> StoreResult<usize> {
         let manifest = self.load_latest().await?;
-        if manifest.pending_gc.is_empty() {
+        if manifest.pending_gc.is_empty() && manifest.pending_s3_deletes.is_empty() {
             return Ok(0);
         }
 
@@ -246,7 +297,7 @@ impl ManifestStore {
             .map(|s| s.object_path.as_str())
             .collect();
 
-        let mut deleted_paths: HashSet<String> = HashSet::new();
+        let mut candidate_paths: Vec<String> = Vec::new();
         for entry in &manifest.pending_gc {
             if now_ms < entry.eligible_after_ms {
                 continue;
@@ -257,15 +308,35 @@ impl ManifestStore {
             if pin_tracker.is_pinned(&entry.object_path) {
                 continue;
             }
-            let loc = ObjectPath::from(entry.object_path.as_str());
+            candidate_paths.push(entry.object_path.clone());
+        }
+        for entry in &manifest.pending_s3_deletes {
+            if entry.eligible_after_ms.is_none_or(|t| now_ms < t) {
+                continue;
+            }
+            if active_paths.contains(entry.object_path.as_str()) {
+                continue;
+            }
+            if pin_tracker.is_pinned(&entry.object_path) {
+                continue;
+            }
+            candidate_paths.push(entry.object_path.clone());
+        }
+        if candidate_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted_paths: HashSet<String> = HashSet::new();
+        for path in candidate_paths {
+            let loc = ObjectPath::from(path.as_str());
             match self.object_store.delete(&loc).await {
                 Ok(()) | Err(OsError::NotFound { .. }) => {
-                    deleted_paths.insert(entry.object_path.clone());
+                    deleted_paths.insert(path);
                 }
                 Err(e) => {
                     tracing::warn!(
                         project_id = %self.project_id,
-                        path = %entry.object_path,
+                        path = %path,
                         error = %e,
                         "failed to delete pending GC segment"
                     );
@@ -279,10 +350,13 @@ impl ManifestStore {
 
         let deleted_count = deleted_paths.len();
         self.commit_with_cas(|m| {
-            let before = m.pending_gc.len();
+            let before_gc = m.pending_gc.len();
+            let before_s3 = m.pending_s3_deletes.len();
             m.pending_gc
                 .retain(|e| !deleted_paths.contains(&e.object_path));
-            if m.pending_gc.len() != before {
+            m.pending_s3_deletes
+                .retain(|e| !deleted_paths.contains(&e.object_path));
+            if m.pending_gc.len() != before_gc || m.pending_s3_deletes.len() != before_s3 {
                 m.updated_at_ms = now_ms;
                 Ok(true)
             } else {
@@ -293,6 +367,288 @@ impl ManifestStore {
 
         Ok(deleted_count)
     }
+}
+
+/// Dense-sequence published S3 manifest (`agent_published/{project_id}/pub_{publish_seq:012}.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedAgentManifest {
+    pub publish_seq: u64,
+    pub writer_generation: u64,
+    pub source_local_epoch: u64,
+    pub published_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    #[serde(default)]
+    pub segments: Vec<SegmentDescriptor>,
+    #[serde(default)]
+    pub committed_wal_seq: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub erased_traces: BTreeMap<String, i64>,
+}
+
+impl PublishedAgentManifest {
+    /// Materializes a local [`AgentManifest`] for `restore --from-published` or `NodeRole::Query`.
+    pub fn to_local_manifest(
+        &self,
+        target_epoch: u64,
+        target_writer_generation: u64,
+    ) -> AgentManifest {
+        AgentManifest {
+            epoch: target_epoch,
+            updated_at_ms: self.published_at_ms,
+            writer_generation: target_writer_generation,
+            last_published_seq: Some(self.publish_seq),
+            fenced: false,
+            segments: self.segments.clone(),
+            committed_wal_seq: self.committed_wal_seq.clone(),
+            pending_gc: Vec::new(),
+            pending_s3_deletes: Vec::new(),
+            s3_partition_last_upload_ms: BTreeMap::new(),
+            erased_traces: self.erased_traces.clone(),
+        }
+    }
+}
+
+/// Conditional-create store for `agent_published/{project_id}/pub_{publish_seq:012}.json`.
+pub struct PublishedAgentManifestStore {
+    project_id: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl PublishedAgentManifestStore {
+    pub fn new(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> StoreResult<Self> {
+        let project_id = project_id.into();
+        validate_identifier("project_id", &project_id)?;
+        Ok(Self {
+            project_id,
+            object_store,
+        })
+    }
+
+    fn prefix(&self) -> ObjectPath {
+        ObjectPath::from(format!("agent_published/{}", self.project_id))
+    }
+
+    pub fn pub_path(&self, publish_seq: u64) -> ObjectPath {
+        ObjectPath::from(format!(
+            "agent_published/{}/pub_{:012}.json",
+            self.project_id, publish_seq
+        ))
+    }
+
+    async fn list_pub_seqs(&self) -> StoreResult<Vec<(u64, ObjectMeta)>> {
+        let prefix = self.prefix();
+        let res = self.object_store.list_with_delimiter(Some(&prefix)).await?;
+        let expected_dir = format!("agent_published/{}/", self.project_id);
+        let mut out: Vec<(u64, ObjectMeta)> = res
+            .objects
+            .into_iter()
+            .filter_map(|m| {
+                let rel = m.location.as_ref().strip_prefix(&expected_dir)?;
+                if rel.contains('/') {
+                    return None;
+                }
+                parse_pub_seq_from_filename(rel).map(|seq| (seq, m))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(seq, _)| *seq);
+        Ok(out)
+    }
+
+    pub async fn latest_pub_seq(&self) -> StoreResult<Option<(u64, ObjectMeta)>> {
+        Ok(self.list_pub_seqs().await?.pop())
+    }
+
+    pub async fn load_from_meta(&self, meta: &ObjectMeta) -> StoreResult<PublishedAgentManifest> {
+        let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
+        let manifest: PublishedAgentManifest = serde_json::from_slice(&bytes)?;
+        Ok(manifest)
+    }
+
+    pub async fn load_latest(&self) -> StoreResult<Option<PublishedAgentManifest>> {
+        let Some((_, meta)) = self.latest_pub_seq().await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.load_from_meta(&meta).await?))
+    }
+
+    pub async fn load_seq(&self, publish_seq: u64) -> StoreResult<PublishedAgentManifest> {
+        let path = self.pub_path(publish_seq);
+        let bytes = self.object_store.get(&path).await?.bytes().await?;
+        let manifest: PublishedAgentManifest = serde_json::from_slice(&bytes)?;
+        Ok(manifest)
+    }
+
+    /// Writes `pub_manifest` create-only at `pub_{publish_seq:012}.json`, verifying
+    /// `head(publish_seq - 1)` when `publish_seq > 0` so a stale writer behind GC cannot slip past.
+    pub async fn publish_next(
+        &self,
+        pub_manifest: PublishedAgentManifest,
+    ) -> StoreResult<PublishedAgentManifest> {
+        let seq = pub_manifest.publish_seq;
+        let path = self.pub_path(seq);
+        let payload = serde_json::to_vec(&pub_manifest)?;
+        let opts = PutOptions::from(PutMode::Create);
+        match self
+            .object_store
+            .put_opts(&path, PutPayload::from_bytes(Bytes::from(payload)), opts)
+            .await
+        {
+            Ok(_) => {
+                if seq > 0 {
+                    match self.object_store.head(&self.pub_path(seq - 1)).await {
+                        Ok(_) => {}
+                        Err(OsError::NotFound { .. }) => {
+                            let _ = self.object_store.delete(&path).await;
+                            return Err(StoreError::ManifestConflict);
+                        }
+                        Err(other) => {
+                            let _ = self.object_store.delete(&path).await;
+                            return Err(StoreError::ObjectStore(other));
+                        }
+                    }
+                }
+                Ok(pub_manifest)
+            }
+            Err(OsError::AlreadyExists { .. }) | Err(OsError::Precondition { .. }) => {
+                Err(StoreError::ManifestConflict)
+            }
+            Err(other) => Err(StoreError::ObjectStore(other)),
+        }
+    }
+}
+
+fn parse_pub_seq_from_filename(fname: &str) -> Option<u64> {
+    let body = fname.strip_prefix("pub_")?.strip_suffix(".json")?;
+    body.parse::<u64>().ok()
+}
+
+/// One per-partition merged S3 output batch planned in Step 1 of the agent upload cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentUploadIntentBatch {
+    pub date: String,
+    pub shard_id: u16,
+    pub source_segment_ids: Vec<String>,
+    pub source_object_paths: Vec<String>,
+    pub target_segment_prefix: String,
+}
+
+/// Local intent record written at Step 1 of the agent upload cycle
+/// (`agent_manifests/{project_id}/upload_intent.json`, excluded from `ManifestStore::list_epochs`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentUploadIntent {
+    pub intent_id: String,
+    pub writer_generation: u64,
+    pub base_local_epoch: u64,
+    pub target_publish_seq: u64,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub batches: Vec<AgentUploadIntentBatch>,
+}
+
+pub struct AgentUploadIntentStore {
+    project_id: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl AgentUploadIntentStore {
+    pub fn new(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> StoreResult<Self> {
+        let project_id = project_id.into();
+        validate_identifier("project_id", &project_id)?;
+        Ok(Self {
+            project_id,
+            object_store,
+        })
+    }
+
+    pub fn path(&self) -> ObjectPath {
+        ObjectPath::from(format!(
+            "agent_manifests/{}/upload_intent.json",
+            self.project_id
+        ))
+    }
+
+    pub async fn load(&self) -> StoreResult<Option<AgentUploadIntent>> {
+        let path = self.path();
+        match self.object_store.get(&path).await {
+            Ok(res) => {
+                let bytes = res.bytes().await?;
+                let intent: AgentUploadIntent = serde_json::from_slice(&bytes)?;
+                Ok(Some(intent))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(StoreError::ObjectStore(e)),
+        }
+    }
+
+    pub async fn save(&self, intent: &AgentUploadIntent) -> StoreResult<()> {
+        let payload = serde_json::to_vec(intent)?;
+        self.object_store
+            .put_opts(
+                &self.path(),
+                PutPayload::from_bytes(Bytes::from(payload)),
+                PutOptions::from(PutMode::Overwrite),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear(&self) -> StoreResult<()> {
+        match self.object_store.delete(&self.path()).await {
+            Ok(()) | Err(OsError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StoreError::ObjectStore(e)),
+        }
+    }
+}
+
+/// Installs a local [`AgentManifest`] restored from `pub_manifest` at `epoch = 1` with
+/// `writer_generation = pub_manifest.writer_generation + 1` (used by `restore --from-published`).
+/// Also reconciles any S3 objects under `agent_segments/{project_id}/` not referenced by
+/// `pub_manifest.segments` into `pending_s3_deletes` so superseded S3 segments are cleaned up
+/// instead of leaking indefinitely across volume loss.
+pub async fn install_restored_agent_manifest(
+    project_id: &str,
+    pub_manifest: &PublishedAgentManifest,
+    object_store: Arc<dyn ObjectStore>,
+) -> StoreResult<AgentManifest> {
+    let store = ManifestStore::new(project_id, object_store.clone(), AGENT_GC_GRACE_MS)?;
+    let next_gen = pub_manifest.writer_generation.saturating_add(1);
+    let mut restored = pub_manifest.to_local_manifest(0, next_gen);
+    let referenced_s3: HashSet<&str> = pub_manifest
+        .segments
+        .iter()
+        .map(|s| s.object_path.as_str())
+        .collect();
+    let seg_prefix = ObjectPath::from(format!("agent_segments/{project_id}/"));
+    let metas: Vec<_> = object_store.list(Some(&seg_prefix)).try_collect().await?;
+    for meta in metas {
+        let path_str = meta.location.as_ref();
+        if path_str.ends_with(".plss") && !referenced_s3.contains(path_str) {
+            let seg_id = path_str
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.strip_suffix(".plss"))
+                .unwrap_or(path_str)
+                .to_string();
+            restored.pending_s3_deletes.push(PendingAgentS3Delete {
+                object_path: path_str.to_string(),
+                segment_id: seg_id,
+                superseding_pub_seq: pub_manifest.publish_seq,
+                superseded_at_ms: Some(pub_manifest.published_at_ms),
+                eligible_after_ms: None,
+                urgent_erasure_deadline_ms: None,
+                erasure_tombstone_ids: Vec::new(),
+            });
+        }
+    }
+    restored.epoch = 0; // `commit_next` increments to 1
+    store.commit_next(restored).await
 }
 
 fn parse_epoch_from_path(path: &str) -> Option<u64> {
@@ -399,6 +755,8 @@ mod tests {
                 segment_id: "old".to_string(),
                 superseded_at_ms: superseded_at,
                 eligible_after_ms: superseded_at + AGENT_GC_GRACE_MS,
+                urgent_erasure_deadline_ms: None,
+                erasure_tombstone_ids: Vec::new(),
             });
             Ok(true)
         })

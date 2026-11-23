@@ -90,4 +90,4 @@ See [How Pulse works](how-it-works.md#2-how-events-are-stored).
 
 ## MCP
 
-The **Model Context Protocol** is the standard AI agents use to call tools. Pulse serves an MCP endpoint (`POST /v1/mcp`), so agents can read the lexicon and run analytics queries. Agents are *consumers* of your analytics; Pulse does not trace the agents themselves. See [MCP for agents](mcp.md).
+The **Model Context Protocol** is the standard AI agents use to call tools. Pulse serves an MCP endpoint (`POST /v1/mcp`), so agents can read the lexicon, run analytics queries, and inspect agent traces/evaluations. See [MCP for agents](mcp.md) and [AI agent observability](agent-observability-architecture.md).

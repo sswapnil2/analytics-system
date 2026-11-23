@@ -53,8 +53,8 @@ def main():
 
     index = ["# Pulse", "",
              "> Open-source, self-hosted product analytics in one Rust binary: event ingest, exact funnels, "
-             "retention and trends, privacy-masked session replay, feature flags and experiments, and an MCP "
-             "endpoint for AI agents. Pulse does not ingest OpenTelemetry traces and does not trace LLM or agent runs.",
+             "retention and trends, privacy-masked session replay, feature flags and experiments, AI agent "
+             "observability (with OTLP GenAI spans), and an MCP endpoint for AI agents.",
              "",
              f"Every page below is plain Markdown. All of them in one file: {BASE}llms-full.txt",
              f"Human-readable site: {BASE}docs/ · Source: https://github.com/sswapnil2/analytics-system", ""]

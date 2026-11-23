@@ -32,15 +32,19 @@ use crate::store::segment::{
 use crate::store::AgentTraceStore;
 use crate::{MAX_TRACE_LIST_LIMIT, MIN_SIGNIFICANCE_SAMPLES};
 
-/// Reads a segment tail, skipping (with a warning) a segment whose file is gone so one lost
-/// object doesn't fail every query in the project. Other errors, like corruption, still fail.
+/// Reads a segment tail, skipping (with a warning) a segment whose file is gone when
+/// `allow_not_found_skip` is true. On `NodeRole::Query` first attempt (`allow_not_found_skip == false`),
+/// `NotFound` is propagated so the caller can refresh `PublishedAgentManifest` and retry once.
 async fn tail_or_skip(
     reader: &crate::store::segment::PlssReader,
     seg: &SegmentDescriptor,
+    allow_not_found_skip: bool,
 ) -> StoreResult<Option<Arc<SegmentTail>>> {
     match reader.read_eof_tail(seg).await {
         Ok(tail) => Ok(Some(tail)),
-        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. })) => {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if allow_not_found_skip =>
+        {
             tracing::warn!(segment = %seg.object_path, "agent segment missing from object store; skipping it");
             Ok(None)
         }
@@ -535,6 +539,25 @@ pub(crate) async fn list_sessions_impl(
     filter: &SessionListFilter,
     tombstones: &[AgentErasureTombstone],
 ) -> StoreResult<SessionListResponse> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match list_sessions_once(store, project_id, filter, tombstones, !retry_on_not_found).await {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            list_sessions_once(store, project_id, filter, tombstones, true).await
+        }
+        other => other,
+    }
+}
+
+async fn list_sessions_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    filter: &SessionListFilter,
+    tombstones: &[AgentErasureTombstone],
+    allow_not_found_skip: bool,
+) -> StoreResult<SessionListResponse> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -554,7 +577,7 @@ pub(crate) async fn list_sessions_impl(
         Vec::with_capacity(snap.manifest.segments.len());
 
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         if seg.zone_map.session_count == 0 {
@@ -1010,6 +1033,33 @@ pub(crate) async fn get_session_detail_impl(
     session_id: &str,
     tombstones: &[AgentErasureTombstone],
 ) -> StoreResult<Option<SessionDetail>> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match get_session_detail_once(
+        store,
+        project_id,
+        session_id,
+        tombstones,
+        !retry_on_not_found,
+    )
+    .await
+    {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            get_session_detail_once(store, project_id, session_id, tombstones, true).await
+        }
+        other => other,
+    }
+}
+
+async fn get_session_detail_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    session_id: &str,
+    tombstones: &[AgentErasureTombstone],
+    allow_not_found_skip: bool,
+) -> StoreResult<Option<SessionDetail>> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -1033,7 +1083,7 @@ pub(crate) async fn get_session_detail_impl(
         Vec::new();
 
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         if seg.zone_map.session_count == 0 || !tail.index.may_contain_session(session_id) {
@@ -1566,6 +1616,35 @@ pub(crate) async fn list_traces_impl(
     rollups: &HashMap<(EvalTargetType, String), AgentEvalRollup>,
     tombstones: &[AgentErasureTombstone],
 ) -> StoreResult<TraceListResponse> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match list_traces_once(
+        store,
+        project_id,
+        filter,
+        rollups,
+        tombstones,
+        !retry_on_not_found,
+    )
+    .await
+    {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            list_traces_once(store, project_id, filter, rollups, tombstones, true).await
+        }
+        other => other,
+    }
+}
+
+async fn list_traces_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    filter: &TraceListFilter,
+    rollups: &HashMap<(EvalTargetType, String), AgentEvalRollup>,
+    tombstones: &[AgentErasureTombstone],
+    allow_not_found_skip: bool,
+) -> StoreResult<TraceListResponse> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -1584,7 +1663,7 @@ pub(crate) async fn list_traces_impl(
 
     // Never touch Tag 0x04 or Tag 0x05 in list_traces!
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         let (matched, cand_bm) =
@@ -1815,6 +1894,26 @@ pub(crate) async fn get_trace_detail_impl(
     trace_id: &str,
     tombstones: &[AgentErasureTombstone],
 ) -> StoreResult<Option<TraceDetail>> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match get_trace_detail_once(store, project_id, trace_id, tombstones, !retry_on_not_found).await
+    {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            get_trace_detail_once(store, project_id, trace_id, tombstones, true).await
+        }
+        other => other,
+    }
+}
+
+async fn get_trace_detail_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    trace_id: &str,
+    tombstones: &[AgentErasureTombstone],
+    allow_not_found_skip: bool,
+) -> StoreResult<Option<TraceDetail>> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -1845,7 +1944,7 @@ pub(crate) async fn get_trace_detail_impl(
 
     let mut parts: Vec<RankedTracePart> = Vec::new();
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         if !tail.index.may_contain_trace(trace_id) {
@@ -2244,6 +2343,35 @@ pub(crate) async fn query_analytics_impl(
     tombstones: &[AgentErasureTombstone],
     rollups: &HashMap<(EvalTargetType, String), AgentEvalRollup>,
 ) -> StoreResult<AgentAnalyticsOverview> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match query_analytics_once(
+        store,
+        project_id,
+        filter,
+        tombstones,
+        rollups,
+        !retry_on_not_found,
+    )
+    .await
+    {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            query_analytics_once(store, project_id, filter, tombstones, rollups, true).await
+        }
+        other => other,
+    }
+}
+
+async fn query_analytics_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    filter: &AnalyticsFilter,
+    tombstones: &[AgentErasureTombstone],
+    rollups: &HashMap<(EvalTargetType, String), AgentEvalRollup>,
+    allow_not_found_skip: bool,
+) -> StoreResult<AgentAnalyticsOverview> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -2264,7 +2392,7 @@ pub(crate) async fn query_analytics_impl(
 
     // Never touch Tag 0x04 or Tag 0x05!
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         let (matched, cand_bm) = pass1_segment_candidates(
@@ -2882,6 +3010,25 @@ pub(crate) async fn compare_groups_impl(
     filter: &CompareFilter,
     tombstones: &[AgentErasureTombstone],
 ) -> StoreResult<CompareResponse> {
+    let retry_on_not_found = store.is_read_only() && store.is_local_hot_tier();
+    match compare_groups_once(store, project_id, filter, tombstones, !retry_on_not_found).await {
+        Err(StoreError::ObjectStore(object_store::Error::NotFound { .. }))
+            if retry_on_not_found =>
+        {
+            store.invalidate_query_publish_cache(project_id);
+            compare_groups_once(store, project_id, filter, tombstones, true).await
+        }
+        other => other,
+    }
+}
+
+async fn compare_groups_once(
+    store: &AgentTraceStore,
+    project_id: &str,
+    filter: &CompareFilter,
+    tombstones: &[AgentErasureTombstone],
+    allow_not_found_skip: bool,
+) -> StoreResult<CompareResponse> {
     if store.closed.load(Ordering::Acquire) {
         return Err(StoreError::Shutdown);
     }
@@ -2925,7 +3072,7 @@ pub(crate) async fn compare_groups_impl(
     let l0_empty = snap.l0_entries.is_empty();
 
     for seg in &snap.manifest.segments {
-        let Some(tail) = tail_or_skip(&reader, seg).await? else {
+        let Some(tail) = tail_or_skip(&reader, seg, allow_not_found_skip).await? else {
             continue;
         };
         let (matched, cand_bm) =

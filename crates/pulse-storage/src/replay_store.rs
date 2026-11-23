@@ -492,19 +492,38 @@ impl ReplayStore {
         validate_replay_identifier("project_id", project_id)?;
         validate_replay_identifier("session_id", session_id)?;
 
-        let mut by_seq: BTreeMap<u64, ReplayChunkMeta> = BTreeMap::new();
-        if self.is_local_hot_tier() && !self.read_only {
-            for c in self
-                .list_prefix_chunks(&hot_session_prefix(project_id, session_id))
+        let local_chunks = if self.is_local_hot_tier() && !self.read_only {
+            self.list_prefix_chunks(&hot_session_prefix(project_id, session_id))
                 .await?
-            {
-                by_seq.insert(c.seq, c);
+        } else {
+            Vec::new()
+        };
+        let s3_chunks = self
+            .list_prefix_chunks(&s3_session_prefix(project_id, session_id))
+            .await?;
+
+        if !local_chunks.is_empty() {
+            let cursor = self.load_cursor(project_id, session_id).await?;
+            if let Some(committed_before) = cursor.local_committed_before_seq {
+                // During recovery from a partial shift after `AlreadyExists` with differing
+                // bytes, S3 holds `[0..s3_next_seq)` (including already-shifted chunks) while
+                // un-shifted local chunks with `seq >= committed_before` logically follow them
+                // even if their local `seq` numbers overlap S3.
+                let mut out = s3_chunks;
+                for c in local_chunks {
+                    if c.seq >= committed_before {
+                        out.push(c);
+                    }
+                }
+                return Ok(out);
             }
         }
-        for c in self
-            .list_prefix_chunks(&s3_session_prefix(project_id, session_id))
-            .await?
-        {
+
+        let mut by_seq: BTreeMap<u64, ReplayChunkMeta> = BTreeMap::new();
+        for c in local_chunks {
+            by_seq.insert(c.seq, c);
+        }
+        for c in s3_chunks {
             // Prefer uploaded S3 `replays/` entry on seq collision.
             by_seq.insert(c.seq, c);
         }
@@ -2051,5 +2070,59 @@ mod tests {
                 .contains(&("proj_race".to_string(), "sess_deleted".to_string())),
             "recorded_sessions must not contain deleted session"
         );
+    }
+
+    #[tokio::test]
+    async fn list_session_chunks_preserves_unshifted_local_chunks_after_partial_shift() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set_local();
+        let s3 = Arc::new(InMemory::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let routed = crate::with_hot_store(s3.clone(), tmp.path()).await.unwrap();
+        let store = ReplayStore::new_with_options(routed.clone(), true, false);
+
+        // Pre-existing S3 chunks seq=0 and seq=1 (e.g., from an earlier volume), plus local
+        // hot chunks seq=0 (already shifted/uploaded to S3 seq=2) and seq=1 (not yet shifted).
+        for (i, path) in [
+            (0u32, "replays/proj_shift/sess_s/0000000000.plsr"),
+            (1, "replays/proj_shift/sess_s/0000000001.plsr"),
+            (2, "replays/proj_shift/sess_s/0000000002.plsr"),
+            (3, "hot/replay/proj_shift/sess_s/0000000000.plsr"),
+            (4, "hot/replay/proj_shift/sess_s/0000000001.plsr"),
+        ] {
+            let chunk = sample_chunk("proj_shift", "sess_s", i);
+            let encoded = Bytes::from(chunk.encode_binary(3).unwrap());
+            routed
+                .put(&ObjectPath::from(path), PutPayload::from_bytes(encoded))
+                .await
+                .unwrap();
+        }
+        let cursor = ReplaySessionCursor {
+            next_seq: 3,
+            uploaded_bytes: 300,
+            local_committed_before_seq: Some(1),
+        };
+        store
+            .save_cursor("proj_shift", "sess_s", &cursor)
+            .await
+            .unwrap();
+
+        let listed = store
+            .list_session_chunks("proj_shift", "sess_s")
+            .await
+            .unwrap();
+        let paths: Vec<&str> = listed.iter().map(|c| c.location.as_ref()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "replays/proj_shift/sess_s/0000000000.plsr",
+                "replays/proj_shift/sess_s/0000000001.plsr",
+                "replays/proj_shift/sess_s/0000000002.plsr",
+                "hot/replay/proj_shift/sess_s/0000000001.plsr",
+            ],
+            "unshifted local seq=1 must not be masked by S3 seq=1"
+        );
+        let decoded = store.read_chunks("proj_shift", "sess_s", 0).await.unwrap();
+        assert_eq!(decoded.len(), 4);
     }
 }

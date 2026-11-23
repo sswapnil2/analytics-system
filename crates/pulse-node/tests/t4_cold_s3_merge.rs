@@ -303,16 +303,18 @@ fn t4_1_cold_s3_merge_e2e_closed_idle_grace_and_zero_idle_s3_calls() {
         let http = reqwest::Client::new();
         let base_url = format!("http://{}", node.http_addr);
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let today_date = chrono::Utc::now().date_naive();
+        let now_ms = today_date
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
         let d2_ts = now_ms - 2 * 86_400_000;
         let d1_ts = now_ms - 86_400_000;
         let d2_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(d2_ts)
             .unwrap()
             .date_naive();
         let d1_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(d1_ts)
-            .unwrap()
-            .date_naive();
-        let today_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms)
             .unwrap()
             .date_naive();
 
@@ -539,14 +541,14 @@ fn t4_1_cold_s3_merge_e2e_closed_idle_grace_and_zero_idle_s3_calls() {
         s3_fault.take_calls();
         assert_eq!(
             node.storage
-                .cold_merge_all_projects_at(pub_sup_ts + 1_200_000)
+                .cold_merge_all_projects_at(t_late + 4_800_000)
                 .await
                 .unwrap(),
             0
         );
         assert_eq!(
             node.storage
-                .upload_all_projects_at(pub_sup_ts + 1_200_000)
+                .upload_all_projects_at(t_late + 4_800_000)
                 .await
                 .unwrap(),
             0

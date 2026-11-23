@@ -122,7 +122,7 @@ From that moment, queries hide every event the user had sent up to the erasure. 
 
 Limits of erasure:
 
-- **When rows disappear.** Rows are physically removed only when each affected `(day, bucket)` is next compacted. Until then they are hidden, not gone.
+- **When rows disappear.** In tiered S3 storage (`PULSE_HOT_STORE=local`), S3 event segments are merged once at upload and at most once by cold S3 merge (`> 1 h` idle), so event rows erased *after* that merge stay in S3 segment bytes indefinitely behind the `erased_uids` tombstone (until then they are hidden, not gone; see [Limitations](limitations.md#data-limitations)). By contrast, AI agent erasure tombstones (`POST /v1/projects/:id/agent/erasure`) that carry an `expires_at` trigger physical purge/rewrite across L0, `agent_wal/`, local `hot/agent_segments/`, S3 `agent_segments/`, `agent_published/`, and `pending_gc` / `pending_s3_deletes` before `expires_at` expires.
 - **Exports and backups.** Data already exported to a warehouse or captured in a backup is not touched.
 - **New events.** If the same id sends new events later, they are counted. Erasure is not a block list.
 
