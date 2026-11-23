@@ -162,6 +162,19 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if let IngestError::Storage(pulse_storage::StorageError::StaleWriter { .. }) = &self.0 {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "stale_writer",
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(body),
+            )
+                .into_response();
+        }
         let status = match &self.0 {
             IngestError::Unauthorized => StatusCode::UNAUTHORIZED,
             IngestError::Wire(_)

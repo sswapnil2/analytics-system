@@ -175,6 +175,8 @@ pub struct ControlPlaneService {
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
     /// Per project: the update time up to which user profiles are loaded into the catalog.
     profiles_synced_ms: DashMap<String, i64>,
+    /// Per project: `publish_seq` last loaded into `ColumnarProfileIndex` on `NodeRole::Query`.
+    synced_published_seq: DashMap<String, u64>,
     /// Per project: `canonical_uid -> merged updated_at_ms` currently stored in `ColumnarProfileIndex`.
     profile_catalog_ts: DashMap<String, HashMap<u32, i64>>,
     discovery_tx: mpsc::UnboundedSender<Vec<DiscoveredEventSchema>>,
@@ -309,6 +311,7 @@ impl ControlPlaneService {
             known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
             profiles_synced_ms: DashMap::new(),
+            synced_published_seq: DashMap::new(),
             profile_catalog_ts: DashMap::new(),
             discovery_tx: tx,
             auth_cfg: parking_lot::RwLock::new(AuthConfig::from_env()),
@@ -517,7 +520,7 @@ impl ControlPlaneService {
         Ok(None)
     }
 
-    pub async fn reload_caches_from_db(&self) -> Result<(), String> {
+    async fn refresh_api_key_cache(&self) -> Result<(), String> {
         let keys = self
             .meta
             .list_api_keys(None)
@@ -539,6 +542,14 @@ impl ControlPlaneService {
             }
         }
         self.api_key_cache.retain(|hash, _| live.contains(hash));
+        Ok(())
+    }
+
+    pub async fn reload_caches_from_db(&self) -> Result<(), String> {
+        if let Err(e) = self.refresh_encryption_keyring().await {
+            tracing::warn!(error = %e, "failed to refresh BYOK keyring");
+        }
+        self.refresh_api_key_cache().await?;
 
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
         let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
@@ -638,7 +649,7 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    /// Restores the encryption keyring across restarts, failing closed if sealed secrets cannot decrypt.
+    /// Restores the encryption keyring across restarts and key rotations, failing closed if sealed secrets cannot decrypt.
     async fn restore_encryption_keyring_inner(
         meta: &MetaStore,
         vault_kek: &[u8; 32],
@@ -648,7 +659,17 @@ impl ControlPlaneService {
             .list_system_keyring()
             .await
             .map_err(|e| e.to_string())?;
-        for row in keyring_rows {
+        if keyring_rows.is_empty() {
+            return Ok(());
+        }
+        let enc_store = qengine.storage().encrypted_store();
+        for row in &keyring_rows {
+            if enc_store.has_master_key(&row.key_id) {
+                if row.is_active {
+                    enc_store.activate_master_key(&row.key_id);
+                }
+                continue;
+            }
             let secret = unseal_secret(vault_kek, &row.sealed_key_hex).map_err(|e| {
                 format!(
                     "failed to unseal cluster encryption key '{}': {e}",
@@ -669,11 +690,13 @@ impl ControlPlaneService {
                 .register_byok_master_key(&row.key_id, master, row.is_active)
                 .map_err(|e| e.to_string())?;
         }
+        if keyring_rows.iter().all(|r| !r.is_active) {
+            qengine.storage().disable_new_encryption();
+        }
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn restore_encryption_keyring(&self) -> Result<(), String> {
+    pub async fn refresh_encryption_keyring(&self) -> Result<(), String> {
         Self::restore_encryption_keyring_inner(&self.meta, &self.vault_kek, &self.qengine).await
     }
 
@@ -836,6 +859,21 @@ impl ControlPlaneService {
         expanded: &pulse_storage::ErasedUids,
         id_graph: Option<&pulse_identity::ProjectIdentityGraph>,
     ) -> Result<(), String> {
+        let mut published_seq_opt = self
+            .qengine
+            .storage()
+            .published_profile_snapshot_key(project_id)
+            .map(|(seq, _)| seq);
+        if let Some(pub_seq) = published_seq_opt {
+            if self
+                .synced_published_seq
+                .get(project_id)
+                .is_some_and(|v| *v == pub_seq)
+            {
+                return Ok(());
+            }
+        }
+
         let cat = self.qengine.catalogs().for_project(project_id);
         let pstore = self
             .qengine
@@ -843,8 +881,28 @@ impl ControlPlaneService {
             .profile_store(project_id, false)
             .await
             .map_err(|e| e.to_string())?;
+        if published_seq_opt.is_none() {
+            published_seq_opt = self
+                .qengine
+                .storage()
+                .published_profile_snapshot_key(project_id)
+                .map(|(seq, _)| seq);
+            if let Some(pub_seq) = published_seq_opt {
+                if self
+                    .synced_published_seq
+                    .get(project_id)
+                    .is_some_and(|v| *v == pub_seq)
+                {
+                    return Ok(());
+                }
+            }
+        }
         let started_ms = Utc::now().timestamp_millis();
-        let since = self.profiles_synced_ms.get(project_id).map(|v| *v);
+        let since = if published_seq_opt.is_some() {
+            None
+        } else {
+            self.profiles_synced_ms.get(project_id).map(|v| *v)
+        };
         match since {
             None => {
                 let mut stored_rows = pstore
@@ -922,6 +980,10 @@ impl ControlPlaneService {
         // timestamp while this load ran is not missed; rebuilding a user is idempotent.
         self.profiles_synced_ms
             .insert(project_id.to_string(), started_ms - PROFILE_SYNC_OVERLAP_MS);
+        if let Some(pub_seq) = published_seq_opt {
+            self.synced_published_seq
+                .insert(project_id.to_string(), pub_seq);
+        }
         Ok(())
     }
 
@@ -986,7 +1048,10 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    pub async fn refresh_project_virtual_catalog(&self, project_id: &str) -> Result<(), String> {
+    async fn refresh_project_virtual_catalog_metadata(
+        &self,
+        project_id: &str,
+    ) -> Result<(), String> {
         let cat = self.qengine.catalogs().for_project(project_id);
 
         if let Some(proj) = self
@@ -1041,6 +1106,13 @@ impl ControlPlaneService {
         cat.saved_cohorts
             .retain(|id, _| active_cohort_ids.contains(id));
 
+        Ok(())
+    }
+
+    pub async fn refresh_project_virtual_catalog(&self, project_id: &str) -> Result<(), String> {
+        self.refresh_project_virtual_catalog_metadata(project_id)
+            .await?;
+
         // Sync expanded `erased_uids` into StorageEngine BEFORE refreshing user profiles so
         // initial loads and remote readers always observe fresh erasure tombstones.
         let (expanded, id_graph) = self.load_erased_for_project(project_id).await?;
@@ -1048,6 +1120,230 @@ impl ControlPlaneService {
             .await?;
 
         Ok(())
+    }
+
+    async fn sync_published_project_atomic(&self, project_id: &str) -> Result<bool, String> {
+        let storage = self.qengine.storage();
+        if !storage.is_published_reader() {
+            let (expanded, id_graph) = self.load_erased_for_project(project_id).await?;
+            self.refresh_user_profiles(project_id, &expanded, id_graph.as_deref())
+                .await?;
+            return Ok(false);
+        }
+
+        let was_open = storage.get_project(project_id).is_some();
+        let ps = storage
+            .get_or_open_project(project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _refresh_guard = ps.lock_refresh().await;
+
+        let prepared = ps
+            .prepare_published_refresh()
+            .await
+            .map_err(|e| e.to_string())?;
+        let target_pub_seq = prepared
+            .as_ref()
+            .map(|p| p.publish_seq())
+            .or_else(|| ps.last_published_seq());
+
+        let need_profile_reload = target_pub_seq.is_some_and(|seq| {
+            self.synced_published_seq
+                .get(project_id)
+                .is_none_or(|v| *v != seq)
+        });
+
+        let cat = self.qengine.catalogs().for_project(project_id);
+        let lock_timeout = self
+            .qengine
+            .query_timeout()
+            .min(std::time::Duration::from_secs(10))
+            .max(std::time::Duration::from_millis(500));
+
+        if prepared.is_some() || need_profile_reload {
+            let started_ms = Utc::now().timestamp_millis();
+            let erased: pulse_storage::ErasedUids = self
+                .meta
+                .list_erased_uids(project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect();
+
+            let target_id_graph = prepared
+                .as_ref()
+                .and_then(|p| p.id_graph().cloned())
+                .unwrap_or_else(|| ps.id_graph());
+            let expanded =
+                pulse_storage::expand_erased_with_identity(&erased, Some(&target_id_graph));
+
+            let target_pstore = match prepared.as_ref().and_then(|p| p.prof_store().cloned()) {
+                Some(p) => p,
+                None => storage
+                    .profile_store(project_id, false)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            };
+            let stored_rows = target_pstore
+                .list_updated_since(0)
+                .await
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<UserProfileRecord> = stored_rows
+                .into_iter()
+                .filter(|s| !pulse_storage::is_profile_erased(s, &expanded, Some(&target_id_graph)))
+                .map(Self::from_stored_profile)
+                .collect();
+            let merged_map = merge_profile_rows(rows);
+            let ts_map: HashMap<u32, i64> = merged_map
+                .iter()
+                .map(|(&uid, p)| (uid, p.updated_at_ms))
+                .collect();
+            let merged = merged_map
+                .into_iter()
+                .map(|(uid, p)| (uid, profile_to_catalog_props(&p)))
+                .collect();
+            let prepared_profiles =
+                pulse_exec::VirtualCatalog::prepare_user_profiles(merged, ts_map.clone());
+
+            let Ok(gate_guard) =
+                tokio::time::timeout(lock_timeout, cat.acquire_refresh_write()).await
+            else {
+                tracing::warn!(
+                    project_id,
+                    "timed out waiting for in-flight queries before atomic published refresh; retrying next tick"
+                );
+                return Ok(false);
+            };
+
+            let applied = if let Some(prep) = prepared {
+                ps.apply_prepared_refresh(prep)
+            } else {
+                !was_open && target_pub_seq.is_some()
+            };
+            storage.set_erased(project_id, expanded);
+            self.profile_catalog_ts
+                .insert(project_id.to_string(), ts_map);
+            cat.install_prepared_user_profiles(prepared_profiles);
+            self.profiles_synced_ms
+                .insert(project_id.to_string(), started_ms - PROFILE_SYNC_OVERLAP_MS);
+            if let Some(pub_seq) = target_pub_seq {
+                self.synced_published_seq
+                    .insert(project_id.to_string(), pub_seq);
+            }
+            drop(gate_guard);
+
+            ps.cleanup_retired_stores().await;
+            return Ok(applied);
+        }
+
+        // No published manifest yet (e.g. shared-disk pre-pub_0 deployment): fall back to
+        // local manifest/identity refresh + incremental profile sync.
+        if target_pub_seq.is_none() {
+            drop(_refresh_guard);
+            let local_refreshed = ps.refresh_manifest().await.map_err(|e| e.to_string())?;
+            let (expanded, id_graph) = self.load_erased_for_project(project_id).await?;
+            self.refresh_user_profiles(project_id, &expanded, id_graph.as_deref())
+                .await?;
+            ps.cleanup_retired_stores().await;
+            return Ok(local_refreshed);
+        }
+
+        // No new publish: still refresh `erased_uids` and drain any retired `query_hot` stores.
+        let erased: pulse_storage::ErasedUids = self
+            .meta
+            .list_erased_uids(project_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        let id_graph = (!erased.is_empty()).then(|| ps.id_graph());
+        let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
+        if let Ok(gate_guard) =
+            tokio::time::timeout(lock_timeout, cat.acquire_refresh_write()).await
+        {
+            storage.set_erased(project_id, expanded.clone());
+            if !expanded.is_empty() {
+                let id_snap = id_graph.as_deref().map(|ig| ig.snapshot());
+                let evicted = cat.evict_erased_profiles(&expanded, id_snap.as_ref());
+                if !evicted.is_empty() {
+                    if let Some(mut ts_map) = self.profile_catalog_ts.get_mut(project_id) {
+                        for uid in evicted {
+                            ts_map.remove(&uid);
+                        }
+                    }
+                }
+            }
+            drop(gate_guard);
+        } else {
+            storage.set_erased(project_id, expanded);
+        }
+        ps.cleanup_retired_stores().await;
+        Ok(false)
+    }
+
+    /// Atomically refreshes control-plane caches, discovers newly created projects, and syncs
+    /// published manifests + `erased_uids` + `ColumnarProfileIndex` for `NodeRole::Query`.
+    pub async fn refresh_query_caches_and_manifests(
+        &self,
+    ) -> (Result<(), String>, Result<usize, String>) {
+        let mut control_err: Option<String> = None;
+        if let Err(e) = self.refresh_api_key_cache().await {
+            control_err.get_or_insert(e);
+        }
+
+        let mut refreshed = 0usize;
+        let mut manifest_err: Option<String> = None;
+        let mut covered_projects: HashSet<String> = HashSet::new();
+
+        match self.meta.list_projects().await {
+            Ok(projects) => {
+                let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+                self.known_projects
+                    .retain(|id, _| live_projects.contains(id.as_str()));
+                for proj in &projects {
+                    covered_projects.insert(proj.id.clone());
+                    if let Err(e) = self.refresh_project_lexicon_cache(&proj.id).await {
+                        control_err.get_or_insert(format!("project {}: {e}", proj.id));
+                    }
+                    if let Err(e) = self
+                        .refresh_project_virtual_catalog_metadata(&proj.id)
+                        .await
+                    {
+                        control_err.get_or_insert(format!("project {}: {e}", proj.id));
+                    }
+                    match self.sync_published_project_atomic(&proj.id).await {
+                        Ok(true) => refreshed += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            manifest_err.get_or_insert(format!("project {}: {e}", proj.id));
+                        }
+                    }
+                    self.known_projects
+                        .insert(proj.id.clone(), proj.org_id.clone());
+                }
+            }
+            Err(e) => {
+                control_err.get_or_insert(e.to_string());
+            }
+        }
+
+        for ps in self.qengine.storage().open_projects() {
+            let pid = ps.project_id().to_string();
+            if covered_projects.contains(&pid) {
+                continue;
+            }
+            match self.sync_published_project_atomic(&pid).await {
+                Ok(true) => refreshed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    manifest_err.get_or_insert(format!("project {pid}: {e}"));
+                }
+            }
+        }
+
+        let control_res = control_err.map_or(Ok(()), Err);
+        let manifest_res = manifest_err.map_or(Ok(refreshed), Err);
+        (control_res, manifest_res)
     }
 
     async fn erase_user_dpdp(
@@ -1975,19 +2271,32 @@ async fn handle_status(
         .resolve_and_check(&principal, q.get("project_id").map(|s| s.as_str()))
         .await?;
 
-    let ps = ctrl
-        .qengine
-        .storage()
-        .get_or_open_project(&pid)
-        .await
-        .map_err(CtrlError::internal)?;
-    let snap = ps.snapshot();
-    let id_graph = ctrl
-        .qengine
-        .storage()
-        .identity_graph(&pid, false)
-        .await
-        .map_err(CtrlError::internal)?;
+    let (snap, l0_rows, interned_users) = {
+        let refresh_cat = ctrl
+            .qengine
+            .storage()
+            .is_published_reader()
+            .then(|| ctrl.qengine.catalogs().for_project(&pid));
+        let _refresh_guard = match refresh_cat.as_ref() {
+            Some(cat) => Some(cat.acquire_query_read().await),
+            None => None,
+        };
+        let ps = ctrl
+            .qengine
+            .storage()
+            .get_or_open_project(&pid)
+            .await
+            .map_err(CtrlError::internal)?;
+        let snap = ps.snapshot();
+        let l0_rows = ps.total_l0_rows();
+        let id_graph = ctrl
+            .qengine
+            .storage()
+            .identity_graph(&pid, false)
+            .await
+            .map_err(CtrlError::internal)?;
+        (snap, l0_rows, id_graph.user_count())
+    };
 
     let (live_eps, accepted_total, deduped_total, dropped_total) =
         if let Some(ing) = ctrl.ingest.read().await.as_ref() {
@@ -2015,10 +2324,10 @@ async fn handle_status(
         "last_query_latency_us": ctrl.qengine.last_query_latency_us(),
         "queries_executed": ctrl.qengine.queries_executed(),
         "snapshot_epoch": snap.epoch(),
-        "l0_rows": ps.total_l0_rows(),
+        "l0_rows": l0_rows,
         "l1_rows": snap.manifest.total_l1_rows(),
         "segment_count": snap.manifest.total_segments(),
-        "interned_users": id_graph.user_count(),
+        "interned_users": interned_users,
         "projects": projects,
     })))
 }

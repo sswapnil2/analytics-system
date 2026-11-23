@@ -866,6 +866,7 @@ async fn run_candidate_b_benchmark() -> BenchSummary {
     };
     let id_router = Arc::new(IdentityRouter::new(enc_store.as_object_store()));
     let engine = StorageEngine::new_with_encrypted(cfg, enc_store.clone(), id_router);
+    engine.set_upload_interval(std::time::Duration::ZERO);
 
     let ps = engine.get_or_open_project(pid).await.unwrap();
     let id_graph = engine.identity_graph(pid, true).await.unwrap();
@@ -1104,7 +1105,7 @@ fn empirical_t1_snapshot_benchmark_candidate_a_vs_candidate_b() {
         sum_a.total_snap_puts
     );
     assert_eq!(sum_b.total_snap_puts, 8); // 2 PUTs * 4 active cycles
-    assert_eq!(sum_b.s3_snapshot_objects, 2); // 1 identity + 1 profiles
+    assert_eq!(sum_b.s3_snapshot_objects, 8); // T2 grace retains superseded snapshots until GC after +2 cycles
     assert_eq!(sum_a.verified_rows, 1900);
     assert_eq!(sum_b.verified_rows, 1900);
     assert_eq!(sum_a.verified_profiles, 500);
@@ -1231,6 +1232,7 @@ fn t1_publish_all_four_crash_points_restore_cleanly() {
             let enc = Arc::new(EncryptedObjectStore::new(routed));
             let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
             let engine = StorageEngine::new_with_encrypted(cfg.clone(), enc.clone(), id_router);
+            engine.set_upload_interval(std::time::Duration::ZERO);
 
             let ps = engine.get_or_open_project(&pid).await.unwrap();
             let id_graph = engine.identity_graph(&pid, true).await.unwrap();
@@ -1350,6 +1352,7 @@ fn t1_publish_all_four_crash_points_restore_cleanly() {
             let enc = Arc::new(EncryptedObjectStore::new(routed));
             let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
             let engine = StorageEngine::new_with_encrypted(cfg.clone(), enc.clone(), id_router);
+            engine.set_upload_interval(std::time::Duration::ZERO);
 
             let ps = engine.get_or_open_project(pid).await.unwrap();
             let id_graph = engine.identity_graph(pid, true).await.unwrap();
@@ -1389,7 +1392,55 @@ fn t1_publish_all_four_crash_points_restore_cleanly() {
             ps.append_bucket_events(0, vec![(make_event("u1", 2), u1)])
                 .await
                 .unwrap();
-            ps.flush_bucket(0).await.unwrap(); // commits epoch 2 + publishes pub_1 (local manifest on disk has last_published_seq=Some(0)!)
+            // Simulate step-6 crash: flush locally without publishing, then write pub_1 to S3
+            // BEFORE local manifest persists `last_published_seq = Some(1)`.
+            ps.set_publish_enabled(false);
+            ps.flush_bucket(0).await.unwrap();
+            let snap = ps.snapshot();
+            let prof_exp = pstore.export_snapshot_bytes().await.unwrap();
+            let prof_path = format!("published/{pid}/snapshots/profiles_000000000001_sim.pzst");
+            enc.as_object_store()
+                .put(
+                    &ObjectPath::from(prof_path.as_str()),
+                    PutPayload::from(prof_exp),
+                )
+                .await
+                .unwrap();
+            let id_exp = id_graph.export_snapshot().await.unwrap();
+            let id_path = format!("published/{pid}/snapshots/identity_000000000001_sim.pzst");
+            enc.as_object_store()
+                .put(
+                    &ObjectPath::from(id_path.as_str()),
+                    PutPayload::from(id_exp.payload),
+                )
+                .await
+                .unwrap();
+            PublishedManifestStore::new(pid, enc.as_object_store())
+                .publish_next(PublishedManifest {
+                    publish_seq: 1,
+                    writer_generation: snap.manifest.writer_generation,
+                    source_local_epoch: snap.manifest.epoch,
+                    high_water_mark: id_exp.user_count,
+                    published_at_ms: chrono::Utc::now().timestamp_millis(),
+                    partitions: snap.manifest.to_sorted_partitions(),
+                    dict_snapshot: snap.manifest.dict_snapshot.clone(),
+                    committed_wal_seq: snap.manifest.committed_wal_seq.clone(),
+                    committed_l0_seq: snap.manifest.committed_l0_seq.clone(),
+                    snapshot_ref: SnapshotRef {
+                        identity: IdentitySnapshotRef {
+                            object_path: id_path,
+                            user_count: id_exp.user_count,
+                            mutation_epoch: id_exp.mutation_epoch,
+                        },
+                        profiles: Some(ProfileSnapshotRef {
+                            object_path: prof_path,
+                            dirty_seq: pstore.dirty_seq(),
+                        }),
+                    },
+                })
+                .await
+                .unwrap();
+            drop(snap);
 
             // Verify on-disk manifest still has last_published_seq == Some(0) while S3 has pub_1!
             let on_disk_mf = ManifestStore::new(pid, enc.as_object_store())
@@ -1442,6 +1493,7 @@ fn t1_publish_all_four_crash_points_restore_cleanly() {
             let enc2 = Arc::new(EncryptedObjectStore::new(routed2));
             let id_router2 = Arc::new(IdentityRouter::new(enc2.as_object_store()));
             let engine2 = StorageEngine::new_with_encrypted(cfg, enc2, id_router2);
+            engine2.set_upload_interval(std::time::Duration::ZERO);
             let ps2 = engine2.get_or_open_project(pid).await.unwrap();
             assert_eq!(ps2.last_published_seq(), Some(1));
             let id2 = engine2.identity_graph(pid, true).await.unwrap();

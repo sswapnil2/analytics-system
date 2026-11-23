@@ -162,7 +162,7 @@ async fn a_clean_shutdown_leaves_the_local_wal_empty_and_the_object_store_comple
         "local WAL after shutdown"
     );
 
-    // All 20 rows and a published manifest are in the object store.
+    // All 20 rows and a published manifest are in the object store, while manifests/ stays local.
     let enc: Arc<dyn ObjectStore> =
         Arc::new(pulse_storage::EncryptedObjectStore::new(store.clone()));
     assert_eq!(
@@ -170,14 +170,22 @@ async fn a_clean_shutdown_leaves_the_local_wal_empty_and_the_object_store_comple
             .load_latest()
             .await
             .unwrap()
-            .total_l1_rows(),
-        20
+            .epoch,
+        0,
+        "local manifests/ must not be written to S3"
     );
-    assert!(pulse_storage::PublishedManifestStore::new(PID, enc)
+    let pub_m = pulse_storage::PublishedManifestStore::new(PID, enc)
         .load_latest()
         .await
         .unwrap()
-        .is_some());
+        .expect("published manifest must exist after clean shutdown");
+    let pub_rows: u64 = pub_m
+        .partitions
+        .iter()
+        .flat_map(|p| p.segments.iter())
+        .map(|s| s.footer.row_count as u64)
+        .sum();
+    assert_eq!(pub_rows, 20);
 
     // Starting on a fresh/wiped <data_dir> while S3 `published/` exists must refuse startup.
     let fresh = tempfile::tempdir().unwrap();

@@ -133,12 +133,29 @@ impl QueryEngine {
         let timeout = Duration::from_millis(timeout_ms);
         // Queue for at most one deadline's worth; past that, tell the caller to back off.
         let _permits = self.admission.acquire(project_id, timeout).await?;
+        let refresh_cat = self
+            .storage
+            .is_published_reader()
+            .then(|| self.catalogs.for_project(project_id));
+        let (remaining, _refresh_guard) = match refresh_cat.as_ref() {
+            Some(cat) => {
+                let started = Instant::now();
+                let guard = tokio::time::timeout(timeout, cat.acquire_query_read())
+                    .await
+                    .map_err(|_| ExecError::QueryTimeout(timeout_ms))?;
+                let rem = timeout
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_millis(1));
+                (rem, Some(guard))
+            }
+            None => (timeout, None),
+        };
         let ctx = Arc::new(crate::budget::QueryCtx::with_memory_limit(
             timeout,
             self.max_rows.load(Ordering::Relaxed),
             self.max_memory_bytes.load(Ordering::Relaxed),
         ));
-        let out = tokio::time::timeout(timeout, crate::budget::scope(ctx.clone(), fut))
+        let out = tokio::time::timeout(remaining, crate::budget::scope(ctx.clone(), fut))
             .await
             .map_err(|_| ExecError::QueryTimeout(timeout_ms))?;
         // Compute loops stop early once the deadline passes and return partial results; discard them.

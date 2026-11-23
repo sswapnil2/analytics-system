@@ -13,7 +13,7 @@ pub use ast::*;
 pub use cache::{SegmentBlockCache, TierAColumns};
 pub use catalog::{
     arrow_array_to_prop_values, evaluate_custom_property, extract_sql_identifiers, CatalogRegistry,
-    CustomEventDef, CustomPropertyDef, LookupTableDef, VirtualCatalog,
+    CustomEventDef, CustomPropertyDef, LookupTableDef, PreparedUserProfiles, VirtualCatalog,
 };
 pub use engine::{ExportedEventRow, QueryEngine};
 pub use flows::FlowsEngine;

@@ -53,6 +53,15 @@ pub enum StorageError {
     #[error("this node does not hold the writer lease for project '{project_id}'")]
     NotWriter { project_id: String },
 
+    #[error("stale local state for project '{project_id}': published seq {pub_seq} (gen {pub_gen}) is ahead of local last_published_seq {local_last_pub_seq:?} (gen {local_gen}); recover with `pulse-node restore --from-published`")]
+    StaleWriter {
+        project_id: String,
+        pub_seq: u64,
+        pub_gen: u64,
+        local_last_pub_seq: Option<u64>,
+        local_gen: u64,
+    },
+
     #[error("project dictionary capacity exceeded for {kind} (max 65536)")]
     DictionaryFull { kind: &'static str },
 

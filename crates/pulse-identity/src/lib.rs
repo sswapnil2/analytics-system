@@ -1395,6 +1395,61 @@ impl ProjectIdentityGraph {
         }))
     }
 
+    /// Restores a project's identity graph into `object_store` from a logical export created by
+    /// [`Self::export_snapshot`], closes the temporary writable SlateDB handle cleanly (so zero
+    /// background compactor/GC tasks remain running), and returns a read-only handle (`db: None`,
+    /// `read_only: true`).
+    pub async fn restore_from_export_read_only(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        export_bytes: &[u8],
+    ) -> Result<Arc<Self>> {
+        let project_id = project_id.into();
+        let cp = decode_checkpoint(export_bytes)?;
+        let chunk_count = cp.next_chunk_seq.max(1);
+
+        let fast_lookup: DashMap<String, (u32, u8)> = DashMap::new();
+        let mut state = GraphState::new();
+        let start_seq = restore_checkpoint(&mut state, &fast_lookup, cp)?;
+        let initial_user_count = state.u32_to_external.len() as u64;
+        let initial_snap = state.compress_all_and_build_snapshot();
+
+        let db = open_slatedb_handle(&project_id, &object_store).await?;
+        let mut batch = WriteBatch::new();
+        batch.put(META_CHECKPOINT_KEY, export_bytes);
+        batch.put(META_CHUNK_COUNT_KEY, chunk_count.to_le_bytes());
+        let write_opts = WriteOptions {
+            await_durable: false,
+        };
+        if let Err(e) = db.write_with_options(batch, &write_opts).await {
+            let _ = db.close().await;
+            return Err(IdentityError::SlateDb(e));
+        }
+        if let Err(e) = db.flush().await {
+            let _ = db.close().await;
+            return Err(IdentityError::SlateDb(e));
+        }
+        db.close().await?;
+
+        Ok(Arc::new(Self {
+            project_id,
+            object_store,
+            read_only: true,
+            fast_lookup,
+            state: RwLock::new(state),
+            snapshot_cache: RwLock::new(Some(initial_snap)),
+            snapshot_dirty: AtomicBool::new(false),
+            next_chunk_seq: AtomicU64::new(chunk_count),
+            last_checkpoint_seq: AtomicU64::new(start_seq),
+            mutations_since_checkpoint: AtomicU64::new(0),
+            mutation_epoch: AtomicU64::new(0),
+            flushed_epoch: AtomicU64::new(0),
+            flushed_user_count: AtomicU64::new(initial_user_count),
+            pending_mutations: Mutex::new(Vec::new()),
+            db: tokio::sync::Mutex::new(None),
+        }))
+    }
+
     /// Flushes and creates a SlateDB checkpoint for Candidate A snapshot benchmarking/sync.
     pub async fn create_slatedb_checkpoint(&self) -> Result<slatedb::CheckpointCreateResult> {
         if self.read_only {
@@ -1536,6 +1591,13 @@ impl IdentityRouter {
         };
         self.graphs.insert(project_id.to_string(), g.clone());
         Ok(g)
+    }
+
+    /// Atomically replaces the cached read-only graph for `project_id` (used by remote
+    /// `NodeRole::Query` nodes after restoring a newer published snapshot locally).
+    pub fn replace_read_only(&self, project_id: &str, graph: Arc<ProjectIdentityGraph>) {
+        self.graphs.insert(project_id.to_string(), graph);
+        self.readers.remove(project_id);
     }
 
     /// Forgets a project's graph so the next `get_or_open` rebuilds it from storage.

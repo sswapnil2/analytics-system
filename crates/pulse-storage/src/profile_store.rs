@@ -214,8 +214,8 @@ fn decode_profile_snapshot(bytes: &[u8]) -> Result<Vec<StoredUserProfile>> {
     }
 }
 
-async fn open_profile_db(project_id: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
-    let db_path = ObjectPath::from(format!("profiles/{project_id}"));
+async fn open_profile_db(db_prefix: &str, object_store: &Arc<dyn ObjectStore>) -> Result<Db> {
+    let db_path = ObjectPath::from(db_prefix);
     for attempt in 0..8 {
         let gc_dir = GarbageCollectorDirectoryOptions {
             execution_mode: GcExecutionMode::Periodic(Duration::from_secs(60)),
@@ -247,10 +247,10 @@ async fn open_profile_db(project_id: &str, object_store: &Arc<dyn ObjectStore>) 
 }
 
 async fn open_profile_reader(
-    project_id: &str,
+    db_prefix: &str,
     object_store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<DbReader>> {
-    let db_path = ObjectPath::from(format!("profiles/{project_id}"));
+    let db_path = ObjectPath::from(db_prefix);
     for attempt in 0..2 {
         match DbReader::open(
             db_path.clone(),
@@ -279,6 +279,7 @@ async fn open_profile_reader(
 /// Per-project durable User Profile Store backed by SlateDB on `ObjectStore`.
 pub struct ProjectProfileStore {
     project_id: String,
+    db_prefix: String,
     object_store: Arc<dyn ObjectStore>,
     read_only: bool,
     dirty_seq: AtomicU64,
@@ -307,9 +308,11 @@ impl ProjectProfileStore {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Self>> {
         let project_id = project_id.into();
-        let db = open_profile_db(&project_id, &object_store).await?;
+        let db_prefix = format!("profiles/{project_id}");
+        let db = open_profile_db(&db_prefix, &object_store).await?;
         Ok(Arc::new(Self {
             project_id,
+            db_prefix,
             object_store,
             read_only: false,
             dirty_seq: AtomicU64::new(0),
@@ -322,14 +325,29 @@ impl ProjectProfileStore {
         project_id: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Arc<Self> {
+        let project_id = project_id.into();
+        let db_prefix = format!("profiles/{project_id}");
+        Self::open_read_only_at(project_id, db_prefix, object_store)
+    }
+
+    pub fn open_read_only_at(
+        project_id: impl Into<String>,
+        db_prefix: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             project_id: project_id.into(),
+            db_prefix: db_prefix.into(),
             object_store,
             read_only: true,
             dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(None),
             reader: tokio::sync::Mutex::new(None),
         })
+    }
+
+    pub fn db_prefix(&self) -> &str {
+        &self.db_prefix
     }
 
     /// Monotonic counter incremented after every flushed write or delete (used to skip idle snapshots).
@@ -341,7 +359,7 @@ impl ProjectProfileStore {
     async fn shared_reader(&self) -> Result<Option<Arc<DbReader>>> {
         let mut guard = self.reader.lock().await;
         if guard.is_none() {
-            *guard = open_profile_reader(&self.project_id, &self.object_store)
+            *guard = open_profile_reader(&self.db_prefix, &self.object_store)
                 .await?
                 .map(Arc::new);
         }
@@ -360,7 +378,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -435,7 +453,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -471,7 +489,7 @@ impl ProjectProfileStore {
 
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -525,7 +543,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -654,7 +672,7 @@ impl ProjectProfileStore {
 
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -733,7 +751,7 @@ impl ProjectProfileStore {
 
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -802,7 +820,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -822,7 +840,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -861,6 +879,42 @@ impl ProjectProfileStore {
         Ok(store)
     }
 
+    /// Restores profiles into a versioned `db_prefix` (e.g. `profiles/{project_id}/pub_{seq}`),
+    /// closes the temporary writable SlateDB handle cleanly, and opens a read-only handle over it.
+    pub async fn restore_from_export_read_only_at(
+        project_id: impl Into<String>,
+        db_prefix: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        export_bytes: &[u8],
+    ) -> Result<Arc<Self>> {
+        let project_id = project_id.into();
+        let db_prefix = db_prefix.into();
+        let profiles = decode_profile_snapshot(export_bytes)?;
+
+        let prefix = ObjectPath::from(db_prefix.as_str());
+        let existing: Vec<_> = object_store.list(Some(&prefix)).try_collect().await?;
+        for meta in existing {
+            object_store.delete(&meta.location).await?;
+        }
+
+        let db = open_profile_db(&db_prefix, &object_store).await?;
+        let writable = Arc::new(Self {
+            project_id: project_id.clone(),
+            db_prefix: db_prefix.clone(),
+            object_store: object_store.clone(),
+            read_only: false,
+            dirty_seq: AtomicU64::new(0),
+            db: tokio::sync::Mutex::new(Some(Arc::new(db))),
+            reader: tokio::sync::Mutex::new(None),
+        });
+        for chunk in profiles.chunks(10_000) {
+            writable.upsert_batch(chunk).await?;
+        }
+        writable.close().await?;
+
+        Ok(Self::open_read_only_at(project_id, db_prefix, object_store))
+    }
+
     /// Creates a SlateDB checkpoint for Candidate A snapshot benchmarking/sync.
     pub async fn create_slatedb_checkpoint(&self) -> Result<slatedb::CheckpointCreateResult> {
         if self.read_only {
@@ -870,7 +924,7 @@ impl ProjectProfileStore {
         }
         let mut guard = self.db.lock().await;
         if guard.is_none() {
-            let reopened = open_profile_db(&self.project_id, &self.object_store).await?;
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
             *guard = Some(Arc::new(reopened));
         }
         let db = guard
@@ -892,7 +946,7 @@ impl ProjectProfileStore {
         &self,
         checkpoint: &slatedb::CheckpointCreateResult,
     ) -> Result<()> {
-        let db_path = ObjectPath::from(format!("profiles/{}", self.project_id));
+        let db_path = ObjectPath::from(self.db_prefix.as_str());
         Db::delete_checkpoint(&db_path, self.object_store.clone(), checkpoint.id)
             .await
             .map_err(slatedb_err)
@@ -1108,6 +1162,19 @@ impl ProfileRouter {
         };
         self.stores.insert(project_id.to_string(), s.clone());
         Ok(s)
+    }
+
+    /// Atomically replaces the cached read-only profile store for `project_id` (used by remote
+    /// `NodeRole::Query` nodes after restoring a newer published snapshot locally), returning the
+    /// previous store if one was cached.
+    pub fn replace_read_only(
+        &self,
+        project_id: &str,
+        store: Arc<ProjectProfileStore>,
+    ) -> Option<Arc<ProjectProfileStore>> {
+        let prev = self.stores.insert(project_id.to_string(), store);
+        self.readers.remove(project_id);
+        prev
     }
 
     /// Forgets a project's store so the next `get_or_open` reopens it from storage.

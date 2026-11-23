@@ -23,6 +23,28 @@ pub struct PartitionEntry {
     pub segments: Vec<SegmentMeta>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingS3DeleteKind {
+    Segment,
+    IdentitySnapshot,
+    ProfileSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingS3Delete {
+    pub object_path: String,
+    pub kind: PendingS3DeleteKind,
+    /// First `publish_seq` that no longer references `object_path`.
+    pub superseding_pub_seq: u64,
+    /// UTC ms (`PublishedManifest.published_at_ms`) when `superseding_pub_seq` landed in S3.
+    #[serde(default)]
+    pub superseded_at_ms: Option<i64>,
+    /// `superseded_at_ms + 2 * publish_interval_ms` (stamped once `superseding_pub_seq` is published).
+    #[serde(default)]
+    pub eligible_after_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestWire {
     epoch: u64,
@@ -32,6 +54,8 @@ struct ManifestWire {
     writer_generation: u64,
     #[serde(default)]
     last_published_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_s3_deletes: Vec<PendingS3Delete>,
     partitions: Vec<PartitionEntry>,
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
@@ -48,6 +72,8 @@ pub struct Manifest {
     pub writer_generation: u64,
     /// Dense `publish_seq` of the newest `PublishedManifest` emitted for this project (if any).
     pub last_published_seq: Option<u64>,
+    /// Superseded S3 segments and snapshot blobs awaiting the 2-publish-interval grace period.
+    pub pending_s3_deletes: Vec<PendingS3Delete>,
     pub active_segments: HashMap<(NaiveDate, u8), Vec<SegmentMeta>>,
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
@@ -99,6 +125,7 @@ impl Manifest {
             fenced_wal_epoch: self.fenced_wal_epoch,
             writer_generation: self.writer_generation,
             last_published_seq: self.last_published_seq,
+            pending_s3_deletes: self.pending_s3_deletes.clone(),
             partitions: self.to_sorted_partitions(),
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -116,6 +143,7 @@ impl Manifest {
             fenced_wal_epoch: w.fenced_wal_epoch,
             writer_generation: w.writer_generation,
             last_published_seq: w.last_published_seq,
+            pending_s3_deletes: w.pending_s3_deletes,
             active_segments,
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,
@@ -344,6 +372,7 @@ impl PublishedManifest {
             fenced_wal_epoch: target_epoch,
             writer_generation: self.writer_generation,
             last_published_seq: Some(self.publish_seq),
+            pending_s3_deletes: Vec::new(),
             active_segments,
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
@@ -396,13 +425,20 @@ impl PublishedManifestStore {
         Ok(out)
     }
 
+    pub async fn latest_pub_seq(&self) -> Result<Option<(u64, ObjectMeta)>> {
+        Ok(self.list_pub_seqs().await?.pop())
+    }
+
+    pub async fn load_from_meta(&self, meta: &ObjectMeta) -> Result<PublishedManifest> {
+        let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
+        decode_json_zstd(&bytes)
+    }
+
     pub async fn load_latest(&self) -> Result<Option<PublishedManifest>> {
-        let Some((_, meta)) = self.list_pub_seqs().await?.pop() else {
+        let Some((_, meta)) = self.latest_pub_seq().await? else {
             return Ok(None);
         };
-        let bytes = self.object_store.get(&meta.location).await?.bytes().await?;
-        let decoded: PublishedManifest = decode_json_zstd(&bytes)?;
-        Ok(Some(decoded))
+        Ok(Some(self.load_from_meta(&meta).await?))
     }
 
     pub async fn load_seq(&self, publish_seq: u64) -> Result<PublishedManifest> {
@@ -831,5 +867,80 @@ mod tests {
             .unwrap();
         assert_eq!(installed2.epoch, 6);
         assert_eq!(installed2.last_published_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn pending_s3_deletes_roundtrip_and_legacy_wire_compat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ms = ManifestStore::new("p_gc", store.clone());
+
+        // Legacy ManifestWire JSON without `pending_s3_deletes` deserializes cleanly.
+        let legacy_json = br#"{
+            "epoch": 1,
+            "fenced_wal_epoch": 1,
+            "writer_generation": 2,
+            "last_published_seq": 0,
+            "partitions": [],
+            "committed_wal_seq": {},
+            "committed_l0_seq": {},
+            "dict_snapshot": { "events": [], "prop_keys": [] }
+        }"#;
+        store
+            .put(
+                &ObjectPath::from("manifests/p_gc/epoch_000000000001.json"),
+                PutPayload::from_static(legacy_json),
+            )
+            .await
+            .unwrap();
+        let loaded = ms.load_latest().await.unwrap();
+        assert_eq!(loaded.epoch, 1);
+        assert!(loaded.pending_s3_deletes.is_empty());
+
+        // Round-trip all PendingS3DeleteKind variants through PZST ManifestStore.
+        let mut next = loaded;
+        next.pending_s3_deletes = vec![
+            PendingS3Delete {
+                object_path: "segments/p_gc/2026-11-22/bucket_000/seg_1.pvtx".into(),
+                kind: PendingS3DeleteKind::Segment,
+                superseding_pub_seq: 1,
+                superseded_at_ms: Some(1_790_000_000_000),
+                eligible_after_ms: Some(1_790_000_600_000),
+            },
+            PendingS3Delete {
+                object_path: "published/p_gc/snapshots/identity_000000000000_a.pzst".into(),
+                kind: PendingS3DeleteKind::IdentitySnapshot,
+                superseding_pub_seq: 1,
+                superseded_at_ms: None,
+                eligible_after_ms: None,
+            },
+            PendingS3Delete {
+                object_path: "published/p_gc/snapshots/profiles_000000000000_b.pzst".into(),
+                kind: PendingS3DeleteKind::ProfileSnapshot,
+                superseding_pub_seq: 2,
+                superseded_at_ms: Some(1_790_000_100_000),
+                eligible_after_ms: Some(1_790_000_700_000),
+            },
+        ];
+        let committed = ms.commit_next(next).await.unwrap();
+        assert_eq!(committed.epoch, 2);
+
+        let reloaded = ms.load_latest().await.unwrap();
+        assert_eq!(reloaded.pending_s3_deletes.len(), 3);
+        assert_eq!(
+            reloaded.pending_s3_deletes[0].kind,
+            PendingS3DeleteKind::Segment
+        );
+        assert_eq!(
+            reloaded.pending_s3_deletes[1].kind,
+            PendingS3DeleteKind::IdentitySnapshot
+        );
+        assert_eq!(
+            reloaded.pending_s3_deletes[2].kind,
+            PendingS3DeleteKind::ProfileSnapshot
+        );
+        assert_eq!(
+            reloaded.pending_s3_deletes[2].eligible_after_ms,
+            Some(1_790_000_700_000)
+        );
     }
 }

@@ -324,8 +324,9 @@ fn full_restore_from_published_with_byok_erasure_reconciliation_hwm_and_restart(
         .await
         .unwrap();
 
-        // Flush -> writes encrypted PLSEAGM2 snapshots & PublishedManifest with HWM = 4.
+        // Flush + publish -> writes encrypted PLSEAGM2 snapshots & PublishedManifest with HWM = 4.
         node1.storage.flush_all_projects().await.unwrap();
+        node1.storage.publish_all_projects().await.unwrap();
         let pub_m = PublishedManifestStore::new(
             "proj_a",
             Arc::new(pulse_storage::EncryptedObjectStore::new(s3_store.clone()))

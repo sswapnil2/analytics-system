@@ -149,7 +149,7 @@ What this setup gives you:
   - Cloudflare R2: 10 GB free, no egress fees. Set `AWS_REGION=auto` and set `AWS_ENDPOINT` to the R2 endpoint.
   - Hetzner Object Storage, Backblaze B2 and AWS S3 also work; leave `AWS_ENDPOINT` unset for AWS.
   - Flushes and compaction make many small writes, so watch the request counts against the free tier.
-  - By default, metadata (`pulse_meta.db`) stays on local disk either way. In `PULSE_HOT_STORE=local` mode, `pulse-node` warns at startup when using SQLite; set `DATABASE_URL=postgres://…` if you need `pulse-node restore --from-published` to recover a lost local volume from S3 `published/` snapshots.
+  - By default, metadata (`pulse_meta.db`) stays on local disk either way. In `PULSE_HOT_STORE=local` mode (default), `wal/`, `identity/`, `profiles/`, and authoritative `manifests/` live on local disk while S3 `published/` manifests and Candidate B snapshots publish every `PULSE_UPLOAD_INTERVAL_SECS` (default `300` s). `pulse-node` warns at startup when using SQLite; set `DATABASE_URL=postgres://…` if you need `pulse-node restore --from-published` to recover a lost local volume from S3 `published/` snapshots, or to run remote `--role query` nodes with shared `PULSE_VAULT_KEK` (and `PULSE_BYOK_MASTER_KEY` if enabled).
   - Pick one before you ingest real data; switching later doesn't move existing data.
 
 ## 5. Backups

@@ -95,7 +95,8 @@ flowchart LR
     subgraph os["Tiered store (local hot disk + object store / S3)"]
         WAL["wal/…/*.wal<br/>local disk by default (&lt;data_dir&gt;/wal)"]
         SEG["segments/{proj}/{YYYYMMDD}/bucket_NNN/*.pvtx<br/>Vortex columnar + indexes"]
-        MAN["manifests/{proj}/epoch_N.json<br/>active segments + footers"]
+        MAN["manifests/{proj}/epoch_N.json<br/>local disk by default (&lt;data_dir&gt;/hot)"]
+        PUB["published/{proj}/pub_*.json + snapshots/<br/>S3 / object store on publish interval"]
         ID["identity/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
         PROF["profiles/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
         REP["replays/{proj}/{session}/*.plsr"]
@@ -104,10 +105,11 @@ flowchart LR
     L0 -- "flush: 250k rows or 60 s" --> SEG
     SEG -- "CAS commit" --> MAN
     MAN -- "then purge" --> WAL
+    MAN -- "publish cycle (PULSE_UPLOAD_INTERVAL_SECS)" --> PUB
     SEG -- "compaction: ≥ 4 segments per (day, bucket)" --> SEG
 ```
 
-All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and SlateDB hot state (`identity/`, `profiles/`) routes to `<data_dir>/hot`, while segments, manifests and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
+All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and hot state (`identity/`, `profiles/`, `manifests/`) routes to `<data_dir>/hot`, while segments, `published/` manifests/snapshots, and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
 
 ### L0, flush and segments
 
@@ -120,8 +122,8 @@ All persistent state goes through one `object_store` interface (`crates/pulse-st
 ### Manifests and compaction
 
 - **Commits.** A manifest (`manifests/{proj}/epoch_N.json`, zstd-compressed JSON) lists the active segments and the WAL position they cover. It is created with "create if absent" semantics, so two writers can never both commit the same epoch. A losing writer reloads and retries, up to 8 times.
-- **Old epochs.** The 16 newest epochs are kept, plus a 300 s grace period. A segment still in use by a running query is never garbage-collected.
-- **Compaction.** When a `(day, bucket)` has 4 or more segments, they are merged into one. Compaction is also when [erased users](security-privacy.md#erasure) are physically removed.
+- **Old epochs and S3 deletion grace.** The 16 newest local epochs are kept, plus a 300 s grace period. Superseded S3 segments and superseded S3 snapshot blobs are persisted in `pending_s3_deletes` on the local manifest and deleted only after a superseding `PublishedManifest` has landed in S3, 2 publish intervals have elapsed, and no local `StorageSnapshot` pins them.
+- **Compaction and publish.** When a `(day, bucket)` has 4 or more segments, they are merged into one. Compaction is also when [erased users](security-privacy.md#erasure) are physically removed. Every `PULSE_UPLOAD_INTERVAL_SECS` (default 300 s; `0` = eager) and on clean shutdown, dirty projects export Candidate B identity/profile snapshots (`T_id >= T_prof >= T_freeze`) and write a create-only `PublishedManifest` at dense `publish_seq`, fencing stale or deposed writers on open.
 
 ### Encryption at rest (optional)
 
@@ -141,7 +143,7 @@ Analytics counts *people*, but an SDK first sees an anonymous device. Pulse keep
 - **Merging.** `identify(userId)`, or a Segment `identify`/`alias`, links the anonymous id to the user id with union-find. The user's root is marked *identified*.
 - **History stays put.** Stored events are never rewritten. Queries resolve every id through the graph's canonical map at read time, so a user's events from before they logged in count as theirs.
 - **Merge conflicts.** Merging two ids that are *both* already identified would combine two real people, so it is refused with `409`.
-- **Durability.** Changes are written as a log in SlateDB with periodic checkpoints. Query-role nodes open the graph read-only and refresh it.
+- **Durability.** Changes are written as a log in SlateDB with periodic checkpoints. Remote `query`-role nodes restore published Candidate B snapshots into `<data_dir>/query_hot` (or open read-only `DbReader` when sharing `<data_dir>` before publish) and refresh them on `published/` updates.
 
 User and group **profiles** (properties set with `$set`, `$set_once`, `$increment` and so on) live in a separate SlateDB store at `profiles/{proj}` (`crates/pulse-storage/src/profile_store.rs`).
 

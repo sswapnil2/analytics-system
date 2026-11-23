@@ -111,6 +111,7 @@ impl MultipartUpload for DurableMultipartUpload {
 pub struct DurableLocalObjectStore {
     root: PathBuf,
     inner: LocalFileSystem,
+    prune_empty_below_depth: Option<usize>,
 }
 
 impl DurableLocalObjectStore {
@@ -118,7 +119,19 @@ impl DurableLocalObjectStore {
         std::fs::create_dir_all(dir)?;
         let root = std::fs::canonicalize(dir)?;
         let inner = LocalFileSystem::new_with_prefix(&root)?;
-        Ok(Self { root, inner })
+        Ok(Self {
+            root,
+            inner,
+            prune_empty_below_depth: None,
+        })
+    }
+
+    /// Prunes empty parent directories created under keys deeper than `min_depth` path components
+    /// relative to `root` when objects are deleted (e.g. `min_depth = 2` on `query_hot` removes
+    /// `profiles/{pid}/pub_{seq}/...` once empty while preserving `profiles/{pid}` and `profiles`).
+    pub fn with_prune_empty_below_depth(mut self, min_depth: usize) -> Self {
+        self.prune_empty_below_depth = Some(min_depth);
+        self
     }
 
     fn fs_path_for(&self, location: &ObjectPath) -> PathBuf {
@@ -186,7 +199,28 @@ impl ObjectStore for DurableLocalObjectStore {
     }
 
     async fn delete(&self, location: &ObjectPath) -> OsResult<()> {
-        self.inner.delete(location).await
+        self.inner.delete(location).await?;
+        if let Some(min_depth) = self.prune_empty_below_depth {
+            let root = self.root.clone();
+            let path = self.fs_path_for(location);
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut parent = path.parent();
+                while let Some(dir) = parent {
+                    let Ok(rel) = dir.strip_prefix(&root) else {
+                        break;
+                    };
+                    if rel.components().count() <= min_depth {
+                        break;
+                    }
+                    if std::fs::remove_dir(dir).is_err() {
+                        break;
+                    }
+                    parent = dir.parent();
+                }
+            })
+            .await;
+        }
+        Ok(())
     }
 
     fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
@@ -234,11 +268,11 @@ const WAL_PREFIXES: [&str; 5] = [
     "agent_wal_corrupt",
 ];
 
-/// Key prefixes for persistent hot SlateDB state (`identity/` and `profiles/`).
-const HOT_PREFIXES: [&str; 2] = ["identity", "profiles"];
+/// Key prefixes for persistent hot state (`identity/`, `profiles/`, and `manifests/`).
+const HOT_PREFIXES: [&str; 3] = ["identity", "profiles", "manifests"];
 
 /// Union of all local hot-tier prefixes used for opposite-tier leftover detection.
-const ALL_HOT_PREFIXES: [&str; 7] = [
+const ALL_HOT_PREFIXES: [&str; 8] = [
     "wal",
     "wal_corrupt",
     "wal_dead",
@@ -246,6 +280,7 @@ const ALL_HOT_PREFIXES: [&str; 7] = [
     "agent_wal_corrupt",
     "identity",
     "profiles",
+    "manifests",
 ];
 
 const HOT_STORE_MODE_FILE: &str = "hot_store_mode";
@@ -336,6 +371,7 @@ async fn init_local_hot_dirs(data_dir: &Path, wal_dir: &Path, hot_dir: &Path) ->
         std::fs::create_dir_all(&wal_dir)?;
         std::fs::create_dir_all(hot_dir.join("identity"))?;
         std::fs::create_dir_all(hot_dir.join("profiles"))?;
+        std::fs::create_dir_all(hot_dir.join("manifests"))?;
         fsync_dir_sync(&hot_dir)?;
         fsync_dir_sync(&data_dir)?;
         Ok(())
@@ -392,14 +428,27 @@ async fn refuse_opposite_tier_objects(
     Ok(())
 }
 
-/// P0-7: `PULSE_HOT_STORE=local` (default) keeps the WALs at `<data_dir>/wal` and the hot
-/// SlateDB stores (`identity/`, `profiles/`) at `<data_dir>/hot`, fsync'd like
-/// `DurableLocalObjectStore`, so acknowledging a request makes no segment-store call.
-/// `object` keeps them in `segments`. A persistent `<data_dir>/hot_store_mode` marker prevents
-/// silent mode switches or starting after losing local `identity/` / `profiles/`.
+/// P0-7 / T2: `PULSE_HOT_STORE=local` (default) keeps the WALs at `<data_dir>/wal` and the hot
+/// state (`identity/`, `profiles/`, `manifests/`) at `<data_dir>/hot`, fsync'd like
+/// `DurableLocalObjectStore`, so acknowledging a request or committing an L0 flush makes no
+/// segment-store call. `object` keeps them in `segments`. A persistent `<data_dir>/hot_store_mode`
+/// marker prevents silent mode switches or starting after losing local `identity/` / `profiles/` /
+/// `manifests/`.
 pub async fn with_hot_store(
     segments: Arc<dyn ObjectStore>,
     data_dir: &Path,
+) -> Result<Arc<dyn ObjectStore>> {
+    with_hot_store_for_role(segments, data_dir, false).await
+}
+
+/// Role-aware variant of [`with_hot_store`]. When `read_only` is `true` (`NodeRole::Query`),
+/// mode-mismatch and opposite-tier checks still run, while writer-only wiped-`<data_dir>` /
+/// empty-`identity/` / `published/` startup refusals are skipped so remote query nodes can boot
+/// with an empty `<data_dir>` and restore from S3 `published/`.
+pub async fn with_hot_store_for_role(
+    segments: Arc<dyn ObjectStore>,
+    data_dir: &Path,
+    read_only: bool,
 ) -> Result<Arc<dyn ObjectStore>> {
     let desired = parse_hot_store_env()?;
     let wal_dir = data_dir.join("wal");
@@ -441,9 +490,26 @@ pub async fn with_hot_store(
         HotStoreMode::Local => {
             refuse_opposite_tier_objects(&segments, "the object store", "object", "local").await?;
 
+            if read_only {
+                if marker.is_none() {
+                    init_local_hot_dirs(data_dir, &wal_dir, &hot_dir).await?;
+                    write_mode_marker(data_dir, &marker_path, HotStoreMode::Local).await?;
+                }
+                let wal_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
+                let hot_store: Arc<dyn ObjectStore> =
+                    Arc::new(DurableLocalObjectStore::new_at(&hot_dir)?);
+                return Ok(Arc::new(HotRouted {
+                    wal: wal_store,
+                    hot: hot_store,
+                    segments,
+                }));
+            }
+
             if marker == Some(HotStoreMode::Local) {
                 let id_dir = hot_dir.join("identity");
                 let prof_dir = hot_dir.join("profiles");
+                let mf_dir = hot_dir.join("manifests");
                 if !id_dir.is_dir() {
                     return Err(config_error(format!(
                         "hot-store mode is `local` but local identity store `{}` is missing; \
@@ -459,6 +525,13 @@ pub async fn with_hot_store(
                         prof_dir.display()
                     )));
                 }
+                if !mf_dir.is_dir() {
+                    return Err(config_error(format!(
+                        "hot-store mode is `local` but local manifests store `{}` is missing; \
+                         refusing to start (recover with `pulse-node restore --from-published`)",
+                        mf_dir.display()
+                    )));
+                }
                 let wal_store: Arc<dyn ObjectStore> =
                     Arc::new(DurableLocalObjectStore::new_at(&wal_dir)?);
                 let hot_store: Arc<dyn ObjectStore> =
@@ -467,15 +540,14 @@ pub async fn with_hot_store(
                     .await?
                     .is_none()
                 {
-                    let has_segments =
-                        first_object_under(&segments, &["manifests", "segments", "published"])
-                            .await?
-                            .is_some();
-                    let has_wal = first_object_under(&wal_store, &["wal"]).await?.is_some();
-                    let has_profiles = first_object_under(&hot_store, &["profiles"])
+                    let has_segments = first_object_under(&segments, &["segments", "published"])
                         .await?
                         .is_some();
-                    if has_segments || has_wal || has_profiles {
+                    let has_wal = first_object_under(&wal_store, &["wal"]).await?.is_some();
+                    let has_local_hot = first_object_under(&hot_store, &["profiles", "manifests"])
+                        .await?
+                        .is_some();
+                    if has_segments || has_wal || has_local_hot {
                         return Err(config_error(format!(
                             "hot-store mode is `local` and local identity store `{}` is empty \
                              while existing project state was found; refusing to start to prevent \
@@ -1231,6 +1303,12 @@ mod hot_store_and_multipart_tests {
         }
         assert!(!target_drop.exists());
         assert_eq!(fsync_probe_map().lock().get(&target_drop).copied(), None);
+        for _ in 0..50 {
+            if count_files(tmp.path()) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             count_files(tmp.path()),
             0,
@@ -1247,7 +1325,7 @@ mod hot_store_and_multipart_tests {
         let store = with_hot_store(segments.clone(), tmp.path()).await.unwrap();
         segments.reset();
 
-        // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes route locally with 0 S3 calls.
+        // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes (including manifests) route locally with 0 S3 calls.
         for key in [
             "wal/p1/bucket_000/seq_0.wal",
             "wal_corrupt/p1/bucket_000/bad.wal",
@@ -1256,6 +1334,7 @@ mod hot_store_and_multipart_tests {
             "agent_wal_corrupt/p1/w1/seq_0.ptwl",
             "identity/p1/manifest/000001.manifest",
             "profiles/p1/wal/000001.sst",
+            "manifests/p1/epoch_000000000001.json",
         ] {
             let p = ObjectPath::from(key);
             store
@@ -1300,8 +1379,8 @@ mod hot_store_and_multipart_tests {
             .try_collect()
             .await
             .unwrap();
-        assert_eq!(all_none.len(), 8);
-        assert_eq!(all_empty.len(), 8);
+        assert_eq!(all_none.len(), 9);
+        assert_eq!(all_empty.len(), 9);
 
         // list_with_delimiter(None) and list_with_delimiter(Some("")) merge and dedup common_prefixes.
         let delim_none = store.list_with_delimiter(None).await.unwrap();
@@ -1313,6 +1392,7 @@ mod hot_store_and_multipart_tests {
             "agent_wal",
             "agent_wal_corrupt",
             "identity",
+            "manifests",
             "profiles",
             "segments",
             "wal",
@@ -1333,7 +1413,7 @@ mod hot_store_and_multipart_tests {
             )
             .await
             .unwrap();
-        let cross_dst = ObjectPath::from("manifests/p1/copied_from_hot.bin");
+        let cross_dst = ObjectPath::from("published/p1/copied_from_hot.bin");
         store
             .copy(&ObjectPath::from("profiles/p1/wal/000001.sst"), &cross_dst)
             .await
@@ -1401,6 +1481,7 @@ mod hot_store_and_multipart_tests {
             assert!(tmp.path().join("wal").is_dir());
             assert!(tmp.path().join("hot/identity").is_dir());
             assert!(tmp.path().join("hot/profiles").is_dir());
+            assert!(tmp.path().join("hot/manifests").is_dir());
 
             // Empty restart succeeds.
             let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
@@ -1479,8 +1560,17 @@ mod hot_store_and_multipart_tests {
                 "{err}"
             );
 
-            // Restore profiles dir; agent_wal alone is allowed with empty identity.
+            // Restore profiles dir, delete hot/manifests dir -> refused.
             std::fs::create_dir_all(tmp.path().join("hot/profiles")).unwrap();
+            std::fs::remove_dir_all(tmp.path().join("hot/manifests")).unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+
+            // Restore manifests dir; agent_wal alone is allowed with empty identity.
+            std::fs::create_dir_all(tmp.path().join("hot/manifests")).unwrap();
             let store = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
             store
                 .put(
@@ -1491,10 +1581,28 @@ mod hot_store_and_multipart_tests {
                 .unwrap();
             let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
 
-            // Put a manifest in segments while identity/ is empty -> refused!
+            // Put a local manifest while identity/ is empty -> refused!
+            store
+                .put(
+                    &ObjectPath::from("manifests/p1/epoch_1.json"),
+                    PutPayload::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+
+            // Clear local manifests and put a segment in S3 while identity/ is empty -> refused!
+            store
+                .delete(&ObjectPath::from("manifests/p1/epoch_1.json"))
+                .await
+                .unwrap();
             seg.put(
-                &ObjectPath::from("manifests/p1/epoch_1.json"),
-                PutPayload::from_static(b"{}"),
+                &ObjectPath::from("segments/p1/seg_1.pvtx"),
+                PutPayload::from_static(b"s"),
             )
             .await
             .unwrap();
@@ -1505,8 +1613,8 @@ mod hot_store_and_multipart_tests {
             );
         }
 
-        // 5b. Uninitialized / wiped <data_dir> (no marker) with S3 published/ -> refused,
-        //     and leaves <data_dir> untouched (no marker or hot/ created).
+        // 5b. Uninitialized / wiped <data_dir> (no marker) with S3 published/ -> refused for writer,
+        //     leaves <data_dir> untouched, and succeeds for read_only (NodeRole::Query).
         {
             let _env = HotStoreEnvGuard::set(Some("local"));
             let tmp = tempfile::tempdir().unwrap();
@@ -1528,6 +1636,12 @@ mod hot_store_and_multipart_tests {
             assert!(!tmp.path().join("hot_store_mode").exists());
             assert!(!tmp.path().join("hot").exists());
             assert!(!tmp.path().join("wal").exists());
+
+            // Read-only query node opens cleanly on an empty <data_dir> even when published/ exists.
+            let q_tmp = tempfile::tempdir().unwrap();
+            let _query_store = with_hot_store_for_role(seg.clone(), q_tmp.path(), true)
+                .await
+                .expect("read-only query node must start with empty data_dir");
 
             // Restore helpers open without refusal and finalize marker afterwards.
             let restore_store = open_hot_store_for_restore(seg.clone(), tmp.path())
@@ -1585,5 +1699,54 @@ mod hot_store_and_multipart_tests {
                 matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn durable_local_object_store_prune_empty_below_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_dir = tmp.path().join("default");
+        let pruned_dir = tmp.path().join("pruned");
+
+        let default_store = DurableLocalObjectStore::new_at(&default_dir).unwrap();
+        let pruned_store = DurableLocalObjectStore::new_at(&pruned_dir)
+            .unwrap()
+            .with_prune_empty_below_depth(2);
+
+        let keys = [
+            "profiles/proj_a/pub_0/manifest/00001.manifest",
+            "profiles/proj_a/pub_0/wal/00001.wal",
+            "identity/proj_a/manifest/00001.manifest",
+        ];
+        for key in keys {
+            let path = ObjectPath::from(key);
+            default_store
+                .put(&path, PutPayload::from_static(b"data"))
+                .await
+                .unwrap();
+            pruned_store
+                .put(&path, PutPayload::from_static(b"data"))
+                .await
+                .unwrap();
+        }
+        for key in keys {
+            let path = ObjectPath::from(key);
+            default_store.delete(&path).await.unwrap();
+            pruned_store.delete(&path).await.unwrap();
+        }
+
+        // Default store keeps empty parent dirs untouched.
+        assert!(default_dir.join("profiles/proj_a/pub_0/manifest").is_dir());
+        assert!(default_dir.join("profiles/proj_a/pub_0").is_dir());
+
+        // Depth-2 pruned store removes `pub_0` + its subdirs and `identity/proj_a/manifest`,
+        // while preserving depth <= 2 (`profiles/proj_a`, `profiles`, `identity/proj_a`, `identity`).
+        assert!(!pruned_dir.join("profiles/proj_a/pub_0/manifest").exists());
+        assert!(!pruned_dir.join("profiles/proj_a/pub_0/wal").exists());
+        assert!(!pruned_dir.join("profiles/proj_a/pub_0").exists());
+        assert!(pruned_dir.join("profiles/proj_a").is_dir());
+        assert!(pruned_dir.join("profiles").is_dir());
+        assert!(!pruned_dir.join("identity/proj_a/manifest").exists());
+        assert!(pruned_dir.join("identity/proj_a").is_dir());
+        assert!(pruned_dir.join("identity").is_dir());
     }
 }

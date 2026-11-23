@@ -77,6 +77,62 @@ pub async fn restore_identity_from_snapshot(
     Ok((id_graph, identity_user_count))
 }
 
+/// Restores `identity/{project_id}` into `local_store` (preserving `PLSEAGM2` path binding) from
+/// a remote `PublishedManifest`'s `id_ref` in `s3_store`, returning a read-only
+/// [`ProjectIdentityGraph`] (`db: None`) after asserting `identity_user_count >= high_water_mark`.
+pub async fn restore_identity_from_snapshot_read_only(
+    project_id: &str,
+    s3_store: &Arc<dyn ObjectStore>,
+    local_store: Arc<dyn ObjectStore>,
+    id_ref: &IdentitySnapshotRef,
+    high_water_mark: u64,
+) -> Result<(Arc<ProjectIdentityGraph>, u64)> {
+    let snap_path = ObjectPath::from(id_ref.object_path.as_str());
+    let bytes = s3_store.get(&snap_path).await?.bytes().await?;
+    delete_objects_with_prefix(&local_store, &format!("identity/{project_id}")).await?;
+    let id_graph =
+        ProjectIdentityGraph::restore_from_export_read_only(project_id, local_store, &bytes)
+            .await?;
+    let identity_user_count = id_graph.user_count() as u64;
+    if identity_user_count < high_water_mark {
+        return Err(StorageError::HighWaterMarkViolation {
+            project_id: project_id.to_string(),
+            identity_user_count,
+            high_water_mark,
+        });
+    }
+    Ok((id_graph, identity_user_count))
+}
+
+/// Restores `profiles/{project_id}/pub_{publish_seq}` into `local_store` (preserving `PLSEAGM2`
+/// path binding) from `profile_ref` in `s3_store`, returning a read-only [`ProjectProfileStore`].
+pub async fn restore_profiles_from_snapshot_read_only(
+    project_id: &str,
+    publish_seq: u64,
+    s3_store: &Arc<dyn ObjectStore>,
+    local_store: Arc<dyn ObjectStore>,
+    profile_ref: Option<&ProfileSnapshotRef>,
+) -> Result<Arc<ProjectProfileStore>> {
+    let db_prefix = format!("profiles/{project_id}/pub_{publish_seq}");
+    let Some(pref) = profile_ref else {
+        delete_objects_with_prefix(&local_store, &db_prefix).await?;
+        return Ok(ProjectProfileStore::open_read_only_at(
+            project_id,
+            db_prefix,
+            local_store,
+        ));
+    };
+    let snap_path = ObjectPath::from(pref.object_path.as_str());
+    let bytes = s3_store.get(&snap_path).await?.bytes().await?;
+    ProjectProfileStore::restore_from_export_read_only_at(
+        project_id,
+        db_prefix,
+        local_store,
+        &bytes,
+    )
+    .await
+}
+
 /// Restores `identity/`, `profiles/`, and `manifests/` for `project_id` from `published` via
 /// `enc_store` (`EncryptedObjectStore` preserving `PLSEAGM2` path binding), asserting
 /// `identity_user_count >= published.high_water_mark`.

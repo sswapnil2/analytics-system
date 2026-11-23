@@ -1287,6 +1287,14 @@ impl ColumnarProfileIndex {
     }
 }
 
+/// Pre-built `ColumnarProfileIndex` and property metadata constructed off-lock before being
+/// atomically installed into [`VirtualCatalog`] under [`VirtualCatalog::acquire_refresh_write`].
+pub struct PreparedUserProfiles {
+    index: ColumnarProfileIndex,
+    timestamps: HashMap<u32, i64>,
+    prop_keys: HashSet<String>,
+}
+
 /// Per-project virtual schema catalog (Custom Events, Custom Properties, Lookup Tables, Saved Cohorts, User Profiles, and IANA Timezone).
 pub struct VirtualCatalog {
     pub custom_events: DashMap<String, CustomEventDef>,
@@ -1297,6 +1305,7 @@ pub struct VirtualCatalog {
     user_profile_ts: RwLock<HashMap<u32, i64>>,
     user_prop_keys: RwLock<HashSet<String>>,
     timezone: RwLock<Tz>,
+    query_refresh_gate: tokio::sync::RwLock<()>,
 }
 
 impl Default for VirtualCatalog {
@@ -1310,6 +1319,7 @@ impl Default for VirtualCatalog {
             user_profile_ts: RwLock::new(HashMap::new()),
             user_prop_keys: RwLock::new(HashSet::new()),
             timezone: RwLock::new(chrono_tz::UTC),
+            query_refresh_gate: tokio::sync::RwLock::new(()),
         }
     }
 }
@@ -1317,6 +1327,14 @@ impl Default for VirtualCatalog {
 impl VirtualCatalog {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub async fn acquire_query_read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.query_refresh_gate.read().await
+    }
+
+    pub async fn acquire_refresh_write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.query_refresh_gate.write().await
     }
 
     pub fn timezone(&self) -> Tz {
@@ -1334,6 +1352,33 @@ impl VirtualCatalog {
         self.lookup_tables.insert(name, def.into_indexed_arc());
     }
 
+    pub fn prepare_user_profiles(
+        profiles: HashMap<u32, HashMap<String, PropValue>>,
+        timestamps: HashMap<u32, i64>,
+    ) -> PreparedUserProfiles {
+        let mut prop_keys = HashSet::new();
+        for p in profiles.values() {
+            for k in p.keys() {
+                prop_keys.insert(k.clone());
+            }
+        }
+        let mut index = ColumnarProfileIndex::default();
+        index.set_all(profiles);
+        PreparedUserProfiles {
+            index,
+            timestamps,
+            prop_keys,
+        }
+    }
+
+    pub fn install_prepared_user_profiles(&self, prepared: PreparedUserProfiles) {
+        *self.user_prop_keys.write() = prepared.prop_keys;
+        let mut idx = self.user_profiles.write();
+        let mut ts_map = self.user_profile_ts.write();
+        *idx = prepared.index;
+        *ts_map = prepared.timestamps;
+    }
+
     pub fn set_user_profiles(&self, profiles: HashMap<u32, HashMap<String, PropValue>>) {
         self.set_user_profiles_with_ts(profiles, HashMap::new());
     }
@@ -1343,17 +1388,7 @@ impl VirtualCatalog {
         profiles: HashMap<u32, HashMap<String, PropValue>>,
         timestamps: HashMap<u32, i64>,
     ) {
-        let mut keys = HashSet::new();
-        for p in profiles.values() {
-            for k in p.keys() {
-                keys.insert(k.clone());
-            }
-        }
-        *self.user_prop_keys.write() = keys;
-        let mut idx = self.user_profiles.write();
-        let mut ts_map = self.user_profile_ts.write();
-        idx.set_all(profiles);
-        *ts_map = timestamps;
+        self.install_prepared_user_profiles(Self::prepare_user_profiles(profiles, timestamps));
     }
 
     pub fn upsert_user_profile(&self, canon_uid: u32, props: HashMap<String, PropValue>) {

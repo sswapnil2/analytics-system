@@ -19,8 +19,8 @@ use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
 use pulse_storage::{
-    build_object_store, with_hot_store, MaintenanceKind, StorageConfig, StorageEngine,
-    DEFAULT_NUM_BUCKETS,
+    build_object_store, with_hot_store_for_role, DurableLocalObjectStore, MaintenanceKind,
+    StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
 };
 use tokio::sync::{oneshot, watch};
 use tower_http::compression::predicate::{NotForContentType, Predicate};
@@ -189,6 +189,12 @@ pub struct RunningNode {
 }
 
 impl RunningNode {
+    /// Executes one `NodeRole::Query` refresh cycle (keyring, control caches, published
+    /// manifests, `erased_uids`, and `ColumnarProfileIndex` atomic swap).
+    pub async fn run_query_refresh_tick(&self) -> usize {
+        run_query_refresh_tick(&self.control, &self.storage).await
+    }
+
     pub async fn shutdown(mut self) {
         // Fail `/readyz` first so load balancers stop routing here, then give them
         // `PULSE_SHUTDOWN_DRAIN_MS` (default 0) to notice before the listener closes.
@@ -223,6 +229,9 @@ impl RunningNode {
             // Losing these would lose acknowledged data from memory: say so loudly.
             if let Err(e) = self.storage.flush_all_projects().await {
                 tracing::error!(error = %e, "final flush on shutdown failed");
+            }
+            if let Err(e) = self.storage.publish_all_projects().await {
+                tracing::error!(error = %e, "final publish on shutdown failed");
             }
             if let Err(e) = self.storage.identity_router().close_all().await {
                 tracing::error!(error = %e, "closing identity stores on shutdown failed");
@@ -356,6 +365,29 @@ fn build_admin_cors_layer(origins: &[String]) -> CorsLayer {
         ])
 }
 
+/// Executes one `NodeRole::Query` refresh cycle:
+/// 1. Reloads the BYOK decryption keyring from `MetaStore`.
+/// 2. Reloads control-plane metadata, discovers new projects, and atomically refreshes published
+///    manifests, `erased_uids`, and `ColumnarProfileIndex` under each project's
+///    `query_refresh_gate`.
+pub async fn run_query_refresh_tick(
+    control: &ControlPlaneService,
+    storage: &StorageEngine,
+) -> usize {
+    if let Err(e) = control.refresh_encryption_keyring().await {
+        tracing::warn!(error = %e, "query node failed to refresh BYOK keyring");
+    }
+    let (control_res, manifest_res) = control.refresh_query_caches_and_manifests().await;
+    if let Err(e) = control_res {
+        tracing::warn!(error = %e, "query node failed to reload control state");
+    }
+    let refreshed = manifest_res.as_ref().copied().unwrap_or(0);
+    storage
+        .maintenance_errors()
+        .check(MaintenanceKind::ManifestRefresh, manifest_res);
+    refreshed
+}
+
 /// Boots the Pulse Analytics Node (`All`, `Ingest`, `Query`, or `Compactor` role).
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
@@ -369,7 +401,9 @@ pub async fn start_pulse_node_with_store(
     raw_store: Arc<dyn object_store::ObjectStore>,
 ) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let raw_store = with_hot_store(raw_store, &config.data_dir).await?;
+    let raw_store =
+        with_hot_store_for_role(raw_store, &config.data_dir, config.role == NodeRole::Query)
+            .await?;
     let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
     let identity_router = Arc::new(if config.role.serves_ingest() {
         IdentityRouter::new(enc_store.as_object_store())
@@ -383,7 +417,16 @@ pub async fn start_pulse_node_with_store(
         l0_flush_max_age: Duration::from_secs(60),
         compaction_min_segments: 4,
     };
-    let storage = StorageEngine::new_with_encrypted(storage_cfg, enc_store, identity_router);
+    let storage =
+        StorageEngine::new_with_encrypted(storage_cfg, enc_store.clone(), identity_router);
+    if config.role == NodeRole::Query {
+        let query_hot_dir = config.data_dir.join("query_hot");
+        let query_hot_raw: Arc<dyn object_store::ObjectStore> = Arc::new(
+            DurableLocalObjectStore::new_at(&query_hot_dir)?.with_prune_empty_below_depth(2),
+        );
+        let query_hot_enc = enc_store.with_shared_keyring(query_hot_raw);
+        storage.enable_published_reader(query_hot_enc.as_object_store());
+    }
 
     let catalogs = CatalogRegistry::new();
     let foyer_dir = config.data_dir.join("foyer_cache");
@@ -600,13 +643,50 @@ pub async fn start_pulse_node_with_store(
         });
     }
     let _bg_handle = if config.role == NodeRole::All {
+        let keyring_control = control.clone();
+        let mut keyring_shutdown = shutdown_bg_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = keyring_control.refresh_encryption_keyring().await {
+                            tracing::warn!(error = %e, "failed to refresh BYOK keyring");
+                        }
+                    }
+                    changed = keyring_shutdown.changed() => {
+                        if changed.is_err() || *keyring_shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
         storage.spawn_background_maintenance(shutdown_bg_rx)
     } else {
         let bg_storage = storage.clone();
         let bg_control = control.clone();
         let role = config.role;
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            let mut ticker = if role == NodeRole::Query {
+                if let Some(secs) = std::env::var("PULSE_QUERY_REFRESH_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                {
+                    let dur = Duration::from_secs(secs.max(1));
+                    tokio::time::interval_at(tokio::time::Instant::now() + dur, dur)
+                } else {
+                    tokio::time::interval(Duration::from_secs(5))
+                }
+            } else {
+                tokio::time::interval(Duration::from_secs(5))
+            };
+            let interval = bg_storage.upload_interval();
+            let mut publish_ticker = (role == NodeRole::Ingest && !interval.is_zero()).then(|| {
+                let mut t =
+                    tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                t
+            });
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -618,11 +698,15 @@ pub async fn start_pulse_node_with_store(
                                 for p in bg_storage.open_projects() {
                                     errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
                                 }
+                                errs.check(MaintenanceKind::Compaction, bg_storage.run_gc_all_projects().await);
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
                                     tracing::warn!(error = %e, "reloading API key cache failed");
                                 }
                             }
                             NodeRole::Compactor => {
+                                if let Err(e) = bg_control.refresh_encryption_keyring().await {
+                                    tracing::warn!(error = %e, "compactor failed to refresh BYOK keyring");
+                                }
                                 let errs = bg_storage.maintenance_errors();
                                 errs.check(MaintenanceKind::ManifestRefresh, bg_storage.refresh_all_manifests().await);
                                 // Erasure tombstones decide which rows compaction drops.
@@ -646,14 +730,19 @@ pub async fn start_pulse_node_with_store(
                                 errs.check(MaintenanceKind::Compaction, bg_storage.compact_all_projects().await);
                             }
                             NodeRole::Query => {
-                                bg_storage.maintenance_errors().check(MaintenanceKind::ManifestRefresh, bg_storage.refresh_all_manifests().await);
-                                // Keys, erasures, profiles, cohorts and time zones are written
-                                // by whichever node took the admin call; pick them up here.
-                                if let Err(e) = bg_control.reload_caches_from_db().await {
-                                    tracing::warn!(error = %e, "query node failed to reload control state");
-                                }
+                                run_query_refresh_tick(&bg_control, &bg_storage).await;
                             }
                         }
+                    }
+                    _ = async {
+                        match publish_ticker.as_mut() {
+                            Some(t) => t.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        bg_storage
+                            .maintenance_errors()
+                            .check(MaintenanceKind::Publish, bg_storage.publish_all_projects().await);
                     }
                     changed = shutdown_bg_rx.changed() => {
                         if changed.is_err() || *shutdown_bg_rx.borrow() {

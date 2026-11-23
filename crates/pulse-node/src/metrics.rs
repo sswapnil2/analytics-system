@@ -234,6 +234,7 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
         ("flush", &errs.flush),
         ("compaction", &errs.compaction),
         ("manifest_refresh", &errs.manifest_refresh),
+        ("publish", &errs.publish),
     ] {
         let _ = writeln!(
             out,

@@ -383,7 +383,7 @@ pub fn unseal_ephemeral_blob(ephemeral_key: &[u8; 32], sealed: &[u8]) -> Result<
 pub struct EncryptedObjectStore {
     inner: Arc<dyn ObjectStore>,
     keyring: Arc<DashMap<String, [u8; 32]>>,
-    active_key_id: RwLock<Option<String>>,
+    active_key_id: Arc<RwLock<Option<String>>>,
     /// Per-object header cache (`Some(hdr)` = PLSEAGM1 encrypted, `None` = plaintext).
     headers: Arc<DashMap<String, Option<EnvelopeHeader>>>,
     ops_encrypted: Arc<AtomicU64>,
@@ -433,12 +433,26 @@ impl EncryptedObjectStore {
         Self {
             inner,
             keyring,
-            active_key_id: RwLock::new(active_key_id),
+            active_key_id: Arc::new(RwLock::new(active_key_id)),
             headers: Arc::new(DashMap::new()),
             ops_encrypted: Arc::new(AtomicU64::new(0)),
             ops_decrypted: Arc::new(AtomicU64::new(0)),
             ephemeral_cache_key,
         }
+    }
+
+    /// Creates a new `EncryptedObjectStore` wrapping `inner` while sharing this store's
+    /// decryption `keyring` and `active_key_id` so keys registered on one are visible to both.
+    pub fn with_shared_keyring(&self, inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            keyring: self.keyring.clone(),
+            active_key_id: self.active_key_id.clone(),
+            headers: Arc::new(DashMap::new()),
+            ops_encrypted: Arc::new(AtomicU64::new(0)),
+            ops_decrypted: Arc::new(AtomicU64::new(0)),
+            ephemeral_cache_key: self.ephemeral_cache_key,
+        })
     }
 
     pub fn raw_inner(&self) -> &Arc<dyn ObjectStore> {
@@ -467,6 +481,20 @@ impl EncryptedObjectStore {
             *self.active_key_id.write() = Some(key_id.to_string());
         }
         Ok(())
+    }
+
+    pub fn has_master_key(&self, key_id: &str) -> bool {
+        self.keyring.contains_key(key_id)
+    }
+
+    pub fn activate_master_key(&self, key_id: &str) -> bool {
+        if !self.keyring.contains_key(key_id) {
+            return false;
+        }
+        if self.active_key_id.read().as_deref() != Some(key_id) {
+            *self.active_key_id.write() = Some(key_id.to_string());
+        }
+        true
     }
 
     /// Stops encrypting *new* writes while preserving the decryption keyring so all existing objects stay readable.
