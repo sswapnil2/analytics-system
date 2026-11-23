@@ -421,6 +421,12 @@ pub async fn start_pulse_node_with_store(
     };
     let storage =
         StorageEngine::new_with_encrypted(storage_cfg, enc_store.clone(), identity_router);
+    if config.role.serves_ingest() {
+        storage
+            .replay_store()
+            .recover_pending_local_sessions_once()
+            .await?;
+    }
     if config.role == NodeRole::Query {
         let query_hot_dir = config.data_dir.join("query_hot");
         let query_hot_raw: Arc<dyn object_store::ObjectStore> = Arc::new(
@@ -715,6 +721,14 @@ pub async fn start_pulse_node_with_store(
                                     errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
                                 }
                                 errs.check(MaintenanceKind::Compaction, bg_storage.run_gc_all_projects().await);
+                                if bg_storage.upload_interval().is_zero()
+                                    && bg_storage.replay_store().has_pending_local_work()
+                                {
+                                    errs.check(
+                                        MaintenanceKind::Publish,
+                                        bg_storage.upload_dirty_replays().await,
+                                    );
+                                }
                                 if let Err(e) = bg_control.reload_caches_from_db().await {
                                     tracing::warn!(error = %e, "reloading API key cache failed");
                                 }
@@ -1051,13 +1065,21 @@ async fn restore_from_published_inner(
             continue;
         };
 
-        // Clear any stale local WAL, hot segments, and upload intent from an earlier partial volume before restoring.
+        // Clear any stale local WAL, hot segments, hot replays/cursors, and upload intent from an earlier partial volume before restoring.
         pulse_storage::delete_objects_with_prefix(&enc_store, &format!("wal/{project_id}")).await?;
         pulse_storage::delete_objects_with_prefix(
             &enc_store,
             &format!("hot/segments/{project_id}"),
         )
         .await?;
+        pulse_storage::delete_objects_with_prefix(&enc_store, &format!("hot/replay/{project_id}"))
+            .await?;
+        pulse_storage::delete_objects_with_prefix(
+            &enc_store,
+            &format!("hot/replay_cursors/{project_id}"),
+        )
+        .await?;
+        pulse_storage::ReplayStore::seed_cursors_from_s3(&enc_store, &project_id).await?;
         pulse_storage::UploadIntentStore::new(&project_id, enc_store.clone())
             .clear()
             .await?;

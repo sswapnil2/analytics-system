@@ -1265,6 +1265,9 @@ impl ControlPlaneService {
             } else {
                 !was_open && target_pub_seq.is_some()
             };
+            if applied {
+                storage.replay_store().invalidate_project(project_id);
+            }
             storage.set_erased(project_id, expanded);
             self.profile_catalog_ts
                 .insert(project_id.to_string(), ts_map);

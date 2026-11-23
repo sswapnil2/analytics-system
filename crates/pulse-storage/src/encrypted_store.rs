@@ -920,9 +920,12 @@ impl ObjectStore for EncryptedObjectStore {
             return Ok(());
         }
         self.inner.copy(from, to).await?;
-        if let Some(cached) = self.headers.get(from.as_ref()) {
-            self.headers
-                .insert(to.as_ref().to_string(), cached.value().clone());
+        let cached = self
+            .headers
+            .get(from.as_ref())
+            .map(|entry| entry.value().clone());
+        if let Some(hdr) = cached {
+            self.headers.insert(to.as_ref().to_string(), hdr);
         }
         Ok(())
     }
@@ -932,9 +935,12 @@ impl ObjectStore for EncryptedObjectStore {
             return Ok(());
         }
         self.inner.copy_if_not_exists(from, to).await?;
-        if let Some(cached) = self.headers.get(from.as_ref()) {
-            self.headers
-                .insert(to.as_ref().to_string(), cached.value().clone());
+        let cached = self
+            .headers
+            .get(from.as_ref())
+            .map(|entry| entry.value().clone());
+        if let Some(hdr) = cached {
+            self.headers.insert(to.as_ref().to_string(), hdr);
         }
         Ok(())
     }
@@ -975,5 +981,64 @@ mod tests {
         fresh.set_master_key(Some([7u8; 32]));
         assert!(fresh.get(&b).await.is_err());
         assert!(fresh.get_range(&b, 0..4).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn plaintext_copy_and_copy_if_not_exists_do_not_deadlock_on_shard_collision() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = EncryptedObjectStore::new(inner);
+        assert!(!store.is_encryption_enabled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for i in 0..512u32 {
+                let from = ObjectPath::from(format!("hot/replay/proj_a/sess_a/{i:010}.plsr"));
+                let to_create = ObjectPath::from(format!("replays/proj_a/sess_a/{i:010}.plsr"));
+                let to_overwrite =
+                    ObjectPath::from(format!("replays/proj_a/sess_copy/{i:010}.plsr"));
+                let payload = PutPayload::from(Bytes::from(format!("chunk-{i}")));
+                store
+                    .put_opts(
+                        &from,
+                        payload,
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..PutOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                store.copy_if_not_exists(&from, &to_create).await.unwrap();
+                store.copy(&from, &to_overwrite).await.unwrap();
+            }
+        })
+        .await
+        .expect(
+            "plaintext copy / copy_if_not_exists must not self-deadlock on DashMap shard collision",
+        );
+
+        assert_eq!(
+            store
+                .get(&ObjectPath::from("replays/proj_a/sess_a/0000000511.plsr"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"chunk-511"
+        );
+        assert_eq!(
+            store
+                .get(&ObjectPath::from(
+                    "replays/proj_a/sess_copy/0000000511.plsr"
+                ))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"chunk-511"
+        );
     }
 }

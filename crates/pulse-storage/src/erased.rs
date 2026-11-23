@@ -5,7 +5,7 @@ use std::collections::HashMap;
 /// An erased id hides only events at or before its erasure time, so a person who signs up again
 /// with the same id is counted from then on. Rows erased before tombstones carried a time are
 /// stored with `i64::MAX` and stay hidden for good.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ErasedUids {
     at: HashMap<u32, i64>,
 }

@@ -204,6 +204,7 @@ struct RunCalls {
     traces: Calls,
     identifies: Calls,
     engages: Calls,
+    replays: Calls,
     idle_l0: Calls,
     idle_flushed: Calls,
     user_detail: Calls,
@@ -313,6 +314,31 @@ async fn run(mode: &str, n: usize, idle: Duration) -> RunCalls {
     }
     let engages = store.take();
     print(&format!("{mode}: 20 engage requests"), &engages);
+    for i in 0..20 {
+        assert_eq!(
+            post(
+                &node,
+                "/v1/replay/chunk",
+                &key,
+                json!({
+                    "project_id": "",
+                    "session_id": format!("sess_calls_{}", i % 4),
+                    "chunk_start_ts_ms": now + i as i64 * 100,
+                    "ops": [{
+                        "op": "pointer_interaction",
+                        "ts_offset_ms": i * 10,
+                        "x": 120,
+                        "y": 240,
+                        "kind": { "type": "tap" }
+                    }]
+                })
+            )
+            .await,
+            200
+        );
+    }
+    let replays = store.take();
+    print(&format!("{mode}: 20 replay chunk requests"), &replays);
 
     tokio::time::sleep(idle).await;
     let idle_l0 = store.take();
@@ -371,6 +397,7 @@ async fn run(mode: &str, n: usize, idle: Duration) -> RunCalls {
         traces,
         identifies,
         engages,
+        replays,
         idle_l0,
         idle_flushed,
         user_detail,
@@ -408,6 +435,11 @@ async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
         "object mode writes profiles on /v1/engage: {:?}",
         obj.engages
     );
+    assert!(
+        prefix_puts(&obj.replays, "replays") > 0,
+        "object mode writes replays to the segment store on /v1/replay/chunk: {:?}",
+        obj.replays
+    );
 
     let loc = run("local", 1000, idle).await;
     assert_eq!(
@@ -433,6 +465,11 @@ async fn acknowledged_requests_make_zero_hot_tier_calls_in_local_mode() {
         0,
         "local mode: zero hot-tier calls during /v1/engage acks: {:?}",
         loc.engages
+    );
+    assert!(
+        loc.replays.is_empty(),
+        "local mode: zero S3 calls during /v1/replay/chunk: {:?}",
+        loc.replays
     );
     assert_eq!(
         hot_calls(&loc.user_detail),

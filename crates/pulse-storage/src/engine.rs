@@ -33,7 +33,7 @@ use crate::mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
 use crate::profile_store::{ProfileRouter, ProjectProfileStore};
-use crate::replay_store::{ReplayAppendResult, ReplayStore};
+use crate::replay_store::{validate_replay_identifier, ReplayAppendResult, ReplayStore};
 use crate::segment::{
     write_vortex_segment, write_vortex_segment_opts, SegmentMeta, VortexSegmentReader,
 };
@@ -4174,14 +4174,17 @@ impl StorageEngine {
     ) -> Arc<Self> {
         let wrapped_store: Arc<dyn ObjectStore> = encrypted_store.clone();
         let segment_reader = Arc::new(VortexSegmentReader::new(wrapped_store.clone()));
-        let replay_store = Arc::new(ReplayStore::new(wrapped_store.clone()));
+        let is_hot_routed = is_hot_routed_store(encrypted_store.raw_inner().as_ref());
+        let replay_store = Arc::new(ReplayStore::new_with_options(
+            wrapped_store.clone(),
+            is_hot_routed,
+            identity_router.is_read_only(),
+        ));
         let profile_router = Arc::new(crate::ProfileRouter::new(
             wrapped_store.clone(),
             identity_router.is_read_only(),
         ));
-        let local_segment_tier = Arc::new(AtomicBool::new(is_hot_routed_store(
-            encrypted_store.raw_inner().as_ref(),
-        )));
+        let local_segment_tier = Arc::new(AtomicBool::new(is_hot_routed));
         let upload_interval_ms =
             Arc::new(AtomicU64::new(upload_interval_from_env().as_millis() as u64));
         let closed_date_upload_ms = Arc::new(AtomicU64::new(
@@ -4501,11 +4504,22 @@ impl StorageEngine {
     }
 
     /// Sets a project's erasure tombstones without opening its storage; applied on open.
+    ///
+    /// Invalidates cached replay session discovery for `project_id` whenever the project's
+    /// effective erasure set changes so `NodeRole::Query` readers observe DPDP replay deletions
+    /// immediately even before a new `PublishedManifest` is published.
     pub fn set_erased(&self, project_id: &str, erased: ErasedUids) {
         let erased = Arc::new(erased);
-        self.erased.insert(project_id.to_string(), erased.clone());
+        let prev = self.erased.insert(project_id.to_string(), erased.clone());
+        let changed = match prev {
+            Some(prev) => prev.as_ref() != erased.as_ref(),
+            None => !erased.is_empty(),
+        };
         if let Some(p) = self.projects.get(project_id) {
             p.set_erased(erased);
+        }
+        if changed {
+            self.replay_store.invalidate_project(project_id);
         }
     }
 
@@ -4517,6 +4531,15 @@ impl StorageEngine {
     }
 
     pub async fn append_replay_chunk(&self, chunk: &ReplayChunk) -> Result<ReplayAppendResult> {
+        validate_replay_identifier("project_id", &chunk.project_id)?;
+        validate_replay_identifier("session_id", &chunk.session_id)?;
+        if self.identity_router.is_read_only() {
+            return Err(StorageError::NotWriter {
+                project_id: chunk.project_id.clone(),
+            });
+        }
+        let ps = self.get_or_open_project(&chunk.project_id).await?;
+        ps.check_writer()?;
         let res = self.replay_store.append_chunk(chunk).await?;
         let mut flags = 0u16;
         if chunk.has_rage_tap() {
@@ -4529,8 +4552,15 @@ impl StorageEngine {
             flags |= SESSION_FLAG_ERROR;
         }
         if flags != 0 {
-            let ps = self.get_or_open_project(&chunk.project_id).await?;
             ps.record_session_flags(&chunk.session_id, flags);
+        }
+        if self.upload_interval().is_zero()
+            && self.replay_store.is_local_hot_tier()
+            && ps.publish_enabled.load(Ordering::Acquire)
+        {
+            self.replay_store
+                .upload_session(&chunk.project_id, &chunk.session_id)
+                .await?;
         }
         Ok(res)
     }
@@ -4688,6 +4718,74 @@ impl StorageEngine {
             .await
     }
 
+    /// Uploads any pending local `hot/replay/` chunks to S3 `replays/`, checking writer lease
+    /// ownership per dirty project. Makes **0 S3 calls** when clean.
+    pub async fn upload_dirty_replays(&self) -> Result<usize> {
+        if self.identity_router.is_read_only()
+            || self.is_published_reader()
+            || !self.replay_store.is_local_hot_tier()
+        {
+            return Ok(0);
+        }
+        self.replay_store
+            .recover_pending_local_sessions_once()
+            .await?;
+        let dirty = self.replay_store.dirty_sessions_snapshot();
+        if dirty.is_empty() {
+            return Ok(0);
+        }
+
+        let distinct_pids: HashSet<String> = dirty.into_iter().map(|(pid, _)| pid).collect();
+        let mut allowed_pids: HashSet<String> = HashSet::new();
+        let mut first_err: Option<StorageError> = None;
+
+        for pid in distinct_pids {
+            if self.writer_leases.get().is_some() {
+                match self.get_or_open_project(&pid).await {
+                    Ok(ps) => {
+                        if ps.check_writer().is_ok() && ps.publish_enabled.load(Ordering::Acquire) {
+                            allowed_pids.insert(pid);
+                        }
+                    }
+                    Err(StorageError::NotWriter { .. }) | Err(StorageError::StaleWriter { .. }) => {
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            } else if let Some(ps) = self.projects.get(&pid) {
+                if ps.check_writer().is_ok() && ps.publish_enabled.load(Ordering::Acquire) {
+                    allowed_pids.insert(pid);
+                }
+            } else {
+                allowed_pids.insert(pid);
+            }
+        }
+
+        let mut uploaded = 0usize;
+        if !allowed_pids.is_empty() {
+            match self
+                .replay_store
+                .upload_dirty_sessions_with_filter(|pid| allowed_pids.contains(pid))
+                .await
+            {
+                Ok(n) => uploaded = n,
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(uploaded)
+    }
+
     /// Time-parameterized upload + publish across all open projects.
     pub async fn upload_all_projects_at(&self, now_ms: i64) -> Result<usize> {
         self.upload_signal
@@ -4715,6 +4813,11 @@ impl StorageEngine {
                 }
             }
         }
+        if let Err(e) = self.upload_dirty_replays().await {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
         if let Some(err) = first_err {
             self.upload_signal.mark_failure();
             return Err(err);
@@ -4723,9 +4826,9 @@ impl StorageEngine {
         Ok(published)
     }
 
-    /// Runs deferred S3 deletion grace cleanup and unpinned local segment drains across all open projects.
+    /// Runs deferred S3 deletion grace cleanup and unpinned local segment/replay drains across all open projects.
     pub async fn run_gc_all_projects(&self) -> Result<usize> {
-        let mut deleted = 0usize;
+        let mut deleted = self.replay_store.drain_pending_local_deletes().await;
         for p in self.open_projects() {
             deleted += p.drain_pending_local_deletes().await;
             deleted += p.run_gc().await?;
@@ -4814,6 +4917,15 @@ impl StorageEngine {
                             );
                             p.drain_pending_local_deletes().await;
                             errs.check(MaintenanceKind::Compaction, p.run_gc().await);
+                        }
+                        engine.replay_store.drain_pending_local_deletes().await;
+                        if engine.upload_interval().is_zero()
+                            && engine.replay_store.has_pending_local_work()
+                        {
+                            errs.check(
+                                MaintenanceKind::Publish,
+                                engine.upload_dirty_replays().await,
+                            );
                         }
                     }
                     _ = async {
@@ -7913,5 +8025,80 @@ mod t4_cold_merge_tests {
             0
         );
         assert_eq!(ColdCountingStore::total_calls(&store.take()), 0);
+    }
+
+    #[tokio::test]
+    async fn set_erased_invalidates_replay_store_only_when_changed() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let enc = Arc::new(crate::EncryptedObjectStore::new(mem.clone()));
+        let writer_replays = ReplayStore::new_with_options(enc.as_object_store(), false, false);
+        for (pid, sid) in [("p_a", "s1"), ("p_b", "s2")] {
+            let chunk = pulse_wire::ReplayChunk {
+                project_id: pid.to_string(),
+                session_id: sid.to_string(),
+                chunk_start_ts_ms: 1_762_000_000_000,
+                ops: vec![pulse_wire::WireframeOp::PointerInteraction {
+                    ts_offset_ms: 0,
+                    x: 1,
+                    y: 2,
+                    kind: pulse_wire::InteractionKind::Tap,
+                }],
+            };
+            writer_replays.append_chunk(&chunk).await.unwrap();
+        }
+
+        let id_router = Arc::new(pulse_identity::IdentityRouter::new_read_only(
+            enc.as_object_store(),
+        ));
+        let reader = StorageEngine::new_with_encrypted(StorageConfig::default(), enc, id_router);
+        reader.enable_published_reader(Arc::new(object_store::memory::InMemory::new()));
+        // Prime ReplayStore::recorded_sessions cache for both p_a and p_b.
+        assert!(reader.replay_store().has_session("p_a", "s1").await);
+        assert!(reader.replay_store().has_session("p_b", "s2").await);
+
+        // Delete underlying S3 replay objects directly (simulating remote Ingest DPDP erasure).
+        mem.delete(&ObjectPath::from("replays/p_a/s1/0000000000.plsr"))
+            .await
+            .unwrap();
+        mem.delete(&ObjectPath::from("replays/p_b/s2/0000000000.plsr"))
+            .await
+            .unwrap();
+
+        // Empty -> empty is a no-op and must not invalidate cached discovery.
+        reader.set_erased("p_a", ErasedUids::default());
+        assert!(reader.replay_store().has_session("p_a", "s1").await);
+
+        // Transitioning to a non-empty erasure set invalidates only `p_a`.
+        let mut erased = ErasedUids::default();
+        erased.insert(42, 1_762_000_005_000);
+        reader.set_erased("p_a", erased.clone());
+        assert!(!reader.replay_store().has_session("p_a", "s1").await);
+        assert!(
+            reader.replay_store().has_session("p_b", "s2").await,
+            "other projects must remain cached"
+        );
+
+        // Re-apply identical `erased` after re-seeding p_a: must be a no-op.
+        let chunk = pulse_wire::ReplayChunk {
+            project_id: "p_a".to_string(),
+            session_id: "s1".to_string(),
+            chunk_start_ts_ms: 1_762_000_000_000,
+            ops: vec![pulse_wire::WireframeOp::PointerInteraction {
+                ts_offset_ms: 0,
+                x: 1,
+                y: 2,
+                kind: pulse_wire::InteractionKind::Tap,
+            }],
+        };
+        writer_replays.append_chunk(&chunk).await.unwrap();
+        assert!(reader.replay_store().has_session("p_a", "s1").await);
+        mem.delete(&ObjectPath::from("replays/p_a/s1/0000000000.plsr"))
+            .await
+            .unwrap();
+        reader.set_erased("p_a", erased);
+        assert!(
+            reader.replay_store().has_session("p_a", "s1").await,
+            "unchanged ErasedUids must not invalidate cached discovery"
+        );
     }
 }

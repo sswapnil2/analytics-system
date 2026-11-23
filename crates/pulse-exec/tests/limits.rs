@@ -1873,3 +1873,127 @@ async fn deterministic_entity_bucket_sampling_scales_counts_preserves_ratios_and
 
     id_router.close_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn erased_compaction_preserves_session_id_and_row_mask_safety() {
+    let store = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 100,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router.clone(),
+    );
+    let gov = InMemoryGovernance::new();
+    let ingest = IngestService::new(storage.clone(), gov);
+    let catalogs = CatalogRegistry::new();
+    let qengine = QueryEngine::new(storage.clone(), 16 * 1024 * 1024, None, 0, catalogs)
+        .await
+        .unwrap();
+
+    let ts = 1_762_000_000_000i64;
+    let batch = WireBatch::new(vec![
+        ev(
+            1,
+            "u1",
+            "sess_u1_real",
+            "Step_A",
+            ts,
+            vec![("plan", PropValue::Str("pro".into()))],
+        ),
+        ev(
+            2,
+            "u2",
+            "sess_u2_real",
+            "Step_A",
+            ts + 100,
+            vec![("plan", PropValue::Str("free".into()))],
+        ),
+        ev(
+            3,
+            "u3",
+            "sess_u3_real",
+            "Step_A",
+            ts + 200,
+            vec![("plan", PropValue::Str("pro".into()))],
+        ),
+    ]);
+    ingest
+        .ingest_for_project("proj_erased_seg", batch, ts + 1_000)
+        .await
+        .unwrap();
+    // Flush to an L1 Vortex segment so all 3 users share the single bucket-0 segment.
+    storage.flush_all_projects().await.unwrap();
+
+    let id_graph = storage
+        .identity_graph("proj_erased_seg", false)
+        .await
+        .unwrap();
+    let uid_u1 = id_graph.lookup_canonical("u1").unwrap();
+    let uid_u2 = id_graph.lookup_canonical("u2").unwrap();
+    let uid_u3 = id_graph.lookup_canonical("u3").unwrap();
+
+    let mut erased = pulse_storage::ErasedUids::default();
+    erased.insert(uid_u1, ts + 10_000);
+    storage.set_erased("proj_erased_seg", erased);
+
+    // 1. Exporting events for surviving users `u2` and `u3` in the same compacted segment must
+    //    return their real session IDs (not `"sess_<hex>"`).
+    let rows_u2 = qengine
+        .export_events("proj_erased_seg", None, Some(uid_u2), 100, false)
+        .await
+        .unwrap();
+    assert_eq!(rows_u2.len(), 1);
+    assert_eq!(rows_u2[0].session_id, "sess_u2_real");
+
+    let rows_u3 = qengine
+        .export_events("proj_erased_seg", None, Some(uid_u3), 100, false)
+        .await
+        .unwrap();
+    assert_eq!(rows_u3.len(), 1);
+    assert_eq!(rows_u3[0].session_id, "sess_u3_real");
+
+    // 2. Cohort evaluation with an indexed Tier-B property filter (`plan == "pro"`) on the
+    //    compacted chunk must NOT apply stale pre-compaction RoaringBitmap row offsets.
+    let ps = storage
+        .get_or_open_project("proj_erased_seg")
+        .await
+        .unwrap();
+    let snap = ps.snapshot();
+    let id_snap = id_graph.snapshot();
+    let catalog = qengine.catalogs().for_project("proj_erased_seg");
+    let bm = pulse_exec::scanner::evaluate_cohort(
+        &BehavioralCohortDef::PerformedEvent {
+            event_name: "Step_A".into(),
+            min_count: 1,
+            time_range: Some(TimeRange {
+                start_ts_ms: ts - 1_000,
+                end_ts_ms: ts + 10_000,
+            }),
+            where_clauses: vec![PropPredicate {
+                prop_name: "plan".into(),
+                filter: PropFilterOp::Eq(PropValue::Str("pro".into())),
+            }],
+        },
+        None,
+        &ps,
+        &snap,
+        &id_snap,
+        qengine.cache(),
+        &catalog,
+    )
+    .await
+    .unwrap();
+    assert!(!bm.contains(uid_u1), "erased u1 must be excluded");
+    assert!(!bm.contains(uid_u2), "u2 has plan=free, not pro");
+    assert!(
+        bm.contains(uid_u3),
+        "u3 has plan=pro and must survive compacted row-index check"
+    );
+
+    id_router.close_all().await.unwrap();
+}

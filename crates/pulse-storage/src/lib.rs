@@ -50,7 +50,9 @@ pub use profile_store::{
     expand_erased_with_identity, is_profile_erased, ProfileRouter, ProjectProfileStore,
     StoredUserProfile,
 };
-pub use replay_store::{validate_replay_identifier, ReplayAppendResult, ReplayStore};
+pub use replay_store::{
+    validate_replay_identifier, ReplayAppendResult, ReplaySessionCursor, ReplayStore,
+};
 pub use segment::{
     decode_session_index, decode_tier_c_row, tier_c_key_bit, write_vortex_segment,
     write_vortex_segment_opts, InvertedValueTag, SegmentFooterMeta, SegmentInvertedIndex,

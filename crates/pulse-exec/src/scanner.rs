@@ -106,7 +106,12 @@ pub struct DataChunk {
     pub prop_cols: HashMap<String, Arc<Vec<PropValue>>>,
     /// Optional L0 raw rows (None for L1 segments).
     l0_rows: Option<Vec<StoredRow>>,
+    /// Segment metadata for row-index-aligned operations (`precompute_segment_row_mask`), cleared
+    /// to `None` whenever rows are compacted out of `tier_a` (e.g. DPDP erasure filtering).
     segment_meta: Option<SegmentMeta>,
+    /// Segment metadata for row-index-independent session ID resolution (`SegmentSessionIndex`
+    /// keyed by `(raw_uid, session_hash)`), preserved even when rows are compacted.
+    session_meta: Option<SegmentMeta>,
 }
 
 impl DataChunk {
@@ -129,7 +134,7 @@ impl DataChunk {
         }
         let shash = self.tier_a.session_hash[row_idx];
         let raw_uid = self.tier_a.uid_internal[row_idx];
-        if let Some(meta) = &self.segment_meta {
+        if let Some(meta) = &self.session_meta {
             if let Ok(sidx) = cache.get_session_index(meta).await {
                 for hdr in &sidx.headers {
                     if hdr.raw_uid == raw_uid && hdr.session_hash == shash {
@@ -577,6 +582,7 @@ pub async fn load_project_chunks_sampled(
                     base_map.insert(bp.clone(), col);
                 }
 
+                let session_meta = Some(seg.clone());
                 let mut seg_meta_opt = Some(seg.clone());
                 if !erased_ref.is_empty()
                     && (0..orig_n)
@@ -636,6 +642,7 @@ pub async fn load_project_chunks_sampled(
                     prop_cols,
                     l0_rows: None,
                     segment_meta: seg_meta_opt,
+                    session_meta,
                 })
             }
         })
@@ -727,6 +734,7 @@ pub async fn load_project_chunks_sampled(
             prop_cols,
             l0_rows: Some(l0_rows),
             segment_meta: None,
+            session_meta: None,
         });
     }
 
