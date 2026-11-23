@@ -220,6 +220,14 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
                 .await
             {
                 Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
+                Err(IngestError::Storage(
+                    e @ pulse_storage::StorageError::HotSegmentBackpressure { .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": "hot_segment_backpressure",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => serde_json::to_vec(&serde_json::json!({
                     "status": "error",
                     "message": e.to_string(),
@@ -235,6 +243,14 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
         QUIC_OP_IDENTIFY => match serde_json::from_slice::<IdentifyRequest>(&body) {
             Ok(req) => match service.identify_for_project(&project_id, req).await {
                 Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
+                Err(IngestError::Storage(
+                    e @ pulse_storage::StorageError::HotSegmentBackpressure { .. },
+                )) => serde_json::to_vec(&serde_json::json!({
+                    "status": "error",
+                    "code": "hot_segment_backpressure",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
                 Err(e) => serde_json::to_vec(&serde_json::json!({
                     "status": "error",
                     "message": e.to_string(),
@@ -311,6 +327,11 @@ pub async fn send_quic_ingest_batch(
         .map_err(|e| IngestError::Quic(format!("read_to_end error: {e}")))?;
 
     conn.close(0u32.into(), b"done");
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+        if val.get("status").and_then(|s| s.as_str()) == Some("error") {
+            return Err(IngestError::Quic(val.to_string()));
+        }
+    }
     let resp: IngestResponse = serde_json::from_slice(&resp_bytes)?;
     Ok(resp)
 }

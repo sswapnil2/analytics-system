@@ -15,7 +15,7 @@ use bytemuck::{Pod, Zeroable};
 use bytes::Bytes;
 use chrono::NaiveDate;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use pulse_wire::{decode_zstd_bounded, PropValue, MAX_DECOMPRESSED_BYTES};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -413,7 +413,8 @@ fn prepare_and_sort_rows(rows: Vec<StoredRow>) -> Vec<SortedRowEntry> {
     entries
 }
 
-/// Writes sorted rows into an immutable Vortex-backed Tier A/B/C segment on `ObjectStore`.
+/// Writes sorted rows into an immutable Vortex-backed Tier A/B/C segment on `ObjectStore`
+/// under `segments/{project_id}/{YYYYMMDD}/bucket_{NNN}/{segment_id}.pvtx`.
 pub async fn write_vortex_segment(
     object_store: &Arc<dyn ObjectStore>,
     project_id: &str,
@@ -421,6 +422,32 @@ pub async fn write_vortex_segment(
     bucket_id: u8,
     segment_id: &str,
     rows: Vec<StoredRow>,
+) -> Result<Option<SegmentMeta>> {
+    write_vortex_segment_opts(
+        object_store,
+        "segments",
+        project_id,
+        date,
+        bucket_id,
+        segment_id,
+        rows,
+        PutMode::Overwrite,
+    )
+    .await
+}
+
+/// Writes sorted rows into an immutable Vortex-backed Tier A/B/C segment under
+/// `{prefix_root}/{project_id}/{YYYYMMDD}/bucket_{NNN}/{segment_id}.pvtx` using `put_mode`.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_vortex_segment_opts(
+    object_store: &Arc<dyn ObjectStore>,
+    prefix_root: &str,
+    project_id: &str,
+    date: NaiveDate,
+    bucket_id: u8,
+    segment_id: &str,
+    rows: Vec<StoredRow>,
+    put_mode: PutMode,
 ) -> Result<Option<SegmentMeta>> {
     let Some(built) = tokio::task::spawn_blocking(move || build_segment_payload_sync(rows))
         .await
@@ -446,12 +473,20 @@ pub async fn write_vortex_segment(
     container.extend_from_slice(&built.inverted_bytes);
     container.extend_from_slice(&built.session_idx_bytes);
 
+    let prefix_root = prefix_root.trim_end_matches('/');
     let yyyymmdd = date.format("%Y%m%d").to_string();
     let rel_path =
-        format!("segments/{project_id}/{yyyymmdd}/bucket_{bucket_id:03}/{segment_id}.pvtx");
+        format!("{prefix_root}/{project_id}/{yyyymmdd}/bucket_{bucket_id:03}/{segment_id}.pvtx");
     let obj_path = ObjectPath::from(rel_path.as_str());
     object_store
-        .put(&obj_path, PutPayload::from_bytes(Bytes::from(container)))
+        .put_opts(
+            &obj_path,
+            PutPayload::from_bytes(Bytes::from(container)),
+            PutOptions {
+                mode: put_mode,
+                ..PutOptions::default()
+            },
+        )
         .await?;
 
     Ok(Some(SegmentMeta {

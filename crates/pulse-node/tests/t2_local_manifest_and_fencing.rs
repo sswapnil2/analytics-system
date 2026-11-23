@@ -232,7 +232,8 @@ fn t2_14_local_manifests_zero_s3_flush_eager_zero_and_idle_zero_calls() {
         let ps = engine.get_or_open_project(pid).await.unwrap();
         let ig = engine.identity_graph(pid, true).await.unwrap();
 
-        // 4 separate flushes -> 0 S3 manifests/ or published/ calls; manifests/ written under data_dir/hot/manifests.
+        // 4 separate flushes -> 0 S3 segments/, manifests/, or published/ calls;
+        // segments written locally under data_dir/hot/hot/segments and manifests under data_dir/hot/manifests.
         s3_counting.take();
         for i in 0..4u64 {
             let uid = ig.get_or_intern(&format!("u_{i}"), 0);
@@ -250,27 +251,37 @@ fn t2_14_local_manifests_zero_s3_flush_eager_zero_and_idle_zero_calls() {
         let flush_calls = s3_counting.take();
         assert_eq!(sum_prefix_ops(&flush_calls, "manifests", "PUT"), 0);
         assert_eq!(sum_prefix_ops(&flush_calls, "published", "PUT"), 0);
-        assert!(sum_prefix_ops(&flush_calls, "segments", "PUT") >= 4);
+        assert_eq!(sum_prefix_ops(&flush_calls, "segments", "PUT"), 0);
         assert!(ps.last_published_seq().is_none());
         assert!(data_dir.join("hot/manifests").join(pid).is_dir());
+        assert!(data_dir.join("hot/hot/segments").join(pid).is_dir());
 
-        // Count-based compaction remains active for all PULSE_UPLOAD_INTERVAL_SECS values and writes 0 S3 manifests/published.
+        // Count-based compaction is disabled for the local segment tier when PULSE_UPLOAD_INTERVAL_SECS > 0.
         s3_counting.take();
         let compacted = ps.compact_overdue(engine.segment_reader()).await.unwrap();
-        assert_eq!(compacted, 1);
-        let cmp_calls = s3_counting.take();
-        assert_eq!(sum_prefix_ops(&cmp_calls, "manifests", "PUT"), 0);
-        assert_eq!(sum_prefix_ops(&cmp_calls, "published", "PUT"), 0);
-        assert_eq!(ps.snapshot().manifest.total_segments(), 1);
+        assert_eq!(compacted, 0);
+        assert_eq!(total_calls(&s3_counting.take()), 0);
+        assert_eq!(ps.snapshot().manifest.total_segments(), 4);
 
-        // Publish cycle writes pub_0 to S3 and persists last_published_seq = Some(0) locally.
+        // Publish cycle uploads local segments (merging 4 -> 1 S3 segment) and writes pub_0 to S3,
+        // persisting last_published_seq = Some(0) locally and cleaning up hot/segments/.
         s3_counting.take();
-        let pub_count = engine.publish_all_projects().await.unwrap();
+        let pub_count = engine
+            .upload_all_projects_at(
+                chrono::DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+                    .unwrap()
+                    .timestamp_millis(),
+            )
+            .await
+            .unwrap();
         assert_eq!(pub_count, 1);
         let pub_calls = s3_counting.take();
         assert_eq!(sum_prefix_ops(&pub_calls, "manifests", "PUT"), 0);
+        assert_eq!(sum_prefix_ops(&pub_calls, "segments", "PUT"), 1);
         assert_eq!(sum_prefix_ops(&pub_calls, "published", "PUT"), 2); // identity + pub_0 (no profiles yet)
         assert_eq!(ps.last_published_seq(), Some(0));
+        assert_eq!(ps.snapshot().manifest.total_segments(), 1);
+        assert_eq!(ps.hot_segment_bytes(), 0);
 
         let local_mf = ManifestStore::new(pid, enc.as_object_store())
             .load_latest()
@@ -693,6 +704,8 @@ fn t2_16_s3_deletion_grace_segments_and_snapshot_blobs_across_restart() {
             enc.clone(),
             Arc::new(IdentityRouter::new(enc.as_object_store())),
         );
+        // Exercise T2 S3-side compaction + 2-interval deletion grace directly on S3 segments.
+        engine.set_local_segment_tier(false);
         let ps = engine.get_or_open_project(pid).await.unwrap();
         let ig = engine.identity_graph(pid, true).await.unwrap();
         let pstore = engine.profile_store(pid, true).await.unwrap();
@@ -763,6 +776,7 @@ fn t2_16_s3_deletion_grace_segments_and_snapshot_blobs_across_restart() {
             enc2.clone(),
             Arc::new(IdentityRouter::new(enc2.as_object_store())),
         );
+        engine2.set_local_segment_tier(false);
         let ps2 = engine2.get_or_open_project(pid).await.unwrap();
         let ig2 = engine2.identity_graph(pid, true).await.unwrap();
         let pstore2 = engine2.profile_store(pid, true).await.unwrap();
@@ -923,8 +937,8 @@ fn t2_16_s3_deletion_grace_segments_and_snapshot_blobs_across_restart() {
         ps2.append_bucket_events(0, vec![(make_event("u4", 1_790_000_006_000, 6), u4)])
             .await
             .unwrap();
-        ps2.flush_bucket(0).await.unwrap(); // pub_5 == 3 + 2 -> eligible!
-        assert!(ps2.run_gc().await.unwrap() >= 1);
+        ps2.flush_bucket(0).await.unwrap(); // pub_5 == 3 + 2 -> eligible (drained by Step 6 run_gc_at)!
+        assert_eq!(ps2.run_gc().await.unwrap(), 0);
         assert!(s3_raw
             .head(&ObjectPath::from(id2_path.as_str()))
             .await
@@ -947,6 +961,7 @@ fn t2_16_s3_deletion_grace_segments_and_snapshot_blobs_across_restart() {
             fs_enc.clone(),
             Arc::new(IdentityRouter::new(fs_enc.as_object_store())),
         );
+        fs_engine.set_local_segment_tier(false);
         let fs_ps = fs_engine
             .get_or_open_project("proj_fs_notfound")
             .await

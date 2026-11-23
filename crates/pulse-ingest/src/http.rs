@@ -148,6 +148,23 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if let IngestError::Storage(pulse_storage::StorageError::HotSegmentBackpressure {
+            ..
+        }) = &self.0
+        {
+            // Local hot/segments/ uploads are behind ingest (e.g. S3 unreachable).
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "hot_segment_backpressure",
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(body),
+            )
+                .into_response();
+        }
         if let IngestError::Storage(pulse_storage::StorageError::NotWriter { .. }) = &self.0 {
             // Another node writes this project (or this node could not renew its lease).
             let body = serde_json::json!({

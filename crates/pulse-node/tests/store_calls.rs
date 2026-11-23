@@ -23,7 +23,7 @@ use std::time::Duration;
 const ADMIN: &str = "sk_root_storecallstest0000000000000000000000000000";
 type Calls = BTreeMap<(String, &'static str), u64>;
 
-const HOT_PREFIXES: [&str; 8] = [
+const HOT_PREFIXES: [&str; 9] = [
     "wal",
     "wal_corrupt",
     "wal_dead",
@@ -32,6 +32,7 @@ const HOT_PREFIXES: [&str; 8] = [
     "identity",
     "profiles",
     "manifests",
+    "hot",
 ];
 
 struct HotStoreEnvGuard {

@@ -75,6 +75,14 @@ pub enum StorageError {
         current_rows: usize,
         max_rows: usize,
     },
+
+    /// Local `hot/segments/` bytes awaiting upload to S3 reached 2x their configured limit.
+    #[error("hot segment backpressure on project '{project_id}' ({bytes} >= {max_bytes} bytes)")]
+    HotSegmentBackpressure {
+        project_id: String,
+        bytes: u64,
+        max_bytes: u64,
+    },
 }
 
 impl From<vortex_error::VortexError> for StorageError {

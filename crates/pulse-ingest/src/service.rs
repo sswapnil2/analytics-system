@@ -361,7 +361,10 @@ impl IngestService {
             by_bucket.entry(bucket_id).or_default().push((ev, uid, fp));
         }
 
-        // 6. Enforce bounded L0 high-water backpressure BEFORE flushing identities or appending WALs.
+        // 6. Enforce bounded local hot-segment & L0 high-water backpressure BEFORE flushing identities or appending WALs.
+        if !by_bucket.is_empty() {
+            ps.check_hot_segment_backpressure()?;
+        }
         for &bucket_id in by_bucket.keys() {
             ps.check_l0_backpressure(bucket_id)?;
         }

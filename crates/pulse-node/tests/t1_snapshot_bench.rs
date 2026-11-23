@@ -600,6 +600,8 @@ async fn run_candidate_a_benchmark() -> BenchSummary {
         compaction_min_segments: 100,
     };
     let engine = StorageEngine::new_with_encrypted(cfg, enc_store.clone(), id_router);
+    // Candidate A benchmark measures T1 direct segment writes + checkpoint copy snapshot overhead.
+    engine.set_local_segment_tier(false);
     let ps = engine.get_or_open_project(pid).await.unwrap();
     ps.set_publish_enabled(false);
     let id_graph = engine.identity_graph(pid, true).await.unwrap();
@@ -1105,7 +1107,7 @@ fn empirical_t1_snapshot_benchmark_candidate_a_vs_candidate_b() {
         sum_a.total_snap_puts
     );
     assert_eq!(sum_b.total_snap_puts, 8); // 2 PUTs * 4 active cycles
-    assert_eq!(sum_b.s3_snapshot_objects, 8); // T2 grace retains superseded snapshots until GC after +2 cycles
+    assert_eq!(sum_b.s3_snapshot_objects, 4); // Step 6 run_gc_at deletes snapshots past +2 publish cycles, retaining 2 active/grace cycles (4 objects)
     assert_eq!(sum_a.verified_rows, 1900);
     assert_eq!(sum_b.verified_rows, 1900);
     assert_eq!(sum_a.verified_profiles, 500);

@@ -88,15 +88,17 @@ Storage keeps the dense 32-bit id of `distinct_id`, never the string. The **iden
 | Object path | Contents |
 |---|---|
 | `wal/{proj}/bucket_NNN/epoch_E_seq_S.wal` | Events acknowledged but not yet in a segment (`<data_dir>/wal/` in `local` mode) |
-| `segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Columnar events for one day and bucket, with an inverted index and a session index |
+| `hot/segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Local L0-flushed columnar segments awaiting the 7-step upload cycle (`<data_dir>/hot/` in `local` mode) |
+| `segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` | Uploaded S3 columnar events for one day and bucket, with an inverted index and a session index |
 | `manifests/{proj}/epoch_N.json` | Authoritative local manifest: active segments, footers, and persisted `pending_s3_deletes` (`<data_dir>/hot/manifests/` in `local` mode) |
+| `manifests/{proj}/upload_intent.json` | Local upload-cycle intent record for crash-safe cleanup of orphaned S3 segments/snapshots (`<data_dir>/hot/manifests/` in `local` mode) |
 | `published/{proj}/pub_{publish_seq:012}.json` | Dense-sequence published S3 manifest (`writer_generation`, `source_local_epoch`, `high_water_mark`, `snapshot_ref`) |
 | `published/{proj}/snapshots/{identity,profiles}_*.pzst` | Candidate B logical snapshots of identity and profile state |
 | `identity/{proj}` | Identity graph (SlateDB; `<data_dir>/hot/identity/` in `local` mode) |
 | `profiles/{proj}` | User and group profiles (SlateDB; `<data_dir>/hot/profiles/` in `local` mode) |
 | `replays/{proj}/{session}/{seq}.plsr` | Replay chunks |
 
-With `PULSE_HOT_STORE=local` (the default), `wal/` (plus `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) lives under `<data_dir>/wal/` and `identity/`, `profiles/`, and `manifests/` live under `<data_dir>/hot/`, while `segments/`, `published/`, and `replays/` live in `<data_dir>/object_store/` or your S3 bucket (`PULSE_HOT_STORE=object` puts all paths in the object store). Remote `--role query` nodes keep restored snapshot copies under `<data_dir>/query_hot/`. The data directory also holds:
+With `PULSE_HOT_STORE=local` (the default), `wal/` (plus `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) lives under `<data_dir>/wal/` and `identity/`, `profiles/`, `manifests/`, and `hot/segments/` live under `<data_dir>/hot/`, while `segments/`, `published/`, and `replays/` live in `<data_dir>/object_store/` or your S3 bucket (`PULSE_HOT_STORE=object` puts all paths in the object store). Remote `--role query` nodes keep restored snapshot copies under `<data_dir>/query_hot/`. The data directory also holds:
 
 - `hot_store_mode`: persistent `local` / `object` mode marker
 - `pulse_meta.db`: the SQLite metadata DB

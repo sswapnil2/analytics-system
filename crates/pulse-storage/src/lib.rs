@@ -22,9 +22,13 @@ pub use encrypted_store::{
     unseal_ephemeral_blob, ByokEncryptionStatus, EncryptedObjectStore,
 };
 pub use engine::{
-    event_uuid_fingerprint, route_bucket, upload_interval_from_env, MaintenanceErrors,
-    MaintenanceKind, PreparedPublishedRefresh, ProjectStorage, StorageConfig, StorageEngine,
-    WriterLeases, DEAD_LETTERED_EVENTS, DEFAULT_NUM_BUCKETS,
+    closed_date_max_bytes_from_env, closed_date_upload_interval_from_env, event_uuid_fingerprint,
+    route_bucket, upload_interval_from_env, upload_merge_max_input_bytes_from_env,
+    MaintenanceErrors, MaintenanceKind, PreparedPublishedRefresh, ProjectStorage, StorageConfig,
+    StorageEngine, WriterLeases, DEAD_LETTERED_EVENTS, DEFAULT_CLOSED_DATE_MAX_BYTES,
+    DEFAULT_CLOSED_DATE_UPLOAD_SECS, DEFAULT_HOT_SEGMENTS_MAX_MB,
+    DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB, DEFAULT_NUM_BUCKETS, DEFAULT_UPLOAD_INTERVAL_SECS,
+    DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES,
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
@@ -32,7 +36,8 @@ pub use hll::{CompactHll, HllSketch};
 pub use manifest::{
     install_restored_manifest, IdentitySnapshotRef, Manifest, ManifestStore, PartitionEntry,
     PendingS3Delete, PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest,
-    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot,
+    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent,
+    UploadIntentBatch, UploadIntentStore,
 };
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
@@ -44,9 +49,9 @@ pub use profile_store::{
 pub use replay_store::{validate_replay_identifier, ReplayAppendResult, ReplayStore};
 pub use segment::{
     decode_session_index, decode_tier_c_row, tier_c_key_bit, write_vortex_segment,
-    InvertedValueTag, SegmentFooterMeta, SegmentInvertedIndex, SegmentMeta, SegmentSessionIndex,
-    SessionHeader, TierBColumnEntry, VortexSegmentReader, MAX_INVERTED_INDEX_CARDINALITY,
-    MAX_TIER_B_KEYS,
+    write_vortex_segment_opts, InvertedValueTag, SegmentFooterMeta, SegmentInvertedIndex,
+    SegmentMeta, SegmentSessionIndex, SessionHeader, TierBColumnEntry, VortexSegmentReader,
+    MAX_INVERTED_INDEX_CARDINALITY, MAX_TIER_B_KEYS,
 };
 pub use snapshot::{
     delete_objects_with_prefix, restore_identity_from_snapshot,
@@ -57,8 +62,9 @@ pub use snapshot::{
 pub use store_factory::{
     allow_private_endpoints, build_customer_object_store, build_from_url, build_object_store,
     check_resolved_addrs, finalize_local_hot_store_marker, is_forbidden_ssrf_ip,
-    is_local_hot_store_mode, open_hot_store_for_restore, validate_object_store_connection,
-    validate_outbound_url_ssrf, with_hot_store, with_hot_store_for_role, DurableLocalObjectStore,
+    is_hot_routed_store, is_local_hot_store_mode, open_hot_store_for_restore,
+    validate_object_store_connection, validate_outbound_url_ssrf, with_hot_store,
+    with_hot_store_for_role, DurableLocalObjectStore,
 };
 pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
 

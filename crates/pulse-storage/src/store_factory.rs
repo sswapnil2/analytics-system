@@ -272,7 +272,7 @@ const WAL_PREFIXES: [&str; 5] = [
 const HOT_PREFIXES: [&str; 3] = ["identity", "profiles", "manifests"];
 
 /// Union of all local hot-tier prefixes used for opposite-tier leftover detection.
-const ALL_HOT_PREFIXES: [&str; 8] = [
+const ALL_HOT_PREFIXES: [&str; 9] = [
     "wal",
     "wal_corrupt",
     "wal_dead",
@@ -281,6 +281,7 @@ const ALL_HOT_PREFIXES: [&str; 8] = [
     "identity",
     "profiles",
     "manifests",
+    "hot/segments",
 ];
 
 const HOT_STORE_MODE_FILE: &str = "hot_store_mode";
@@ -372,6 +373,7 @@ async fn init_local_hot_dirs(data_dir: &Path, wal_dir: &Path, hot_dir: &Path) ->
         std::fs::create_dir_all(hot_dir.join("identity"))?;
         std::fs::create_dir_all(hot_dir.join("profiles"))?;
         std::fs::create_dir_all(hot_dir.join("manifests"))?;
+        std::fs::create_dir_all(hot_dir.join("hot/segments"))?;
         fsync_dir_sync(&hot_dir)?;
         fsync_dir_sync(&data_dir)?;
         Ok(())
@@ -398,6 +400,7 @@ async fn first_object_under(
                 "identity" => "identity",
                 "profiles" => "profiles",
                 "manifests" => "manifests",
+                "hot/segments" => "hot/segments",
                 "segments" => "segments",
                 "published" => "published",
                 _ => "other",
@@ -544,9 +547,10 @@ pub async fn with_hot_store_for_role(
                         .await?
                         .is_some();
                     let has_wal = first_object_under(&wal_store, &["wal"]).await?.is_some();
-                    let has_local_hot = first_object_under(&hot_store, &["profiles", "manifests"])
-                        .await?
-                        .is_some();
+                    let has_local_hot =
+                        first_object_under(&hot_store, &["profiles", "manifests", "hot/segments"])
+                            .await?
+                            .is_some();
                     if has_segments || has_wal || has_local_hot {
                         return Err(config_error(format!(
                             "hot-store mode is `local` and local identity store `{}` is empty \
@@ -639,9 +643,15 @@ fn config_error(msg: String) -> StorageError {
     StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
 }
 
-/// Sends WAL prefixes to `wal`, persistent hot SlateDB prefixes (`identity/`, `profiles/`) to
-/// `hot`, and every other key to `segments`. Sits below encryption, so local hot tiers are
-/// encrypted like everything else.
+/// Returns `true` when `store` (including `EncryptedObjectStore` or transparent `Display`
+/// wrappers) routes local hot prefixes through [`HotRouted`].
+pub fn is_hot_routed_store(store: &dyn ObjectStore) -> bool {
+    store.to_string().contains("HotRouted(")
+}
+
+/// Sends WAL prefixes to `wal`, persistent hot prefixes (`identity/`, `profiles/`, `manifests/`,
+/// and `hot/segments/`) to `hot`, and every other key to `segments`. Sits below encryption, so
+/// local hot tiers are encrypted like everything else.
 #[derive(Debug)]
 struct HotRouted {
     wal: Arc<dyn ObjectStore>,
@@ -651,11 +661,25 @@ struct HotRouted {
 
 impl HotRouted {
     fn route(&self, p: Option<&ObjectPath>) -> &Arc<dyn ObjectStore> {
-        match p.and_then(|p| p.parts().next()) {
-            Some(first) if WAL_PREFIXES.contains(&first.as_ref()) => &self.wal,
-            Some(first) if HOT_PREFIXES.contains(&first.as_ref()) => &self.hot,
+        let Some(p) = p else {
+            return &self.segments;
+        };
+        let mut parts = p.parts();
+        match (parts.next(), parts.next()) {
+            (Some(first), _) if WAL_PREFIXES.contains(&first.as_ref()) => &self.wal,
+            (Some(first), _) if HOT_PREFIXES.contains(&first.as_ref()) => &self.hot,
+            (Some(first), Some(second))
+                if first.as_ref() == "hot" && second.as_ref() == "segments" =>
+            {
+                &self.hot
+            }
             _ => &self.segments,
         }
+    }
+
+    fn is_bare_hot_prefix(p: &ObjectPath) -> bool {
+        let mut parts = p.parts();
+        matches!((parts.next(), parts.next()), (Some(first), None) if first.as_ref() == "hot")
     }
 }
 
@@ -699,6 +723,10 @@ impl ObjectStore for HotRouted {
     fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
         let p = p.filter(|p| p.parts().next().is_some());
         match p {
+            Some(path) if Self::is_bare_hot_prefix(path) => Box::pin(futures::StreamExt::chain(
+                self.segments.list(Some(path)),
+                self.hot.list(Some(path)),
+            )),
             Some(_) => self.route(p).list(p),
             None => Box::pin(futures::StreamExt::chain(
                 self.segments.list(None),
@@ -708,7 +736,16 @@ impl ObjectStore for HotRouted {
     }
     async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
         let p = p.filter(|p| p.parts().next().is_some());
-        if p.is_some() {
+        if let Some(path) = p {
+            if Self::is_bare_hot_prefix(path) {
+                let mut out = self.segments.list_with_delimiter(Some(path)).await?;
+                let hot = self.hot.list_with_delimiter(Some(path)).await?;
+                out.common_prefixes.extend(hot.common_prefixes);
+                out.common_prefixes.sort();
+                out.common_prefixes.dedup();
+                out.objects.extend(hot.objects);
+                return Ok(out);
+            }
             return self.route(p).list_with_delimiter(p).await;
         }
         let mut out = self.segments.list_with_delimiter(None).await?;
@@ -1325,7 +1362,7 @@ mod hot_store_and_multipart_tests {
         let store = with_hot_store(segments.clone(), tmp.path()).await.unwrap();
         segments.reset();
 
-        // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes (including manifests) route locally with 0 S3 calls.
+        // All WAL prefixes (including agent_wal_corrupt) and HOT prefixes (including manifests & hot/segments) route locally with 0 S3 calls.
         for key in [
             "wal/p1/bucket_000/seq_0.wal",
             "wal_corrupt/p1/bucket_000/bad.wal",
@@ -1335,6 +1372,7 @@ mod hot_store_and_multipart_tests {
             "identity/p1/manifest/000001.manifest",
             "profiles/p1/wal/000001.sst",
             "manifests/p1/epoch_000000000001.json",
+            "hot/segments/p1/20261122/bucket_000/seg_0.pvtx",
         ] {
             let p = ObjectPath::from(key);
             store
@@ -1349,6 +1387,8 @@ mod hot_store_and_multipart_tests {
             0,
             "local WAL and hot prefixes must make zero calls to segments"
         );
+        assert!(is_hot_routed_store(store.as_ref()));
+        assert!(!is_hot_routed_store(segments.as_ref()));
 
         // get_ranges delegates properly.
         let ranges = store
@@ -1364,13 +1404,21 @@ mod hot_store_and_multipart_tests {
         );
         assert_eq!(segments.count(), 0);
 
-        // Non-hot prefix goes to segments.
+        // Non-hot prefix goes to segments (including narrow `hot/other/*`).
         let seg_key = ObjectPath::from("segments/p1/20261122/bucket_000/seg_1.pvtx");
         store
             .put(&seg_key, PutPayload::from_static(b"seg-bytes"))
             .await
             .unwrap();
         assert_eq!(segments.count(), 1);
+        let narrow_key = ObjectPath::from("hot/other/marker.txt");
+        store
+            .put(&narrow_key, PutPayload::from_static(b"s3-bytes"))
+            .await
+            .unwrap();
+        assert_eq!(segments.count(), 2);
+        store.delete(&narrow_key).await.unwrap();
+        assert_eq!(segments.count(), 3);
 
         // list(None) and list(Some("")) normalize and include all 3 tiers.
         let all_none: Vec<_> = store.list(None).try_collect().await.unwrap();
@@ -1379,8 +1427,8 @@ mod hot_store_and_multipart_tests {
             .try_collect()
             .await
             .unwrap();
-        assert_eq!(all_none.len(), 9);
-        assert_eq!(all_empty.len(), 9);
+        assert_eq!(all_none.len(), 10);
+        assert_eq!(all_empty.len(), 10);
 
         // list_with_delimiter(None) and list_with_delimiter(Some("")) merge and dedup common_prefixes.
         let delim_none = store.list_with_delimiter(None).await.unwrap();
@@ -1391,6 +1439,7 @@ mod hot_store_and_multipart_tests {
         let expected_prefixes: Vec<ObjectPath> = [
             "agent_wal",
             "agent_wal_corrupt",
+            "hot",
             "identity",
             "manifests",
             "profiles",
@@ -1404,6 +1453,47 @@ mod hot_store_and_multipart_tests {
         .collect();
         assert_eq!(delim_none.common_prefixes, expected_prefixes);
         assert_eq!(delim_empty.common_prefixes, expected_prefixes);
+
+        // 1-component prefix "hot" merges `segments` (`hot/other/*`) and `hot` (`hot/segments/*`).
+        let hot_other = ObjectPath::from("hot/other/sub.txt");
+        let cnt_before_hot_other = segments.count();
+        store
+            .put(&hot_other, PutPayload::from_static(b"s3-sub"))
+            .await
+            .unwrap();
+        assert_eq!(
+            segments.count(),
+            cnt_before_hot_other + 1,
+            "hot/other/* must still route to segments"
+        );
+        let mut hot_listed: Vec<String> = store
+            .list(Some(&ObjectPath::from("hot")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.location.to_string())
+            .collect();
+        hot_listed.sort();
+        assert_eq!(
+            hot_listed,
+            vec![
+                "hot/other/sub.txt".to_string(),
+                "hot/segments/p1/20261122/bucket_000/seg_0.pvtx".to_string(),
+            ]
+        );
+        let hot_delim = store
+            .list_with_delimiter(Some(&ObjectPath::from("hot")))
+            .await
+            .unwrap();
+        assert_eq!(
+            hot_delim.common_prefixes,
+            vec![
+                ObjectPath::from("hot/other"),
+                ObjectPath::from("hot/segments"),
+            ]
+        );
+        store.delete(&hot_other).await.unwrap();
 
         // Same-tier copy (wal -> wal_corrupt) and cross-tier copy (hot -> segments, segments -> hot).
         store
@@ -1482,6 +1572,11 @@ mod hot_store_and_multipart_tests {
             assert!(tmp.path().join("hot/identity").is_dir());
             assert!(tmp.path().join("hot/profiles").is_dir());
             assert!(tmp.path().join("hot/manifests").is_dir());
+            assert!(tmp.path().join("hot/hot/segments").is_dir());
+
+            // M3a upgrade compatibility: removing hot/hot/segments still opens cleanly.
+            std::fs::remove_dir_all(tmp.path().join("hot/hot")).unwrap();
+            let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
 
             // Empty restart succeeds.
             let _ = with_hot_store(seg.clone(), tmp.path()).await.unwrap();
@@ -1595,11 +1690,31 @@ mod hot_store_and_multipart_tests {
                 "{err}"
             );
 
-            // Clear local manifests and put a segment in S3 while identity/ is empty -> refused!
+            // Clear local manifests and put a local hot segment while identity/ is empty -> refused!
             store
                 .delete(&ObjectPath::from("manifests/p1/epoch_1.json"))
                 .await
                 .unwrap();
+            store
+                .put(
+                    &ObjectPath::from("hot/segments/p1/20261122/bucket_000/seg_1.pvtx"),
+                    PutPayload::from_static(b"hs"),
+                )
+                .await
+                .unwrap();
+            let err = with_hot_store(seg.clone(), tmp.path()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("restore --from-published"),
+                "{err}"
+            );
+            store
+                .delete(&ObjectPath::from(
+                    "hot/segments/p1/20261122/bucket_000/seg_1.pvtx",
+                ))
+                .await
+                .unwrap();
+
+            // Put a segment in S3 while identity/ is empty -> refused!
             seg.put(
                 &ObjectPath::from("segments/p1/seg_1.pvtx"),
                 PutPayload::from_static(b"s"),

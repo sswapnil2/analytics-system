@@ -94,7 +94,8 @@ flowchart LR
     end
     subgraph os["Tiered store (local hot disk + object store / S3)"]
         WAL["wal/…/*.wal<br/>local disk by default (&lt;data_dir&gt;/wal)"]
-        SEG["segments/{proj}/{YYYYMMDD}/bucket_NNN/*.pvtx<br/>Vortex columnar + indexes"]
+        HSEG["hot/segments/{proj}/{YYYYMMDD}/bucket_NNN/*.pvtx<br/>local disk by default (&lt;data_dir&gt;/hot)"]
+        SEG["segments/{proj}/{YYYYMMDD}/bucket_NNN/*.pvtx<br/>S3 / object store (uploaded &amp; merged)"]
         MAN["manifests/{proj}/epoch_N.json<br/>local disk by default (&lt;data_dir&gt;/hot)"]
         PUB["published/{proj}/pub_*.json + snapshots/<br/>S3 / object store on publish interval"]
         ID["identity/{proj} (SlateDB)<br/>local disk by default (&lt;data_dir&gt;/hot)"]
@@ -102,28 +103,37 @@ flowchart LR
         REP["replays/{proj}/{session}/*.plsr"]
     end
     WAL -. replay on restart .-> L0
-    L0 -- "flush: 250k rows or 60 s" --> SEG
-    SEG -- "CAS commit" --> MAN
+    L0 -- "flush: 250k rows or 60 s" --> HSEG
+    HSEG -- "CAS commit" --> MAN
     MAN -- "then purge" --> WAL
+    HSEG -- "7-step upload (<= 64 MiB/part)" --> SEG
     MAN -- "publish cycle (PULSE_UPLOAD_INTERVAL_SECS)" --> PUB
-    SEG -- "compaction: ≥ 4 segments per (day, bucket)" --> SEG
+    SEG -- "compaction (when interval = 0)" --> SEG
 ```
 
-All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and hot state (`identity/`, `profiles/`, `manifests/`) routes to `<data_dir>/hot`, while segments, `published/` manifests/snapshots, and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
+All persistent state goes through one `object_store` interface (`crates/pulse-storage/src/store_factory.rs`). Under the default `PULSE_HOT_STORE=local`, WAL prefixes (`wal/`, `wal_corrupt/`, `wal_dead/`, `agent_wal/`, `agent_wal_corrupt/`) route to `<data_dir>/wal` and hot state (`identity/`, `profiles/`, `manifests/`, `hot/segments/`) routes to `<data_dir>/hot`, while `segments/`, `published/` manifests/snapshots, and replays route to `<data_dir>/object_store` (or `s3://bucket`, `file://…`, `memory://` via `PULSE_OBJECT_STORE_URL`). Every local write (single `put` and `put_multipart` completion) is fsynced along with its parent directory.
 
 ### L0, flush and segments
 
 - **L0 buffer.** L0 is an in-memory buffer per `(project, bucket)`. A bucket is flushed when it reaches 250,000 rows or turns 60 seconds old. A background loop checks every 5 s.
-- **Backpressure.** If a bucket grows past its high-water mark (`PULSE_L0_MAX_ROWS_PER_BUCKET`, default 1,000,000), or in-memory rows exceed their byte limit (`PULSE_L0_PROJECT_MAX_MB`, `PULSE_L0_MAX_MB`), ingest answers `429 Retry-After: 1` until the flush catches up.
-- **Flush.** A flush groups rows by day and writes one **segment** per `(day, bucket)`: `segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx`. It then commits a new **manifest** with compare-and-swap, then drops those rows from L0 and deletes the WAL objects it covered.
+- **Backpressure.** If a bucket grows past its high-water mark (`PULSE_L0_MAX_ROWS_PER_BUCKET`, default 1,000,000), or in-memory rows exceed their byte limit (`PULSE_L0_PROJECT_MAX_MB`, `PULSE_L0_MAX_MB`), ingest answers `429 Retry-After: 1` (`l0_backpressure`) until the flush catches up. Local `hot/segments/` bytes are bounded by `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB` / `PULSE_HOT_SEGMENTS_MAX_MB` (default `512` / `2048` MiB `1x`): crossing `1x` triggers an early upload cycle, and reaching `2x` answers `429 Retry-After: 1` (`hot_segment_backpressure`).
+- **Flush.** A flush groups rows by day and writes one **segment** per `(day, bucket)`: `hot/segments/{proj}/{YYYYMMDD}/bucket_NNN/{id}.pvtx` on local disk under `PULSE_HOT_STORE=local` (zero S3 PUTs per flush), or directly to `segments/` under `PULSE_HOT_STORE=object`. It then commits a new **manifest** with compare-and-swap, then drops those rows from L0 and deletes the WAL objects it covered.
 - **Segment contents.** A segment holds [Vortex](https://github.com/spiraldb/vortex) columnar data, a Roaring-bitmap inverted index for low-cardinality properties, and a session index (`crates/pulse-storage/src/segment.rs`). Inside a segment, rows are sorted by user and time, so per-user scans such as funnels and retention read data in order.
 - **Footers in the manifest.** Each segment's **footer** is stored in the manifest, not in the segment file. It holds row and session counts, min and max time, a 64-bit event bloom filter, exact per-event counts, and HyperLogLog sketches (p = 10, about 3.25 % error) for the top 32 events. Many queries are answered, or have segments ruled out, from footers alone, without reading a segment.
 
-### Manifests and compaction
+### Manifests, upload cycle and compaction
 
 - **Commits.** A manifest (`manifests/{proj}/epoch_N.json`, zstd-compressed JSON) lists the active segments and the WAL position they cover. It is created with "create if absent" semantics, so two writers can never both commit the same epoch. A losing writer reloads and retries, up to 8 times.
 - **Old epochs and S3 deletion grace.** The 16 newest local epochs are kept, plus a 300 s grace period. Superseded S3 segments and superseded S3 snapshot blobs are persisted in `pending_s3_deletes` on the local manifest and deleted only after a superseding `PublishedManifest` has landed in S3, 2 publish intervals have elapsed, and no local `StorageSnapshot` pins them.
-- **Compaction and publish.** When a `(day, bucket)` has 4 or more segments, they are merged into one. Compaction is also when [erased users](security-privacy.md#erasure) are physically removed. Every `PULSE_UPLOAD_INTERVAL_SECS` (default 300 s; `0` = eager) and on clean shutdown, dirty projects export Candidate B identity/profile snapshots (`T_id >= T_prof >= T_freeze`) and write a create-only `PublishedManifest` at dense `publish_seq`, fencing stale or deposed writers on open.
+- **7-step upload cycle and compaction.** With `PULSE_HOT_STORE=local` and `PULSE_UPLOAD_INTERVAL_SECS > 0` (default `300` s), count-based compaction on L0 flushes is disabled; instead, the per-project upload task runs a crash-safe 7-step cycle (and makes zero S3 calls when a project is idle or holds only deferred closed-date segments):
+  1. **Freeze & intent:** freeze eligible `hot/segments/` (closed dates `date < today_utc` defer for `1 h` unless their local bytes exceed `4 MiB` or `1x` pressure forces upload), split each `(date, bucket)` into batches with at most `64 MiB` input bytes (`PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES`), pre-assign target S3 `segments/` and snapshot paths, and persist `manifests/{proj}/upload_intent.json`.
+  2. **Snapshot profiles (`T_prof >= T_freeze`)** to S3 (`PutMode::Create`).
+  3. **Flush & snapshot identity (`T_id >= T_prof >= T_freeze`)** to S3 (`PutMode::Create`), asserting `user_count >= HWM`.
+  4. **Upload:** sequentially one `(date, bucket)` partition at a time, merge only the frozen local segments, drop erased rows, and write create-only to S3 `segments/`.
+  5. **Commit local manifest:** atomically replace frozen local segment IDs with the new S3 segment metas (preserving concurrent L0 flushes).
+  6. **Publish:** write a create-only `PublishedManifest` (listing S3 `segments/` only) at dense `publish_seq` with `head(publish_seq - 1)` GC guard, record `last_published_seq`, and run `pending_s3_deletes` GC.
+  7. **Clean up:** delete uploaded local `hot/segments/` once unpinned by local `StorageSnapshot`s and clear `upload_intent.json`.
+  When `PULSE_UPLOAD_INTERVAL_SECS=0`, flushes upload eagerly and count-based compaction (merging `>= 4` segments per `(day, bucket)`) stays active on S3 `segments/`. On startup, `upload_intent.json` cleans up any orphaned S3 upload/snapshot objects and unreferenced `hot/segments/` files are swept; dedup seeding fails closed (`503`) if recent S3 segments cannot be read.
 
 ### Encryption at rest (optional)
 

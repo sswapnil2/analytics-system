@@ -254,6 +254,11 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
         p.storage.l0_bytes() as f64,
     );
     gauge(
+        "pulse_hot_segment_bytes",
+        "Bytes of local hot/segments files awaiting upload to S3.",
+        p.storage.hot_segment_bytes() as f64,
+    );
+    gauge(
         "pulse_l0_rows",
         "Rows buffered in memory, not yet flushed to segments.",
         l0_rows as f64,

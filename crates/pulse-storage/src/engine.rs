@@ -1,12 +1,13 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
+use futures::TryStreamExt;
 use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
@@ -23,25 +24,41 @@ use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
 use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
 use crate::manifest::{
-    IdentitySnapshotRef, Manifest, ManifestStore, PendingS3Delete, PendingS3DeleteKind,
-    ProfileSnapshotRef, PublishedManifest, PublishedManifestStore, ReaderPinTracker, SnapshotRef,
-    StorageSnapshot,
+    IdentitySnapshotRef, Manifest, ManifestStore, PartitionEntry, PendingS3Delete,
+    PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest, PublishedManifestStore,
+    ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent, UploadIntentBatch,
+    UploadIntentStore,
 };
 use crate::mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
 };
 use crate::profile_store::{ProfileRouter, ProjectProfileStore};
 use crate::replay_store::{ReplayAppendResult, ReplayStore};
-use crate::segment::{write_vortex_segment, SegmentMeta, VortexSegmentReader};
+use crate::segment::{
+    write_vortex_segment, write_vortex_segment_opts, SegmentMeta, VortexSegmentReader,
+};
 use crate::snapshot::{
     delete_objects_with_prefix, restore_identity_from_snapshot_read_only,
     restore_profiles_from_snapshot_read_only,
 };
+use crate::store_factory::is_hot_routed_store;
 use crate::wal::BucketWal;
 
 pub const DEFAULT_NUM_BUCKETS: u16 = 16;
 /// Default interval (`PULSE_UPLOAD_INTERVAL_SECS`) between S3 `published/` cycles (300 s; `0` = eager).
 pub const DEFAULT_UPLOAD_INTERVAL_SECS: u64 = 300;
+/// Default closed-date upload timer (`PULSE_CLOSED_DATE_UPLOAD_SECS`, 1 hour).
+pub const DEFAULT_CLOSED_DATE_UPLOAD_SECS: u64 = 3600;
+/// Default closed-date local byte threshold (`PULSE_CLOSED_DATE_MAX_BYTES`, 4 MiB).
+pub const DEFAULT_CLOSED_DATE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Default input-byte cap per merged S3 output segment (`PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES`, 64 MiB).
+pub const DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default per-project `hot/segments/` `1x` limit in MiB (`PULSE_HOT_SEGMENTS_PROJECT_MAX_MB`).
+pub const DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB: u64 = 512;
+/// Default per-node `hot/segments/` `1x` limit in MiB (`PULSE_HOT_SEGMENTS_MAX_MB`).
+pub const DEFAULT_HOT_SEGMENTS_MAX_MB: u64 = 2048;
+/// Minimum cooldown between upload retries triggered by `1x`/`2x` pressure after an S3 upload failure.
+const UPLOAD_FAILURE_COOLDOWN: Duration = Duration::from_secs(2);
 /// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback.
 const DEDUP_SEED_LOOKBACK_MS: i64 = 30 * 60 * 1_000;
 const MAX_SESSION_FLAGS_CACHE_ENTRIES: u64 = 262_144;
@@ -53,6 +70,33 @@ pub fn upload_interval_from_env() -> Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_UPLOAD_INTERVAL_SECS);
     Duration::from_secs(secs)
+}
+
+/// Reads `PULSE_CLOSED_DATE_UPLOAD_SECS` (default `3600`).
+pub fn closed_date_upload_interval_from_env() -> Duration {
+    let secs = std::env::var("PULSE_CLOSED_DATE_UPLOAD_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CLOSED_DATE_UPLOAD_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Reads `PULSE_CLOSED_DATE_MAX_BYTES` (default `4 MiB`).
+pub fn closed_date_max_bytes_from_env() -> u64 {
+    std::env::var("PULSE_CLOSED_DATE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_CLOSED_DATE_MAX_BYTES)
+}
+
+/// Reads `PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES` (default `64 MiB`).
+pub fn upload_merge_max_input_bytes_from_env() -> u64 {
+    std::env::var("PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES)
 }
 
 /// Deterministic entity-centric bucket router (`xxh3_64(routing_seed) % num_buckets`).
@@ -103,12 +147,25 @@ fn env_mb(name: &str, default_mb: usize) -> usize {
         .saturating_mul(1024 * 1024)
 }
 
-/// Byte bounds on the event rows a node holds in memory, and the node-wide running total.
+fn env_mb_u64(name: &str, default_mb: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(default_mb)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Byte bounds on the event rows a node holds in memory and local `hot/segments/` awaiting upload.
 pub struct NodeLoad {
     l0_bytes: Arc<AtomicUsize>,
     /// `PULSE_L0_PROJECT_MAX_MB` (512) / `PULSE_L0_MAX_MB` (1024): rows not yet in a segment.
     l0_max_project: AtomicUsize,
     l0_max_node: AtomicUsize,
+    hot_segment_bytes: Arc<AtomicU64>,
+    /// `PULSE_HOT_SEGMENTS_PROJECT_MAX_MB` (512) / `PULSE_HOT_SEGMENTS_MAX_MB` (2048): `1x` bounds.
+    hot_seg_max_project: AtomicU64,
+    hot_seg_max_node: AtomicU64,
 }
 
 impl NodeLoad {
@@ -117,7 +174,58 @@ impl NodeLoad {
             l0_bytes: Arc::new(AtomicUsize::new(0)),
             l0_max_project: AtomicUsize::new(env_mb("PULSE_L0_PROJECT_MAX_MB", 512)),
             l0_max_node: AtomicUsize::new(env_mb("PULSE_L0_MAX_MB", 1024)),
+            hot_segment_bytes: Arc::new(AtomicU64::new(0)),
+            hot_seg_max_project: AtomicU64::new(env_mb_u64(
+                "PULSE_HOT_SEGMENTS_PROJECT_MAX_MB",
+                DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB,
+            )),
+            hot_seg_max_node: AtomicU64::new(env_mb_u64(
+                "PULSE_HOT_SEGMENTS_MAX_MB",
+                DEFAULT_HOT_SEGMENTS_MAX_MB,
+            )),
         })
+    }
+}
+
+/// Coalesced upload wakeup signal with failure cooldown so `1x`/`2x` pressure cannot busy-spin S3.
+#[derive(Default)]
+struct UploadSignal {
+    notify: tokio::sync::Notify,
+    in_progress: AtomicBool,
+    last_failure: Mutex<Option<Instant>>,
+}
+
+impl UploadSignal {
+    fn request_upload_if_due(&self) {
+        if self.in_progress.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(last_fail) = *self.last_failure.lock() {
+            if last_fail.elapsed() < UPLOAD_FAILURE_COOLDOWN {
+                return;
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    fn mark_success(&self) {
+        *self.last_failure.lock() = None;
+    }
+
+    fn mark_failure(&self) {
+        *self.last_failure.lock() = Some(Instant::now());
+    }
+}
+
+struct UploadInProgressGuard<'a>(&'a UploadSignal);
+
+impl Drop for UploadInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.in_progress.store(false, Ordering::Release);
     }
 }
 
@@ -171,11 +279,22 @@ pub struct ProjectStorage {
     refresh_lock: AsyncMutex<()>,
     gc_lock: AsyncMutex<()>,
     publish_enabled: AtomicBool,
+    local_segment_tier: Arc<AtomicBool>,
     upload_interval_ms: Arc<AtomicU64>,
+    closed_date_upload_ms: Arc<AtomicU64>,
+    closed_date_max_bytes: Arc<AtomicU64>,
+    upload_merge_max_input_bytes: Arc<AtomicU64>,
+    upload_signal: Arc<UploadSignal>,
     last_published_seq: Mutex<Option<u64>>,
     last_published_epoch: Mutex<Option<u64>>,
+    last_published_s3_partitions: Mutex<Option<Vec<PartitionEntry>>>,
     last_snapshot_state: Mutex<LastSnapshotState>,
     restored_snapshot_paths: Mutex<(Option<String>, Option<String>)>,
+    closed_date_pending_since_ms: Mutex<HashMap<NaiveDate, i64>>,
+    tracked_hot_segments: Mutex<HashMap<String, u64>>,
+    hot_segment_bytes: AtomicU64,
+    pending_local_deletes: Mutex<HashMap<String, u64>>,
+    has_pending_upload_intent: AtomicBool,
     retired_profile_stores: Mutex<Vec<Arc<ProjectProfileStore>>>,
     dictionary: Arc<ProjectDictionary>,
     wals: Vec<BucketWal>,
@@ -202,6 +321,13 @@ impl Drop for ProjectStorage {
         for handle in self.bg_flush_handles.get_mut().drain(..) {
             handle.abort();
         }
+        let rem = *self.hot_segment_bytes.get_mut();
+        if rem > 0 {
+            self.node_load
+                .hot_segment_bytes
+                .fetch_sub(rem, Ordering::Relaxed);
+            *self.hot_segment_bytes.get_mut() = 0;
+        }
     }
 }
 
@@ -226,6 +352,151 @@ fn default_max_l0_rows_per_bucket(config: &StorageConfig) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| config.l0_flush_row_threshold.saturating_mul(4).max(1_000))
+}
+
+fn date_from_ms(ts_ms: i64) -> NaiveDate {
+    DateTime::<Utc>::from_timestamp_millis(ts_ms)
+        .unwrap_or_else(Utc::now)
+        .date_naive()
+}
+
+fn s3_partitions(m: &Manifest) -> Vec<PartitionEntry> {
+    let mut partitions: Vec<PartitionEntry> = m
+        .active_segments
+        .iter()
+        .filter_map(|(&(date, bucket_id), segs)| {
+            let s3_segs: Vec<SegmentMeta> = segs
+                .iter()
+                .filter(|s| !s.object_path.starts_with("hot/"))
+                .cloned()
+                .collect();
+            if s3_segs.is_empty() {
+                None
+            } else {
+                Some(PartitionEntry {
+                    date,
+                    bucket_id,
+                    segments: s3_segs,
+                })
+            }
+        })
+        .collect();
+    partitions.sort_by_key(|p| (p.date, p.bucket_id));
+    partitions
+}
+
+async fn reconcile_upload_intent_with_stores(
+    project_id: &str,
+    object_store: &Arc<dyn ObjectStore>,
+    manifest: &Manifest,
+    latest_published: Option<&PublishedManifest>,
+    last_snapshot_ref: Option<&SnapshotRef>,
+) -> Result<Vec<String>> {
+    let intent_store = UploadIntentStore::new(project_id, object_store.clone());
+    let Some(intent) = intent_store.load().await? else {
+        return Ok(Vec::new());
+    };
+
+    let active_manifest_segments: HashSet<&str> = manifest
+        .active_segments
+        .values()
+        .flat_map(|v| v.iter().map(|s| s.object_path.as_str()))
+        .collect();
+    let mut unreferenced_local_sources: Vec<String> = Vec::new();
+    for batch in &intent.batches {
+        for src_path in &batch.source_object_paths {
+            if src_path.starts_with("hot/segments/")
+                && !active_manifest_segments.contains(src_path.as_str())
+            {
+                unreferenced_local_sources.push(src_path.clone());
+            }
+        }
+    }
+
+    let mut referenced_segments: HashSet<&str> = active_manifest_segments;
+    if let Some(pub_m) = latest_published {
+        for part in &pub_m.partitions {
+            for seg in &part.segments {
+                referenced_segments.insert(seg.object_path.as_str());
+            }
+        }
+    }
+    for pending in &manifest.pending_s3_deletes {
+        if pending.kind == PendingS3DeleteKind::Segment {
+            referenced_segments.insert(pending.object_path.as_str());
+        }
+    }
+
+    let mut referenced_snapshots: HashSet<&str> = HashSet::new();
+    for sr in latest_published
+        .map(|p| &p.snapshot_ref)
+        .into_iter()
+        .chain(last_snapshot_ref)
+    {
+        referenced_snapshots.insert(sr.identity.object_path.as_str());
+        if let Some(ref pr) = sr.profiles {
+            referenced_snapshots.insert(pr.object_path.as_str());
+        }
+    }
+    for pending in &manifest.pending_s3_deletes {
+        if pending.kind != PendingS3DeleteKind::Segment {
+            referenced_snapshots.insert(pending.object_path.as_str());
+        }
+    }
+
+    for batch in &intent.batches {
+        if !referenced_segments.contains(batch.target_object_path.as_str()) {
+            let obj_path = ObjectPath::from(batch.target_object_path.as_str());
+            match object_store.delete(&obj_path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(StorageError::ObjectStore(e)),
+            }
+        }
+    }
+
+    for snap_path in [
+        intent.new_identity_snapshot_path.as_deref(),
+        intent.new_profile_snapshot_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !referenced_snapshots.contains(snap_path) {
+            let obj_path = ObjectPath::from(snap_path);
+            match object_store.delete(&obj_path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(StorageError::ObjectStore(e)),
+            }
+        }
+    }
+
+    intent_store.clear().await?;
+    Ok(unreferenced_local_sources)
+}
+
+async fn sweep_local_hot_segments_for_project(
+    project_id: &str,
+    object_store: &Arc<dyn ObjectStore>,
+    manifest: &Manifest,
+) -> Result<usize> {
+    let active_paths: HashSet<&str> = manifest
+        .active_segments
+        .values()
+        .flat_map(|v| v.iter().map(|s| s.object_path.as_str()))
+        .collect();
+    let prefix = ObjectPath::from(format!("hot/segments/{project_id}"));
+    let metas: Vec<_> = object_store.list(Some(&prefix)).try_collect().await?;
+    let mut swept = 0usize;
+    for meta in metas {
+        if !active_paths.contains(meta.location.as_ref()) {
+            match object_store.delete(&meta.location).await {
+                Ok(()) => swept += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(StorageError::ObjectStore(e)),
+            }
+        }
+    }
+    Ok(swept)
 }
 
 fn manifest_matches_published(m: &Manifest, p: &PublishedManifest) -> bool {
@@ -496,8 +767,17 @@ impl ProjectStorage {
             object_store.clone(),
             identity_router.is_read_only(),
         ));
+        let local_segment_tier =
+            Arc::new(AtomicBool::new(is_hot_routed_store(object_store.as_ref())));
         let upload_interval_ms =
             Arc::new(AtomicU64::new(upload_interval_from_env().as_millis() as u64));
+        let closed_date_upload_ms = Arc::new(AtomicU64::new(
+            closed_date_upload_interval_from_env().as_millis() as u64,
+        ));
+        let closed_date_max_bytes = Arc::new(AtomicU64::new(closed_date_max_bytes_from_env()));
+        let upload_merge_max_input_bytes =
+            Arc::new(AtomicU64::new(upload_merge_max_input_bytes_from_env()));
+        let upload_signal = Arc::new(UploadSignal::default());
         Self::open_inner(
             project_id.into(),
             config,
@@ -508,7 +788,12 @@ impl ProjectStorage {
             None,
             None,
             NodeLoad::from_env(),
+            local_segment_tier,
             upload_interval_ms,
+            closed_date_upload_ms,
+            closed_date_max_bytes,
+            upload_merge_max_input_bytes,
+            upload_signal,
         )
         .await
     }
@@ -524,7 +809,12 @@ impl ProjectStorage {
         query_snapshot_store: Option<Arc<dyn ObjectStore>>,
         lease: Option<(u64, Instant)>,
         node_load: Arc<NodeLoad>,
+        local_segment_tier: Arc<AtomicBool>,
         upload_interval_ms: Arc<AtomicU64>,
+        closed_date_upload_ms: Arc<AtomicU64>,
+        closed_date_max_bytes: Arc<AtomicU64>,
+        upload_merge_max_input_bytes: Arc<AtomicU64>,
+        upload_signal: Arc<UploadSignal>,
     ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
         let published_store = PublishedManifestStore::new(&project_id, object_store.clone());
@@ -692,8 +982,24 @@ impl ProjectStorage {
                 }
                 last_snapshot_ref = Some(pub_m.snapshot_ref.clone());
             }
+
+            // Replay/discard any leftover UploadIntent (AFTER step-6 recovery, BEFORE dedup seeding)
+            // and sweep unreferenced local `hot/segments/{project_id}/` files.
+            let _ = reconcile_upload_intent_with_stores(
+                &project_id,
+                &object_store,
+                &manifest,
+                latest_published.as_ref(),
+                last_snapshot_ref.as_ref(),
+            )
+            .await?;
+            sweep_local_hot_segments_for_project(&project_id, &object_store, &manifest).await?;
+
             id_graph = identity_router.get_or_open(&project_id).await?;
         }
+
+        let initial_last_published_s3_partitions =
+            latest_published.as_ref().map(|p| p.partitions.clone());
 
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
@@ -761,15 +1067,26 @@ impl ProjectStorage {
             refresh_lock: AsyncMutex::new(()),
             gc_lock: AsyncMutex::new(()),
             publish_enabled: AtomicBool::new(true),
+            local_segment_tier,
             upload_interval_ms,
+            closed_date_upload_ms,
+            closed_date_max_bytes,
+            upload_merge_max_input_bytes,
+            upload_signal,
             last_published_seq: Mutex::new(initial_last_published_seq),
             last_published_epoch: Mutex::new(initial_last_published_epoch),
+            last_published_s3_partitions: Mutex::new(initial_last_published_s3_partitions),
             last_snapshot_state: Mutex::new(LastSnapshotState {
                 last_snapshot_ref,
                 exported_id_epoch: None,
                 exported_prof_dirty_seq: None,
             }),
             restored_snapshot_paths: Mutex::new(initial_restored_paths),
+            closed_date_pending_since_ms: Mutex::new(HashMap::new()),
+            tracked_hot_segments: Mutex::new(HashMap::new()),
+            hot_segment_bytes: AtomicU64::new(0),
+            pending_local_deletes: Mutex::new(HashMap::new()),
+            has_pending_upload_intent: AtomicBool::new(false),
             retired_profile_stores: Mutex::new(Vec::new()),
             dictionary,
             wals,
@@ -793,6 +1110,37 @@ impl ProjectStorage {
         });
 
         if !identity_router.is_read_only() {
+            // Seed live `hot/segments/` byte tracking and closed-date 1h timers from local state (0 S3 calls).
+            let now_ms = Utc::now().timestamp_millis();
+            let today_utc = date_from_ms(now_ms);
+            let local_hot_segs: Vec<SegmentMeta> = ps
+                .manifest
+                .read()
+                .active_segments
+                .values()
+                .flat_map(|v| v.iter())
+                .filter(|s| s.object_path.starts_with("hot/segments/"))
+                .cloned()
+                .collect();
+            for seg in &local_hot_segs {
+                ps.record_hot_segment(&seg.object_path, seg.file_size);
+                if seg.date < today_utc {
+                    let ts_ms = match ps
+                        .object_store
+                        .head(&ObjectPath::from(seg.object_path.as_str()))
+                        .await
+                    {
+                        Ok(meta) => meta.last_modified.timestamp_millis(),
+                        Err(_) => now_ms,
+                    };
+                    let mut guard = ps.closed_date_pending_since_ms.lock();
+                    guard
+                        .entry(seg.date)
+                        .and_modify(|cur| *cur = (*cur).min(ts_ms))
+                        .or_insert(ts_ms);
+                }
+            }
+
             // Replay uncommitted WAL records across all buckets (RPO = 0)
             let mut seen_replay_fps: HashSet<u64> = HashSet::new();
 
@@ -812,18 +1160,21 @@ impl ProjectStorage {
                 .cloned()
                 .collect();
             for seg in &recent_segs {
-                if let Ok(batch) = reader.project_columns(seg, &["event_uuid_fp"]).await {
-                    if let Some(col) = batch.column_by_name("event_uuid_fp") {
-                        use arrow_array::cast::AsArray;
-                        use arrow_array::types::UInt64Type;
-                        let arr = col.as_primitive::<UInt64Type>();
-                        let mut rec_guard = ps.recovered_uuid_fps.lock();
-                        for i in 0..arr.len() {
-                            let fp = arr.value(i);
-                            seen_replay_fps.insert(fp);
-                            rec_guard.push((seg.bucket_id, fp));
-                        }
-                    }
+                let batch = reader.project_columns(seg, &["event_uuid_fp"]).await?;
+                let col = batch.column_by_name("event_uuid_fp").ok_or_else(|| {
+                    StorageError::Corrupted(format!(
+                        "segment `{}` missing `event_uuid_fp` column during dedup seeding",
+                        seg.object_path
+                    ))
+                })?;
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::UInt64Type;
+                let arr = col.as_primitive::<UInt64Type>();
+                let mut rec_guard = ps.recovered_uuid_fps.lock();
+                for i in 0..arr.len() {
+                    let fp = arr.value(i);
+                    seen_replay_fps.insert(fp);
+                    rec_guard.push((seg.bucket_id, fp));
                 }
             }
 
@@ -1232,13 +1583,172 @@ impl ProjectStorage {
         Ok(count)
     }
 
+    pub fn is_local_segment_tier(&self) -> bool {
+        self.local_segment_tier.load(Ordering::Acquire)
+    }
+
+    pub fn hot_segment_bytes(&self) -> u64 {
+        self.hot_segment_bytes.load(Ordering::Acquire)
+    }
+
+    fn record_hot_segment(&self, path: &str, bytes: u64) {
+        if !path.starts_with("hot/segments/") {
+            return;
+        }
+        let mut guard = self.tracked_hot_segments.lock();
+        let prev = guard.insert(path.to_string(), bytes);
+        let prev_bytes = prev.unwrap_or(0);
+        if bytes >= prev_bytes {
+            let diff = bytes - prev_bytes;
+            self.hot_segment_bytes.fetch_add(diff, Ordering::Relaxed);
+            self.node_load
+                .hot_segment_bytes
+                .fetch_add(diff, Ordering::Relaxed);
+        } else {
+            let diff = prev_bytes - bytes;
+            self.hot_segment_bytes.fetch_sub(diff, Ordering::Relaxed);
+            self.node_load
+                .hot_segment_bytes
+                .fetch_sub(diff, Ordering::Relaxed);
+        }
+    }
+
+    fn unrecord_hot_segment(&self, path: &str) {
+        let mut guard = self.tracked_hot_segments.lock();
+        if let Some(prev) = guard.remove(path) {
+            self.hot_segment_bytes.fetch_sub(prev, Ordering::Relaxed);
+            self.node_load
+                .hot_segment_bytes
+                .fetch_sub(prev, Ordering::Relaxed);
+        }
+    }
+
+    fn after_flush_local_segments(&self, written_segments: &[SegmentMeta], now_ms: i64) {
+        let today_utc = date_from_ms(now_ms);
+        let mut touched_closed_dates: HashSet<NaiveDate> = HashSet::new();
+        for meta in written_segments {
+            if meta.object_path.starts_with("hot/segments/") {
+                self.record_hot_segment(&meta.object_path, meta.file_size);
+                if meta.date < today_utc {
+                    self.closed_date_pending_since_ms
+                        .lock()
+                        .entry(meta.date)
+                        .or_insert(now_ms);
+                    touched_closed_dates.insert(meta.date);
+                }
+            }
+        }
+        if !self.is_local_segment_tier() || self.upload_interval().is_zero() {
+            return;
+        }
+        let proj_bytes = self.hot_segment_bytes();
+        let proj_1x = self.node_load.hot_seg_max_project.load(Ordering::Relaxed);
+        let node_bytes = self.node_load.hot_segment_bytes.load(Ordering::Relaxed);
+        let node_1x = self.node_load.hot_seg_max_node.load(Ordering::Relaxed);
+        let closed_max = self.closed_date_max_bytes.load(Ordering::Acquire);
+        let closed_over = if touched_closed_dates.is_empty() {
+            false
+        } else {
+            let mf = self.manifest.read();
+            touched_closed_dates.into_iter().any(|date| {
+                let sum: u64 = mf
+                    .active_segments
+                    .iter()
+                    .filter(|(&(d, _), _)| d == date)
+                    .flat_map(|(_, segs)| segs.iter())
+                    .filter(|s| s.object_path.starts_with("hot/segments/"))
+                    .map(|s| s.file_size)
+                    .sum();
+                sum > closed_max
+            })
+        };
+        if proj_bytes >= proj_1x || node_bytes >= node_1x || closed_over {
+            self.upload_signal.request_upload_if_due();
+        }
+    }
+
+    /// Enforces `2x` `hot/segments/` byte bounds (returning `StorageError::HotSegmentBackpressure`)
+    /// and triggers an early upload wake (with failure cooldown) at `>= 1x`.
+    pub fn check_hot_segment_backpressure(&self) -> Result<()> {
+        if !self.is_local_segment_tier() {
+            return Ok(());
+        }
+        let proj_bytes = self.hot_segment_bytes();
+        let proj_1x = self.node_load.hot_seg_max_project.load(Ordering::Relaxed);
+        let node_bytes = self.node_load.hot_segment_bytes.load(Ordering::Acquire);
+        let node_1x = self.node_load.hot_seg_max_node.load(Ordering::Relaxed);
+
+        if proj_bytes >= proj_1x || node_bytes >= node_1x {
+            self.upload_signal.request_upload_if_due();
+        }
+        let proj_2x = proj_1x.saturating_mul(2);
+        if proj_bytes >= proj_2x {
+            return Err(StorageError::HotSegmentBackpressure {
+                project_id: self.project_id.clone(),
+                bytes: proj_bytes,
+                max_bytes: proj_2x,
+            });
+        }
+        let node_2x = node_1x.saturating_mul(2);
+        if node_bytes >= node_2x {
+            return Err(StorageError::HotSegmentBackpressure {
+                project_id: self.project_id.clone(),
+                bytes: node_bytes,
+                max_bytes: node_2x,
+            });
+        }
+        Ok(())
+    }
+
+    /// Deletes any deferred local `hot/segments/` paths that are no longer pinned by a `StorageSnapshot`.
+    pub async fn drain_pending_local_deletes(&self) -> usize {
+        let ready: Vec<String> = {
+            let guard = self.pending_local_deletes.lock();
+            if guard.is_empty() {
+                return 0;
+            }
+            guard
+                .keys()
+                .filter(|p| !self.pin_tracker.is_pinned(p.as_str()))
+                .cloned()
+                .collect()
+        };
+        let mut deleted = 0usize;
+        for path in ready {
+            match self
+                .object_store
+                .delete(&ObjectPath::from(path.as_str()))
+                .await
+            {
+                Ok(()) => {
+                    self.pending_local_deletes.lock().remove(&path);
+                    self.unrecord_hot_segment(&path);
+                    deleted += 1;
+                }
+                Err(object_store::Error::NotFound { .. }) => {
+                    self.pending_local_deletes.lock().remove(&path);
+                    self.unrecord_hot_segment(&path);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %self.project_id,
+                        path = %path,
+                        error = %e,
+                        "deferred local segment delete failed; will retry"
+                    );
+                }
+            }
+        }
+        deleted
+    }
+
     /// Flushes a single bucket's L0 `MemBucket` into immutable Vortex L1 segment(s) and commits a new MVCC Manifest epoch.
     pub async fn flush_bucket(&self, bucket_id: u8) -> Result<Vec<SegmentMeta>> {
         let b_idx = bucket_id as usize;
         let Some(flush_lock) = self.bucket_flush_locks.get(b_idx) else {
             return Ok(Vec::new());
         };
-        let _bucket_guard = flush_lock.lock().await;
+        let bucket_guard = flush_lock.lock().await;
 
         // Guarantee interned u32 identities are durable in SlateDB BEFORE publishing any L1 segment.
         self.id_graph().flush().await?;
@@ -1261,16 +1771,23 @@ impl ProjectStorage {
             by_date.entry(row.event_date()).or_default().push(row);
         }
 
+        let prefix_root = if self.is_local_segment_tier() {
+            "hot/segments"
+        } else {
+            "segments"
+        };
         let mut written_segments = Vec::with_capacity(by_date.len());
         for (date, rows) in by_date {
             let seg_id = format!("seg_{}", Uuid::new_v4().simple());
-            if let Some(meta) = write_vortex_segment(
+            if let Some(meta) = write_vortex_segment_opts(
                 &self.object_store,
+                prefix_root,
                 &self.project_id,
                 date,
                 bucket_id,
                 &seg_id,
                 rows,
+                PutMode::Create,
             )
             .await?
             {
@@ -1278,45 +1795,62 @@ impl ProjectStorage {
             }
         }
 
-        // Atomically commit new MVCC Manifest epoch (with CAS reload-and-merge retries) BEFORE evicting from L0 MemBucket!
-        {
-            let _publish_guard = self.publish_lock.lock().await;
-            if let Some(committed) = self
-                .commit_manifest_cas(|next_manifest| {
-                    for meta in &written_segments {
-                        next_manifest
-                            .active_segments
-                            .entry((meta.date, bucket_id))
-                            .or_default()
-                            .push(meta.clone());
-                    }
+        // Atomically commit new MVCC Manifest epoch (without holding `publish_lock`) BEFORE evicting from L0 MemBucket!
+        let committed_res = self
+            .commit_manifest_cas(|next_manifest| {
+                for meta in &written_segments {
                     next_manifest
-                        .committed_l0_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_l0))
-                        .or_insert(max_l0);
-                    next_manifest
-                        .committed_wal_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_wal))
-                        .or_insert(max_wal);
-                    next_manifest.dict_snapshot = self.dictionary.snapshot();
-                    true
-                })
-                .await?
-            {
-                self.wals[b_idx].advance_epoch(committed.epoch);
-                if !self.id_graph().is_read_only()
-                    && self.publish_enabled.load(Ordering::Acquire)
-                    && self.upload_interval().is_zero()
-                {
-                    self.publish_committed_state(&committed).await?;
+                        .active_segments
+                        .entry((meta.date, bucket_id))
+                        .or_default()
+                        .push(meta.clone());
                 }
+                next_manifest
+                    .committed_l0_seq
+                    .entry(bucket_id)
+                    .and_modify(|v| *v = (*v).max(max_l0))
+                    .or_insert(max_l0);
+                next_manifest
+                    .committed_wal_seq
+                    .entry(bucket_id)
+                    .and_modify(|v| *v = (*v).max(max_wal))
+                    .or_insert(max_wal);
+                next_manifest.dict_snapshot = self.dictionary.snapshot();
+                true
+            })
+            .await;
+
+        let committed_opt = match committed_res {
+            Ok(opt) => opt,
+            Err(e) => {
+                for meta in &written_segments {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(meta.object_path.as_str()))
+                        .await;
+                }
+                return Err(e);
             }
+        };
+
+        if let Some(ref committed) = committed_opt {
+            self.wals[b_idx].advance_epoch(committed.epoch);
         }
 
         self.mem_buckets[b_idx].complete_flush(max_l0);
         let _ = self.wals[b_idx].purge_up_to(max_wal).await;
+
+        let now_ms = Utc::now().timestamp_millis();
+        self.after_flush_local_segments(&written_segments, now_ms);
+        drop(bucket_guard);
+
+        if committed_opt.is_some()
+            && !self.id_graph().is_read_only()
+            && self.publish_enabled.load(Ordering::Acquire)
+            && self.upload_interval().is_zero()
+        {
+            self.upload_if_dirty_at(now_ms, false).await?;
+        }
 
         Ok(written_segments)
     }
@@ -1334,9 +1868,66 @@ impl ProjectStorage {
         self.published_store.load_latest().await
     }
 
-    /// Publishes this project's current state to S3 `published/` if any local manifest, identity,
-    /// or profile changes occurred since the last publish. Performs **0 S3 calls** when idle.
+    fn select_eligible_local_segments(
+        &self,
+        manifest: &Manifest,
+        now_ms: i64,
+        force_closed: bool,
+    ) -> BTreeMap<(NaiveDate, u8), Vec<SegmentMeta>> {
+        let today_utc = date_from_ms(now_ms);
+        let upload_eager = self.upload_interval().is_zero();
+        let closed_interval_ms = self.closed_date_upload_ms.load(Ordering::Acquire) as i64;
+        let closed_max_bytes = self.closed_date_max_bytes.load(Ordering::Acquire);
+
+        let mut by_date: BTreeMap<NaiveDate, Vec<(u8, SegmentMeta)>> = BTreeMap::new();
+        for (&(date, bucket_id), segs) in &manifest.active_segments {
+            for seg in segs {
+                if seg.object_path.starts_with("hot/segments/") {
+                    by_date
+                        .entry(date)
+                        .or_default()
+                        .push((bucket_id, seg.clone()));
+                }
+            }
+        }
+
+        let mut out: BTreeMap<(NaiveDate, u8), Vec<SegmentMeta>> = BTreeMap::new();
+        for (date, entries) in by_date {
+            let eligible = if date >= today_utc || upload_eager || force_closed {
+                true
+            } else {
+                let date_bytes: u64 = entries.iter().map(|(_, s)| s.file_size).sum();
+                let first_seen = *self
+                    .closed_date_pending_since_ms
+                    .lock()
+                    .entry(date)
+                    .or_insert(now_ms);
+                let age_ms = now_ms.saturating_sub(first_seen);
+                date_bytes > closed_max_bytes || age_ms >= closed_interval_ms
+            };
+            if eligible {
+                for (bucket_id, seg) in entries {
+                    out.entry((date, bucket_id)).or_default().push(seg);
+                }
+            }
+        }
+        out
+    }
+
+    /// Runs the 7-step local-to-S3 upload & publish cycle if any eligible local segments, S3
+    /// segment changes, identity mutations, or profile mutations exist. Performs **0 S3 calls**
+    /// when idle or when only deferred closed-date `hot/segments/` are present.
     pub async fn publish_if_dirty(&self) -> Result<Option<PublishedManifest>> {
+        self.upload_if_dirty_at(Utc::now().timestamp_millis(), false)
+            .await
+    }
+
+    /// Time-parameterized 7-step upload & publish cycle for deterministic timer/crash testing.
+    pub async fn upload_if_dirty_at(
+        &self,
+        now_ms: i64,
+        force_closed: bool,
+    ) -> Result<Option<PublishedManifest>> {
         let _publish_guard = self.publish_lock.lock().await;
         let id_graph = self.id_graph();
         if id_graph.is_read_only() || !self.publish_enabled.load(Ordering::Acquire) {
@@ -1346,13 +1937,40 @@ impl ProjectStorage {
             return Err(self.not_writer());
         }
 
+        self.drain_pending_local_deletes().await;
+
+        // Reconcile any leftover local intent from an earlier failed Step 4/5/6 (without restart).
+        if self.has_pending_upload_intent.load(Ordering::Acquire) {
+            let cur_mf = (**self.manifest.read()).clone();
+            let last_snap = self.last_snapshot_state.lock().last_snapshot_ref.clone();
+            let stale_local_sources = reconcile_upload_intent_with_stores(
+                &self.project_id,
+                &self.object_store,
+                &cur_mf,
+                None,
+                last_snap.as_ref(),
+            )
+            .await?;
+            if !stale_local_sources.is_empty() {
+                let tracked = self.tracked_hot_segments.lock();
+                let mut pending = self.pending_local_deletes.lock();
+                for local_path in stale_local_sources {
+                    let sz = tracked.get(&local_path).copied().unwrap_or(0);
+                    pending.insert(local_path, sz);
+                }
+            }
+            self.drain_pending_local_deletes().await;
+            self.has_pending_upload_intent
+                .store(false, Ordering::Release);
+        }
+
         let mut cur_mf = (**self.manifest.read()).clone();
-        let mf_has_data = !cur_mf.active_segments.is_empty()
-            || !cur_mf.committed_wal_seq.is_empty()
-            || !cur_mf.committed_l0_seq.is_empty()
-            || !cur_mf.dict_snapshot.events.is_empty()
-            || !cur_mf.dict_snapshot.prop_keys.is_empty();
-        let mf_dirty = *self.last_published_epoch.lock() != Some(cur_mf.epoch) && mf_has_data;
+        let frozen_groups = self.select_eligible_local_segments(&cur_mf, now_ms, force_closed);
+        let cur_s3_parts = s3_partitions(&cur_mf);
+        let s3_state_dirty = match &*self.last_published_s3_partitions.lock() {
+            Some(published_parts) => *published_parts != cur_s3_parts,
+            None => !cur_s3_parts.is_empty(),
+        };
 
         let id_dirty = id_graph.user_count() > 0
             && self.last_snapshot_state.lock().exported_id_epoch != Some(id_graph.mutation_epoch());
@@ -1366,31 +1984,81 @@ impl ProjectStorage {
                         != Some(ps.dirty_seq())
             });
 
-        if !mf_dirty && !id_dirty && !prof_dirty {
+        if frozen_groups.is_empty() && !s3_state_dirty && !id_dirty && !prof_dirty {
             return Ok(None);
         }
 
+        self.check_writer()?;
         if cur_mf.epoch == 0 {
             if let Some(committed) = self.commit_manifest_cas(|_| true).await? {
                 cur_mf = (*committed).clone();
             }
         }
 
-        let published = self.publish_committed_state(&cur_mf).await?;
-        Ok(Some(published))
-    }
-
-    /// Publishes snapshots in strict `T_id >= T_prof >= T_freeze` order and writes a create-only
-    /// [`PublishedManifest`] with dense `publish_seq`. Caller MUST hold `self.publish_lock`.
-    async fn publish_committed_state(&self, committed: &Manifest) -> Result<PublishedManifest> {
-        self.check_writer()?;
-        let id_graph = self.id_graph();
         let publish_seq = self
             .last_published_seq
             .lock()
             .map_or(0, |seq| seq.saturating_add(1));
 
-        // 1. T_prof >= T_freeze: snapshot profiles if open or already present in object_store.
+        // ------------------------------------------------------------------
+        // Step 1 — Freeze eligible local segments, chunk <= 64 MiB/batch per (date, bucket),
+        //          pre-assign target S3 segment & snapshot paths, and persist UploadIntent locally.
+        // ------------------------------------------------------------------
+        struct PlannedBatch {
+            date: NaiveDate,
+            bucket_id: u8,
+            sources: Vec<SegmentMeta>,
+            target_segment_id: String,
+            target_object_path: String,
+        }
+
+        let max_input_bytes = self
+            .upload_merge_max_input_bytes
+            .load(Ordering::Acquire)
+            .max(1);
+        let mut planned_batches: Vec<PlannedBatch> = Vec::new();
+        for ((date, bucket_id), mut segs) in frozen_groups {
+            segs.sort_by(|a, b| a.segment_id.cmp(&b.segment_id));
+            let mut chunk: Vec<SegmentMeta> = Vec::new();
+            let mut chunk_bytes: u64 = 0;
+            for seg in segs {
+                if !chunk.is_empty() && chunk_bytes.saturating_add(seg.file_size) > max_input_bytes
+                {
+                    let target_segment_id = format!("seg_up_{}", Uuid::new_v4().simple());
+                    let yyyymmdd = date.format("%Y%m%d").to_string();
+                    let target_object_path = format!(
+                        "segments/{}/{yyyymmdd}/bucket_{bucket_id:03}/{target_segment_id}.pvtx",
+                        self.project_id
+                    );
+                    planned_batches.push(PlannedBatch {
+                        date,
+                        bucket_id,
+                        sources: std::mem::take(&mut chunk),
+                        target_segment_id,
+                        target_object_path,
+                    });
+                    chunk_bytes = 0;
+                }
+                chunk_bytes = chunk_bytes.saturating_add(seg.file_size);
+                chunk.push(seg);
+            }
+            if !chunk.is_empty() {
+                let target_segment_id = format!("seg_up_{}", Uuid::new_v4().simple());
+                let yyyymmdd = date.format("%Y%m%d").to_string();
+                let target_object_path = format!(
+                    "segments/{}/{yyyymmdd}/bucket_{bucket_id:03}/{target_segment_id}.pvtx",
+                    self.project_id
+                );
+                planned_batches.push(PlannedBatch {
+                    date,
+                    bucket_id,
+                    sources: chunk,
+                    target_segment_id,
+                    target_object_path,
+                });
+            }
+        }
+
         let prof_store = if let Some(ps) = self.profile_router.get_if_open(&self.project_id) {
             Some(ps)
         } else {
@@ -1416,24 +2084,94 @@ impl ProjectStorage {
             )
         };
 
+        let reuse_prof = prof_store.as_ref().and_then(|ps| {
+            let cur_dirty = ps.dirty_seq();
+            if prev_prof_dirty == Some(cur_dirty) {
+                prev_snapshot_ref
+                    .as_ref()
+                    .and_then(|s| s.profiles.clone())
+                    .map(|p| (p, cur_dirty))
+            } else {
+                None
+            }
+        });
+        let preassigned_prof_path = if prof_store.is_some() && reuse_prof.is_none() {
+            Some(format!(
+                "published/{}/snapshots/profiles_{:012}_{}.pzst",
+                self.project_id,
+                publish_seq,
+                Uuid::new_v4().simple()
+            ))
+        } else {
+            None
+        };
+
+        let prelim_id_epoch = id_graph.mutation_epoch();
+        let prelim_flushed_epoch = id_graph.flushed_mutation_epoch();
+        let can_reuse_id_prelim = prev_id_epoch == Some(prelim_id_epoch)
+            && prelim_flushed_epoch == prelim_id_epoch
+            && !id_graph.has_pending_mutations()
+            && prev_snapshot_ref.is_some();
+        let preassigned_id_path = if can_reuse_id_prelim {
+            None
+        } else {
+            Some(format!(
+                "published/{}/snapshots/identity_{:012}_{}.pzst",
+                self.project_id,
+                publish_seq,
+                Uuid::new_v4().simple()
+            ))
+        };
+
+        let intent_store = UploadIntentStore::new(&self.project_id, self.object_store.clone());
+        let mut intent = UploadIntent {
+            intent_id: format!("intent_{}", Uuid::new_v4().simple()),
+            writer_generation: cur_mf.writer_generation,
+            base_local_epoch: cur_mf.epoch,
+            target_publish_seq: publish_seq,
+            created_at_ms: now_ms,
+            batches: planned_batches
+                .iter()
+                .map(|b| UploadIntentBatch {
+                    date: b.date,
+                    bucket_id: b.bucket_id,
+                    source_segment_ids: b.sources.iter().map(|s| s.segment_id.clone()).collect(),
+                    source_object_paths: b.sources.iter().map(|s| s.object_path.clone()).collect(),
+                    target_segment_id: b.target_segment_id.clone(),
+                    target_object_path: b.target_object_path.clone(),
+                })
+                .collect(),
+            new_identity_snapshot_path: preassigned_id_path.clone(),
+            new_profile_snapshot_path: preassigned_prof_path.clone(),
+        };
+        self.has_pending_upload_intent
+            .store(true, Ordering::Release);
+        intent_store.save(&intent).await?;
+
+        // ------------------------------------------------------------------
+        // Step 2 — Snapshot profiles (`T_prof >= T_freeze`) to S3 (`PutMode::Create`).
+        // ------------------------------------------------------------------
         let (prof_ref, new_prof_dirty, prof_uploaded_path) = match prof_store {
             Some(ps) => {
-                let cur_dirty = ps.dirty_seq();
-                let reuse = if prev_prof_dirty == Some(cur_dirty) {
-                    prev_snapshot_ref.as_ref().and_then(|s| s.profiles.clone())
-                } else {
-                    None
-                };
-                if let Some(prev_prof) = reuse {
+                if let Some((prev_prof, cur_dirty)) = reuse_prof {
                     (Some(prev_prof), Some(cur_dirty), None)
                 } else {
+                    let cur_dirty = ps.dirty_seq();
                     let bytes = ps.export_snapshot_bytes().await?;
-                    let path_str = format!(
-                        "published/{}/snapshots/profiles_{:012}_{}.pzst",
-                        self.project_id,
-                        publish_seq,
-                        Uuid::new_v4().simple()
-                    );
+                    let path_str = preassigned_prof_path.clone().unwrap_or_else(|| {
+                        format!(
+                            "published/{}/snapshots/profiles_{:012}_{}.pzst",
+                            self.project_id,
+                            publish_seq,
+                            Uuid::new_v4().simple()
+                        )
+                    });
+                    if intent.new_profile_snapshot_path.as_deref() != Some(path_str.as_str()) {
+                        intent.new_profile_snapshot_path = Some(path_str.clone());
+                        self.has_pending_upload_intent
+                            .store(true, Ordering::Release);
+                        intent_store.save(&intent).await?;
+                    }
                     self.object_store
                         .put_opts(
                             &ObjectPath::from(path_str.as_str()),
@@ -1457,7 +2195,9 @@ impl ProjectStorage {
             None => (None, None, None),
         };
 
-        // 2. T_id >= T_prof >= T_freeze: flush & snapshot identity, asserting HWM.
+        // ------------------------------------------------------------------
+        // Step 3 — Flush & snapshot identity (`T_id >= T_prof >= T_freeze`) + HWM assertion.
+        // ------------------------------------------------------------------
         id_graph.flush().await?;
         let flushed_hwm = id_graph.flushed_user_count();
         let cur_id_epoch = id_graph.mutation_epoch();
@@ -1487,12 +2227,20 @@ impl ProjectStorage {
                     high_water_mark: flushed_hwm,
                 });
             }
-            let path_str = format!(
-                "published/{}/snapshots/identity_{:012}_{}.pzst",
-                self.project_id,
-                publish_seq,
-                Uuid::new_v4().simple()
-            );
+            let path_str = preassigned_id_path.clone().unwrap_or_else(|| {
+                format!(
+                    "published/{}/snapshots/identity_{:012}_{}.pzst",
+                    self.project_id,
+                    publish_seq,
+                    Uuid::new_v4().simple()
+                )
+            });
+            if intent.new_identity_snapshot_path.as_deref() != Some(path_str.as_str()) {
+                intent.new_identity_snapshot_path = Some(path_str.clone());
+                self.has_pending_upload_intent
+                    .store(true, Ordering::Release);
+                intent_store.save(&intent).await?;
+            }
             self.object_store
                 .put_opts(
                     &ObjectPath::from(path_str.as_str()),
@@ -1514,21 +2262,141 @@ impl ProjectStorage {
             )
         };
 
+        // ------------------------------------------------------------------
+        // Step 4 — Merge frozen local segments sequentially one `(date, bucket_id)` partition
+        //          at a time (`<= 64 MiB` input cap, create-only to S3 `segments/`).
+        // ------------------------------------------------------------------
+        let mut uploaded_outputs: Vec<Option<SegmentMeta>> =
+            Vec::with_capacity(planned_batches.len());
+        if !planned_batches.is_empty() {
+            let erased = self.erased_snapshot();
+            let reader = VortexSegmentReader::new(self.object_store.clone());
+            for batch in &planned_batches {
+                let mut merged_rows = Vec::new();
+                for seg in &batch.sources {
+                    let mut rows = reader.read_all_rows(seg).await?;
+                    merged_rows.append(&mut rows);
+                }
+                if !erased.is_empty() {
+                    merged_rows.retain(|r| !erased.hides(r.uid_internal, r.event_ts_ms));
+                }
+                let meta_opt = write_vortex_segment_opts(
+                    &self.object_store,
+                    "segments",
+                    &self.project_id,
+                    batch.date,
+                    batch.bucket_id,
+                    &batch.target_segment_id,
+                    merged_rows,
+                    PutMode::Create,
+                )
+                .await?;
+                uploaded_outputs.push(meta_opt);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 5 — Commit local manifest: frozen local segments out, new S3 segments in.
+        // ------------------------------------------------------------------
+        let mut committed_mf = cur_mf.clone();
+        if !planned_batches.is_empty() {
+            #[derive(Default)]
+            struct PartitionReplace {
+                source_ids: HashSet<String>,
+                source_paths: Vec<String>,
+                new_metas: Vec<SegmentMeta>,
+            }
+            let mut by_part: BTreeMap<(NaiveDate, u8), PartitionReplace> = BTreeMap::new();
+            for (batch, new_meta_opt) in planned_batches.iter().zip(uploaded_outputs.iter()) {
+                let part = by_part.entry((batch.date, batch.bucket_id)).or_default();
+                for src in &batch.sources {
+                    part.source_ids.insert(src.segment_id.clone());
+                    part.source_paths.push(src.object_path.clone());
+                }
+                if let Some(ref meta) = new_meta_opt {
+                    part.new_metas.push(meta.clone());
+                }
+            }
+
+            let mut rejected_s3_paths: Vec<String> = Vec::new();
+            let mut maybe_accepted_paths: Vec<String> = Vec::new();
+            if let Some(committed) = self
+                .commit_manifest_cas(|next_manifest| {
+                    rejected_s3_paths.clear();
+                    maybe_accepted_paths.clear();
+                    let mut any_accepted = false;
+                    for (&(date, bucket_id), repl) in &by_part {
+                        let active_ok = next_manifest
+                            .active_segments
+                            .get(&(date, bucket_id))
+                            .is_some_and(|entry| {
+                                let active_ids: HashSet<&str> =
+                                    entry.iter().map(|s| s.segment_id.as_str()).collect();
+                                repl.source_ids
+                                    .iter()
+                                    .all(|sid| active_ids.contains(sid.as_str()))
+                            });
+                        if active_ok {
+                            if let Some(entry) =
+                                next_manifest.active_segments.get_mut(&(date, bucket_id))
+                            {
+                                entry.retain(|s| !repl.source_ids.contains(&s.segment_id));
+                                entry.extend(repl.new_metas.iter().cloned());
+                                if entry.is_empty() {
+                                    next_manifest.active_segments.remove(&(date, bucket_id));
+                                }
+                            }
+                            maybe_accepted_paths.extend(repl.source_paths.iter().cloned());
+                            any_accepted = true;
+                        } else {
+                            rejected_s3_paths
+                                .extend(repl.new_metas.iter().map(|m| m.object_path.clone()));
+                        }
+                    }
+                    if !any_accepted {
+                        return false;
+                    }
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                })
+                .await?
+            {
+                committed_mf = (*committed).clone();
+                let tracked = self.tracked_hot_segments.lock();
+                let mut pending = self.pending_local_deletes.lock();
+                for local_path in maybe_accepted_paths {
+                    let sz = tracked.get(&local_path).copied().unwrap_or(0);
+                    pending.insert(local_path, sz);
+                }
+            }
+            for rej_path in rejected_s3_paths {
+                let _ = self
+                    .object_store
+                    .delete(&ObjectPath::from(rej_path.as_str()))
+                    .await;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 6 — Publish `PublishedManifest` (S3 segments only, create-only + head(seq-1) guard),
+        //          update local `last_published_seq`, stamp grace, and run S3 GC.
+        // ------------------------------------------------------------------
         let high_water_mark = id_ref.user_count;
         let snapshot_ref = SnapshotRef {
             identity: id_ref,
             profiles: prof_ref,
         };
+        let pub_partitions = s3_partitions(&committed_mf);
         let pub_manifest = PublishedManifest {
             publish_seq,
-            writer_generation: committed.writer_generation,
-            source_local_epoch: committed.epoch.max(1),
+            writer_generation: committed_mf.writer_generation,
+            source_local_epoch: committed_mf.epoch.max(1),
             high_water_mark,
             published_at_ms: Utc::now().timestamp_millis(),
-            partitions: committed.to_sorted_partitions(),
-            dict_snapshot: committed.dict_snapshot.clone(),
-            committed_wal_seq: committed.committed_wal_seq.clone(),
-            committed_l0_seq: committed.committed_l0_seq.clone(),
+            partitions: pub_partitions.clone(),
+            dict_snapshot: committed_mf.dict_snapshot.clone(),
+            committed_wal_seq: committed_mf.committed_wal_seq.clone(),
+            committed_l0_seq: committed_mf.committed_l0_seq.clone(),
             snapshot_ref: snapshot_ref.clone(),
         };
 
@@ -1557,6 +2425,7 @@ impl ProjectStorage {
         };
 
         *self.last_published_seq.lock() = Some(publish_seq);
+        *self.last_published_s3_partitions.lock() = Some(pub_partitions);
         {
             let mut st = self.last_snapshot_state.lock();
             st.last_snapshot_ref = Some(snapshot_ref.clone());
@@ -1564,8 +2433,6 @@ impl ProjectStorage {
             st.exported_prof_dirty_seq = new_prof_dirty;
         }
 
-        // Persist `last_published_seq` to local `ManifestStore`, stamp `pending_s3_deletes`
-        // unlocked by this publish, and queue superseded S3 snapshot blobs under the 2-interval grace.
         let pub_ts_ms = published.published_at_ms;
         let grace_ms = (self.upload_interval_ms() as i64).saturating_mul(2);
         let post_step6 = self
@@ -1599,7 +2466,34 @@ impl ProjectStorage {
             *self.last_published_epoch.lock() = Some(mf_arc.epoch);
         }
 
-        Ok(published)
+        self.run_gc_at(now_ms).await?;
+
+        // ------------------------------------------------------------------
+        // Step 7 — Delete uploaded local segments (if unpinned, else queue) & clear UploadIntent.
+        // ------------------------------------------------------------------
+        {
+            let active_hot_dates: HashSet<NaiveDate> = self
+                .manifest
+                .read()
+                .active_segments
+                .iter()
+                .filter(|(_, segs)| {
+                    segs.iter()
+                        .any(|s| s.object_path.starts_with("hot/segments/"))
+                })
+                .map(|(&(d, _), _)| d)
+                .collect();
+            self.closed_date_pending_since_ms
+                .lock()
+                .retain(|d, _| active_hot_dates.contains(d));
+        }
+
+        self.drain_pending_local_deletes().await;
+
+        intent_store.clear().await?;
+        self.has_pending_upload_intent
+            .store(false, Ordering::Release);
+        Ok(Some(published))
     }
 
     async fn commit_manifest_cas<F>(&self, mut apply: F) -> Result<Option<Arc<Manifest>>>
@@ -1702,6 +2596,11 @@ impl ProjectStorage {
             return Ok(0);
         }
 
+        let prefix_root = if self.is_local_segment_tier() {
+            "hot/segments"
+        } else {
+            "segments"
+        };
         let sem = Arc::new(tokio::sync::Semaphore::new(16));
         let mut join_set = tokio::task::JoinSet::new();
         let mut bucket_watermarks = Vec::with_capacity(staged_buckets.len());
@@ -1715,7 +2614,17 @@ impl ProjectStorage {
                 join_set.spawn(async move {
                     let _permit = sem_c.acquire_owned().await.unwrap();
                     let seg_id = format!("seg_{}", Uuid::new_v4().simple());
-                    write_vortex_segment(&store, &pid, date, bucket_id, &seg_id, rows).await
+                    write_vortex_segment_opts(
+                        &store,
+                        prefix_root,
+                        &pid,
+                        date,
+                        bucket_id,
+                        &seg_id,
+                        rows,
+                        PutMode::Create,
+                    )
+                    .await
                 });
             }
         }
@@ -1729,43 +2638,48 @@ impl ProjectStorage {
             }
         }
 
-        {
-            let _publish_guard = self.publish_lock.lock().await;
-            if let Some(committed) = self
-                .commit_manifest_cas(|next_manifest| {
-                    for meta in &written_segments {
-                        next_manifest
-                            .active_segments
-                            .entry((meta.date, meta.bucket_id))
-                            .or_default()
-                            .push(meta.clone());
-                    }
-                    for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
-                        next_manifest
-                            .committed_l0_seq
-                            .entry(bucket_id)
-                            .and_modify(|v| *v = (*v).max(max_l0))
-                            .or_insert(max_l0);
-                        next_manifest
-                            .committed_wal_seq
-                            .entry(bucket_id)
-                            .and_modify(|v| *v = (*v).max(max_wal))
-                            .or_insert(max_wal);
-                    }
-                    next_manifest.dict_snapshot = self.dictionary.snapshot();
-                    true
-                })
-                .await?
-            {
-                for &(_, b_idx, _, _) in &bucket_watermarks {
-                    self.wals[b_idx].advance_epoch(committed.epoch);
+        let committed_res = self
+            .commit_manifest_cas(|next_manifest| {
+                for meta in &written_segments {
+                    next_manifest
+                        .active_segments
+                        .entry((meta.date, meta.bucket_id))
+                        .or_default()
+                        .push(meta.clone());
                 }
-                if !self.id_graph().is_read_only()
-                    && self.publish_enabled.load(Ordering::Acquire)
-                    && self.upload_interval().is_zero()
-                {
-                    self.publish_committed_state(&committed).await?;
+                for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
+                    next_manifest
+                        .committed_l0_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_l0))
+                        .or_insert(max_l0);
+                    next_manifest
+                        .committed_wal_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_wal))
+                        .or_insert(max_wal);
                 }
+                next_manifest.dict_snapshot = self.dictionary.snapshot();
+                true
+            })
+            .await;
+
+        let committed_opt = match committed_res {
+            Ok(opt) => opt,
+            Err(e) => {
+                for meta in &written_segments {
+                    let _ = self
+                        .object_store
+                        .delete(&ObjectPath::from(meta.object_path.as_str()))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(ref committed) = committed_opt {
+            for &(_, b_idx, _, _) in &bucket_watermarks {
+                self.wals[b_idx].advance_epoch(committed.epoch);
             }
         }
 
@@ -1774,7 +2688,18 @@ impl ProjectStorage {
             let _ = self.wals[b_idx].purge_up_to(max_wal).await;
         }
 
+        let now_ms = Utc::now().timestamp_millis();
+        self.after_flush_local_segments(&written_segments, now_ms);
         drop(guards);
+
+        if committed_opt.is_some()
+            && !self.id_graph().is_read_only()
+            && self.publish_enabled.load(Ordering::Acquire)
+            && self.upload_interval().is_zero()
+        {
+            self.upload_if_dirty_at(now_ms, false).await?;
+        }
+
         Ok(written_segments.len())
     }
 
@@ -1812,6 +2737,10 @@ impl ProjectStorage {
     ) -> Result<usize> {
         const COMPACTION_COMMIT_BATCH: usize = 32;
         const COMPACTION_CONCURRENCY: usize = 8;
+
+        if self.is_local_segment_tier() && !self.upload_interval().is_zero() {
+            return Ok(0);
+        }
 
         let min_segments = min_segments.max(2);
         let mut candidates = self
@@ -1924,6 +2853,7 @@ impl ProjectStorage {
 
             if !prepared.is_empty() {
                 let mut accepted_flags = vec![false; prepared.len()];
+                let mut superseded_local_paths: Vec<String> = Vec::new();
                 let committed = {
                     let _publish_guard = self.publish_lock.lock().await;
                     let mut queued_superseded: Vec<String> = Vec::new();
@@ -1931,6 +2861,7 @@ impl ProjectStorage {
                         .commit_manifest_cas(|next_manifest| {
                             let mut any_accepted = false;
                             queued_superseded.clear();
+                            superseded_local_paths.clear();
                             for (idx, item) in prepared.iter().enumerate() {
                                 let entry = next_manifest
                                     .active_segments
@@ -1966,7 +2897,9 @@ impl ProjectStorage {
                                 .map(|e| e.object_path.clone())
                                 .collect();
                             for path in &queued_superseded {
-                                if !path.starts_with("hot/") && seen_pending.insert(path.clone()) {
+                                if path.starts_with("hot/") {
+                                    superseded_local_paths.push(path.clone());
+                                } else if seen_pending.insert(path.clone()) {
                                     next_manifest.pending_s3_deletes.push(PendingS3Delete {
                                         object_path: path.clone(),
                                         kind: PendingS3DeleteKind::Segment,
@@ -1980,18 +2913,48 @@ impl ProjectStorage {
                             true
                         })
                         .await?;
-                    if let Some(ref c) = committed_opt {
-                        if !self.id_graph().is_read_only()
-                            && self.publish_enabled.load(Ordering::Acquire)
-                            && self.upload_interval().is_zero()
-                        {
-                            self.publish_committed_state(c).await?;
-                        }
-                    }
                     committed_opt
                 };
 
+                for local_path in superseded_local_paths {
+                    if self.pin_tracker.is_pinned(&local_path) {
+                        let sz = self
+                            .tracked_hot_segments
+                            .lock()
+                            .get(&local_path)
+                            .copied()
+                            .unwrap_or(0);
+                        self.pending_local_deletes.lock().insert(local_path, sz);
+                    } else {
+                        match self
+                            .object_store
+                            .delete(&ObjectPath::from(local_path.as_str()))
+                            .await
+                        {
+                            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                                self.unrecord_hot_segment(&local_path);
+                            }
+                            Err(_) => {
+                                let sz = self
+                                    .tracked_hot_segments
+                                    .lock()
+                                    .get(&local_path)
+                                    .copied()
+                                    .unwrap_or(0);
+                                self.pending_local_deletes.lock().insert(local_path, sz);
+                            }
+                        }
+                    }
+                }
+
                 if committed.is_some() {
+                    if !self.id_graph().is_read_only()
+                        && self.publish_enabled.load(Ordering::Acquire)
+                        && self.upload_interval().is_zero()
+                    {
+                        self.upload_if_dirty_at(Utc::now().timestamp_millis(), false)
+                            .await?;
+                    }
                     for (item, accepted) in prepared.into_iter().zip(accepted_flags) {
                         if accepted {
                             compacted_partitions += 1;
@@ -2412,7 +3375,12 @@ pub struct StorageEngine {
     open_lock: AsyncMutex<()>,
     writer_leases: OnceLock<Arc<dyn WriterLeases>>,
     node_load: Arc<NodeLoad>,
+    local_segment_tier: Arc<AtomicBool>,
     upload_interval_ms: Arc<AtomicU64>,
+    closed_date_upload_ms: Arc<AtomicU64>,
+    closed_date_max_bytes: Arc<AtomicU64>,
+    upload_merge_max_input_bytes: Arc<AtomicU64>,
+    upload_signal: Arc<UploadSignal>,
 }
 
 impl StorageEngine {
@@ -2437,8 +3405,18 @@ impl StorageEngine {
             wrapped_store.clone(),
             identity_router.is_read_only(),
         ));
+        let local_segment_tier = Arc::new(AtomicBool::new(is_hot_routed_store(
+            encrypted_store.raw_inner().as_ref(),
+        )));
         let upload_interval_ms =
             Arc::new(AtomicU64::new(upload_interval_from_env().as_millis() as u64));
+        let closed_date_upload_ms = Arc::new(AtomicU64::new(
+            closed_date_upload_interval_from_env().as_millis() as u64,
+        ));
+        let closed_date_max_bytes = Arc::new(AtomicU64::new(closed_date_max_bytes_from_env()));
+        let upload_merge_max_input_bytes =
+            Arc::new(AtomicU64::new(upload_merge_max_input_bytes_from_env()));
+        let upload_signal = Arc::new(UploadSignal::default());
         Arc::new(Self {
             maintenance_errors: MaintenanceErrors::default(),
             config,
@@ -2454,7 +3432,12 @@ impl StorageEngine {
             open_lock: AsyncMutex::new(()),
             writer_leases: OnceLock::new(),
             node_load: NodeLoad::from_env(),
+            local_segment_tier,
             upload_interval_ms,
+            closed_date_upload_ms,
+            closed_date_max_bytes,
+            upload_merge_max_input_bytes,
+            upload_signal,
         })
     }
 
@@ -2490,6 +3473,34 @@ impl StorageEngine {
     pub fn set_upload_interval(&self, interval: Duration) {
         self.upload_interval_ms
             .store(interval.as_millis() as u64, Ordering::Release);
+    }
+
+    pub fn is_local_segment_tier(&self) -> bool {
+        self.local_segment_tier.load(Ordering::Acquire)
+    }
+
+    /// Overrides whether L0 flushes write to local `hot/segments/` (defaults to `true` when `HotRouted` is active).
+    pub fn set_local_segment_tier(&self, enabled: bool) {
+        self.local_segment_tier.store(enabled, Ordering::Release);
+    }
+
+    /// Overrides closed-date upload policy (`PULSE_CLOSED_DATE_UPLOAD_SECS`, `PULSE_CLOSED_DATE_MAX_BYTES`).
+    pub fn set_closed_date_upload_policy(&self, interval: Duration, max_bytes: u64) {
+        self.closed_date_upload_ms
+            .store(interval.as_millis() as u64, Ordering::Release);
+        self.closed_date_max_bytes
+            .store(max_bytes.max(1), Ordering::Release);
+    }
+
+    /// Overrides the per-partition input-byte cap for Step 4 upload merging (`PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES`).
+    pub fn set_upload_merge_max_input_bytes(&self, max_bytes: u64) {
+        self.upload_merge_max_input_bytes
+            .store(max_bytes.max(1), Ordering::Release);
+    }
+
+    /// Returns a future woken when `1x` `hot/segments/` bounds or closed-date `> 4 MiB` requests an early upload.
+    pub fn upload_requested(&self) -> tokio::sync::futures::Notified<'_> {
+        self.upload_signal.notified()
     }
 
     pub fn profile_router(&self) -> &Arc<crate::ProfileRouter> {
@@ -2590,7 +3601,12 @@ impl StorageEngine {
             self.query_snapshot_store.get().cloned(),
             lease,
             self.node_load.clone(),
+            self.local_segment_tier.clone(),
             self.upload_interval_ms.clone(),
+            self.closed_date_upload_ms.clone(),
+            self.closed_date_max_bytes.clone(),
+            self.upload_merge_max_input_bytes.clone(),
+            self.upload_signal.clone(),
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
@@ -2615,6 +3631,22 @@ impl StorageEngine {
     /// Bytes of event rows this node holds in L0.
     pub fn l0_bytes(&self) -> usize {
         self.node_load.l0_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Overrides the `1x` `hot/segments/` byte bounds read from the environment: `(per project, per node)`.
+    /// Reaching `1x` triggers an immediate upload cycle; reaching `2x` returns `HotSegmentBackpressure` (`429`).
+    pub fn set_hot_segment_byte_limits(&self, project_1x: u64, node_1x: u64) {
+        self.node_load
+            .hot_seg_max_project
+            .store(project_1x, Ordering::Relaxed);
+        self.node_load
+            .hot_seg_max_node
+            .store(node_1x, Ordering::Relaxed);
+    }
+
+    /// Bytes of local `hot/segments/` files across all open projects on this node.
+    pub fn hot_segment_bytes(&self) -> u64 {
+        self.node_load.hot_segment_bytes.load(Ordering::Relaxed)
     }
 
     /// Sets a project's erasure tombstones without opening its storage; applied on open.
@@ -2798,24 +3830,53 @@ impl StorageEngine {
         Ok(total)
     }
 
-    /// Publishes all open dirty projects to S3 `published/` (0 S3 calls for idle projects).
+    /// Uploads eligible local segments and publishes all open dirty projects to S3 `published/`
+    /// (0 S3 calls for idle projects or projects holding only deferred closed-date segments).
     pub async fn publish_all_projects(&self) -> Result<usize> {
+        self.upload_all_projects_at(Utc::now().timestamp_millis())
+            .await
+    }
+
+    /// Time-parameterized upload + publish across all open projects.
+    pub async fn upload_all_projects_at(&self, now_ms: i64) -> Result<usize> {
+        self.upload_signal
+            .in_progress
+            .store(true, Ordering::Release);
+        let _guard = UploadInProgressGuard(&self.upload_signal);
+
+        let node_bytes = self.hot_segment_bytes();
+        let node_1x = self.node_load.hot_seg_max_node.load(Ordering::Relaxed);
+        let proj_1x = self.node_load.hot_seg_max_project.load(Ordering::Relaxed);
+        let node_over_1x = node_bytes >= node_1x;
+
         let mut published = 0usize;
+        let mut first_err: Option<StorageError> = None;
         for p in self.open_projects() {
-            match p.publish_if_dirty().await {
+            let force_closed = node_over_1x || p.hot_segment_bytes() >= proj_1x;
+            match p.upload_if_dirty_at(now_ms, force_closed).await {
                 Ok(Some(_)) => published += 1,
                 Ok(None) => {}
                 Err(StorageError::NotWriter { .. }) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
+        if let Some(err) = first_err {
+            self.upload_signal.mark_failure();
+            return Err(err);
+        }
+        self.upload_signal.mark_success();
         Ok(published)
     }
 
-    /// Runs deferred S3 deletion grace cleanup across all open projects (0 S3 calls if empty or in grace).
+    /// Runs deferred S3 deletion grace cleanup and unpinned local segment drains across all open projects.
     pub async fn run_gc_all_projects(&self) -> Result<usize> {
         let mut deleted = 0usize;
         for p in self.open_projects() {
+            deleted += p.drain_pending_local_deletes().await;
             deleted += p.run_gc().await?;
         }
         Ok(deleted)
@@ -2832,7 +3893,7 @@ impl StorageEngine {
         Ok(refreshed)
     }
 
-    /// Spawns background L0 age-based flusher, late-data compactor, GC drain, and periodic publish loop.
+    /// Spawns background L0 age-based flusher, late-data compactor, GC drain, and periodic upload/publish loop.
     pub fn spawn_background_maintenance(
         self: &Arc<Self>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -2860,6 +3921,7 @@ impl StorageEngine {
                                 MaintenanceKind::Compaction,
                                 p.compact_overdue(&engine.segment_reader).await,
                             );
+                            p.drain_pending_local_deletes().await;
                             errs.check(MaintenanceKind::Compaction, p.run_gc().await);
                         }
                     }
@@ -2869,6 +3931,11 @@ impl StorageEngine {
                             None => std::future::pending().await,
                         }
                     } => {
+                        engine
+                            .maintenance_errors
+                            .check(MaintenanceKind::Publish, engine.publish_all_projects().await);
+                    }
+                    _ = engine.upload_requested() => {
                         engine
                             .maintenance_errors
                             .check(MaintenanceKind::Publish, engine.publish_all_projects().await);
@@ -3825,5 +4892,565 @@ mod manifest_retention_tests {
                 "retry against pub_2 must recompute restore_identity=true and load u_new_id"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod t3_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutResult, Result as OsResult,
+    };
+    use std::fmt::{Display, Formatter};
+    use std::ops::Range;
+
+    #[derive(Debug, Default)]
+    struct CountingMemStore {
+        inner: InMemory,
+        calls: Mutex<BTreeMap<(String, &'static str), u64>>,
+        fail_get_prefix: Mutex<Option<String>>,
+        fail_put_substring: Mutex<Option<String>>,
+    }
+
+    impl CountingMemStore {
+        fn count(&self, op: &'static str, p: Option<&ObjectPath>) {
+            let prefix = p
+                .and_then(|p| p.parts().next())
+                .map_or("(root)".to_string(), |s| s.as_ref().to_string());
+            *self.calls.lock().entry((prefix, op)).or_default() += 1;
+        }
+
+        fn take(&self) -> BTreeMap<(String, &'static str), u64> {
+            std::mem::take(&mut *self.calls.lock())
+        }
+
+        fn sum_prefix(
+            calls: &BTreeMap<(String, &'static str), u64>,
+            prefix: &str,
+            op: &str,
+        ) -> u64 {
+            calls
+                .iter()
+                .filter(|((p, o), _)| p == prefix && *o == op)
+                .map(|(_, n)| *n)
+                .sum()
+        }
+    }
+
+    impl Display for CountingMemStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingMemStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingMemStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.count("PUT", Some(l));
+            if let Some(ref sub) = *self.fail_put_substring.lock() {
+                if l.as_ref().contains(sub.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "CountingMemStore",
+                        source: Box::new(std::io::Error::other(format!(
+                            "injected PUT failure on {l}"
+                        ))),
+                    });
+                }
+            }
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.count("PUT", Some(l));
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+            self.count("GET", Some(l));
+            if let Some(ref pref) = *self.fail_get_prefix.lock() {
+                if l.as_ref().starts_with(pref.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "CountingMemStore",
+                        source: Box::new(std::io::Error::other("injected S3 read failure")),
+                    });
+                }
+            }
+            self.inner.get_opts(l, o).await
+        }
+        async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
+            self.count("GET", Some(l));
+            if let Some(ref pref) = *self.fail_get_prefix.lock() {
+                if l.as_ref().starts_with(pref.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "CountingMemStore",
+                        source: Box::new(std::io::Error::other("injected S3 get_range failure")),
+                    });
+                }
+            }
+            self.inner.get_range(l, r).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+            self.count("DELETE", Some(l));
+            self.inner.delete(l).await
+        }
+        fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.count("LIST", p);
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.count("LIST", p);
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.count("PUT", Some(to));
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.count("PUT", Some(to));
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn mk_event(did: &str, ts_ms: i64, seq: u64) -> WireEvent {
+        WireEvent {
+            event_uuid: WireEvent::deterministic_uuid(did, "s1", "click", ts_ms, seq),
+            routing_seed: did.into(),
+            distinct_id: did.into(),
+            session_id: "s1".into(),
+            event_name: "click".into(),
+            client_event_ts_ms: ts_ms,
+            client_sent_ts_ms: 0,
+            props: vec![("k".into(), PropValue::Str(format!("val_{seq}")))],
+            replay_offset_kb: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_64mib_merge_cap_splits_batches_and_allows_single_oversize_segment() {
+        assert_eq!(DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES, 64 * 1024 * 1024);
+        let store = Arc::new(CountingMemStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store)),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+
+        let ps = engine.get_or_open_project("p_cap").await.unwrap();
+        let ig = engine.identity_graph("p_cap", true).await.unwrap();
+        let uid = ig.get_or_intern("u0", 0);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut sizes = Vec::new();
+        for w in 0..3u64 {
+            let mut batch = Vec::new();
+            for i in 0..40u64 {
+                batch.push((
+                    mk_event("u0", now_ms + (w * 100 + i) as i64, w * 100 + i),
+                    uid,
+                ));
+            }
+            ps.append_bucket_events(0, batch).await.unwrap();
+            let segs = ps.flush_bucket(0).await.unwrap();
+            assert_eq!(segs.len(), 1);
+            assert!(segs[0].object_path.starts_with("hot/segments/"));
+            sizes.push(segs[0].file_size);
+        }
+
+        // Cap just above one segment's size so 3 segments split into at least 2 S3 output segments.
+        let cap = sizes.iter().copied().max().unwrap() + 1;
+        engine.set_upload_merge_max_input_bytes(cap);
+
+        store.take();
+        let pub0 = ps
+            .upload_if_dirty_at(now_ms, false)
+            .await
+            .unwrap()
+            .expect("must upload today's segments");
+        let calls = store.take();
+        assert_eq!(
+            CountingMemStore::sum_prefix(&calls, "segments", "GET"),
+            0,
+            "Step 4 must never read existing S3 segments/"
+        );
+        assert_eq!(CountingMemStore::sum_prefix(&calls, "segments", "LIST"), 0);
+        let s3_segs: Vec<_> = pub0
+            .partitions
+            .iter()
+            .flat_map(|p| p.segments.iter())
+            .collect();
+        assert!(
+            s3_segs.len() >= 2,
+            "expected >=2 split S3 segments under cap={cap}, got {} (sizes={sizes:?})",
+            s3_segs.len()
+        );
+        assert_eq!(ps.snapshot().manifest.total_l1_rows(), 120);
+        assert_eq!(ps.hot_segment_bytes(), 0);
+
+        // Single local segment larger than cap must still make forward progress as 1 S3 segment.
+        let mut big_batch = Vec::new();
+        for i in 0..60u64 {
+            big_batch.push((mk_event("u0", now_ms + 10_000 + i as i64, 10_000 + i), uid));
+        }
+        ps.append_bucket_events(0, big_batch).await.unwrap();
+        let big_seg = ps.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert!(big_seg.file_size > 256);
+        engine.set_upload_merge_max_input_bytes(256);
+        let pub1 = ps
+            .upload_if_dirty_at(now_ms + 1_000, false)
+            .await
+            .unwrap()
+            .expect("oversize single segment must upload");
+        assert_eq!(pub1.publish_seq, 1);
+        assert_eq!(ps.snapshot().manifest.total_l1_rows(), 180);
+    }
+
+    #[tokio::test]
+    async fn closed_date_1h_timer_4mib_threshold_empty_erasure_and_zero_idle_s3() {
+        let store = Arc::new(CountingMemStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store)),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+
+        let ps = engine.get_or_open_project("p_closed").await.unwrap();
+        let ig = engine.identity_graph("p_closed", true).await.unwrap();
+        let uid = ig.get_or_intern("u0", 0);
+
+        // Publish initial pub_0 with today's event so identity snapshot is already clean.
+        let now_ms = Utc::now().timestamp_millis();
+        ps.append_bucket_events(0, vec![(mk_event("u0", now_ms, 1), uid)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+        let pub0 = ps.upload_if_dirty_at(now_ms, false).await.unwrap().unwrap();
+        assert_eq!(pub0.publish_seq, 0);
+
+        // Idle upload makes 0 S3 calls.
+        store.take();
+        assert!(ps
+            .upload_if_dirty_at(now_ms + 10_000, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.take().values().sum::<u64>(), 0);
+
+        // Flush a late event for a closed date (`now_ms - 2 days`) for existing user `u0`.
+        let old_ts = now_ms - 2 * 86_400_000;
+        ps.append_bucket_events(0, vec![(mk_event("u0", old_ts, 2), uid)])
+            .await
+            .unwrap();
+        let closed_seg = ps.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert!(closed_seg.object_path.starts_with("hot/segments/"));
+        let t_flush = Utc::now().timestamp_millis();
+
+        // Before 1h (and <= 4 MiB): deferred closed-date segment MUST make 0 S3 calls and NOT dirty S3 state!
+        store.take();
+        assert!(ps
+            .upload_if_dirty_at(t_flush + 3_599_000, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.take().values().sum::<u64>(),
+            0,
+            "deferred closed-date segment must not trigger S3 calls before 1h"
+        );
+
+        // At +1h (3_600_000 ms): uploads cleanly.
+        let pub1 = ps
+            .upload_if_dirty_at(t_flush + 3_600_000, false)
+            .await
+            .unwrap()
+            .expect("1h timer must upload closed-date segment");
+        assert_eq!(pub1.publish_seq, 1);
+        assert_eq!(ps.hot_segment_bytes(), 0);
+
+        // Now test > closed_date_max_bytes threshold AND empty-after-erasure batch handling.
+        engine.set_closed_date_upload_policy(Duration::from_secs(3600), 100);
+        ps.append_bucket_events(0, vec![(mk_event("u0", old_ts + 1_000, 3), uid)])
+            .await
+            .unwrap();
+        ps.flush_bucket(0).await.unwrap();
+
+        // Erase uid up to old_ts + 2000 so the frozen batch produces 0 rows!
+        let mut erased = ErasedUids::default();
+        erased.insert(uid, old_ts + 2_000);
+        engine.set_erased("p_closed", erased);
+
+        let pub2 = ps
+            .upload_if_dirty_at(now_ms + 3_601_000, false)
+            .await
+            .unwrap()
+            .expect("closed date > max_bytes must upload immediately");
+        assert_eq!(pub2.publish_seq, 2);
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        // The fully-erased closed-date segment was dropped without writing an empty S3 segment.
+        assert_eq!(
+            ps.snapshot()
+                .manifest
+                .active_segments
+                .get(&(date_from_ms(old_ts), 0))
+                .map_or(0, |v| v.len()),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_local_segment_defers_delete_and_dedup_seeding_propagates_s3_errors() {
+        let store = Arc::new(CountingMemStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+
+        let ps = engine.get_or_open_project("p_pin").await.unwrap();
+        let ig = engine.identity_graph("p_pin", true).await.unwrap();
+        let uid = ig.get_or_intern("u0", 0);
+
+        let now_ms = Utc::now().timestamp_millis();
+        let ev1 = mk_event("u0", now_ms, 10);
+        let fp1 = event_uuid_fingerprint(&ev1.event_uuid);
+        ps.append_bucket_events(0, vec![(ev1, uid)]).await.unwrap();
+        let seg1 = ps.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert!(seg1.object_path.starts_with("hot/segments/"));
+
+        // Hold StorageSnapshot pinning seg1 across upload cycle.
+        let pinned_snap = ps.snapshot();
+        let pub0 = ps.upload_if_dirty_at(now_ms, false).await.unwrap().unwrap();
+        assert!(
+            pub0.partitions
+                .iter()
+                .flat_map(|p| p.segments.iter())
+                .all(|s| !s.object_path.starts_with("hot/")),
+            "PublishedManifest must never include hot/ paths"
+        );
+        assert!(
+            dyn_store
+                .head(&ObjectPath::from(seg1.object_path.as_str()))
+                .await
+                .is_ok(),
+            "pinned local segment must stay on disk while StorageSnapshot is held"
+        );
+        assert!(ps.hot_segment_bytes() > 0);
+
+        // Drop StorageSnapshot -> drain deletes local segment and zeroes hot_segment_bytes.
+        drop(pinned_snap);
+        assert_eq!(ps.drain_pending_local_deletes().await, 1);
+        assert!(dyn_store
+            .head(&ObjectPath::from(seg1.object_path.as_str()))
+            .await
+            .is_err());
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+
+        ig.close().await.unwrap();
+        drop(ps);
+        drop(engine);
+
+        // Inject S3 read failure on `segments/` during reopen dedup seeding (`engine.rs:815` fix).
+        *store.fail_get_prefix.lock() = Some("segments/".to_string());
+        let engine_fail = StorageEngine::new(
+            cfg.clone(),
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        let err = match engine_fail.get_or_open_project("p_pin").await {
+            Ok(_) => panic!("dedup seeding must propagate S3 segment read error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StorageError::ObjectStore(_)), "{err}");
+        assert!(
+            engine_fail.get_project("p_pin").is_none(),
+            "failed open must not cache project with empty dedup"
+        );
+
+        // Clear fault -> reopen succeeds and recovers fp1.
+        *store.fail_get_prefix.lock() = None;
+        let ps_ok = engine_fail.get_or_open_project("p_pin").await.unwrap();
+        let recovered = ps_ok.take_recovered_uuid_fps();
+        assert!(
+            recovered.contains(&(0, fp1)),
+            "reopen after S3 recovery must seed fp1 into dedup"
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_segment_byte_bounds_backpressure_and_drop_accounting() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(cfg, store.clone(), Arc::new(IdentityRouter::new(store)));
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_hot_segment_byte_limits(100, 10_000_000);
+
+        let ps_a = engine.get_or_open_project("p_a").await.unwrap();
+        let ps_b = engine.get_or_open_project("p_b").await.unwrap();
+        let ig_a = engine.identity_graph("p_a", true).await.unwrap();
+        let ua = ig_a.get_or_intern("ua", 0);
+        let now_ms = Utc::now().timestamp_millis();
+
+        ps_a.append_bucket_events(0, vec![(mk_event("ua", now_ms, 1), ua)])
+            .await
+            .unwrap();
+        let seg_a = ps_a.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert_eq!(ps_a.hot_segment_bytes(), seg_a.file_size);
+        assert_eq!(engine.hot_segment_bytes(), seg_a.file_size);
+        assert!(seg_a.file_size >= 200);
+
+        // Project A exceeds 2x (200 bytes) -> HotSegmentBackpressure; Project B stays Ok.
+        assert!(matches!(
+            ps_a.check_hot_segment_backpressure(),
+            Err(StorageError::HotSegmentBackpressure { .. })
+        ));
+        assert!(ps_b.check_hot_segment_backpressure().is_ok());
+
+        // Dropping engine / ProjectStorage subtracts remaining bytes cleanly.
+        let bytes_before = engine.hot_segment_bytes();
+        assert!(bytes_before > 0);
+        engine.projects.remove("p_a");
+        drop(ps_a);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_step5_to_step6_transient_failure_recovery_without_restart() {
+        let store = Arc::new(CountingMemStore::default());
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(3600),
+            compaction_min_segments: 2,
+        };
+        let engine = StorageEngine::new(
+            cfg,
+            dyn_store.clone(),
+            Arc::new(IdentityRouter::new(dyn_store.clone())),
+        );
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_hot_segment_byte_limits(100, 100_000_000);
+
+        let pid = "p_live_step6";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let ig = engine.identity_graph(pid, true).await.unwrap();
+        let uid = ig.get_or_intern("u0", 0);
+        let now_ms = Utc::now().timestamp_millis();
+
+        ps.append_bucket_events(0, vec![(mk_event("u0", now_ms, 1), uid)])
+            .await
+            .unwrap();
+        let seg = ps.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert!(seg.object_path.starts_with("hot/segments/"));
+        assert!(seg.file_size >= 200);
+        assert!(matches!(
+            ps.check_hot_segment_backpressure(),
+            Err(StorageError::HotSegmentBackpressure { .. })
+        ));
+
+        // Fail Step 6 (`published/{pid}/pub_000000000000.json` PUT) after Step 5 local manifest commit.
+        *store.fail_put_substring.lock() = Some("/pub_000000000000.json".to_string());
+        let err = ps
+            .upload_if_dirty_at(now_ms, false)
+            .await
+            .expect_err("Step 6 PUT failure must surface error");
+        assert!(matches!(err, StorageError::ObjectStore(_)), "{err}");
+        assert_eq!(ps.last_published_seq(), None);
+
+        // Recover S3 WITHOUT restarting ProjectStorage / StorageEngine and retry upload_if_dirty_at.
+        *store.fail_put_substring.lock() = None;
+        let pub0 = ps
+            .upload_if_dirty_at(now_ms + 5_000, false)
+            .await
+            .unwrap()
+            .expect("retry after S3 recovery must publish pub_0");
+        assert_eq!(pub0.publish_seq, 0);
+        assert_eq!(ps.last_published_seq(), Some(0));
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+        assert!(ps.check_hot_segment_backpressure().is_ok());
+        let leftovers: Vec<_> = dyn_store
+            .list(Some(&ObjectPath::from(format!("hot/segments/{pid}"))))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(leftovers.is_empty(), "leftover hot/segments: {leftovers:?}");
+
+        // Also test post-Step-6 local manifest commit failure followed by live retry (no restart).
+        ps.append_bucket_events(0, vec![(mk_event("u0", now_ms + 6_000, 2), uid)])
+            .await
+            .unwrap();
+        let seg2 = ps.flush_bucket(0).await.unwrap().pop().unwrap();
+        assert!(seg2.file_size >= 200);
+
+        let cur_epoch = ps.snapshot().manifest.epoch;
+        let post_step6_epoch = cur_epoch + 2; // Step 5 commits cur_epoch+1; post_step6 commits cur_epoch+2.
+        *store.fail_put_substring.lock() = Some(format!("epoch_{post_step6_epoch:012}.json"));
+        let err2 = ps
+            .upload_if_dirty_at(now_ms + 10_000, false)
+            .await
+            .expect_err("post-Step-6 manifest commit failure must surface error");
+        assert!(matches!(err2, StorageError::ObjectStore(_)), "{err2}");
+        assert_eq!(ps.last_published_seq(), Some(1));
+
+        *store.fail_put_substring.lock() = None;
+        let _ = ps.upload_if_dirty_at(now_ms + 15_000, false).await.unwrap();
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+        assert!(ps.check_hot_segment_backpressure().is_ok());
+        let leftovers2: Vec<_> = dyn_store
+            .list(Some(&ObjectPath::from(format!("hot/segments/{pid}"))))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            leftovers2.is_empty(),
+            "leftover hot/segments: {leftovers2:?}"
+        );
     }
 }

@@ -486,6 +486,91 @@ fn parse_pub_seq_from_filename(fname: &str) -> Option<u64> {
     body.parse::<u64>().ok()
 }
 
+/// One per-partition merged S3 output segment planned in Step 1 of the upload cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadIntentBatch {
+    pub date: NaiveDate,
+    pub bucket_id: u8,
+    pub source_segment_ids: Vec<String>,
+    pub source_object_paths: Vec<String>,
+    pub target_segment_id: String,
+    pub target_object_path: String,
+}
+
+/// Local intent record written at Step 1 of the upload cycle (`manifests/{project_id}/upload_intent.json`).
+///
+/// Tracks pre-assigned S3 segment and snapshot paths before any S3 PUT occurs so crash recovery
+/// on open (or retry) can delete orphaned S3 objects and sweep unreferenced local `hot/segments/`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadIntent {
+    pub intent_id: String,
+    pub writer_generation: u64,
+    pub base_local_epoch: u64,
+    pub target_publish_seq: u64,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub batches: Vec<UploadIntentBatch>,
+    #[serde(default)]
+    pub new_identity_snapshot_path: Option<String>,
+    #[serde(default)]
+    pub new_profile_snapshot_path: Option<String>,
+}
+
+/// Durable local store for `manifests/{project_id}/upload_intent.json` (excluded from `ManifestStore::list_epochs`).
+pub struct UploadIntentStore {
+    project_id: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl UploadIntentStore {
+    pub fn new(project_id: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            object_store,
+        }
+    }
+
+    pub fn path(&self) -> ObjectPath {
+        ObjectPath::from(format!("manifests/{}/upload_intent.json", self.project_id))
+    }
+
+    pub async fn load(&self) -> Result<Option<UploadIntent>> {
+        let path = self.path();
+        match self.object_store.get(&path).await {
+            Ok(res) => {
+                let bytes = res.bytes().await?;
+                Ok(Some(decode_json_zstd(&bytes)?))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(StorageError::ObjectStore(e)),
+        }
+    }
+
+    pub async fn save(&self, intent: &UploadIntent) -> Result<()> {
+        let path = self.path();
+        let payload = encode_json_zstd(intent)?;
+        self.object_store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from(payload)),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear(&self) -> Result<()> {
+        let path = self.path();
+        match self.object_store.delete(&path).await {
+            Ok(()) | Err(OsError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StorageError::ObjectStore(e)),
+        }
+    }
+}
+
 /// Installs `pub_m` into `manifests/{project_id}/` for `restore --from-published`.
 ///
 /// When `manifests/{project_id}/` already contains epochs (e.g., T1 with S3 `manifests/`), commits

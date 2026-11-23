@@ -744,6 +744,11 @@ pub async fn start_pulse_node_with_store(
                             .maintenance_errors()
                             .check(MaintenanceKind::Publish, bg_storage.publish_all_projects().await);
                     }
+                    _ = bg_storage.upload_requested(), if role == NodeRole::Ingest => {
+                        bg_storage
+                            .maintenance_errors()
+                            .check(MaintenanceKind::Publish, bg_storage.publish_all_projects().await);
+                    }
                     changed = shutdown_bg_rx.changed() => {
                         if changed.is_err() || *shutdown_bg_rx.borrow() {
                             break;
@@ -1013,8 +1018,16 @@ async fn restore_from_published_inner(
             continue;
         };
 
-        // Clear any stale local WAL from an earlier partial volume before restoring.
+        // Clear any stale local WAL, hot segments, and upload intent from an earlier partial volume before restoring.
         pulse_storage::delete_objects_with_prefix(&enc_store, &format!("wal/{project_id}")).await?;
+        pulse_storage::delete_objects_with_prefix(
+            &enc_store,
+            &format!("hot/segments/{project_id}"),
+        )
+        .await?;
+        pulse_storage::UploadIntentStore::new(&project_id, enc_store.clone())
+            .clear()
+            .await?;
 
         let restored =
             pulse_storage::restore_project_from_published(&project_id, &pub_m, enc_store.clone())
@@ -1724,6 +1737,8 @@ mod tests {
             num_buckets: 1,
         };
         let ingest_node = start_pulse_node(cfg(NodeRole::Ingest)).await.unwrap();
+        // Count-based compaction on S3 segments is active when PULSE_UPLOAD_INTERVAL_SECS=0.
+        ingest_node.storage.set_upload_interval(Duration::ZERO);
         let key = ingest_node
             .bootstrap_credentials
             .generated_ingest_key
@@ -1755,6 +1770,7 @@ mod tests {
         assert_eq!(ps.snapshot().manifest.total_segments(), 4);
 
         let compactor = start_pulse_node(cfg(NodeRole::Compactor)).await.unwrap();
+        compactor.storage.set_upload_interval(Duration::ZERO);
         let mut segments = 4;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(500)).await;
