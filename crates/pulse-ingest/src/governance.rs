@@ -62,9 +62,10 @@ pub trait GovernanceProvider: Send + Sync {
         &self,
         _project_id: &str,
         _distinct_id: &str,
-        _canonical_uid: u32,
+        canonical_uid: u32,
         _ops: &serde_json::Value,
-    ) {
+    ) -> crate::Result<u32> {
+        Ok(canonical_uid)
     }
 
     /// Called after `anon_id` is merged into `user_id` so profile stores can follow the merge.
@@ -73,8 +74,9 @@ pub trait GovernanceProvider: Send + Sync {
         _project_id: &str,
         _anon_id: &str,
         _user_id: &str,
-        _canonical_uid: u32,
-    ) {
+        canonical_uid: u32,
+    ) -> crate::Result<u32> {
+        Ok(canonical_uid)
     }
 
     /// Applies Group Analytics profile operations from `/v1/groups` (`Gap 8`).
@@ -84,7 +86,8 @@ pub trait GovernanceProvider: Send + Sync {
         _group_type: &str,
         _group_id: &str,
         _ops: &serde_json::Value,
-    ) {
+    ) -> crate::Result<()> {
+        Ok(())
     }
 }
 

@@ -149,17 +149,37 @@ IDENTIFY_RES="$(curl -fsS -X POST "${BASE_URL}/v1/identify" \
   -H "x-pulse-key: ${API_KEY}" \
   -d '{"anon_id":"anon_e2e_verify_01","user_id":"+919899900001","routing_seed":"dev_e2e_verify_01"}')"
 
+ENGAGE_RES="$(curl -fsS -X POST "${BASE_URL}/v1/engage" \
+  -H "Content-Type: application/json" \
+  -H "x-pulse-key: ${API_KEY}" \
+  -d '{"distinct_id":"+919899900001","$set":{"plan":"e2e_pro"}}')"
+
+USER_DETAIL_RES="$(curl -fsS -H "${AUTH_HDR}" \
+  "${BASE_URL}/v1/projects/${PROJECT_ID}/users/%2B919899900001")"
+
 METRICS_TEXT="$(curl -fsS "${BASE_URL}/metrics")"
 
-python3 - "$INGEST_1" "$INGEST_2" "$IDENTIFY_RES" "$METRICS_TEXT" <<'PY'
+python3 - "$INGEST_1" "$INGEST_2" "$IDENTIFY_RES" "$ENGAGE_RES" "$USER_DETAIL_RES" "$METRICS_TEXT" <<'PY'
 import json, re, sys
-r1, r2, ident, metrics = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4]
+r1, r2, ident, eng, detail, metrics = (
+    json.loads(sys.argv[1]),
+    json.loads(sys.argv[2]),
+    json.loads(sys.argv[3]),
+    json.loads(sys.argv[4]),
+    json.loads(sys.argv[5]),
+    sys.argv[6],
+)
 assert r1["accepted"] == 2 and r1["deduped"] == 0, f"expected 2 accepted on first send, got {r1}"
 assert r2["accepted"] == 2 and r2["deduped"] == 0, f"expected W1 async ack (accepted=2, deduped=0) on retry, got {r2}"
 m = re.search(r"^pulse_ingest_events_deduped_total\s+(\d+(?:\.\d+)?)$", metrics, re.M)
 assert m and float(m.group(1)) >= 2, f"expected pulse_ingest_events_deduped_total >= 2 in /metrics:\n{metrics}"
 assert ident["status"] == "ok" and int(ident["canonical_uid"]) >= 0, f"identify failed: {ident}"
-print(f"      ✓ First batch accepted=2, W1 retry acked with deduped=0 (metrics deduped_total={m.group(1)}), identify canonical_uid={ident['canonical_uid']}")
+uid = int(ident["canonical_uid"])
+assert eng["status"] == "ok" and int(eng["updated"]) == 1, f"engage failed: {eng}"
+assert int(eng["canonical_uid"]) == uid and eng["canonical_uids"] == [uid], f"engage canonical_uid mismatch: {eng} vs {uid}"
+assert int(detail["canonical_uid"]) == uid, f"user detail canonical_uid mismatch: {detail}"
+assert detail["profile"]["props"]["plan"] == "e2e_pro", f"engage profile not immediately readable: {detail}"
+print(f"      ✓ First batch accepted=2, W1 retry acked with deduped=0 (metrics deduped_total={m.group(1)}), identify/engage canonical_uid={uid} + immediate read-back")
 PY
 
 # 3. Verify POST /v1/query across all 4 core report types (Insights, Funnel, Retention, Flows)

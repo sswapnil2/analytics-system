@@ -30,23 +30,48 @@ pub enum IdentityError {
     Closed,
 }
 
+fn is_slatedb_unavailable(e: &SlateDBError) -> bool {
+    match e {
+        SlateDBError::IoError(_)
+        | SlateDBError::ObjectStoreError(_)
+        | SlateDBError::Fenced
+        | SlateDBError::ManifestVersionExists
+        | SlateDBError::WalFlushChannelError
+        | SlateDBError::MemtableFlushChannelError
+        | SlateDBError::CheckpointChannelError
+        | SlateDBError::ReadChannelError(_)
+        | SlateDBError::BackgroundTaskShutdown => true,
+        SlateDBError::BackgroundTaskPanic(payload) => {
+            let msg = payload
+                .lock()
+                .ok()
+                .and_then(|b| {
+                    b.downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| b.downcast_ref::<&'static str>().copied())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            msg.contains("Fenced")
+                || msg.contains("ObjectStoreError")
+                || msg.contains("IoError")
+                || msg.contains("ManifestVersionExists")
+                || msg.contains("WalFlushChannelError")
+                || msg.contains("MemtableFlushChannelError")
+                || msg.contains("CheckpointChannelError")
+                || msg.contains("ReadChannelError")
+                || msg.contains("BackgroundTaskShutdown")
+        }
+        SlateDBError::InvalidatedIterator(inner) => is_slatedb_unavailable(inner),
+        _ => false,
+    }
+}
+
 impl IdentityError {
     /// Returns `true` when the underlying SlateDB store failed due to I/O, object-store
     /// unavailability, or writer fencing (transient/storage-unavailable -> HTTP 503).
     pub fn is_store_unavailable(&self) -> bool {
-        matches!(
-            self,
-            Self::SlateDb(
-                SlateDBError::IoError(_)
-                    | SlateDBError::ObjectStoreError(_)
-                    | SlateDBError::Fenced
-                    | SlateDBError::WalFlushChannelError
-                    | SlateDBError::MemtableFlushChannelError
-                    | SlateDBError::CheckpointChannelError
-                    | SlateDBError::ReadChannelError(_)
-                    | SlateDBError::BackgroundTaskShutdown
-            )
-        )
+        matches!(self, Self::SlateDb(e) if is_slatedb_unavailable(e))
     }
 }
 
@@ -1791,8 +1816,36 @@ mod tests {
         )));
         assert!(os_err.is_store_unavailable());
         assert!(IdentityError::SlateDb(SlateDBError::Fenced).is_store_unavailable());
+        assert!(IdentityError::SlateDb(SlateDBError::ManifestVersionExists).is_store_unavailable());
         assert!(IdentityError::SlateDb(SlateDBError::WalFlushChannelError).is_store_unavailable());
         assert!(IdentityError::SlateDb(SlateDBError::BackgroundTaskShutdown).is_store_unavailable());
+        assert!(
+            IdentityError::SlateDb(SlateDBError::InvalidatedIterator(Box::new(
+                SlateDBError::Fenced
+            )))
+            .is_store_unavailable()
+        );
+        assert!(
+            !IdentityError::SlateDb(SlateDBError::InvalidatedIterator(Box::new(
+                SlateDBError::InvalidDBState
+            )))
+            .is_store_unavailable()
+        );
+
+        assert!(
+            IdentityError::SlateDb(SlateDBError::BackgroundTaskPanic(Arc::new(
+                std::sync::Mutex::new(Box::new("fatal error loading manifest: Fenced".to_string()))
+            )))
+            .is_store_unavailable()
+        );
+        assert!(
+            !IdentityError::SlateDb(SlateDBError::BackgroundTaskPanic(Arc::new(
+                std::sync::Mutex::new(Box::new(
+                    "fatal error loading manifest: InvalidDBState".to_string()
+                ))
+            )))
+            .is_store_unavailable()
+        );
 
         assert!(!IdentityError::IdentifiedMergeConflict.is_store_unavailable());
         assert!(!IdentityError::CorruptedRecord("bad").is_store_unavailable());

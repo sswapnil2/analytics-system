@@ -22,6 +22,7 @@ Every architecture page was written from the source on `main`, not from older do
 | Unknown ingest key / ingest key on an admin route / 9 MiB body | `401` / `403` / `413` |
 | Insights query from the Integrations page; `sampling` set to `"exact"`, `"auto"`, `{"rate":0.25}` | Returns series and a `sampling` object |
 | `/v1/identify` merging two identified users | `409` with the documented message |
+| `/v1/engage`, `/v1/identify`, `/v1/groups`, `/v1/replay/chunk` (W2 sync durability) | `/v1/identify` and `/v1/engage` flush identity before writing profiles, return `canonical_uid` (`canonical_uids` on batches), read back immediately on the next request, survive `SIGKILL`, and return `503` on `ProfileStore` / `hot/profiles/` unavailability |
 | `DELETE /v1/projects/:id/users/:distinct_id`, then `GET …/deletions` | Erasure recorded with `events_purged` |
 | `/metrics` | `pulse_ingest_events_*`, `pulse_writer_*`, `pulse_wal_bytes`, `pulse_ingest_apply_*`, `pulse_l0_rows`, `pulse_ready` present |
 | MCP `tools/list` | The 9 tools listed in [MCP](mcp.md) |

@@ -67,7 +67,9 @@ pulse.reset();                                      // on logout: new anonymous 
 
 User and group profiles: `setUserProperties`, `setUserPropertiesOnce`, `incrementUserProperty`,
 `unsetUserProperties`, `appendUserProperty`, `unionUserProperty`, `removeUserProperty`, `deleteUser`,
-`setGroup(type, id)`, `setGroupProperties`.
+`setGroup(type, id)`, `setGroupProperties`. `identify()`, user-profile updates (`/v1/engage`), and
+`setGroupProperties()` (`/v1/groups`) use synchronous durable endpoints: errors (`409`, `503`, `500`)
+propagate rather than being silently acknowledged, and committed profiles are readable immediately.
 
 `deleteUser()` only forgets the user on this device. The ingest key is public, so it can't erase
 server-side data; erase a user with the admin API, `DELETE /v1/projects/:id/users/:distinct_id`.

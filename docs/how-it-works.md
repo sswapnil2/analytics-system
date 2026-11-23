@@ -156,7 +156,7 @@ Analytics counts *people*, but an SDK first sees an anonymous device. Pulse keep
 - **Merge conflicts.** Merging two ids that are *both* already identified would combine two real people, so it is refused with `409`.
 - **Durability.** Changes are written as a log in SlateDB with periodic checkpoints. Remote `query`-role nodes restore published Candidate B snapshots into `<data_dir>/query_hot` (or open read-only `DbReader` when sharing `<data_dir>` before publish) and refresh them on `published/` updates.
 
-User and group **profiles** (properties set with `$set`, `$set_once`, `$increment` and so on) live in a separate SlateDB store at `profiles/{proj}` (`crates/pulse-storage/src/profile_store.rs`).
+User and group **profiles** (properties set with `$set`, `$set_once`, `$increment` and so on) live in a separate SlateDB store at `profiles/{proj}` (`crates/pulse-storage/src/profile_store.rs`, user profiles) and `group_profiles` in the metadata DB (group profiles). `/v1/identify`, `/v1/engage`, `/v1/groups`, and `/v1/replay/chunk` are synchronous: they flush identity before writing profiles, write durably before returning `200` with `canonical_uid` (on user profile calls), make profiles immediately readable on the next request, and propagate storage or DB failures (`409`, `503`, `500`) instead of masking them.
 
 ## 4. How queries work
 

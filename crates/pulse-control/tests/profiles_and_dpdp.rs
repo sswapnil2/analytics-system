@@ -153,6 +153,10 @@ async fn profiles_user_props_groups_dpdp_erasure_and_import_export() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{id_res}");
+    assert_eq!(id_res["status"], "ok");
+    let identified_uid = id_res["canonical_uid"]
+        .as_u64()
+        .expect("identify must return canonical_uid");
 
     let (s, eng_res) = send_ingest(
         &ingest_app,
@@ -173,6 +177,30 @@ async fn profiles_user_props_groups_dpdp_erasure_and_import_export() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{eng_res}");
+    assert_eq!(eng_res["status"], "ok");
+    assert_eq!(eng_res["updated"], 2);
+    assert!(eng_res.get("canonical_uid").is_none());
+    let eng_uids = eng_res["canonical_uids"]
+        .as_array()
+        .expect("engage must return canonical_uids");
+    assert_eq!(eng_uids.len(), 2);
+    assert_eq!(eng_uids[0].as_u64(), Some(identified_uid));
+
+    // Immediate read-back on the very next request must reflect both profiles.
+    let (s, detail_bytes) = send_admin(
+        &admin_app,
+        "GET",
+        "/v1/projects/proj_alpha/users/%2B919845000111",
+        None,
+        "application/json",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let detail_json: Value = serde_json::from_slice(&detail_bytes).unwrap();
+    assert_eq!(detail_json["canonical_uid"].as_u64(), Some(identified_uid));
+    assert_eq!(detail_json["profile"]["props"]["plan"], "credit_pro");
+    assert_eq!(detail_json["profile"]["props"]["first_utm"], "meta");
+    assert_eq!(detail_json["profile"]["props"]["logins"], 2);
 
     let (s, grp_res) = send_ingest(
         &ingest_app,
@@ -420,4 +448,108 @@ async fn profiles_user_props_groups_dpdp_erasure_and_import_export() {
         "erased user must be excluded from queries: {keys_after:?}"
     );
     assert!(keys_after.contains(&"upi_plus".to_string()));
+}
+
+#[tokio::test]
+async fn w2_single_engage_returns_canonical_uid_and_propagates_metastore_and_conflict_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (admin_app, ingest_app, ctrl, _ingest) = setup_full(tmp.path()).await;
+
+    // 1) Single-user /v1/engage returns `canonical_uid` and `canonical_uids: [uid]` and reads back immediately.
+    let (s, eng) = send_ingest(
+        &ingest_app,
+        "/v1/engage",
+        json!({
+            "distinct_id": "single_w2_user",
+            "$set": { "plan": "enterprise" }
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{eng}");
+    let uid = eng["canonical_uid"]
+        .as_u64()
+        .expect("single /v1/engage must include canonical_uid");
+    assert_eq!(eng["canonical_uids"], json!([uid]));
+
+    let (s, detail_bytes) = send_admin(
+        &admin_app,
+        "GET",
+        "/v1/projects/proj_alpha/users/single_w2_user",
+        None,
+        "application/json",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&detail_bytes).unwrap();
+    assert_eq!(detail["canonical_uid"].as_u64(), Some(uid));
+    assert_eq!(detail["profile"]["props"]["plan"], "enterprise");
+
+    // 2) Merge conflict on two already-identified users returns 409 on both /v1/identify and mixed /v1/ingest.
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({"anon_id": "a_c1", "user_id": "u_c1"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({"anon_id": "a_c2", "user_id": "u_c2"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, conflict_id) = send_ingest(
+        &ingest_app,
+        "/v1/identify",
+        json!({"anon_id": "u_c1", "user_id": "u_c2"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{conflict_id}");
+
+    let (s, conflict_mix) = send_ingest(
+        &ingest_app,
+        "/v1/ingest",
+        json!({
+            "batch": [
+                {"type": "track", "userId": "u_c1", "event": "Checkout", "messageId": "m_c1"},
+                {"type": "identify", "userId": "u_c2", "anonymousId": "u_c1"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{conflict_mix}");
+
+    // 3) Closing MetaStore causes /v1/groups and /v1/engage (erased_uids read) to return 503, NEVER 200.
+    match ctrl.meta() {
+        MetaStore::Sqlite(pool) => pool.close().await,
+        MetaStore::Postgres(pool) => pool.close().await,
+    }
+    let (s, grp_err) = send_ingest(
+        &ingest_app,
+        "/v1/groups",
+        json!({
+            "group_type": "company",
+            "group_id": "acme",
+            "$set": { "seats": 10 }
+        }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "MetaStore failure on /v1/groups must propagate 503: {grp_err}"
+    );
+    let (s, eng_err) = send_ingest(
+        &ingest_app,
+        "/v1/engage",
+        json!({"distinct_id": "single_w2_user", "$set": {"plan": "broken"}}),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "MetaStore failure during /v1/engage must propagate 503: {eng_err}"
+    );
 }

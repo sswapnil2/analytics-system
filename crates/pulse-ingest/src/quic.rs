@@ -169,6 +169,48 @@ async fn read_exact_bounded(recv: &mut RecvStream, len: usize) -> std::result::R
     Ok(out)
 }
 
+fn quic_error_json(e: &IngestError) -> Vec<u8> {
+    let code: Option<std::borrow::Cow<'static, str>> = match e {
+        IngestError::Storage(pulse_storage::StorageError::HotSegmentBackpressure { .. }) => {
+            Some("hot_segment_backpressure".into())
+        }
+        IngestError::Storage(pulse_storage::StorageError::Backpressure { what, .. }) => {
+            Some(format!("{what}_backpressure").into())
+        }
+        IngestError::Storage(pulse_storage::StorageError::L0Backpressure { .. }) => {
+            Some("l0_backpressure".into())
+        }
+        IngestError::Storage(pulse_storage::StorageError::NotWriter { .. }) => {
+            Some("not_writer".into())
+        }
+        IngestError::Storage(pulse_storage::StorageError::StaleWriter { .. }) => {
+            Some("stale_writer".into())
+        }
+        IngestError::RateLimited { .. } => Some("rate_limited".into()),
+        IngestError::Conflict(_)
+        | IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict)
+        | IngestError::Storage(pulse_storage::StorageError::Identity(
+            pulse_identity::IdentityError::IdentifiedMergeConflict,
+        )) => Some("conflict".into()),
+        IngestError::Unavailable(_) => Some("unavailable".into()),
+        IngestError::Storage(se) if se.is_unavailable() => Some("unavailable".into()),
+        IngestError::Identity(ie) if ie.is_store_unavailable() => Some("unavailable".into()),
+        _ => None,
+    };
+    let val = match code {
+        Some(c) => serde_json::json!({
+            "status": "error",
+            "code": c,
+            "message": e.to_string(),
+        }),
+        None => serde_json::json!({
+            "status": "error",
+            "message": e.to_string(),
+        }),
+    };
+    serde_json::to_vec(&val).unwrap_or_default()
+}
+
 async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> Vec<u8> {
     // 1. Read ONLY 3-byte opcode + key_len header first
     let mut hdr = [0u8; 3];
@@ -220,59 +262,7 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
                 .await
             {
                 Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-                Err(IngestError::Storage(
-                    e @ pulse_storage::StorageError::HotSegmentBackpressure { .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": "hot_segment_backpressure",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(IngestError::Storage(
-                    ref e @ pulse_storage::StorageError::Backpressure { what, .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": format!("{what}_backpressure"),
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(IngestError::Storage(
-                    ref e @ pulse_storage::StorageError::L0Backpressure { .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": "l0_backpressure",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(IngestError::Storage(
-                    ref e @ pulse_storage::StorageError::NotWriter { .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": "not_writer",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(IngestError::Storage(
-                    ref e @ pulse_storage::StorageError::StaleWriter { .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": "stale_writer",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(e @ IngestError::RateLimited { .. }) => {
-                    serde_json::to_vec(&serde_json::json!({
-                        "status": "error",
-                        "code": "rate_limited",
-                        "message": e.to_string(),
-                    }))
-                    .unwrap_or_default()
-                }
-                Err(e) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
+                Err(e) => quic_error_json(&e),
             },
             Err(e) => serde_json::to_vec(&serde_json::json!({
                 "status": "error",
@@ -283,19 +273,7 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
         QUIC_OP_IDENTIFY => match serde_json::from_slice::<IdentifyRequest>(&body) {
             Ok(req) => match service.identify_for_project(&project_id, req).await {
                 Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-                Err(IngestError::Storage(
-                    e @ pulse_storage::StorageError::HotSegmentBackpressure { .. },
-                )) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "code": "hot_segment_backpressure",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
-                Err(e) => serde_json::to_vec(&serde_json::json!({
-                    "status": "error",
-                    "message": e.to_string(),
-                }))
-                .unwrap_or_default(),
+                Err(e) => quic_error_json(&e),
             },
             Err(e) => serde_json::to_vec(&serde_json::json!({
                 "status": "error",
@@ -308,11 +286,7 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
             .await
         {
             Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-            Err(e) => serde_json::to_vec(&serde_json::json!({
-                "status": "error",
-                "message": e.to_string(),
-            }))
-            .unwrap_or_default(),
+            Err(e) => quic_error_json(&e),
         },
         _ => br#"{"status":"error","message":"unknown quic opcode"}"#.to_vec(),
     }

@@ -490,3 +490,369 @@ async fn unwritable_hot_directory_answers_503_on_sync_profile_calls() {
     assert_eq!(post_event(&node, &key, "recovered_user").await, 200);
     node.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_unwritable_profiles_directory_answers_503_on_engage_and_identify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemory::new());
+    let (node, key) = start(tmp.path(), &store).await;
+    let http = reqwest::Client::new();
+
+    // Seed and flush an existing user so `hot/identity/` already exists and is writable.
+    assert_eq!(post_event(&node, &key, "prof_seed_user").await, 200);
+    node.ingest.flush_all().await.unwrap();
+    let seed_eng = http
+        .post(format!("http://{}/v1/engage", node.http_addr))
+        .header("x-pulse-key", &key)
+        .json(&json!({"distinct_id": "prof_seed_user", "$set": {"plan": "free"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed_eng.status().as_u16(), 200);
+
+    // Chmod ONLY `hot/profiles/` to 0o555 while keeping `hot/identity/` writable.
+    let profiles_dir = tmp.path().join("node").join("hot").join("profiles");
+    assert!(
+        profiles_dir.is_dir(),
+        "expected hot/profiles directory at {}",
+        profiles_dir.display()
+    );
+    set_mode_recursive(&profiles_dir, 0o555);
+
+    // Force ProfileStore write (already-flushed user, so SlateDB must open/flush WAL into profiles/).
+    // Note: an open SlateDB Db handle may need a new WAL SST write (which fails on 0o555 dir) -> 503.
+    let eng_err_resp = http
+        .post(format!("http://{}/v1/engage", node.http_addr))
+        .header("x-pulse-key", &key)
+        .json(&json!({"distinct_id": "prof_seed_user", "$set": {"plan": "blocked"}}))
+        .send()
+        .await
+        .unwrap();
+    let eng_status = eng_err_resp.status().as_u16();
+    let eng_body = eng_err_resp.text().await.unwrap_or_default();
+
+    // Also test /v1/identify where `alias_durable` succeeds in `hot/identity/` and `on_identify` hits `hot/profiles/`.
+    let id_err_resp = http
+        .post(format!("http://{}/v1/identify", node.http_addr))
+        .header("x-pulse-key", &key)
+        .json(&json!({"anon_id": "anon_prof_err", "user_id": "prof_seed_user"}))
+        .send()
+        .await
+        .unwrap();
+    let id_status = id_err_resp.status().as_u16();
+    let id_body = id_err_resp.text().await.unwrap_or_default();
+
+    set_mode_recursive(&profiles_dir, 0o755);
+
+    assert_eq!(
+        eng_status, 503,
+        "isolated unwritable hot/profiles/ must answer 503 (never 200 or 500) on /v1/engage; body={eng_body}"
+    );
+    assert_eq!(
+        id_status, 503,
+        "isolated unwritable hot/profiles/ must answer 503 (never 200 or 500) on /v1/identify; body={id_body}"
+    );
+
+    // After restoring permissions, /v1/engage recovers cleanly and returns canonical_uid.
+    let rec_resp = http
+        .post(format!("http://{}/v1/engage", node.http_addr))
+        .header("x-pulse-key", &key)
+        .json(&json!({"distinct_id": "prof_seed_user", "$set": {"plan": "recovered"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rec_resp.status().as_u16(), 200);
+    let rec_json: Value = rec_resp.json().await.unwrap();
+    assert!(rec_json["canonical_uid"].as_u64().is_some(), "{rec_json}");
+
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn w2_sync_profiles_readback_and_sigkill_durability() {
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    async fn wait_healthy(http: &reqwest::Client, base: &str, child: &mut std::process::Child) {
+        for _ in 0..160 {
+            if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
+                if r.status().as_u16() == 200 {
+                    return;
+                }
+            }
+            if let Some(st) = child.try_wait().unwrap() {
+                panic!("pulse-node child exited prematurely with {st}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pulse-node did not become healthy at {base}");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let web_dir = tmp.path().join("no_web");
+    let bin = env!("CARGO_BIN_EXE_pulse-node");
+    let admin_tok = "sk_root_w2_sigkill_test_token_000000000000000000";
+    let pid = "proj_w2_e2e";
+    let http = reqwest::Client::new();
+
+    let port1 = free_port();
+    let base1 = format!("http://127.0.0.1:{port1}");
+    let mut child1 = ChildGuard(Some(
+        std::process::Command::new(bin)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port1.to_string(),
+                "--no-quic",
+                "--no-seed",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--web-dir",
+                web_dir.to_str().unwrap(),
+            ])
+            .env("PULSE_ADMIN_TOKEN", admin_tok)
+            .env("PULSE_DEFAULT_PROJECT", pid)
+            .env("PULSE_WRITER_LEASE_TTL_SECS", "2")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pulse-node"),
+    ));
+    wait_healthy(&http, &base1, child1.0.as_mut().unwrap()).await;
+
+    // Create ingest API key.
+    let key_resp: Value = http
+        .post(format!("{base1}/v1/projects/{pid}/api-keys"))
+        .bearer_auth(admin_tok)
+        .json(&json!({"label": "w2_e2e", "role": "ingest_and_flags"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ingest_key = key_resp["plaintext_key"].as_str().unwrap().to_string();
+
+    // 1) POST /v1/engage -> returns canonical_uid & canonical_uids, immediately readable on next request.
+    let eng_resp = http
+        .post(format!("{base1}/v1/engage"))
+        .header("x-pulse-key", &ingest_key)
+        .json(&json!({"distinct_id": "w2_user", "$set": {"plan": "pro", "tier": "gold"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(eng_resp.status().as_u16(), 200);
+    let eng_json: Value = eng_resp.json().await.unwrap();
+    assert_eq!(eng_json["status"], "ok");
+    assert_eq!(eng_json["updated"], 1);
+    let uid = eng_json["canonical_uid"]
+        .as_u64()
+        .expect("/v1/engage must return canonical_uid");
+    assert_eq!(eng_json["canonical_uids"], json!([uid]));
+
+    let users_list: Vec<Value> = http
+        .get(format!("{base1}/v1/projects/{pid}/users"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(users_list.len(), 1);
+    assert_eq!(users_list[0]["canonical_uid"].as_u64(), Some(uid));
+    assert_eq!(users_list[0]["props"]["plan"], "pro");
+
+    let detail_1: Value = http
+        .get(format!("{base1}/v1/projects/{pid}/users/w2_user"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail_1["canonical_uid"].as_u64(), Some(uid));
+    assert_eq!(detail_1["profile"]["props"]["tier"], "gold");
+
+    // 2) POST /v1/identify -> returns same canonical_uid, immediately readable via anon_id too.
+    let id_resp = http
+        .post(format!("{base1}/v1/identify"))
+        .header("x-pulse-key", &ingest_key)
+        .json(&json!({
+            "anon_id": "anon_w2",
+            "user_id": "w2_user",
+            "user_properties": {"city": "Bengaluru"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(id_resp.status().as_u16(), 200);
+    let id_json: Value = id_resp.json().await.unwrap();
+    assert_eq!(id_json["canonical_uid"].as_u64(), Some(uid));
+
+    let detail_anon: Value = http
+        .get(format!("{base1}/v1/projects/{pid}/users/anon_w2"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail_anon["canonical_uid"].as_u64(), Some(uid));
+    assert_eq!(detail_anon["profile"]["props"]["city"], "Bengaluru");
+    assert_eq!(detail_anon["profile"]["props"]["plan"], "pro");
+
+    // 3) POST /v1/groups + POST /v1/replay/chunk -> 200 and immediately readable.
+    let grp_resp = http
+        .post(format!("{base1}/v1/groups"))
+        .header("x-pulse-key", &ingest_key)
+        .json(&json!({"group_type": "merchant", "group_id": "m_w2", "$set": {"seats": 42}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(grp_resp.status().as_u16(), 200);
+    let grp_json: Value = grp_resp.json().await.unwrap();
+    assert_eq!(grp_json["updated"], 1);
+
+    let rep_resp = http
+        .post(format!("{base1}/v1/replay/chunk"))
+        .header("x-pulse-key", &ingest_key)
+        .json(&json!({
+            "project_id": "",
+            "session_id": "sess_w2_e2e",
+            "chunk_start_ts_ms": chrono::Utc::now().timestamp_millis(),
+            "ops": [{
+                "op": "full_snapshot",
+                "ts_offset_ms": 0,
+                "width": 390,
+                "height": 844,
+                "nodes": [{
+                    "node_id": 1,
+                    "parent_id": 0,
+                    "kind": "screen",
+                    "x": 0,
+                    "y": 0,
+                    "w": 390,
+                    "h": 844,
+                    "bg_rgba": 255,
+                    "masked_label": "Checkout"
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rep_resp.status().as_u16(), 200);
+    let rep_json: Value = rep_resp.json().await.unwrap();
+    assert!(
+        rep_json["replay_offset_kb"].as_u64().is_some(),
+        "{rep_json}"
+    );
+
+    let rep_get_1 = http
+        .get(format!("{base1}/v1/projects/{pid}/replay/sess_w2_e2e"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rep_get_1.status().as_u16(), 200);
+
+    // 4) Abrupt SIGKILL immediately after 200 OK (no graceful shutdown).
+    let mut c1 = child1.0.take().unwrap();
+    c1.kill().expect("SIGKILL pulse-node");
+    let _ = c1.wait();
+
+    // 5) Restart pulse-node on the same `--data-dir` and verify profile + canonical_uid + replay survive.
+    let port2 = free_port();
+    let base2 = format!("http://127.0.0.1:{port2}");
+    let mut child2 = ChildGuard(Some(
+        std::process::Command::new(bin)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port2.to_string(),
+                "--no-quic",
+                "--no-seed",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--web-dir",
+                web_dir.to_str().unwrap(),
+            ])
+            .env("PULSE_ADMIN_TOKEN", admin_tok)
+            .env("PULSE_DEFAULT_PROJECT", pid)
+            .env("PULSE_WRITER_LEASE_TTL_SECS", "2")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("respawn pulse-node"),
+    ));
+    wait_healthy(&http, &base2, child2.0.as_mut().unwrap()).await;
+
+    let users_after: Vec<Value> = http
+        .get(format!("{base2}/v1/projects/{pid}/users"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(users_after.len(), 1);
+    assert_eq!(users_after[0]["canonical_uid"].as_u64(), Some(uid));
+    assert_eq!(users_after[0]["props"]["plan"], "pro");
+    assert_eq!(users_after[0]["props"]["tier"], "gold");
+    assert_eq!(users_after[0]["props"]["city"], "Bengaluru");
+
+    // Wait briefly if dead process's 2s lease hasn't quite expired for export_events in GET /users/:did.
+    let mut detail_after = Value::Null;
+    for _ in 0..40 {
+        let r = http
+            .get(format!("{base2}/v1/projects/{pid}/users/w2_user"))
+            .bearer_auth(admin_tok)
+            .send()
+            .await
+            .unwrap();
+        if r.status().as_u16() == 200 {
+            detail_after = r.json().await.unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert_eq!(
+        detail_after["canonical_uid"].as_u64(),
+        Some(uid),
+        "{detail_after}"
+    );
+    assert_eq!(detail_after["profile"]["props"]["plan"], "pro");
+    assert_eq!(detail_after["profile"]["props"]["city"], "Bengaluru");
+
+    let rep_get_after = http
+        .get(format!("{base2}/v1/projects/{pid}/replay/sess_w2_e2e"))
+        .bearer_auth(admin_tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rep_get_after.status().as_u16(), 200);
+    let rep_after_json: Value = rep_get_after.json().await.unwrap();
+    assert_eq!(
+        rep_after_json["chunks"].as_array().map(|a| a.len()),
+        Some(1)
+    );
+}

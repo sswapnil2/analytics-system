@@ -15,8 +15,8 @@ pub use quic::{
     QUIC_OP_INGEST, QUIC_OP_REPLAY,
 };
 pub use service::{
-    BufferStats, IdentifyRequest, IdentifyResponse, IngestError, IngestMetrics, IngestResponse,
-    IngestService, ReplayIngestResponse, Result,
+    BufferStats, EngageResponse, IdentifyRequest, IdentifyResponse, IngestError, IngestMetrics,
+    IngestResponse, IngestService, ReplayIngestResponse, Result,
 };
 
 #[cfg(test)]

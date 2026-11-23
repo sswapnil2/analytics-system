@@ -97,8 +97,52 @@ fn fwd_ts_key(updated_at_ms: i64, distinct_id: &str) -> Vec<u8> {
     format!("u/{ts:016x}/{distinct_id}").into_bytes()
 }
 
+fn is_slatedb_unavailable(e: &SlateDBError) -> bool {
+    match e {
+        SlateDBError::IoError(_)
+        | SlateDBError::ObjectStoreError(_)
+        | SlateDBError::Fenced
+        | SlateDBError::ManifestVersionExists
+        | SlateDBError::WalFlushChannelError
+        | SlateDBError::MemtableFlushChannelError
+        | SlateDBError::CheckpointChannelError
+        | SlateDBError::ReadChannelError(_)
+        | SlateDBError::BackgroundTaskShutdown => true,
+        SlateDBError::BackgroundTaskPanic(payload) => {
+            // SlateDB 0.6's compactor thread panics (`expect("fatal error loading manifest")`)
+            // when fenced or hitting transient object-store/I/O errors, latching
+            // `BackgroundTaskPanic` instead of `Fenced`/`ObjectStoreError`.
+            let msg = payload
+                .lock()
+                .ok()
+                .and_then(|b| {
+                    b.downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| b.downcast_ref::<&'static str>().copied())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            msg.contains("Fenced")
+                || msg.contains("ObjectStoreError")
+                || msg.contains("IoError")
+                || msg.contains("ManifestVersionExists")
+                || msg.contains("WalFlushChannelError")
+                || msg.contains("MemtableFlushChannelError")
+                || msg.contains("CheckpointChannelError")
+                || msg.contains("ReadChannelError")
+                || msg.contains("BackgroundTaskShutdown")
+        }
+        SlateDBError::InvalidatedIterator(inner) => is_slatedb_unavailable(inner),
+        _ => false,
+    }
+}
+
 fn slatedb_err(e: SlateDBError) -> StorageError {
-    StorageError::Corrupted(format!("profile slatedb error: {e}"))
+    if is_slatedb_unavailable(&e) {
+        StorageError::Unavailable(format!("profile slatedb unavailable: {e}"))
+    } else {
+        StorageError::Corrupted(format!("profile slatedb error: {e}"))
+    }
 }
 
 /// Dedicated 2-thread Tokio runtime for `ProjectProfileStore` SlateDB scans.
@@ -243,12 +287,13 @@ async fn open_profile_db(db_prefix: &str, object_store: &Arc<dyn ObjectStore>) -
             Err(e) => return Err(slatedb_err(e)),
         }
     }
-    Err(StorageError::Corrupted("profile slatedb fenced".into()))
+    Err(slatedb_err(SlateDBError::Fenced))
 }
 
 async fn open_profile_reader(
     db_prefix: &str,
     object_store: &Arc<dyn ObjectStore>,
+    reader_options: &DbReaderOptions,
 ) -> Result<Option<DbReader>> {
     let db_path = ObjectPath::from(db_prefix);
     for attempt in 0..2 {
@@ -256,7 +301,7 @@ async fn open_profile_reader(
             db_path.clone(),
             object_store.clone(),
             None,
-            DbReaderOptions::default(),
+            reader_options.clone(),
         )
         .await
         {
@@ -287,6 +332,7 @@ pub struct ProjectProfileStore {
     /// Read-only stores keep one reader: it follows the writer by polling, and opening one per
     /// read wrote (then deleted) a SlateDB checkpoint each time, two PUTs per read.
     reader: tokio::sync::Mutex<Option<Arc<DbReader>>>,
+    reader_options: DbReaderOptions,
 }
 
 // A SlateDB reader's poller panics if the reader is dropped without `close`, so close it on drop.
@@ -318,6 +364,7 @@ impl ProjectProfileStore {
             dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(Some(Arc::new(db))),
             reader: tokio::sync::Mutex::new(None),
+            reader_options: DbReaderOptions::default(),
         }))
     }
 
@@ -343,6 +390,27 @@ impl ProjectProfileStore {
             dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(None),
             reader: tokio::sync::Mutex::new(None),
+            reader_options: DbReaderOptions::default(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_read_only_with_options(
+        project_id: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        reader_options: DbReaderOptions,
+    ) -> Arc<Self> {
+        let project_id = project_id.into();
+        let db_prefix = format!("profiles/{project_id}");
+        Arc::new(Self {
+            project_id,
+            db_prefix,
+            object_store,
+            read_only: true,
+            dirty_seq: AtomicU64::new(0),
+            db: tokio::sync::Mutex::new(None),
+            reader: tokio::sync::Mutex::new(None),
+            reader_options,
         })
     }
 
@@ -355,15 +423,71 @@ impl ProjectProfileStore {
         self.dirty_seq.load(Ordering::Acquire)
     }
 
+    async fn ensure_open_db(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, Option<Arc<Db>>>,
+    ) -> Result<Arc<Db>> {
+        if guard.is_none() {
+            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
+            **guard = Some(Arc::new(reopened));
+        }
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))
+    }
+
+    fn clear_db_if_unavailable<T>(
+        guard: &mut tokio::sync::MutexGuard<'_, Option<Arc<Db>>>,
+        res: Result<T>,
+    ) -> Result<T> {
+        if let Err(ref err) = res {
+            if err.is_unavailable() {
+                **guard = None;
+            }
+        }
+        res
+    }
+
     /// This read-only store's reader, opened on first use. `None` while the store does not exist.
     async fn shared_reader(&self) -> Result<Option<Arc<DbReader>>> {
         let mut guard = self.reader.lock().await;
         if guard.is_none() {
-            *guard = open_profile_reader(&self.db_prefix, &self.object_store)
+            *guard = open_profile_reader(&self.db_prefix, &self.object_store, &self.reader_options)
                 .await?
                 .map(Arc::new);
         }
         Ok(guard.clone())
+    }
+
+    async fn clear_reader_if_unavailable<T>(
+        &self,
+        failed_reader: &Arc<DbReader>,
+        res: Result<T>,
+    ) -> Result<T> {
+        if let Err(ref err) = res {
+            if err.is_unavailable() {
+                let taken = {
+                    let mut guard = self.reader.lock().await;
+                    if guard
+                        .as_ref()
+                        .is_some_and(|cur| Arc::ptr_eq(cur, failed_reader))
+                    {
+                        guard.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(reader) = taken {
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move {
+                            let _ = reader.close().await;
+                        });
+                    }
+                }
+            }
+        }
+        res
     }
 
     /// Upserts a single user profile atomically, maintaining all secondary indexes.
@@ -377,13 +501,7 @@ impl ProjectProfileStore {
             return Ok(());
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?;
+        let db = self.ensure_open_db(&mut guard).await?;
 
         let mut batch = WriteBatch::new();
         // Track prior state per distinct_id inside the batch so repeated updates to the same
@@ -401,14 +519,20 @@ impl ProjectProfileStore {
                     batch.delete(rev_ts_key(old_ts, &prof.distinct_id));
                     batch.delete(fwd_ts_key(old_ts, &prof.distinct_id));
                 }
-            } else if let Some(prev_bytes) = db.get(&rk).await.map_err(slatedb_err)? {
-                if let Ok(prev) = decode_profile(&prev_bytes) {
-                    if prev.canonical_uid != prof.canonical_uid {
-                        batch.delete(canonical_key(prev.canonical_uid, &prof.distinct_id));
-                    }
-                    if prev.updated_at_ms != prof.updated_at_ms {
-                        batch.delete(rev_ts_key(prev.updated_at_ms, &prof.distinct_id));
-                        batch.delete(fwd_ts_key(prev.updated_at_ms, &prof.distinct_id));
+            } else {
+                let prev_bytes = Self::clear_db_if_unavailable(
+                    &mut guard,
+                    db.get(&rk).await.map_err(slatedb_err),
+                )?;
+                if let Some(prev_bytes) = prev_bytes {
+                    if let Ok(prev) = decode_profile(&prev_bytes) {
+                        if prev.canonical_uid != prof.canonical_uid {
+                            batch.delete(canonical_key(prev.canonical_uid, &prof.distinct_id));
+                        }
+                        if prev.updated_at_ms != prof.updated_at_ms {
+                            batch.delete(rev_ts_key(prev.updated_at_ms, &prof.distinct_id));
+                            batch.delete(fwd_ts_key(prev.updated_at_ms, &prof.distinct_id));
+                        }
                     }
                 }
             }
@@ -445,24 +569,16 @@ impl ProjectProfileStore {
             let Some(reader) = self.shared_reader().await? else {
                 return Ok(None);
             };
-            let res = match reader.get(&rk).await.map_err(slatedb_err)? {
-                Some(b) => Some(decode_profile(&b)?),
-                None => None,
-            };
-            return Ok(res);
+            let raw = self
+                .clear_reader_if_unavailable(&reader, reader.get(&rk).await.map_err(slatedb_err))
+                .await?;
+            return raw.as_deref().map(decode_profile).transpose();
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?;
-        match db.get(&rk).await.map_err(slatedb_err)? {
-            Some(b) => Ok(Some(decode_profile(&b)?)),
-            None => Ok(None),
-        }
+        let db = self.ensure_open_db(&mut guard).await?;
+        let raw =
+            Self::clear_db_if_unavailable(&mut guard, db.get(&rk).await.map_err(slatedb_err))?;
+        raw.as_deref().map(decode_profile).transpose()
     }
 
     /// Returns all profile rows belonging to `canonical_uid` using the `c/<uid>/` prefix index.
@@ -473,12 +589,23 @@ impl ProjectProfileStore {
             let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
+            let keys = self
+                .clear_reader_if_unavailable(
+                    &reader,
+                    scan_reader_keys(reader.clone(), start, end, None).await,
+                )
+                .await?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 if key.len() > prefix_len {
                     if let Ok(did) = std::str::from_utf8(&key[prefix_len..]) {
-                        if let Some(b) = reader.get(record_key(did)).await.map_err(slatedb_err)? {
+                        if let Some(b) = self
+                            .clear_reader_if_unavailable(
+                                &reader,
+                                reader.get(record_key(did)).await.map_err(slatedb_err),
+                            )
+                            .await?
+                        {
                             out.push(decode_profile(&b)?);
                         }
                     }
@@ -488,20 +615,19 @@ impl ProjectProfileStore {
         }
 
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
-            .clone();
-        let keys = scan_db_keys(db.clone(), start, end, None).await?;
+        let db = self.ensure_open_db(&mut guard).await?;
+        let keys = Self::clear_db_if_unavailable(
+            &mut guard,
+            scan_db_keys(db.clone(), start, end, None).await,
+        )?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             if key.len() > prefix_len {
                 if let Ok(did) = std::str::from_utf8(&key[prefix_len..]) {
-                    if let Some(b) = db.get(record_key(did)).await.map_err(slatedb_err)? {
+                    if let Some(b) = Self::clear_db_if_unavailable(
+                        &mut guard,
+                        db.get(record_key(did)).await.map_err(slatedb_err),
+                    )? {
                         out.push(decode_profile(&b)?);
                     }
                 }
@@ -542,18 +668,14 @@ impl ProjectProfileStore {
             return Ok(0);
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?;
+        let db = self.ensure_open_db(&mut guard).await?;
         let mut batch = WriteBatch::new();
         let mut deleted = 0u64;
         for &did in distinct_ids {
             let rk = record_key(did);
-            if let Some(b) = db.get(&rk).await.map_err(slatedb_err)? {
+            let prev_bytes =
+                Self::clear_db_if_unavailable(&mut guard, db.get(&rk).await.map_err(slatedb_err))?;
+            if let Some(b) = prev_bytes {
                 if let Ok(prev) = decode_profile(&b) {
                     batch.delete(canonical_key(prev.canonical_uid, did));
                     batch.delete(rev_ts_key(prev.updated_at_ms, did));
@@ -619,7 +741,12 @@ impl ProjectProfileStore {
             let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let keys = scan_reader_keys(reader.clone(), start, end, max_keys).await?;
+            let keys = self
+                .clear_reader_if_unavailable(
+                    &reader,
+                    scan_reader_keys(reader.clone(), start, end, max_keys).await,
+                )
+                .await?;
             let mut out = Vec::with_capacity(lim);
             let mut matched = 0usize;
             for key in keys {
@@ -634,14 +761,26 @@ impl ProjectProfileStore {
                         matched += 1;
                         continue;
                     }
-                    if let Some(b) = reader.get(record_key(did)).await.map_err(slatedb_err)? {
+                    if let Some(b) = self
+                        .clear_reader_if_unavailable(
+                            &reader,
+                            reader.get(record_key(did)).await.map_err(slatedb_err),
+                        )
+                        .await?
+                    {
                         out.push(decode_profile(&b)?);
                         if out.len() >= lim {
                             break;
                         }
                     }
                     matched += 1;
-                } else if let Some(b) = reader.get(record_key(did)).await.map_err(slatedb_err)? {
+                } else if let Some(b) = self
+                    .clear_reader_if_unavailable(
+                        &reader,
+                        reader.get(record_key(did)).await.map_err(slatedb_err),
+                    )
+                    .await?
+                {
                     let prof = decode_profile(&b)?;
                     if !expanded.is_empty()
                         && is_profile_erased_preexpanded(
@@ -671,15 +810,11 @@ impl ProjectProfileStore {
         }
 
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
-            .clone();
-        let keys = scan_db_keys(db.clone(), start, end, max_keys).await?;
+        let db = self.ensure_open_db(&mut guard).await?;
+        let keys = Self::clear_db_if_unavailable(
+            &mut guard,
+            scan_db_keys(db.clone(), start, end, max_keys).await,
+        )?;
         let mut out = Vec::with_capacity(lim);
         let mut matched = 0usize;
         for key in keys {
@@ -694,14 +829,20 @@ impl ProjectProfileStore {
                     matched += 1;
                     continue;
                 }
-                if let Some(b) = db.get(record_key(did)).await.map_err(slatedb_err)? {
+                if let Some(b) = Self::clear_db_if_unavailable(
+                    &mut guard,
+                    db.get(record_key(did)).await.map_err(slatedb_err),
+                )? {
                     out.push(decode_profile(&b)?);
                     if out.len() >= lim {
                         break;
                     }
                 }
                 matched += 1;
-            } else if let Some(b) = db.get(record_key(did)).await.map_err(slatedb_err)? {
+            } else if let Some(b) = Self::clear_db_if_unavailable(
+                &mut guard,
+                db.get(record_key(did)).await.map_err(slatedb_err),
+            )? {
                 let prof = decode_profile(&b)?;
                 if !expanded.is_empty()
                     && is_profile_erased_preexpanded(&prof, &expanded, id_graph, id_snap.as_ref())
@@ -735,12 +876,23 @@ impl ProjectProfileStore {
             let Some(reader) = self.shared_reader().await? else {
                 return Ok(Vec::new());
             };
-            let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
+            let keys = self
+                .clear_reader_if_unavailable(
+                    &reader,
+                    scan_reader_keys(reader.clone(), start, end, None).await,
+                )
+                .await?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 if key.len() > 19 {
                     if let Ok(did) = std::str::from_utf8(&key[19..]) {
-                        if let Some(b) = reader.get(record_key(did)).await.map_err(slatedb_err)? {
+                        if let Some(b) = self
+                            .clear_reader_if_unavailable(
+                                &reader,
+                                reader.get(record_key(did)).await.map_err(slatedb_err),
+                            )
+                            .await?
+                        {
                             out.push(decode_profile(&b)?);
                         }
                     }
@@ -750,20 +902,19 @@ impl ProjectProfileStore {
         }
 
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
-            .clone();
-        let keys = scan_db_keys(db.clone(), start, end, None).await?;
+        let db = self.ensure_open_db(&mut guard).await?;
+        let keys = Self::clear_db_if_unavailable(
+            &mut guard,
+            scan_db_keys(db.clone(), start, end, None).await,
+        )?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             if key.len() > 19 {
                 if let Ok(did) = std::str::from_utf8(&key[19..]) {
-                    if let Some(b) = db.get(record_key(did)).await.map_err(slatedb_err)? {
+                    if let Some(b) = Self::clear_db_if_unavailable(
+                        &mut guard,
+                        db.get(record_key(did)).await.map_err(slatedb_err),
+                    )? {
                         out.push(decode_profile(&b)?);
                     }
                 }
@@ -815,19 +966,18 @@ impl ProjectProfileStore {
             let Some(reader) = self.shared_reader().await? else {
                 return Ok(0);
             };
-            let keys = scan_reader_keys(reader.clone(), start, end, None).await?;
+            let keys = self
+                .clear_reader_if_unavailable(
+                    &reader,
+                    scan_reader_keys(reader.clone(), start, end, None).await,
+                )
+                .await?;
             return Ok(keys.len() as u64);
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
-            .clone();
-        let keys = scan_db_keys(db, start, end, None).await?;
+        let db = self.ensure_open_db(&mut guard).await?;
+        let keys =
+            Self::clear_db_if_unavailable(&mut guard, scan_db_keys(db, start, end, None).await)?;
         Ok(keys.len() as u64)
     }
 
@@ -839,15 +989,8 @@ impl ProjectProfileStore {
             ));
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?
-            .clone();
-        let profiles = scan_db_records(db).await?;
+        let db = self.ensure_open_db(&mut guard).await?;
+        let profiles = Self::clear_db_if_unavailable(&mut guard, scan_db_records(db).await)?;
         tokio::task::spawn_blocking(move || encode_profile_snapshot(&profiles))
             .await
             .map_err(|_| {
@@ -906,6 +1049,7 @@ impl ProjectProfileStore {
             dirty_seq: AtomicU64::new(0),
             db: tokio::sync::Mutex::new(Some(Arc::new(db))),
             reader: tokio::sync::Mutex::new(None),
+            reader_options: DbReaderOptions::default(),
         });
         for chunk in profiles.chunks(10_000) {
             writable.upsert_batch(chunk).await?;
@@ -923,22 +1067,18 @@ impl ProjectProfileStore {
             ));
         }
         let mut guard = self.db.lock().await;
-        if guard.is_none() {
-            let reopened = open_profile_db(&self.db_prefix, &self.object_store).await?;
-            *guard = Some(Arc::new(reopened));
-        }
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| StorageError::Corrupted("profile store closed".into()))?;
-        db.create_checkpoint(
-            slatedb::config::CheckpointScope::all_with_force_flush(true),
-            &slatedb::config::CheckpointOptions {
-                lifetime: Some(Duration::from_secs(300)),
-                source: None,
-            },
-        )
-        .await
-        .map_err(slatedb_err)
+        let db = self.ensure_open_db(&mut guard).await?;
+        let res = db
+            .create_checkpoint(
+                slatedb::config::CheckpointScope::all_with_force_flush(true),
+                &slatedb::config::CheckpointOptions {
+                    lifetime: Some(Duration::from_secs(300)),
+                    source: None,
+                },
+            )
+            .await
+            .map_err(slatedb_err);
+        Self::clear_db_if_unavailable(&mut guard, res)
     }
 
     /// Deletes a SlateDB checkpoint created by [`Self::create_slatedb_checkpoint`].
@@ -967,7 +1107,7 @@ impl ProjectProfileStore {
             match tokio::spawn(async move { db.close().await }).await {
                 Ok(res) => res.map_err(slatedb_err)?,
                 Err(e) => {
-                    return Err(StorageError::Corrupted(format!(
+                    return Err(StorageError::Unavailable(format!(
                         "closing profile store for '{}' panicked (fenced by another writer?): {e}",
                         self.project_id
                     )))
@@ -1486,5 +1626,518 @@ mod tests {
         ro.close().await.unwrap();
         ps.close().await.unwrap();
         ig.close().await.unwrap();
+    }
+
+    #[test]
+    fn slatedb_err_classifies_unavailable_variants_to_503_and_data_errors_to_corrupted() {
+        let io_err = slatedb_err(SlateDBError::IoError(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ))));
+        assert!(matches!(io_err, StorageError::Unavailable(_)));
+        assert!(io_err.is_unavailable());
+
+        let os_err = slatedb_err(SlateDBError::ObjectStoreError(Arc::new(
+            object_store::Error::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::other("disk down")),
+            },
+        )));
+        assert!(matches!(os_err, StorageError::Unavailable(_)));
+        assert!(os_err.is_unavailable());
+
+        let read_channel_recv_err = {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            drop(tx);
+            rx.blocking_recv().unwrap_err()
+        };
+
+        let unavailable_variants = [
+            SlateDBError::Fenced,
+            SlateDBError::ManifestVersionExists,
+            SlateDBError::WalFlushChannelError,
+            SlateDBError::MemtableFlushChannelError,
+            SlateDBError::CheckpointChannelError,
+            SlateDBError::ReadChannelError(read_channel_recv_err),
+            SlateDBError::BackgroundTaskShutdown,
+            SlateDBError::InvalidatedIterator(Box::new(SlateDBError::Fenced)),
+            SlateDBError::InvalidatedIterator(Box::new(SlateDBError::IoError(Arc::new(
+                std::io::Error::other("io"),
+            )))),
+            SlateDBError::BackgroundTaskPanic(Arc::new(std::sync::Mutex::new(Box::new(
+                "fatal error loading manifest: Fenced".to_string(),
+            )))),
+        ];
+        for err in unavailable_variants {
+            let mapped = slatedb_err(err);
+            assert!(
+                matches!(mapped, StorageError::Unavailable(_)),
+                "expected Unavailable, got {mapped:?}"
+            );
+            assert!(mapped.is_unavailable());
+        }
+
+        let corrupted_variants = [
+            SlateDBError::InvalidDBState,
+            SlateDBError::InvalidatedIterator(Box::new(SlateDBError::InvalidDBState)),
+            SlateDBError::EmptyManifest,
+            SlateDBError::BackgroundTaskPanic(Arc::new(std::sync::Mutex::new(Box::new(
+                "fatal error loading manifest: InvalidDBState".to_string(),
+            )))),
+        ];
+        for err in corrupted_variants {
+            let mapped = slatedb_err(err);
+            assert!(
+                matches!(mapped, StorageError::Corrupted(_)),
+                "expected Corrupted, got {mapped:?}"
+            );
+            assert!(!mapped.is_unavailable());
+        }
+    }
+
+    #[derive(Debug)]
+    struct ToggleFailStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_all: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::fmt::Display for ToggleFailStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ToggleFailStore")
+        }
+    }
+
+    impl ToggleFailStore {
+        fn check(&self, op: &'static str) -> object_store::Result<()> {
+            if self.fail_all.load(Ordering::Acquire) {
+                return Err(object_store::Error::Generic {
+                    store: "ToggleFailStore",
+                    source: Box::new(std::io::Error::other(format!("injected {op} failure"))),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ToggleFailStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.check("put_opts")?;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.check("put_multipart_opts")?;
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.check("get_opts")?;
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_range(
+            &self,
+            location: &ObjectPath,
+            range: std::ops::Range<u64>,
+        ) -> object_store::Result<bytes::Bytes> {
+            self.check("get_range")?;
+            self.inner.get_range(location, range).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.check("get_ranges")?;
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn head(
+            &self,
+            location: &ObjectPath,
+        ) -> object_store::Result<object_store::ObjectMeta> {
+            self.check("head")?;
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.check("delete")?;
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            if self.fail_all.load(Ordering::Acquire) {
+                return Box::pin(futures::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "ToggleFailStore",
+                        source: Box::new(std::io::Error::other("injected list failure")),
+                    })
+                }));
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.check("list_with_delimiter")?;
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.check("copy")?;
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.check("copy_if_not_exists")?;
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    use object_store::{
+        GetOptions, GetResult, MultipartUpload, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult,
+    };
+
+    fn sample_profile(
+        project_id: &str,
+        distinct_id: &str,
+        uid: u32,
+        ts_ms: i64,
+    ) -> StoredUserProfile {
+        StoredUserProfile {
+            project_id: project_id.to_string(),
+            distinct_id: distinct_id.to_string(),
+            canonical_uid: uid,
+            props: BTreeMap::from([("plan".to_string(), json!("pro"))]),
+            total_revenue: 42.0,
+            updated_at_ms: ts_ms,
+        }
+    }
+
+    async fn assert_recovers_after_unavailable<T, F, Fut>(label: &str, mut op: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let first = op().await;
+        match first {
+            Err(e) => assert!(
+                e.is_unavailable(),
+                "{label}: call 1 expected Unavailable (503), got {e:?}"
+            ),
+            Ok(_) => panic!("{label}: call 1 unexpectedly succeeded instead of surfacing latched Unavailable (503)"),
+        }
+        op().await
+            .unwrap_or_else(|e| panic!("{label}: call 2 stayed wedged after recovery: {e:?}"))
+    }
+
+    #[tokio::test]
+    async fn dead_handle_recovery_across_all_writable_and_reader_methods() {
+        // --- Part 1: Fencing recovery across all writable methods ---
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let fence_projects = [
+            "proj_fence_get",
+            "proj_fence_canon",
+            "proj_fence_page",
+            "proj_fence_page_search",
+            "proj_fence_since",
+            "proj_fence_count",
+            "proj_fence_export",
+            "proj_fence_ckpt",
+        ];
+
+        let mut fenced_handles = Vec::with_capacity(fence_projects.len());
+        for pid in fence_projects {
+            let ps_a = ProjectProfileStore::open(pid, mem.clone()).await.unwrap();
+            ps_a.upsert(&sample_profile(pid, "u_1", 10, 1_000))
+                .await
+                .unwrap();
+
+            let ps_b = ProjectProfileStore::open(pid, mem.clone()).await.unwrap();
+            ps_b.upsert(&sample_profile(pid, "u_2", 10, 2_000))
+                .await
+                .unwrap();
+            ps_b.close().await.unwrap();
+            fenced_handles.push(ps_a);
+        }
+
+        // Allow SlateDB compactor/manifest pollers on ps_a handles to observe Fenced.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let got = assert_recovers_after_unavailable("fence get_by_distinct_id", || {
+            fenced_handles[0].get_by_distinct_id("u_1")
+        })
+        .await;
+        assert_eq!(got.unwrap().distinct_id, "u_1");
+
+        let canon = assert_recovers_after_unavailable("fence list_for_canonical", || {
+            fenced_handles[1].list_for_canonical(10)
+        })
+        .await;
+        assert_eq!(canon.len(), 2);
+
+        let page = assert_recovers_after_unavailable("fence list_paginated", || {
+            fenced_handles[2].list_paginated(None, 10, 0)
+        })
+        .await;
+        assert_eq!(page.len(), 2);
+
+        let empty_erased = ErasedUids::default();
+        let filtered =
+            assert_recovers_after_unavailable("fence list_paginated_filtered (search)", || {
+                fenced_handles[3].list_paginated_filtered(Some("pro"), 10, 0, &empty_erased, None)
+            })
+            .await;
+        assert_eq!(filtered.len(), 2);
+
+        let since = assert_recovers_after_unavailable("fence list_updated_since", || {
+            fenced_handles[4].list_updated_since(1_500)
+        })
+        .await;
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].distinct_id, "u_2");
+
+        let cnt =
+            assert_recovers_after_unavailable("fence count", || fenced_handles[5].count()).await;
+        assert_eq!(cnt, 2);
+
+        let exported = assert_recovers_after_unavailable("fence export_snapshot_bytes", || {
+            fenced_handles[6].export_snapshot_bytes()
+        })
+        .await;
+        assert!(exported.starts_with(PROFILE_ZSTD_MAGIC));
+
+        let ckpt = assert_recovers_after_unavailable("fence create_slatedb_checkpoint", || {
+            fenced_handles[7].create_slatedb_checkpoint()
+        })
+        .await;
+        fenced_handles[7]
+            .delete_slatedb_checkpoint(&ckpt)
+            .await
+            .unwrap();
+
+        for ps in fenced_handles {
+            ps.close().await.unwrap();
+        }
+
+        // --- Part 2: Transient ObjectStoreError recovery across writable & read-only handles ---
+        let fail_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggle_store: Arc<dyn ObjectStore> = Arc::new(ToggleFailStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            fail_all: fail_all.clone(),
+        });
+
+        let os_projects = [
+            "proj_os_get",
+            "proj_os_canon",
+            "proj_os_page",
+            "proj_os_page_search",
+            "proj_os_since",
+            "proj_os_count",
+            "proj_os_export",
+            "proj_os_ckpt",
+        ];
+        let mut os_handles = Vec::with_capacity(os_projects.len());
+        for pid in os_projects {
+            let ps = ProjectProfileStore::open(pid, toggle_store.clone())
+                .await
+                .unwrap();
+            ps.upsert(&sample_profile(pid, "u_1", 10, 1_000))
+                .await
+                .unwrap();
+            ps.upsert(&sample_profile(pid, "u_2", 10, 2_000))
+                .await
+                .unwrap();
+            os_handles.push(ps);
+        }
+
+        let ro_projects = [
+            "proj_ro_get",
+            "proj_ro_canon",
+            "proj_ro_page",
+            "proj_ro_page_search",
+            "proj_ro_since",
+            "proj_ro_count",
+        ];
+        let mut ro_handles = Vec::with_capacity(ro_projects.len());
+        let ro_opts = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(50),
+            checkpoint_lifetime: Duration::from_secs(1),
+            ..DbReaderOptions::default()
+        };
+        for pid in ro_projects {
+            let writer = ProjectProfileStore::open(pid, toggle_store.clone())
+                .await
+                .unwrap();
+            writer
+                .upsert(&sample_profile(pid, "u_1", 10, 1_000))
+                .await
+                .unwrap();
+            writer
+                .upsert(&sample_profile(pid, "u_2", 10, 2_000))
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+            let ro = ProjectProfileStore::open_read_only_with_options(
+                pid,
+                toggle_store.clone(),
+                ro_opts.clone(),
+            );
+            // Warm the shared DbReader while the store is healthy.
+            assert_eq!(ro.count().await.unwrap(), 2);
+            ro_handles.push(ro);
+        }
+
+        // Inject a transient object-store outage long enough for SlateDB writer/reader pollers
+        // to fail and latch their error watchers, then restore object-store availability.
+        fail_all.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        fail_all.store(false, Ordering::Release);
+
+        // Writable handles: call 1 returns Unavailable (503) & clears dead handle; call 2 recovers.
+        assert_eq!(
+            assert_recovers_after_unavailable("transient os get_by_distinct_id", || {
+                os_handles[0].get_by_distinct_id("u_1")
+            })
+            .await
+            .unwrap()
+            .distinct_id,
+            "u_1"
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("transient os list_for_canonical", || {
+                os_handles[1].list_for_canonical(10)
+            })
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("transient os list_paginated", || {
+                os_handles[2].list_paginated(None, 10, 0)
+            })
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable(
+                "transient os list_paginated_filtered (search)",
+                || {
+                    os_handles[3].list_paginated_filtered(Some("pro"), 10, 0, &empty_erased, None)
+                }
+            )
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("transient os list_updated_since", || {
+                os_handles[4].list_updated_since(1_500)
+            })
+            .await
+            .len(),
+            1
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("transient os count", || os_handles[5].count()).await,
+            2
+        );
+        assert!(
+            assert_recovers_after_unavailable("transient os export_snapshot_bytes", || {
+                os_handles[6].export_snapshot_bytes()
+            })
+            .await
+            .starts_with(PROFILE_ZSTD_MAGIC)
+        );
+        let os_ckpt =
+            assert_recovers_after_unavailable("transient os create_slatedb_checkpoint", || {
+                os_handles[7].create_slatedb_checkpoint()
+            })
+            .await;
+        os_handles[7]
+            .delete_slatedb_checkpoint(&os_ckpt)
+            .await
+            .unwrap();
+
+        // Read-only handles: call 1 returns Unavailable (503) & clears dead reader; call 2 recovers.
+        assert_eq!(
+            assert_recovers_after_unavailable("ro get_by_distinct_id", || {
+                ro_handles[0].get_by_distinct_id("u_1")
+            })
+            .await
+            .unwrap()
+            .distinct_id,
+            "u_1"
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("ro list_for_canonical", || {
+                ro_handles[1].list_for_canonical(10)
+            })
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("ro list_paginated", || {
+                ro_handles[2].list_paginated(None, 10, 0)
+            })
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("ro list_paginated_filtered (search)", || {
+                ro_handles[3].list_paginated_filtered(Some("pro"), 10, 0, &empty_erased, None)
+            })
+            .await
+            .len(),
+            2
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("ro list_updated_since", || {
+                ro_handles[4].list_updated_since(1_500)
+            })
+            .await
+            .len(),
+            1
+        );
+        assert_eq!(
+            assert_recovers_after_unavailable("ro count", || ro_handles[5].count()).await,
+            2
+        );
+
+        for ro in ro_handles {
+            ro.close().await.unwrap();
+        }
+        for ps in os_handles {
+            ps.close().await.unwrap();
+        }
     }
 }

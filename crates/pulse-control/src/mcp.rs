@@ -505,10 +505,24 @@ fn pick<T: Copy>(args: &Value, key: &str, default: T, options: &[(&str, T)]) -> 
     }
 }
 
+pub(crate) enum SyncErasedError {
+    Meta(crate::db::MetaError),
+    Storage(pulse_storage::StorageError),
+}
+
+impl std::fmt::Display for SyncErasedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Meta(e) => write!(f, "{e}"),
+            Self::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Loads `erased_uids` from `MetaStore`, opens the project's read-only identity graph when
 /// non-empty, expands merged raw->canonical mappings, syncs `StorageEngine::set_erased`, and
 /// evicts any hidden cached entries from `VirtualCatalog`'s `ColumnarProfileIndex`.
-pub(crate) async fn sync_erased_for_project(
+pub(crate) async fn sync_erased_for_project_typed(
     project_id: &str,
     meta: &MetaStore,
     qengine: &QueryEngine,
@@ -517,12 +531,12 @@ pub(crate) async fn sync_erased_for_project(
         pulse_storage::ErasedUids,
         Option<Arc<pulse_identity::ProjectIdentityGraph>>,
     ),
-    String,
+    SyncErasedError,
 > {
     let erased: pulse_storage::ErasedUids = meta
         .list_erased_uids(project_id)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(SyncErasedError::Meta)?
         .into_iter()
         .collect();
     let id_graph = if erased.is_empty() {
@@ -533,7 +547,7 @@ pub(crate) async fn sync_erased_for_project(
                 .storage()
                 .identity_graph(project_id, false)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(SyncErasedError::Storage)?,
         )
     };
     let expanded = pulse_storage::expand_erased_with_identity(&erased, id_graph.as_deref());
@@ -545,6 +559,22 @@ pub(crate) async fn sync_erased_for_project(
         }
     }
     Ok((expanded, id_graph))
+}
+
+pub(crate) async fn sync_erased_for_project(
+    project_id: &str,
+    meta: &MetaStore,
+    qengine: &QueryEngine,
+) -> Result<
+    (
+        pulse_storage::ErasedUids,
+        Option<Arc<pulse_identity::ProjectIdentityGraph>>,
+    ),
+    String,
+> {
+    sync_erased_for_project_typed(project_id, meta, qengine)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Syncs `cat.saved_cohorts` in place (`insert` + `retain`) without clearing concurrent readers.

@@ -81,7 +81,7 @@ An **event** (`WireEvent`, `crates/pulse-wire/src/event.rs`) has these fields:
 
 Storage keeps the dense 32-bit id of `distinct_id`, never the string. The **identity graph** maps many distinct ids, for example a device's anonymous id and the user id after login, to one **canonical user**. That mapping is applied at query time.
 
-**User profiles** (`profiles/{project}` in SlateDB) hold the properties you set with `$set`, `$set_once`, `$increment`, `$append`, `$union`, `$remove` and `$unset`. A profile view merges the properties from every id that belongs to the user, and the newest value wins.
+**User profiles** (`profiles/{project}` in SlateDB) hold the properties you set with `$set`, `$set_once`, `$increment`, `$append`, `$union`, `$remove` and `$unset`. `/v1/identify` and `/v1/engage` flush the identity graph first and write profiles durably to `profiles/{project}` before returning `canonical_uid` (or `409`/`503`/`500` on failure); `/v1/groups` writes durably to `group_profiles` in the metadata DB. A profile view merges the properties from every id that belongs to the user, and the newest value wins.
 
 ## On-disk layout
 

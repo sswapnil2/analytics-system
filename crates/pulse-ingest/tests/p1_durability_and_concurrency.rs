@@ -1702,3 +1702,650 @@ async fn w1_transient_not_writer_recovers_after_lease_renewal() {
         .await
         .expect("IngestService::shutdown hung after lease recovery");
 }
+
+#[tokio::test]
+async fn w2_engage_returns_canonical_uid_and_flushes_identity_before_apply_engage() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::{
+        build_ingest_router, DiscoveredEventSchema, EngageResponse, GovernanceProvider,
+        IngestError, ProjectLexiconRules,
+    };
+    use tower::ServiceExt;
+
+    struct VerifyingGovernance {
+        store: Arc<dyn ObjectStore>,
+        verified_durable: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GovernanceProvider for VerifyingGovernance {
+        async fn authenticate_api_key(&self, api_key: &str) -> Option<String> {
+            (api_key == "pk_w2").then(|| "proj_w2".to_string())
+        }
+
+        fn lexicon_rules(&self, _project_id: &str) -> Arc<ProjectLexiconRules> {
+            Arc::new(ProjectLexiconRules::default())
+        }
+
+        fn record_discovery(&self, _items: Vec<DiscoveredEventSchema>) {}
+
+        async fn apply_engage(
+            &self,
+            project_id: &str,
+            distinct_id: &str,
+            canonical_uid: u32,
+            _ops: &serde_json::Value,
+        ) -> pulse_ingest::Result<u32> {
+            // Re-open identity graph read-only from the backing store to verify `id_graph.flush()`
+            // already made the mapping durable BEFORE `apply_engage` ran.
+            let ro = pulse_identity::ProjectIdentityGraph::open_read_only(
+                project_id,
+                self.store.clone(),
+            )
+            .await
+            .map_err(|e| IngestError::Governance(e.to_string()))?;
+            let persisted = ro.lookup_canonical(distinct_id);
+            ro.close()
+                .await
+                .map_err(|e| IngestError::Governance(e.to_string()))?;
+            if persisted != Some(canonical_uid) {
+                return Err(IngestError::Governance(format!(
+                    "expected durable identity {canonical_uid} before apply_engage, got {persisted:?}"
+                )));
+            }
+            self.verified_durable.fetch_add(1, Ordering::SeqCst);
+            Ok(canonical_uid)
+        }
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store.clone(),
+        id_router,
+    );
+    let gov = Arc::new(VerifyingGovernance {
+        store: store.clone(),
+        verified_durable: AtomicUsize::new(0),
+    });
+    let ingest = IngestService::new(storage.clone(), gov.clone());
+    let app = build_ingest_router(ingest.clone());
+
+    // Single profile object -> returns both `canonical_uid` and `canonical_uids: [uid]`.
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/engage")
+                .header("x-pulse-key", "pk_w2")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"distinct_id": "u_single", "$set": {"plan": "pro"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let b1 = axum::body::to_bytes(resp1.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let e1: EngageResponse = serde_json::from_slice(&b1).unwrap();
+    assert_eq!(e1.status, "ok");
+    assert_eq!(e1.updated, 1);
+    let uid1 = e1
+        .canonical_uid
+        .expect("single /v1/engage must return canonical_uid");
+    assert_eq!(e1.canonical_uids, vec![uid1]);
+
+    // Same-user batch -> shares one UID, so `canonical_uid` is Some(uid1) and `canonical_uids` has [uid1, uid1].
+    let resp_same = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/engage")
+                .header("x-pulse-key", "pk_w2")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!([
+                        {"distinct_id": "u_single", "$set": {"a": 1}},
+                        {"distinct_id": "u_single", "$set": {"b": 2}}
+                    ])
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_same.status(), StatusCode::OK);
+    let b_same = axum::body::to_bytes(resp_same.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let e_same: EngageResponse = serde_json::from_slice(&b_same).unwrap();
+    assert_eq!(e_same.updated, 2);
+    assert_eq!(e_same.canonical_uid, Some(uid1));
+    assert_eq!(e_same.canonical_uids, vec![uid1, uid1]);
+
+    // Multi-user batch -> omits `canonical_uid`, returns `canonical_uids: [uid_a, uid_b]`.
+    let resp_multi = app
+        .oneshot(
+            Request::post("/v1/engage")
+                .header("x-pulse-key", "pk_w2")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "profiles": [
+                            {"distinct_id": "u_multi_a", "$set": {"tier": "a"}},
+                            {"distinct_id": "u_multi_b", "$set": {"tier": "b"}}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_multi.status(), StatusCode::OK);
+    let b_multi = axum::body::to_bytes(resp_multi.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v_multi: serde_json::Value = serde_json::from_slice(&b_multi).unwrap();
+    assert_eq!(v_multi["updated"], 2);
+    assert!(v_multi.get("canonical_uid").is_none());
+    let uids = v_multi["canonical_uids"].as_array().unwrap();
+    assert_eq!(uids.len(), 2);
+    assert_ne!(uids[0], uids[1]);
+    assert_eq!(gov.verified_durable.load(Ordering::SeqCst), 5);
+
+    ingest.shutdown().await;
+}
+
+#[tokio::test]
+async fn w2_governance_errors_propagate_across_http_and_mixed_batches() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::{
+        build_ingest_router, DiscoveredEventSchema, GovernanceProvider, IngestError,
+        ProjectLexiconRules,
+    };
+    use pulse_storage::StorageError;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Conflict,
+        Unavailable,
+        NotWriter,
+        Internal,
+    }
+
+    struct FailingGovernance {
+        mode: parking_lot::Mutex<Mode>,
+    }
+
+    impl FailingGovernance {
+        fn make_err(&self) -> IngestError {
+            match *self.mode.lock() {
+                Mode::Conflict => IngestError::Conflict("meta conflict".into()),
+                Mode::Unavailable => {
+                    IngestError::Storage(StorageError::Unavailable("profile slatedb down".into()))
+                }
+                Mode::NotWriter => IngestError::Storage(StorageError::NotWriter {
+                    project_id: "proj_fail".into(),
+                }),
+                Mode::Internal => IngestError::Governance("db syntax boom".into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GovernanceProvider for FailingGovernance {
+        async fn authenticate_api_key(&self, api_key: &str) -> Option<String> {
+            (api_key == "pk_fail").then(|| "proj_fail".to_string())
+        }
+
+        fn lexicon_rules(&self, _project_id: &str) -> Arc<ProjectLexiconRules> {
+            Arc::new(ProjectLexiconRules::default())
+        }
+
+        fn record_discovery(&self, _items: Vec<DiscoveredEventSchema>) {}
+
+        async fn apply_engage(
+            &self,
+            _project_id: &str,
+            _distinct_id: &str,
+            _canonical_uid: u32,
+            _ops: &serde_json::Value,
+        ) -> pulse_ingest::Result<u32> {
+            Err(self.make_err())
+        }
+
+        async fn on_identify(
+            &self,
+            _project_id: &str,
+            _anon_id: &str,
+            _user_id: &str,
+            _canonical_uid: u32,
+        ) -> pulse_ingest::Result<u32> {
+            Err(self.make_err())
+        }
+
+        async fn apply_group_engage(
+            &self,
+            _project_id: &str,
+            _group_type: &str,
+            _group_id: &str,
+            _ops: &serde_json::Value,
+        ) -> pulse_ingest::Result<()> {
+            Err(self.make_err())
+        }
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let gov = Arc::new(FailingGovernance {
+        mode: parking_lot::Mutex::new(Mode::Unavailable),
+    });
+    let ingest = IngestService::new(storage.clone(), gov.clone());
+    let app = build_ingest_router(ingest.clone());
+
+    for (mode, expected_status) in [
+        (Mode::Conflict, StatusCode::CONFLICT),
+        (Mode::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+        (Mode::NotWriter, StatusCode::SERVICE_UNAVAILABLE),
+        (Mode::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        *gov.mode.lock() = mode;
+
+        let r_eng = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/engage")
+                    .header("x-pulse-key", "pk_fail")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"distinct_id": "u1", "$set": {"a": 1}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_eng.status(),
+            expected_status,
+            "/v1/engage status mismatch"
+        );
+
+        let r_id = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/identify")
+                    .header("x-pulse-key", "pk_fail")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"anon_id": "a1", "user_id": "u1"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_id.status(),
+            expected_status,
+            "/v1/identify status mismatch"
+        );
+
+        let r_grp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/groups")
+                    .header("x-pulse-key", "pk_fail")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"group_type": "org", "group_id": "g1", "$set": {"plan": "ent"}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_grp.status(),
+            expected_status,
+            "/v1/groups status mismatch"
+        );
+
+        let r_mix = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("x-pulse-key", "pk_fail")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "batch": [
+                                {"type": "track", "userId": "u1", "event": "Paid", "messageId": "m_fail"},
+                                {"type": "identify", "userId": "u1", "anonymousId": "a_mix", "traits": {"plan": "pro"}}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_mix.status(),
+            expected_status,
+            "mixed /v1/ingest status mismatch"
+        );
+        assert_eq!(ingest.buffer_stats().buffer_bytes, 0);
+        assert_eq!(ingest.buffer_stats().buffer_events, 0);
+    }
+
+    ingest.flush_all().await.unwrap();
+    let ps = storage.open_for_read("proj_fail").await.unwrap();
+    assert_eq!(ps.total_l0_rows(), 0, "failing mixed batches queued events");
+    ingest.shutdown().await;
+}
+
+#[tokio::test]
+async fn w2_replay_chunk_http_routes_return_offset_400_and_503() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::{build_ingest_router, ReplayIngestResponse};
+    use tower::ServiceExt;
+
+    #[derive(Debug)]
+    struct ToggleReplayStore {
+        inner: InMemory,
+        fail_replay: AtomicBool,
+    }
+    impl Display for ToggleReplayStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ToggleReplayStore")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for ToggleReplayStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            if self.fail_replay.load(Ordering::SeqCst) && location.as_ref().starts_with("replays/")
+            {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(std::io::Error::other("replay disk full")),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[Range<u64>],
+        ) -> OsResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        async fn delete(&self, location: &ObjectPath) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+        fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    let store = Arc::new(ToggleReplayStore {
+        inner: InMemory::new(),
+        fail_replay: AtomicBool::new(false),
+    });
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store.clone(),
+        id_router,
+    );
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_rep", "proj_rep");
+    let ingest = IngestService::new(storage, gov);
+    let app = build_ingest_router(ingest.clone());
+
+    let valid_chunk = ReplayChunk {
+        project_id: String::new(),
+        session_id: "sess_w2_rep".into(),
+        chunk_start_ts_ms: 1_762_000_000_000i64,
+        ops: vec![WireframeOp::FullSnapshot {
+            ts_offset_ms: 0,
+            width: 390,
+            height: 844,
+            nodes: vec![WireNode {
+                node_id: 1,
+                parent_id: 0,
+                kind: NodeKind::Screen,
+                x: 0,
+                y: 0,
+                w: 390,
+                h: 844,
+                bg_rgba: 255,
+                masked_label: "Home".into(),
+            }],
+        }],
+    };
+    let valid_chunk_json = serde_json::to_vec(&valid_chunk).unwrap();
+    let ok_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/replay/chunk")
+                .header("x-pulse-key", "pk_rep")
+                .header("content-type", "application/json")
+                .body(Body::from(valid_chunk_json.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let ok_bytes = axum::body::to_bytes(ok_resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let rep: ReplayIngestResponse = serde_json::from_slice(&ok_bytes).unwrap();
+    assert_eq!(rep.status, "ok");
+    assert!(rep.chunk_bytes > 0);
+    assert_eq!(rep.byte_offset, 0);
+    assert_eq!(rep.replay_offset_kb, 0);
+
+    // Invalid session_id -> 400 BAD_REQUEST
+    let bad_chunk = serde_json::json!({
+        "project_id": "",
+        "session_id": "../escape",
+        "chunk_start_ts_ms": 1_762_000_000_000i64,
+        "ops": []
+    });
+    let bad_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/replay/chunk")
+                .header("x-pulse-key", "pk_rep")
+                .header("content-type", "application/json")
+                .body(Body::from(bad_chunk.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+    // Failing object store -> 503 SERVICE_UNAVAILABLE
+    store.fail_replay.store(true, Ordering::SeqCst);
+    let err_resp = app
+        .oneshot(
+            Request::post("/v1/replay/chunk")
+                .header("x-pulse-key", "pk_rep")
+                .header("content-type", "application/json")
+                .body(Body::from(valid_chunk_json))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(err_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    ingest.shutdown().await;
+}
+
+#[tokio::test]
+async fn w2_quic_error_codes_for_identify_and_replay() {
+    use pulse_ingest::{
+        spawn_quic_listener, DiscoveredEventSchema, GovernanceProvider, IngestError,
+        ProjectLexiconRules, QUIC_OP_IDENTIFY, QUIC_OP_REPLAY,
+    };
+    use pulse_storage::StorageError;
+
+    struct QuicErrGov {
+        err_kind: parking_lot::Mutex<u8>,
+    }
+
+    #[async_trait]
+    impl GovernanceProvider for QuicErrGov {
+        async fn authenticate_api_key(&self, api_key: &str) -> Option<String> {
+            (api_key == "pk_q").then(|| "proj_q".to_string())
+        }
+        fn lexicon_rules(&self, _project_id: &str) -> Arc<ProjectLexiconRules> {
+            Arc::new(ProjectLexiconRules::default())
+        }
+        fn record_discovery(&self, _items: Vec<DiscoveredEventSchema>) {}
+        async fn on_identify(
+            &self,
+            _project_id: &str,
+            _anon_id: &str,
+            _user_id: &str,
+            _canonical_uid: u32,
+        ) -> pulse_ingest::Result<u32> {
+            match *self.err_kind.lock() {
+                0 => Err(IngestError::Conflict("merge conflict".into())),
+                1 => Err(IngestError::Storage(StorageError::Unavailable(
+                    "down".into(),
+                ))),
+                _ => Err(IngestError::Storage(StorageError::NotWriter {
+                    project_id: "proj_q".into(),
+                })),
+            }
+        }
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let gov = Arc::new(QuicErrGov {
+        err_kind: parking_lot::Mutex::new(0),
+    });
+    let ingest = IngestService::new(storage, gov.clone());
+    let quic = spawn_quic_listener("127.0.0.1:0".parse().unwrap(), ingest.clone()).unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            quic.cert_der.as_slice(),
+        ))
+        .unwrap();
+    let client_cfg = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_cfg);
+    let conn = endpoint
+        .connect(quic.local_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+
+    async fn send_op(
+        conn: &quinn::Connection,
+        op: u8,
+        key: &str,
+        body: &[u8],
+    ) -> serde_json::Value {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut hdr = Vec::with_capacity(7 + key.len());
+        hdr.push(op);
+        hdr.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        hdr.extend_from_slice(key.as_bytes());
+        hdr.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        send.write_all(&hdr).await.unwrap();
+        send.write_all(body).await.unwrap();
+        send.finish().unwrap();
+        let resp = recv.read_to_end(64 * 1024).await.unwrap();
+        serde_json::from_slice(&resp).unwrap()
+    }
+
+    let id_body = serde_json::json!({"anon_id": "a1", "user_id": "u1"}).to_string();
+    *gov.err_kind.lock() = 0;
+    let r0 = send_op(&conn, QUIC_OP_IDENTIFY, "pk_q", id_body.as_bytes()).await;
+    assert_eq!(r0["code"], "conflict", "{r0}");
+
+    *gov.err_kind.lock() = 1;
+    let r1 = send_op(&conn, QUIC_OP_IDENTIFY, "pk_q", id_body.as_bytes()).await;
+    assert_eq!(r1["code"], "unavailable", "{r1}");
+
+    *gov.err_kind.lock() = 2;
+    let r2 = send_op(&conn, QUIC_OP_IDENTIFY, "pk_q", id_body.as_bytes()).await;
+    assert_eq!(r2["code"], "not_writer", "{r2}");
+
+    // Also test QUIC_OP_REPLAY returns JSON cleanly (or error without code on invalid JSON).
+    let r_rep = send_op(&conn, QUIC_OP_REPLAY, "pk_q", b"not-json").await;
+    assert_eq!(r_rep["status"], "error", "{r_rep}");
+
+    drop(conn);
+    endpoint.wait_idle().await;
+    ingest.shutdown().await;
+}

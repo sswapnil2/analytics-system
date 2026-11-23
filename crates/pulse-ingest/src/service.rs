@@ -48,6 +48,15 @@ pub enum IngestError {
 
     #[error("ingest rate limit exceeded for this project; retry in {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
+
+    #[error("governance conflict: {0}")]
+    Conflict(String),
+
+    #[error("governance unavailable: {0}")]
+    Unavailable(String),
+
+    #[error("governance error: {0}")]
+    Governance(String),
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -89,6 +98,16 @@ pub struct IdentifyRequest {
 pub struct IdentifyResponse {
     pub status: String,
     pub canonical_uid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngageResponse {
+    pub status: String,
+    pub updated: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canonical_uids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1515,20 +1534,21 @@ impl IngestService {
         let canonical_uid = id_graph
             .alias_durable(&req.anon_id, &req.user_id, anon_bucket, user_bucket)
             .await?;
-        self.governance
+        let canonical_uid = self
+            .governance
             .on_identify(project_id, &req.anon_id, &req.user_id, canonical_uid)
-            .await;
+            .await?;
 
         if let Some(up) = req.user_properties {
             let payload = serde_json::json!({ "$set": up });
             self.governance
                 .apply_engage(project_id, &req.user_id, canonical_uid, &payload)
-                .await;
+                .await?;
         }
         if let Some(ops) = req.operations {
             self.governance
                 .apply_engage(project_id, &req.user_id, canonical_uid, &ops)
-                .await;
+                .await?;
         }
 
         Ok(IdentifyResponse {
@@ -1538,7 +1558,7 @@ impl IngestService {
     }
 
     /// Processes `/engage` or Identify user profile mutations (`Gap 1`).
-    pub async fn engage(&self, api_key: &str, body: &[u8]) -> Result<serde_json::Value> {
+    pub async fn engage(&self, api_key: &str, body: &[u8]) -> Result<EngageResponse> {
         let project_id = self
             .governance
             .authenticate_api_key(api_key)
@@ -1546,18 +1566,14 @@ impl IngestService {
             .ok_or(IngestError::Unauthorized)?;
         self.charge(&project_id, 1)?;
         let val: serde_json::Value = serde_json::from_slice(body)?;
-        let updated = self.engage_for_project(&project_id, val).await?;
-        Ok(serde_json::json!({
-            "status": "ok",
-            "updated": updated,
-        }))
+        self.engage_for_project(&project_id, val).await
     }
 
     pub async fn engage_for_project(
         &self,
         project_id: &str,
         payload: serde_json::Value,
-    ) -> Result<usize> {
+    ) -> Result<EngageResponse> {
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
             .await?;
@@ -1582,9 +1598,9 @@ impl IngestService {
             }
         };
 
-        let mut updated = 0usize;
+        let mut pending: Vec<(String, u32, serde_json::Value)> = Vec::with_capacity(items.len());
         let mut need_flush = false;
-        for item in &items {
+        for item in items {
             let distinct_id = [
                 "distinct_id",
                 "$distinct_id",
@@ -1595,7 +1611,8 @@ impl IngestService {
             .iter()
             .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
             .map(str::trim)
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
             let Some(did) = distinct_id else {
                 continue;
             };
@@ -1603,20 +1620,40 @@ impl IngestService {
                 .get("routing_seed")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or(did);
+                .unwrap_or(&did);
             let bucket_id = route_bucket(seed, num_buckets);
-            let raw_uid = id_graph.get_or_intern(did, bucket_id);
-            let canon_uid = id_graph.lookup_canonical(did).unwrap_or(raw_uid);
+            let raw_uid = id_graph.get_or_intern(&did, bucket_id);
+            let canon_uid = id_graph.lookup_canonical(&did).unwrap_or(raw_uid);
             need_flush = true;
-            self.governance
-                .apply_engage(project_id, did, canon_uid, item)
-                .await;
-            updated += 1;
+            pending.push((did, canon_uid, item));
         }
+        // Flush identity graph BEFORE writing profiles so ProfileStore never persists a UID that
+        // is absent from durable SlateDB identity storage on crash or flush error.
         if need_flush {
             id_graph.flush().await?;
         }
-        Ok(updated)
+
+        let mut updated = 0usize;
+        let mut canonical_uids = Vec::with_capacity(pending.len());
+        for (did, canon_uid, item) in pending {
+            let uid = self
+                .governance
+                .apply_engage(project_id, &did, canon_uid, &item)
+                .await?;
+            canonical_uids.push(uid);
+            updated += 1;
+        }
+        let canonical_uid = canonical_uids
+            .first()
+            .copied()
+            .filter(|&first| canonical_uids.iter().all(|&u| u == first));
+
+        Ok(EngageResponse {
+            status: "ok".to_string(),
+            updated,
+            canonical_uid,
+            canonical_uids,
+        })
     }
 
     /// Processes Group Analytics `/groups` property updates (`Gap 8`).
@@ -1664,7 +1701,7 @@ impl IngestService {
             if let (Some(gt), Some(gid)) = (group_type, group_id) {
                 self.governance
                     .apply_group_engage(project_id, gt, gid, item)
-                    .await;
+                    .await?;
                 updated += 1;
             }
         }

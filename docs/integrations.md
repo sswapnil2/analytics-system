@@ -72,7 +72,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/projects/$PROJECT/query/insights \
 **Limitations:**
 
 - No client library, so batching and retries are your code's job.
-- Profile operations go to `/v1/engage` and group operations to `/v1/groups`.
+- Profile operations go to `/v1/engage` (synchronous; returns `canonical_uid` / `canonical_uids` and propagates `409`/`503`/`500`), identity merges to `/v1/identify` (synchronous; returns `canonical_uid`), and group operations to `/v1/groups` (synchronous; propagates `409`/`503`/`500`).
 
 ## Requesting an integration
 

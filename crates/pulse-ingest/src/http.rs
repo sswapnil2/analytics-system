@@ -68,7 +68,7 @@ async fn handle_engage(
     State(service): State<Arc<IngestService>>,
     headers: HeaderMap,
     body: Bytes,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+) -> std::result::Result<Json<crate::service::EngageResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let resp = service.engage(api_key, &body).await?;
     Ok(Json(resp))
@@ -206,20 +206,16 @@ impl IntoResponse for ApiError {
             | IngestError::Storage(pulse_storage::StorageError::DictionaryFull { .. }) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
-            IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict) => {
-                StatusCode::CONFLICT
-            }
-            // The WAL or local identity store write failed (disk full, unwritable directory,
-            // store down): nothing was acknowledged, so the client may retry.
-            IngestError::Storage(
-                pulse_storage::StorageError::Io(_) | pulse_storage::StorageError::ObjectStore(_),
-            ) => StatusCode::SERVICE_UNAVAILABLE,
-            IngestError::Identity(e)
-            | IngestError::Storage(pulse_storage::StorageError::Identity(e))
-                if e.is_store_unavailable() =>
-            {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            IngestError::Conflict(_)
+            | IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict)
+            | IngestError::Storage(pulse_storage::StorageError::Identity(
+                pulse_identity::IdentityError::IdentifiedMergeConflict,
+            )) => StatusCode::CONFLICT,
+            // The WAL, local identity store, or profile store failed (disk full, unwritable
+            // directory, fenced writer, store down): nothing was acknowledged, so retry.
+            IngestError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            IngestError::Storage(e) if e.is_unavailable() => StatusCode::SERVICE_UNAVAILABLE,
+            IngestError::Identity(e) if e.is_store_unavailable() => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self.0 {

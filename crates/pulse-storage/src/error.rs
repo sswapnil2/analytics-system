@@ -85,6 +85,25 @@ pub enum StorageError {
         bytes: u64,
         max_bytes: u64,
     },
+
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl StorageError {
+    /// Returns `true` when the error reflects I/O, object-store unavailability, writer fencing,
+    /// or stale local state rather than bad input or data corruption (retryable -> HTTP 503).
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            Self::Io(_)
+            | Self::ObjectStore(_)
+            | Self::NotWriter { .. }
+            | Self::StaleWriter { .. }
+            | Self::Unavailable(_) => true,
+            Self::Identity(e) => e.is_store_unavailable(),
+            _ => false,
+        }
+    }
 }
 
 impl From<vortex_error::VortexError> for StorageError {
