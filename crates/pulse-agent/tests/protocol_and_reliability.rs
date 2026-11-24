@@ -188,6 +188,7 @@ fn test_store_config(read_only: bool, gc_grace_secs: i64) -> AgentTraceStoreConf
         max_segment_bytes: 16 * 1024 * 1024,
         gc_grace_secs,
         read_only,
+        skip_boot_scan: false,
         cache_memory_bytes: 8 * 1024 * 1024,
         cache_disk_bytes: 0,
         l0_flush_max_traces: 4096,

@@ -273,13 +273,18 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
 
     match op {
         QUIC_OP_INGEST => match WireBatch::decode_auto(&body, None, service.dict_registry()) {
-            Ok(batch) => match service
-                .ingest_async_for_project(&project_id, batch, Utc::now().timestamp_millis())
-                .await
-            {
-                Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-                Err(e) => quic_error_json(&e),
-            },
+            Ok(batch) => {
+                if let Err(e) = service.charge_for_project(&project_id, batch.events.len() as u64) {
+                    return quic_error_json(&e);
+                }
+                match service
+                    .ingest_async_for_project(&project_id, batch, Utc::now().timestamp_millis())
+                    .await
+                {
+                    Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
+                    Err(e) => quic_error_json(&e),
+                }
+            }
             Err(e) => serde_json::to_vec(&serde_json::json!({
                 "status": "error",
                 "message": e.to_string(),
@@ -287,23 +292,33 @@ async fn handle_quic_stream(service: &IngestService, recv: &mut RecvStream) -> V
             .unwrap_or_default(),
         },
         QUIC_OP_IDENTIFY => match serde_json::from_slice::<IdentifyRequest>(&body) {
-            Ok(req) => match service.identify_for_project(&project_id, req).await {
-                Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-                Err(e) => quic_error_json(&e),
-            },
+            Ok(req) => {
+                if let Err(e) = service.charge_for_project(&project_id, 1) {
+                    return quic_error_json(&e);
+                }
+                match service.identify_for_project(&project_id, req).await {
+                    Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
+                    Err(e) => quic_error_json(&e),
+                }
+            }
             Err(e) => serde_json::to_vec(&serde_json::json!({
                 "status": "error",
                 "message": e.to_string(),
             }))
             .unwrap_or_default(),
         },
-        QUIC_OP_REPLAY => match service
-            .ingest_replay_for_project(&project_id, None, &body)
-            .await
-        {
-            Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
-            Err(e) => quic_error_json(&e),
-        },
+        QUIC_OP_REPLAY => {
+            if let Err(e) = service.charge_for_project(&project_id, 1) {
+                return quic_error_json(&e);
+            }
+            match service
+                .ingest_replay_for_project(&project_id, None, &body)
+                .await
+            {
+                Ok(r) => serde_json::to_vec(&r).unwrap_or_default(),
+                Err(e) => quic_error_json(&e),
+            }
+        }
         _ => br#"{"status":"error","message":"unknown quic opcode"}"#.to_vec(),
     }
 }

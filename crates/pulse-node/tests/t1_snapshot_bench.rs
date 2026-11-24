@@ -699,6 +699,7 @@ async fn run_candidate_a_benchmark() -> BenchSummary {
                         dirty_seq: cur_prof_dirty,
                     }),
                 },
+                writer_offsets: std::collections::BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -1439,6 +1440,7 @@ fn t1_publish_all_four_crash_points_restore_cleanly() {
                             dirty_seq: pstore.dirty_seq(),
                         }),
                     },
+                    writer_offsets: std::collections::BTreeMap::new(),
                 })
                 .await
                 .unwrap();

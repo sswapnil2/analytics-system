@@ -22,7 +22,7 @@ use pulse_exec::{
 };
 use pulse_ingest::{
     forward_loop_middleware, rate_limit::RateLimiter, DiscoveredEventSchema, ForwardLoopGuard,
-    GovernanceProvider, IngestError, IngestService, ProjectLexiconRules,
+    GovernanceProvider, IngestError, IngestService, OwnerDirectory, ProjectLexiconRules,
 };
 use pulse_storage::{
     build_customer_object_store, make_key_id, parse_or_derive_master_key,
@@ -46,7 +46,7 @@ use crate::agent_eval_worker::{
 };
 
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
-use crate::db::{DbProjectOwnerChecker, MetaError, MetaStore};
+use crate::db::{DbProjectOwnerChecker, MetaError, MetaOwnerDirectory, MetaStore};
 use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
 use crate::mcp::JsonRpcRequest;
 use crate::models::{
@@ -190,6 +190,8 @@ pub struct ControlPlaneService {
     advertise_addr: Option<String>,
     owner_checker: Arc<DbProjectOwnerChecker>,
     forward_guard: Arc<ForwardLoopGuard>,
+    stateless_writer: std::sync::atomic::AtomicBool,
+    owner_directory: parking_lot::RwLock<Option<Arc<MetaOwnerDirectory>>>,
 }
 
 fn writer_node_stale_after_ms() -> i64 {
@@ -234,6 +236,7 @@ impl ControlPlaneService {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -255,6 +258,7 @@ impl ControlPlaneService {
             Some(agent_store_config),
             None,
             None,
+            false,
         )
         .await
     }
@@ -279,6 +283,33 @@ impl ControlPlaneService {
             agent_store_config,
             node_name,
             advertise_addr,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_node_identity_with_mode(
+        meta: MetaStore,
+        qengine: Arc<QueryEngine>,
+        default_project_id: impl Into<String>,
+        initial_ingest_key: impl Into<String>,
+        explicit_admin_token: Option<String>,
+        agent_store_config: Option<AgentTraceStoreConfig>,
+        node_name: Option<String>,
+        advertise_addr: Option<String>,
+        stateless_writer: bool,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_options(
+            meta,
+            qengine,
+            default_project_id,
+            initial_ingest_key,
+            explicit_admin_token,
+            agent_store_config,
+            node_name,
+            advertise_addr,
+            stateless_writer,
         )
         .await
     }
@@ -293,6 +324,7 @@ impl ControlPlaneService {
         agent_config: Option<AgentTraceStoreConfig>,
         node_name: Option<String>,
         advertise_addr: Option<String>,
+        stateless_writer: bool,
     ) -> Result<Arc<Self>, String> {
         let default_project_id = default_project_id.into();
         let initial_ingest_key = initial_ingest_key.into();
@@ -386,6 +418,8 @@ impl ControlPlaneService {
             advertise_addr,
             owner_checker,
             forward_guard,
+            stateless_writer: std::sync::atomic::AtomicBool::new(stateless_writer),
+            owner_directory: parking_lot::RwLock::new(None),
         });
 
         let generated_ingest = svc
@@ -656,11 +690,31 @@ impl ControlPlaneService {
         Ok(())
     }
 
+    pub fn set_stateless_writer(&self, enabled: bool) {
+        self.stateless_writer
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_owner_directory(&self, dir: Arc<MetaOwnerDirectory>) {
+        *self.owner_directory.write() = Some(dir);
+    }
+
     pub async fn reload_caches_from_db(&self) -> Result<(), String> {
-        if let Err(e) = self.refresh_encryption_keyring().await {
-            tracing::warn!(error = %e, "failed to refresh BYOK keyring");
+        let is_stateless_writer = self
+            .stateless_writer
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !is_stateless_writer {
+            if let Err(e) = self.refresh_encryption_keyring().await {
+                tracing::warn!(error = %e, "failed to refresh BYOK keyring");
+            }
         }
         self.refresh_api_key_cache().await?;
+        let owner_dir = self.owner_directory.read().clone();
+        if let Some(dir) = owner_dir {
+            if let Err(e) = dir.refresh_all().await {
+                tracing::warn!(error = %e, "failed to refresh owner directory");
+            }
+        }
 
         let projects = self.meta.list_projects().await.map_err(|e| e.to_string())?;
         let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
@@ -668,7 +722,7 @@ impl ControlPlaneService {
             .retain(|id, _| live_projects.contains(id.as_str()));
 
         let is_published_reader = self.qengine.storage().is_published_reader();
-        let owner_map: HashMap<String, String> = if !is_published_reader {
+        let owner_map: HashMap<String, String> = if !is_published_reader && !is_stateless_writer {
             self.meta
                 .list_project_owners()
                 .await
@@ -685,7 +739,9 @@ impl ControlPlaneService {
         for proj in &projects {
             self.known_projects
                 .insert(proj.id.clone(), proj.org_id.clone());
-            let should_sync_virtual_catalog = if is_published_reader {
+            let should_sync_virtual_catalog = if is_stateless_writer {
+                false
+            } else if is_published_reader {
                 true
             } else {
                 match (owner_map.get(&proj.id), self.node_name.as_deref()) {
@@ -699,8 +755,10 @@ impl ControlPlaneService {
                 self.refresh_project_lexicon_cache(&proj.id).await?;
                 if should_sync_virtual_catalog {
                     self.refresh_project_virtual_catalog(&proj.id).await
-                } else {
+                } else if !is_stateless_writer {
                     self.evict_non_owned_profile_cache(&proj.id);
+                    Ok(())
+                } else {
                     Ok(())
                 }
             }

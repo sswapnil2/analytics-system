@@ -25,24 +25,26 @@ pub use engine::{
     closed_date_max_bytes_from_env, closed_date_upload_interval_from_env, cold_merge_idle_from_env,
     cold_merge_interval_from_env, cold_merge_max_input_bytes_from_env, decode_dead_letter,
     encode_dead_letter, event_uuid_fingerprint, list_dead_letters, route_bucket,
-    upload_interval_from_env, upload_merge_max_input_bytes_from_env, DeadLetterEntry,
-    LeaseAcquireOutcome, MaintenanceErrors, MaintenanceKind, OwnerCheck, PreparedPublishedRefresh,
-    ProjectOwnerChecker, ProjectOwnerInfo, ProjectStorage, StorageConfig, StorageEngine,
-    WriterLeases, DEAD_LETTERED_EVENTS, DEAD_LETTER_MAGIC, DEAD_LETTER_VERSION,
-    DEFAULT_CLOSED_DATE_MAX_BYTES, DEFAULT_CLOSED_DATE_UPLOAD_SECS, DEFAULT_COLD_MERGE_IDLE_SECS,
+    upload_interval_from_env, upload_merge_max_input_bytes_from_env,
+    writer_offset_expire_ms_from_env, DeadLetterEntry, LeaseAcquireOutcome, MaintenanceErrors,
+    MaintenanceKind, OwnerCheck, PreparedPublishedRefresh, ProjectOwnerChecker, ProjectOwnerInfo,
+    ProjectStorage, StorageConfig, StorageEngine, WriterLeases, DEAD_LETTERED_EVENTS,
+    DEAD_LETTER_MAGIC, DEAD_LETTER_VERSION, DEFAULT_CLOSED_DATE_MAX_BYTES,
+    DEFAULT_CLOSED_DATE_UPLOAD_SECS, DEFAULT_COLD_MERGE_IDLE_SECS,
     DEFAULT_COLD_MERGE_INTERVAL_SECS, DEFAULT_COLD_MERGE_MAX_INPUT_BYTES,
     DEFAULT_FLUSH_CONCURRENCY, DEFAULT_HOT_SEGMENTS_MAX_MB, DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB,
     DEFAULT_NUM_BUCKETS, DEFAULT_UPLOAD_INTERVAL_SECS, DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES,
+    DEFAULT_WRITER_OFFSET_EXPIRE_SECS,
 };
 pub use erased::ErasedUids;
 pub use error::{Result, StorageError};
 pub use hll::{CompactHll, HllSketch};
 pub use manifest::{
-    install_restored_manifest, ColdMergeIntent, ColdMergeIntentStore, IdentitySnapshotRef,
-    Manifest, ManifestStore, PartitionEntry, PartitionUploadTime, PendingS3Delete,
-    PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest, PublishedManifestStore,
-    ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent, UploadIntentBatch,
-    UploadIntentStore,
+    install_restored_manifest, prune_expired_writer_offsets, ColdMergeIntent, ColdMergeIntentStore,
+    IdentitySnapshotRef, Manifest, ManifestStore, PartitionEntry, PartitionUploadTime,
+    PendingS3Delete, PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest,
+    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent,
+    UploadIntentBatch, UploadIntentStore, WriterOffsetEntry,
 };
 pub use mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
@@ -73,7 +75,10 @@ pub use store_factory::{
     open_hot_store_for_restore, validate_object_store_connection, validate_outbound_url_ssrf,
     with_hot_store, with_hot_store_for_role, DurableLocalObjectStore,
 };
-pub use wal::{decode_wal_frame, decode_wal_frame_with_epoch, BucketWal};
+pub use wal::{
+    decode_wal_frame, decode_wal_frame_full, decode_wal_frame_with_epoch, BucketWal,
+    DecodedWalFrame, WalWriterOffset, WAL_MAGIC_V3,
+};
 
 /// Zero-copy string extractor supporting Arrow `Utf8`, `LargeUtf8`, and `Utf8View` arrays returned by Vortex.
 #[inline]

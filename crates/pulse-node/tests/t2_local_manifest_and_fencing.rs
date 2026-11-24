@@ -417,6 +417,7 @@ fn t2_15_dense_publish_seq_fencing_and_step6_self_crash_recovery() {
                         },
                         profiles: None,
                     },
+                    writer_offsets: std::collections::BTreeMap::new(),
                 })
                 .await
                 .unwrap();

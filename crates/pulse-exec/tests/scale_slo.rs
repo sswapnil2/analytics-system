@@ -943,6 +943,7 @@ async fn run_large_scale_milestone(total_events: usize, distinct_users: u32) {
         committed_wal_seq: std::collections::BTreeMap::new(),
         committed_l0_seq: std::collections::BTreeMap::new(),
         dict_snapshot: dict.snapshot(),
+        writer_offsets: std::collections::BTreeMap::new(),
     };
     let mut total_seg_bytes = 0u64;
     for (date, bucket, meta) in seg_metas {

@@ -80,3 +80,47 @@ groups:
           description: >-
             pulse_maintenance_errors_total increased in the last 5 minutes (check kind label:
             identity_flush, flush, compaction, manifest_refresh, or publish).
+
+      - alert: PulseWriterForwardingLagHigh
+        expr: pulse_writer_forwarding_lag_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse stateless writer forwarding lag is above 60s"
+          description: >-
+            Oldest unforwarded batch in writer_log (pulse_writer_forwarding_lag_seconds)
+            has exceeded 60s for 2 minutes. Check owning storage node reachability and
+            pulse_writer_forward_batches_total{result!="ok"}.
+
+      - alert: PulseWriterForwardingLagApproachingDedupWindow
+        expr: pulse_writer_forwarding_lag_seconds > 600
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pulse stateless writer forwarding lag is approaching the 15-minute dedup window"
+          description: >-
+            pulse_writer_forwarding_lag_seconds exceeded 600s (10m) against the 15-minute
+            client dedup window. Client retries may not be deduplicated until backlog drains.
+
+      - alert: PulseWriterLogDiskSaturation
+        expr: (pulse_writer_log_bytes / clamp_min(pulse_writer_log_capacity_bytes, 1)) > 0.80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pulse writer_log disk usage exceeds 80% of node capacity"
+          description: >-
+            pulse_writer_log_bytes is above 80% of pulse_writer_log_capacity_bytes.
+            Affected projects will receive HTTP 429 (writer_log_backpressure) at 100%.
+
+      - alert: PulseWriterLogExpiredBatchesDropped
+        expr: increase(pulse_writer_log_expired_batches_dropped_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pulse writer_log dropped expired unforwarded batches"
+          description: >-
+            One or more batches exceeded the hard 6-day writer_log max age (< 7-day
+            storage offset T_expire) and were dropped to preserve exactly-once safety.

@@ -56,6 +56,7 @@ struct BucketInner {
     bytes: usize,
     cached_slice: Option<Arc<[Arc<StoredRow>]>>,
     oldest_unflushed_at: Option<Instant>,
+    last_applied_wal_seq: u64,
 }
 
 /// L0 hot in-memory buffer per `(project_id, bucket_id)`.
@@ -87,6 +88,7 @@ impl MemBucket {
                 bytes: 0,
                 cached_slice: Some(Arc::from(&[][..])),
                 oldest_unflushed_at: None,
+                last_applied_wal_seq: 0,
             }),
         }
     }
@@ -110,7 +112,9 @@ impl MemBucket {
         if rows.is_empty() {
             return 0;
         }
+        let max_wal = rows.iter().map(|r| r.wal_seq).max().unwrap_or(0);
         let mut guard = self.inner.write();
+        guard.last_applied_wal_seq = guard.last_applied_wal_seq.max(max_wal);
         if guard.oldest_unflushed_at.is_none() {
             guard.oldest_unflushed_at = Some(Instant::now());
         }
@@ -122,6 +126,17 @@ impl MemBucket {
         guard.rows.extend(rows.into_iter().map(Arc::new));
         guard.cached_slice = None;
         guard.rows.len()
+    }
+
+    /// Records `wal_seq` as applied even when it produced zero `StoredRow`s (e.g. a 100%
+    /// client-deduped `PWL3` frame or dead-lettered batch), under the same lock as `rows`.
+    pub fn record_applied_wal_seq(&self, wal_seq: u64) {
+        let mut guard = self.inner.write();
+        guard.last_applied_wal_seq = guard.last_applied_wal_seq.max(wal_seq);
+    }
+
+    pub fn last_applied_wal_seq(&self) -> u64 {
+        self.inner.read().last_applied_wal_seq
     }
 
     pub fn len(&self) -> usize {
@@ -214,7 +229,49 @@ impl MemBucket {
             .map(|r| r.l0_seq)
             .max()
             .unwrap_or(floor_l0_seq);
-        let max_wal = staged.iter().map(|r| r.wal_seq).max().unwrap_or(0);
+        let max_wal = staged
+            .iter()
+            .map(|r| r.wal_seq)
+            .max()
+            .unwrap_or(0)
+            .max(guard.last_applied_wal_seq);
+        staged.shrink_to_fit();
+        Some((max_l0, max_wal, staged))
+    }
+
+    /// Like [`Self::stage_flush`], but when no L0 rows are pending, still returns
+    /// `(floor_l0_seq, last_applied_wal_seq, Vec::new())` if `last_applied_wal_seq > floor_wal_seq`
+    /// so trailing empty applied WAL records (e.g. client-deduped `PWL3` frames) can advance
+    /// `committed_wal_seq` and promote `writer_offsets` without writing empty segments.
+    pub fn stage_flush_with_wal(
+        &self,
+        floor_l0_seq: u64,
+        floor_wal_seq: u64,
+    ) -> Option<(u64, u64, Vec<StoredRow>)> {
+        let guard = self.inner.read();
+        let mut staged: Vec<StoredRow> = guard
+            .rows
+            .iter()
+            .filter(|r| r.l0_seq > floor_l0_seq)
+            .map(|r| (**r).clone())
+            .collect();
+        if staged.is_empty() {
+            if guard.last_applied_wal_seq > floor_wal_seq {
+                return Some((floor_l0_seq, guard.last_applied_wal_seq, Vec::new()));
+            }
+            return None;
+        }
+        let max_l0 = staged
+            .iter()
+            .map(|r| r.l0_seq)
+            .max()
+            .unwrap_or(floor_l0_seq);
+        let max_wal = staged
+            .iter()
+            .map(|r| r.wal_seq)
+            .max()
+            .unwrap_or(0)
+            .max(guard.last_applied_wal_seq);
         staged.shrink_to_fit();
         Some((max_l0, max_wal, staged))
     }

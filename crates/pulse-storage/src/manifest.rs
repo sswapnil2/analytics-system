@@ -52,6 +52,82 @@ pub struct PartitionUploadTime {
     pub last_upload_ms: i64,
 }
 
+/// High-water offset applied from a stateless writer (`writer_id`) for one `bucket_id` (`W3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterOffsetEntry {
+    pub last_applied_offset: u64,
+    pub last_seen_ts_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WriterOffsetWireEntry {
+    writer_id: String,
+    bucket_id: u8,
+    last_applied_offset: u64,
+    last_seen_ts_ms: i64,
+}
+
+mod writer_offsets_serde {
+    use super::{WriterOffsetEntry, WriterOffsetWireEntry};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(
+        map: &BTreeMap<(String, u8), WriterOffsetEntry>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<WriterOffsetWireEntry> = map
+            .iter()
+            .map(|((writer_id, bucket_id), entry)| WriterOffsetWireEntry {
+                writer_id: writer_id.clone(),
+                bucket_id: *bucket_id,
+                last_applied_offset: entry.last_applied_offset,
+                last_seen_ts_ms: entry.last_seen_ts_ms,
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<(String, u8), WriterOffsetEntry>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<WriterOffsetWireEntry>::deserialize(deserializer)?;
+        let mut map: BTreeMap<(String, u8), WriterOffsetEntry> = BTreeMap::new();
+        for item in entries {
+            map.entry((item.writer_id, item.bucket_id))
+                .and_modify(|cur| {
+                    cur.last_applied_offset = cur.last_applied_offset.max(item.last_applied_offset);
+                    cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(item.last_seen_ts_ms);
+                })
+                .or_insert(WriterOffsetEntry {
+                    last_applied_offset: item.last_applied_offset,
+                    last_seen_ts_ms: item.last_seen_ts_ms,
+                });
+        }
+        Ok(map)
+    }
+}
+
+/// Removes writer offset entries unseen for longer than `expire_ms` (`now_ms - last_seen_ts_ms > expire_ms`).
+pub fn prune_expired_writer_offsets(
+    offsets: &mut BTreeMap<(String, u8), WriterOffsetEntry>,
+    now_ms: i64,
+    expire_ms: i64,
+) -> usize {
+    if expire_ms <= 0 || offsets.is_empty() {
+        return 0;
+    }
+    let before = offsets.len();
+    offsets.retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ts_ms) <= expire_ms);
+    before - offsets.len()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestWire {
     epoch: u64,
@@ -69,6 +145,12 @@ struct ManifestWire {
     committed_wal_seq: BTreeMap<u8, u64>,
     committed_l0_seq: BTreeMap<u8, u64>,
     dict_snapshot: ProjectDictSnapshot,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "writer_offsets_serde"
+    )]
+    writer_offsets: BTreeMap<(String, u8), WriterOffsetEntry>,
 }
 
 /// Durable MVCC Manifest for a project's immutable L1 Vortex segments, WAL checkpoints, and dictionaries.
@@ -89,6 +171,8 @@ pub struct Manifest {
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
     pub dict_snapshot: ProjectDictSnapshot,
+    /// High-water `(writer_id, bucket_id)` offsets promoted alongside `committed_wal_seq` (`W3`).
+    pub writer_offsets: BTreeMap<(String, u8), WriterOffsetEntry>,
 }
 
 impl Manifest {
@@ -154,6 +238,7 @@ impl Manifest {
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
             dict_snapshot: self.dict_snapshot.clone(),
+            writer_offsets: self.writer_offsets.clone(),
         }
     }
 
@@ -178,6 +263,7 @@ impl Manifest {
             committed_wal_seq: w.committed_wal_seq,
             committed_l0_seq: w.committed_l0_seq,
             dict_snapshot: w.dict_snapshot,
+            writer_offsets: w.writer_offsets,
         }
     }
 }
@@ -388,6 +474,12 @@ pub struct PublishedManifest {
     pub committed_wal_seq: BTreeMap<u8, u64>,
     pub committed_l0_seq: BTreeMap<u8, u64>,
     pub snapshot_ref: SnapshotRef,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "writer_offsets_serde"
+    )]
+    pub writer_offsets: BTreeMap<(String, u8), WriterOffsetEntry>,
 }
 
 impl PublishedManifest {
@@ -408,6 +500,7 @@ impl PublishedManifest {
             committed_wal_seq: self.committed_wal_seq.clone(),
             committed_l0_seq: self.committed_l0_seq.clone(),
             dict_snapshot: self.dict_snapshot.clone(),
+            writer_offsets: self.writer_offsets.clone(),
         }
     }
 }
@@ -995,6 +1088,7 @@ mod tests {
                 },
                 profiles: None,
             },
+            writer_offsets: BTreeMap::new(),
         };
 
         // Publish seq 0 and 1.
@@ -1174,5 +1268,84 @@ mod tests {
 
         intent_store.clear().await.unwrap();
         assert!(intent_store.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn writer_offsets_roundtrip_legacy_compat_and_publish_restore() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ms = ManifestStore::new("p_wo", store.clone());
+        let pms = PublishedManifestStore::new("p_wo", store.clone());
+
+        // Legacy JSON without writer_offsets deserializes to empty BTreeMap.
+        let legacy_json = br#"{
+            "epoch": 1,
+            "partitions": [],
+            "committed_wal_seq": {},
+            "committed_l0_seq": {},
+            "dict_snapshot": { "events": [], "prop_keys": [] }
+        }"#;
+        store
+            .put(
+                &ObjectPath::from("manifests/p_wo/epoch_000000000001.json"),
+                PutPayload::from_static(legacy_json),
+            )
+            .await
+            .unwrap();
+        let loaded = ms.load_latest().await.unwrap();
+        assert!(loaded.writer_offsets.is_empty());
+
+        // Writer offsets including colon-containing writer_id roundtrip cleanly through PZST.
+        let mut next = loaded;
+        next.writer_offsets.insert(
+            ("writer:alpha:1".to_string(), 0),
+            WriterOffsetEntry {
+                last_applied_offset: 0,
+                last_seen_ts_ms: 1_790_000_000_000,
+            },
+        );
+        next.writer_offsets.insert(
+            ("writer:beta".to_string(), 3),
+            WriterOffsetEntry {
+                last_applied_offset: 42,
+                last_seen_ts_ms: 1_790_000_050_000,
+            },
+        );
+        let committed = ms.commit_next(next).await.unwrap();
+        let reloaded = ms.load_latest().await.unwrap();
+        assert_eq!(reloaded.writer_offsets, committed.writer_offsets);
+
+        let pub_m = pms
+            .publish_next(PublishedManifest {
+                publish_seq: 0,
+                writer_generation: 1,
+                source_local_epoch: committed.epoch,
+                high_water_mark: 10,
+                published_at_ms: 1_790_000_060_000,
+                partitions: vec![],
+                dict_snapshot: ProjectDictSnapshot::default(),
+                committed_wal_seq: BTreeMap::new(),
+                committed_l0_seq: BTreeMap::new(),
+                snapshot_ref: SnapshotRef {
+                    identity: IdentitySnapshotRef {
+                        object_path: "published/p_wo/snapshots/id_0.pzst".into(),
+                        user_count: 10,
+                        mutation_epoch: 1,
+                    },
+                    profiles: None,
+                },
+                writer_offsets: reloaded.writer_offsets.clone(),
+            })
+            .await
+            .unwrap();
+        let pub_loaded = pms.load_latest().await.unwrap().unwrap();
+        assert_eq!(pub_loaded.writer_offsets, reloaded.writer_offsets);
+        let restored_local = pub_m.to_local_manifest(5);
+        assert_eq!(restored_local.writer_offsets, reloaded.writer_offsets);
+
+        let mut pruned = restored_local.writer_offsets;
+        let removed = prune_expired_writer_offsets(&mut pruned, 1_790_000_060_000, 30_000);
+        assert_eq!(removed, 1);
+        assert!(!pruned.contains_key(&("writer:alpha:1".to_string(), 0)));
+        assert!(pruned.contains_key(&("writer:beta".to_string(), 3)));
     }
 }

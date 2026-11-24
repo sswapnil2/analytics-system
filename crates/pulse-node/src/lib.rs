@@ -13,12 +13,14 @@ use axum::routing::get;
 use axum::Router;
 use pulse_control::{
     build_admin_control_router, build_agent_ingest_router, build_public_flag_router,
-    BootstrapCredentials, ControlPlaneService, MetaStore, WriterNode,
+    AgentTraceStoreConfig, BootstrapCredentials, ControlPlaneService, MetaOwnerDirectory,
+    MetaStore, WriterNode,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
 use pulse_ingest::{
-    build_ingest_router_with_guard, spawn_quic_listener, IngestService, QuicIngestHandle,
+    build_ingest_router_with_guard, build_internal_forward_router, spawn_quic_listener,
+    ForwardLoopGuard, IngestService, QuicIngestHandle, WriterForwarder, WriterLogManager,
 };
 use pulse_storage::{
     build_object_store, with_hot_store_for_role, DurableLocalObjectStore, MaintenanceKind,
@@ -48,6 +50,7 @@ pub enum NodeRole {
     #[default]
     All,
     Ingest,
+    Writer,
     Query,
     Compactor,
 }
@@ -57,6 +60,7 @@ impl NodeRole {
         match s.trim().to_ascii_lowercase().as_str() {
             "all" => Some(Self::All),
             "ingest" => Some(Self::Ingest),
+            "writer" => Some(Self::Writer),
             "query" => Some(Self::Query),
             "compactor" => Some(Self::Compactor),
             _ => None,
@@ -67,6 +71,7 @@ impl NodeRole {
         match self {
             Self::All => "all",
             Self::Ingest => "ingest",
+            Self::Writer => "writer",
             Self::Query => "query",
             Self::Compactor => "compactor",
         }
@@ -74,7 +79,17 @@ impl NodeRole {
 
     #[inline]
     pub fn serves_ingest(&self) -> bool {
+        matches!(self, Self::All | Self::Ingest | Self::Writer)
+    }
+
+    #[inline]
+    pub fn owns_storage(&self) -> bool {
         matches!(self, Self::All | Self::Ingest)
+    }
+
+    #[inline]
+    pub fn is_stateless_writer(&self) -> bool {
+        matches!(self, Self::Writer)
     }
 
     #[inline]
@@ -281,9 +296,11 @@ impl RunningNode {
         if let Err(e) = self.control.agent_store().close().await {
             tracing::error!(error = %e, "closing agent trace store on shutdown failed");
         }
-        if !self.storage.identity_router().is_read_only() {
-            // Drain W1 ingest buffers to WAL and finish applying queued WAL records before final L0 flush.
+        if self.ingest.is_stateless_writer() || !self.storage.identity_router().is_read_only() {
+            // Drain W1 ingest buffers to WAL (or writer_log/) before closing or final L0 flush.
             self.ingest.shutdown().await;
+        }
+        if !self.storage.identity_router().is_read_only() {
             // Losing these would lose acknowledged data from memory: say so loudly.
             if let Err(e) = self.storage.flush_all_projects().await {
                 tracing::error!(error = %e, "final flush on shutdown failed");
@@ -451,7 +468,7 @@ pub async fn run_query_refresh_tick(
     refreshed
 }
 
-/// Boots the Pulse Analytics Node (`All`, `Ingest`, `Query`, or `Compactor` role).
+/// Boots the Pulse Analytics Node (`All`, `Ingest`, `Writer`, `Query`, or `Compactor` role).
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
     start_pulse_node_with_identity(config, NodeIdentity::from_env()).await
 }
@@ -462,7 +479,11 @@ pub async fn start_pulse_node_with_identity(
     identity: Option<NodeIdentity>,
 ) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let segment_store = build_object_store(&config.data_dir)?;
+    let segment_store: Arc<dyn object_store::ObjectStore> = if config.role.is_stateless_writer() {
+        Arc::new(object_store::memory::InMemory::new())
+    } else {
+        build_object_store(&config.data_dir)?
+    };
     start_pulse_node_with_store_and_identity(config, segment_store, identity).await
 }
 
@@ -481,11 +502,13 @@ pub async fn start_pulse_node_with_store_and_identity(
     identity: Option<NodeIdentity>,
 ) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let raw_store =
-        with_hot_store_for_role(raw_store, &config.data_dir, config.role == NodeRole::Query)
-            .await?;
+    let raw_store = if config.role.is_stateless_writer() {
+        Arc::new(object_store::memory::InMemory::new())
+    } else {
+        with_hot_store_for_role(raw_store, &config.data_dir, config.role == NodeRole::Query).await?
+    };
     let enc_store = Arc::new(pulse_storage::EncryptedObjectStore::new(raw_store));
-    let identity_router = Arc::new(if config.role.serves_ingest() {
+    let identity_router = Arc::new(if config.role.owns_storage() {
         IdentityRouter::new(enc_store.as_object_store())
     } else {
         IdentityRouter::new_read_only(enc_store.as_object_store())
@@ -499,7 +522,7 @@ pub async fn start_pulse_node_with_store_and_identity(
     };
     let storage =
         StorageEngine::new_with_encrypted(storage_cfg, enc_store.clone(), identity_router);
-    if config.role.serves_ingest() {
+    if config.role.owns_storage() {
         storage
             .replay_store()
             .recover_pending_local_sessions_once()
@@ -526,9 +549,14 @@ pub async fn start_pulse_node_with_store_and_identity(
         .filter(|&mb| mb > 0)
         .map(|mb| mb.saturating_mul(1024 * 1024))
         .unwrap_or(128 * 1024 * 1024);
+    let qengine_mem_bytes = if config.role.is_stateless_writer() {
+        cache_mem_bytes.min(1024 * 1024)
+    } else {
+        cache_mem_bytes
+    };
     let qengine = QueryEngine::new(
         storage.clone(),
-        cache_mem_bytes,
+        qengine_mem_bytes,
         disk_cache_dir,
         512 * 1024 * 1024,
         catalogs,
@@ -536,7 +564,10 @@ pub async fn start_pulse_node_with_store_and_identity(
     .await?;
 
     let meta = MetaStore::connect_auto(&config.data_dir).await?;
-    if meta.is_sqlite() && pulse_storage::is_local_hot_store_mode().unwrap_or(true) {
+    if !config.role.is_stateless_writer()
+        && meta.is_sqlite()
+        && pulse_storage::is_local_hot_store_mode().unwrap_or(true)
+    {
         tracing::warn!(
             data_dir = %config.data_dir.display(),
             "PULSE_HOT_STORE=local is using SQLite (pulse_meta.db); \
@@ -559,7 +590,7 @@ pub async fn start_pulse_node_with_store_and_identity(
     );
 
     // Set before anything can open a project: only the lease holder (and owner) may write one.
-    let writer_leases = config.role.serves_ingest().then(|| {
+    let writer_leases = config.role.owns_storage().then(|| {
         Arc::new(pulse_control::DbWriterLeases::from_env_with_node(
             meta.clone(),
             node_name.clone(),
@@ -567,7 +598,7 @@ pub async fn start_pulse_node_with_store_and_identity(
     });
     let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
     if let Some(ref name) = node_name {
-        if config.role.serves_ingest() {
+        if config.role.owns_storage() {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let reg_node = WriterNode {
                 node_name: name.clone(),
@@ -634,15 +665,24 @@ pub async fn start_pulse_node_with_store_and_identity(
             }
         });
     }
-    let control = ControlPlaneService::new_with_node_identity(
+    let agent_cfg_override = config
+        .role
+        .is_stateless_writer()
+        .then(|| AgentTraceStoreConfig {
+            read_only: true,
+            skip_boot_scan: true,
+            ..Default::default()
+        });
+    let control = ControlPlaneService::new_with_node_identity_with_mode(
         meta.clone(),
         qengine.clone(),
         &config.default_project_id,
         &config.default_api_key,
         config.admin_token.clone(),
-        None,
+        agent_cfg_override,
         node_name.clone(),
         Some(effective_advertise_addr),
+        config.role.is_stateless_writer(),
     )
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -665,10 +705,42 @@ pub async fn start_pulse_node_with_store_and_identity(
         );
     }
 
-    let ingest = IngestService::new(storage.clone(), control.clone());
+    let internal_token = if config.role.owns_storage() || config.role.is_stateless_writer() {
+        Some(meta.resolve_or_create_internal_token().await?)
+    } else {
+        None
+    };
+
+    let ingest = if config.role.is_stateless_writer() {
+        let writer_log = WriterLogManager::open(&config.data_dir)?;
+        let owner_dir = Arc::new(MetaOwnerDirectory::new(meta.clone()));
+        control.set_owner_directory(owner_dir.clone());
+        let fwd_guard = Arc::new(ForwardLoopGuard::new(
+            node_name
+                .clone()
+                .or_else(|| Some(writer_log.writer_id().to_string())),
+        ));
+        let forwarder = WriterForwarder::start(
+            writer_log.clone(),
+            owner_dir.clone(),
+            fwd_guard.clone(),
+            internal_token.clone(),
+            shutdown_bg_rx.clone(),
+        );
+        IngestService::new_stateless_writer(
+            writer_log,
+            owner_dir,
+            forwarder,
+            control.clone(),
+            fwd_guard,
+            internal_token.clone(),
+        )
+    } else {
+        IngestService::new(storage.clone(), control.clone())
+    };
     control.attach_ingest(ingest.clone()).await;
 
-    if config.auto_seed && config.role.serves_ingest() {
+    if config.auto_seed && config.role.owns_storage() {
         // Each process gets a new node id, so after a crash this node waits out the lease its
         // previous run left behind. A standby that never gets the lease skips seeding.
         let wait = writer_leases.as_ref().map_or(Duration::ZERO, |l| {
@@ -736,10 +808,10 @@ pub async fn start_pulse_node_with_store_and_identity(
             }
         });
     }
-    if config.role != NodeRole::Compactor {
+    if config.role.owns_storage() || config.role.serves_query_and_admin() {
         control.spawn_agent_eval_worker(shutdown_bg_rx.clone());
     }
-    if config.role.serves_ingest() {
+    if config.role.owns_storage() {
         // The agent trace store only flushes and compacts when asked; writers own both.
         // Flush runs on its own task: acknowledged spans pile up in memory until it does, so
         // a long compaction pass must never hold it back.
@@ -774,7 +846,7 @@ pub async fn start_pulse_node_with_store_and_identity(
         let agent_control = control.clone();
         let mut agent_shutdown = shutdown_bg_rx.clone();
         // Both `All` and `Ingest` own writable agent stores; `Query` never prunes tombstones.
-        let prunes_here = config.role.serves_ingest();
+        let prunes_here = config.role.owns_storage();
         tokio::spawn(async move {
             let mut compact_ticker = tokio::time::interval(Duration::from_secs(60));
             compact_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -876,6 +948,7 @@ pub async fn start_pulse_node_with_store_and_identity(
     } else {
         let bg_storage = storage.clone();
         let bg_control = control.clone();
+        let bg_ingest = ingest.clone();
         let role = config.role;
         tokio::spawn(async move {
             let mut ticker = if role == NodeRole::Query {
@@ -888,9 +961,20 @@ pub async fn start_pulse_node_with_store_and_identity(
                 } else {
                     tokio::time::interval(Duration::from_secs(5))
                 }
+            } else if role == NodeRole::Writer {
+                let dur = bg_ingest
+                    .writer_log()
+                    .map(|wl| {
+                        wl.idle_close_duration()
+                            .min(Duration::from_secs(5))
+                            .max(Duration::from_millis(50))
+                    })
+                    .unwrap_or_else(|| Duration::from_secs(1));
+                tokio::time::interval(dur)
             } else {
                 tokio::time::interval(Duration::from_secs(5))
             };
+            let mut last_writer_cache_reload = tokio::time::Instant::now();
             let interval = bg_storage.upload_interval();
             let cold_interval = bg_storage.cold_merge_interval();
             let cold_on_publish =
@@ -978,6 +1062,18 @@ pub async fn start_pulse_node_with_store_and_identity(
                                 }
                                 errs.check(MaintenanceKind::Compaction, bg_storage.compact_all_projects().await);
                             }
+                            NodeRole::Writer => {
+                                if let Some(wl) = bg_ingest.writer_log() {
+                                    wl.close_idle_handles();
+                                    wl.sweep_expired_batches(chrono::Utc::now().timestamp_millis());
+                                }
+                                if last_writer_cache_reload.elapsed() >= Duration::from_secs(5) {
+                                    last_writer_cache_reload = tokio::time::Instant::now();
+                                    if let Err(e) = bg_control.reload_caches_from_db().await {
+                                        tracing::warn!(error = %e, "writer failed to reload caches");
+                                    }
+                                }
+                            }
                             NodeRole::Query => {
                                 run_query_refresh_tick(&bg_control, &bg_storage).await;
                             }
@@ -1061,25 +1157,35 @@ pub async fn start_pulse_node_with_store_and_identity(
                 .filter(|t| !t.trim().is_empty()),
         }));
     if config.role.serves_ingest() {
-        let mut ingest_routes = Router::new()
-            .merge(build_ingest_router_with_guard(
-                ingest.clone(),
-                control.forward_guard(),
-            ))
-            .merge(build_agent_ingest_router(control.clone()));
+        let mut ingest_routes =
+            build_ingest_router_with_guard(ingest.clone(), control.forward_guard());
+        if config.role.owns_storage() {
+            ingest_routes = ingest_routes.merge(build_agent_ingest_router(control.clone()));
+        }
         if let Some(cap) = ingest_inflight_cap() {
             ingest_routes = ingest_routes.layer(axum::middleware::from_fn_with_state(
                 Arc::new(tokio::sync::Semaphore::new(cap)),
                 shed_ingest_when_saturated,
             ));
         }
-        let ingest_public = ingest_routes
-            .merge(build_public_flag_router(control.clone()))
-            .layer(CorsLayer::permissive());
+        let ingest_public = if config.role.owns_storage() {
+            ingest_routes
+                .merge(build_public_flag_router(control.clone()))
+                .layer(CorsLayer::permissive())
+        } else {
+            ingest_routes.layer(CorsLayer::permissive())
+        };
         api_router = api_router.merge(ingest_public);
     } else if config.role.serves_query_and_admin() {
         let flag_public = build_public_flag_router(control.clone()).layer(CorsLayer::permissive());
         api_router = api_router.merge(flag_public);
+    }
+    if config.role.owns_storage() {
+        api_router = api_router.merge(build_internal_forward_router(
+            ingest.clone(),
+            control.forward_guard(),
+            internal_token,
+        ));
     }
     if config.role.serves_query_and_admin() {
         let admin_router = build_admin_control_router(control.clone())

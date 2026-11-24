@@ -14,7 +14,25 @@ use crate::error::{Result, StorageError};
 
 /// V2 WAL frame magic covering `(epoch || seq || len || payload)` under CRC32.
 pub const WAL_MAGIC: [u8; 4] = *b"PWL2";
+/// V3 WAL frame magic carrying `(writer_id, offset, seen_ts_ms)` + `WireBatch` under CRC32 (`W3`).
+pub const WAL_MAGIC_V3: [u8; 4] = *b"PWL3";
 pub const WAL_HEADER_LEN: usize = 28;
+const MAX_WAL_WRITER_ID_LEN: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalWriterOffset {
+    pub writer_id: String,
+    pub offset: u64,
+    pub seen_ts_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedWalFrame {
+    pub epoch: u64,
+    pub seq: u64,
+    pub batch: WireBatch,
+    pub writer_offset: Option<WalWriterOffset>,
+}
 
 /// Durable per-bucket Write-Ahead Log backed by `ObjectStore` with header+payload CRC32 verification,
 /// writer-epoch fencing, transient GET retries, and corrupt-frame quarantine.
@@ -116,9 +134,41 @@ impl BucketWal {
 
     /// Appends a length-prefixed, header+payload CRC32-checked `WireBatch` record durably BEFORE returning `Ok(wal_seq)`.
     pub async fn append(&self, batch: &WireBatch) -> Result<u64> {
+        self.append_with_offset(batch, None).await
+    }
+
+    /// Appends a WAL record, optionally encoding a `WalWriterOffset` (`PWL3`) inside the CRC32-covered payload.
+    pub async fn append_with_offset(
+        &self,
+        batch: &WireBatch,
+        writer_offset: Option<&WalWriterOffset>,
+    ) -> Result<u64> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let epoch = self.epoch.load(Ordering::Acquire);
-        let payload = batch.encode_binary(1)?;
+        let batch_bytes = batch.encode_binary(1)?;
+
+        let (magic, payload) = match writer_offset {
+            None => (WAL_MAGIC, batch_bytes),
+            Some(wo) => {
+                let wid_bytes = wo.writer_id.as_bytes();
+                if wid_bytes.is_empty() || wid_bytes.len() > MAX_WAL_WRITER_ID_LEN {
+                    return Err(StorageError::Corrupted(format!(
+                        "invalid WAL writer_id length: {}",
+                        wid_bytes.len()
+                    )));
+                }
+                let wid_len = wid_bytes.len() as u32;
+                let mut payload =
+                    Vec::with_capacity(4 + wid_bytes.len() + 8 + 8 + batch_bytes.len());
+                payload.extend_from_slice(&wid_len.to_le_bytes());
+                payload.extend_from_slice(wid_bytes);
+                payload.extend_from_slice(&wo.offset.to_le_bytes());
+                payload.extend_from_slice(&wo.seen_ts_ms.to_le_bytes());
+                payload.extend_from_slice(&batch_bytes);
+                (WAL_MAGIC_V3, payload)
+            }
+        };
+
         let len_u32 = u32::try_from(payload.len())
             .map_err(|_| StorageError::Corrupted("WAL payload exceeds 4 GiB".to_string()))?;
 
@@ -130,7 +180,7 @@ impl BucketWal {
         let crc = hasher.finalize();
 
         let mut frame = Vec::with_capacity(WAL_HEADER_LEN + payload.len());
-        frame.extend_from_slice(&WAL_MAGIC);
+        frame.extend_from_slice(&magic);
         frame.extend_from_slice(&epoch.to_le_bytes());
         frame.extend_from_slice(&seq.to_le_bytes());
         frame.extend_from_slice(&len_u32.to_le_bytes());
@@ -211,6 +261,13 @@ impl BucketWal {
     /// Replays all unfenced WAL frames with `seq > committed_seq` in deterministic `(epoch, seq)` order,
     /// verifying header+payload CRC32 checksums and quarantining corrupt frames.
     pub async fn recover(&self, committed_seq: u64) -> Result<Vec<(u64, WireBatch)>> {
+        let frames = self.recover_with_offsets(committed_seq).await?;
+        Ok(frames.into_iter().map(|f| (f.seq, f.batch)).collect())
+    }
+
+    /// Replays all unfenced WAL frames (`PWL2` and `PWL3`) with `seq > committed_seq`, preserving
+    /// any embedded [`WalWriterOffset`] metadata.
+    pub async fn recover_with_offsets(&self, committed_seq: u64) -> Result<Vec<DecodedWalFrame>> {
         let min_epoch = self.min_valid_epoch.load(Ordering::Acquire);
         let prefix = ObjectPath::from(format!(
             "wal/{}/bucket_{:03}/",
@@ -236,20 +293,21 @@ impl BucketWal {
             let Some(bytes) = self.get_bytes_with_retry(&loc).await? else {
                 continue;
             };
-            match decode_wal_frame_with_epoch(&bytes) {
-                Ok((decoded_epoch, decoded_seq, batch)) => {
-                    if decoded_epoch != path_epoch || decoded_seq != path_seq {
+            match decode_wal_frame_full(&bytes) {
+                Ok(frame) => {
+                    if frame.epoch != path_epoch || frame.seq != path_seq {
                         let mismatch = StorageError::Corrupted(format!(
-                            "WAL path ({path_epoch}, {path_seq}) mismatches frame header ({decoded_epoch}, {decoded_seq})"
+                            "WAL path ({path_epoch}, {path_seq}) mismatches frame header ({}, {})",
+                            frame.epoch, frame.seq
                         ));
                         self.quarantine_corrupt_frame(&loc, &bytes, &mismatch).await;
                         continue;
                     }
-                    if decoded_epoch < min_epoch {
+                    if frame.epoch < min_epoch {
                         continue;
                     }
-                    max_seen = max_seen.max(decoded_seq);
-                    out.push((decoded_seq, batch));
+                    max_seen = max_seen.max(frame.seq);
+                    out.push(frame);
                 }
                 Err(
                     err @ (StorageError::Corrupted(_)
@@ -299,13 +357,14 @@ pub fn parse_epoch_and_seq_from_wal_path(path: &str) -> Option<(u64, u64)> {
     Some((epoch, seq))
 }
 
-pub fn decode_wal_frame_with_epoch(bytes: &[u8]) -> Result<(u64, u64, WireBatch)> {
+pub fn decode_wal_frame_full(bytes: &[u8]) -> Result<DecodedWalFrame> {
     if bytes.len() < WAL_HEADER_LEN {
         return Err(StorageError::Corrupted(format!(
             "WAL frame shorter than {WAL_HEADER_LEN}-byte header"
         )));
     }
-    if bytes[0..4] != WAL_MAGIC {
+    let magic = &bytes[0..4];
+    if magic != WAL_MAGIC && magic != WAL_MAGIC_V3 {
         return Err(StorageError::Corrupted("invalid WAL magic".to_string()));
     }
     let mut epoch_arr = [0u8; 8];
@@ -337,11 +396,145 @@ pub fn decode_wal_frame_with_epoch(bytes: &[u8]) -> Result<(u64, u64, WireBatch)
             actual: actual_crc,
         });
     }
-    let batch = WireBatch::decode_binary(payload)?;
-    Ok((epoch, seq, batch))
+
+    if magic == WAL_MAGIC {
+        let batch = WireBatch::decode_binary(payload)?;
+        return Ok(DecodedWalFrame {
+            epoch,
+            seq,
+            batch,
+            writer_offset: None,
+        });
+    }
+
+    // PWL3 payload: writer_id_len(u32 LE) || writer_id || offset(u64 LE) || seen_ts_ms(i64 LE) || PLSB
+    if payload.len() < 4 + 8 + 8 {
+        return Err(StorageError::Corrupted(
+            "PWL3 WAL payload truncated before writer offset metadata".to_string(),
+        ));
+    }
+    let wid_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if wid_len == 0 || wid_len > MAX_WAL_WRITER_ID_LEN || payload.len() < 4 + wid_len + 16 {
+        return Err(StorageError::Corrupted(
+            "PWL3 WAL writer_id length invalid or truncated".to_string(),
+        ));
+    }
+    let wid_end = 4 + wid_len;
+    let writer_id = std::str::from_utf8(&payload[4..wid_end])
+        .map_err(|e| StorageError::Corrupted(format!("PWL3 writer_id UTF-8 error: {e}")))?
+        .to_string();
+    let offset = u64::from_le_bytes(payload[wid_end..wid_end + 8].try_into().unwrap());
+    let seen_ts_ms = i64::from_le_bytes(payload[wid_end + 8..wid_end + 16].try_into().unwrap());
+    let batch = WireBatch::decode_binary(&payload[wid_end + 16..])?;
+    Ok(DecodedWalFrame {
+        epoch,
+        seq,
+        batch,
+        writer_offset: Some(WalWriterOffset {
+            writer_id,
+            offset,
+            seen_ts_ms,
+        }),
+    })
+}
+
+pub fn decode_wal_frame_with_epoch(bytes: &[u8]) -> Result<(u64, u64, WireBatch)> {
+    let frame = decode_wal_frame_full(bytes)?;
+    Ok((frame.epoch, frame.seq, frame.batch))
 }
 
 pub fn decode_wal_frame(bytes: &[u8]) -> Result<(u64, WireBatch)> {
-    let (_epoch, seq, batch) = decode_wal_frame_with_epoch(bytes)?;
-    Ok((seq, batch))
+    let frame = decode_wal_frame_full(bytes)?;
+    Ok((frame.seq, frame.batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use pulse_wire::WireEvent;
+
+    #[tokio::test]
+    async fn pwl3_and_pwl2_roundtrip_and_crc_tamper_quarantine() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal = BucketWal::new("proj_wal", 0, 1, 0, store.clone());
+
+        let ev = WireEvent {
+            event_uuid: [7u8; 16],
+            routing_seed: "u1".into(),
+            distinct_id: "u1".into(),
+            session_id: "s1".into(),
+            event_name: "Click".into(),
+            client_event_ts_ms: 1_790_000_000_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        let b1 = WireBatch::new(vec![ev]);
+        let seq1 = wal.append(&b1).await.unwrap();
+        assert_eq!(seq1, 1);
+
+        let wo = WalWriterOffset {
+            writer_id: "writer-uuid-1".into(),
+            offset: 0,
+            seen_ts_ms: 1_790_000_001_000,
+        };
+        let seq2 = wal.append_with_offset(&b1, Some(&wo)).await.unwrap();
+        assert_eq!(seq2, 2);
+
+        // Empty PWL3 offset marker also roundtrips cleanly.
+        let wo_empty = WalWriterOffset {
+            writer_id: "writer-uuid-1".into(),
+            offset: 1,
+            seen_ts_ms: 1_790_000_002_000,
+        };
+        let seq3 = wal
+            .append_with_offset(&WireBatch::new(vec![]), Some(&wo_empty))
+            .await
+            .unwrap();
+        assert_eq!(seq3, 3);
+
+        let recovered = wal.recover_with_offsets(0).await.unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert!(recovered[0].writer_offset.is_none());
+        assert_eq!(recovered[1].writer_offset.as_ref(), Some(&wo));
+        assert_eq!(recovered[2].writer_offset.as_ref(), Some(&wo_empty));
+        assert!(recovered[2].batch.events.is_empty());
+
+        // Legacy decode_wal_frame decodes PWL3 too.
+        let raw3 = store
+            .get(&ObjectPath::from(
+                "wal/proj_wal/bucket_000/epoch_0000000001_seq_000000000002.wal",
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let (dec_seq, dec_batch) = decode_wal_frame(&raw3).unwrap();
+        assert_eq!(dec_seq, 2);
+        assert_eq!(dec_batch.len(), 1);
+
+        // Tamper a byte in PWL3 payload -> quarantined on recover_with_offsets.
+        let mut tampered = raw3.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        store
+            .put(
+                &ObjectPath::from("wal/proj_wal/bucket_000/epoch_0000000001_seq_000000000002.wal"),
+                PutPayload::from(tampered),
+            )
+            .await
+            .unwrap();
+
+        let wal2 = BucketWal::new("proj_wal", 0, 1, 0, store.clone());
+        let recovered2 = wal2.recover_with_offsets(0).await.unwrap();
+        assert_eq!(recovered2.len(), 2);
+        assert!(store
+            .head(&ObjectPath::from(
+                "wal_corrupt/proj_wal/bucket_000/epoch_0000000001_seq_000000000002.wal"
+            ))
+            .await
+            .is_ok());
+    }
 }

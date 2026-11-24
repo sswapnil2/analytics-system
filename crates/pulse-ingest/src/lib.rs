@@ -1,10 +1,12 @@
 pub mod dedup;
 pub mod forward_guard;
+pub mod forwarder;
 pub mod governance;
 pub mod http;
 pub mod quic;
 pub mod rate_limit;
 pub mod service;
+pub mod writer_log;
 
 pub use dedup::{normalize_event_timestamp, DedupRegistry, DEDUP_WINDOW_MS};
 pub use forward_guard::{
@@ -12,10 +14,16 @@ pub use forward_guard::{
     ForwardCheckError, ForwardLoopGuard, DEFAULT_MAX_FORWARD_HOPS, HEADER_FORWARDED,
     HEADER_FORWARDED_BY, HEADER_FORWARDED_HOP,
 };
+pub use forwarder::{
+    decode_forward_events_envelope, encode_forward_events_envelope, ForwarderStats, OwnerDirectory,
+    OwnerSyncClient, WriterForwarder, FORWARD_EVENTS_MAGIC, HEADER_INTERNAL_TOKEN,
+};
 pub use governance::{
     DiscoveredEventSchema, GovernanceProvider, InMemoryGovernance, ProjectLexiconRules,
 };
-pub use http::{build_ingest_router, build_ingest_router_with_guard};
+pub use http::{
+    build_ingest_router, build_ingest_router_with_guard, build_internal_forward_router,
+};
 pub use quic::{
     send_quic_ingest_batch, spawn_quic_listener, QuicIngestHandle, QUIC_OP_IDENTIFY,
     QUIC_OP_INGEST, QUIC_OP_REPLAY,
@@ -23,6 +31,11 @@ pub use quic::{
 pub use service::{
     BufferStats, EngageResponse, IdentifyRequest, IdentifyResponse, IngestError, IngestMetrics,
     IngestResponse, IngestService, ReplayIngestResponse, Result,
+};
+pub use writer_log::{
+    WriterLogBatch, WriterLogManager, WriterLogStats, DEFAULT_WRITER_LOG_IDLE_CLOSE_MS,
+    DEFAULT_WRITER_LOG_MAX_AGE_SECS, DEFAULT_WRITER_LOG_NODE_MAX_MB,
+    DEFAULT_WRITER_LOG_PROJECT_MAX_MB, WRITER_LOG_HEADER_LEN, WRITER_LOG_MAGIC, WRITER_LOG_VERSION,
 };
 
 #[cfg(test)]
@@ -545,6 +558,50 @@ mod tests {
             "event after re-signup dropped: {got:?}"
         );
         assert_eq!(got.len(), 2, "{got:?}");
+        id_router.close_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_ingest_enforces_per_project_rate_limit() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let id_router = Arc::new(IdentityRouter::new(store.clone()));
+        let storage = StorageEngine::new(StorageConfig::default(), store, id_router.clone());
+        let gov = InMemoryGovernance::new();
+        gov.register_api_key("pk_rl", "proj_rl");
+        let service =
+            IngestService::with_rate_limit(storage, gov, rate_limit::RateLimiter::new(0.001, 1.0));
+        let quic = spawn_quic_listener("127.0.0.1:0".parse().unwrap(), service).expect("bind quic");
+
+        let make_ev = |id: u64| WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u1", "s1", "Ev", 1_790_000_000_000, id),
+            routing_seed: "u1".into(),
+            distinct_id: "u1".into(),
+            session_id: "s1".into(),
+            event_name: "Ev".into(),
+            client_event_ts_ms: 1_790_000_000_000,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+        // First batch overdraws burst=1.0 by 2 events (tokens = 1.0 - 3.0 = -2.0).
+        let batch1 = WireBatch::new(vec![make_ev(1), make_ev(2), make_ev(3)])
+            .encode_binary(1)
+            .unwrap();
+        assert!(
+            send_quic_ingest_batch(quic.local_addr, &quic.cert_der, "pk_rl", &batch1)
+                .await
+                .is_ok()
+        );
+        let batch2 = WireBatch::new(vec![make_ev(4)]).encode_binary(1).unwrap();
+        let second = send_quic_ingest_batch(quic.local_addr, &quic.cert_der, "pk_rl", &batch2)
+            .await
+            .unwrap_err();
+        assert!(
+            second.to_string().contains("rate_limited"),
+            "expected rate_limited error over QUIC, got: {second}"
+        );
+
+        quic.endpoint.close(0u32.into(), b"shutdown");
         id_router.close_all().await.unwrap();
     }
 }

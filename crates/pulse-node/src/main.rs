@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                     cfg.role = r;
                 } else {
                     anyhow::bail!(
-                        "invalid --role '{raw}': expected one of all, ingest, query, compactor"
+                        "invalid --role '{raw}': expected one of all, ingest, writer, query, compactor"
                     );
                 }
             }
@@ -193,7 +193,7 @@ fn print_usage() {
          \t--data-dir <PATH>    Data directory (default: ./pulse_data, env: PULSE_DATA_DIR)\n\
          \t--web-dir <PATH>     Studio dist directory (default: ./web/dist, env: PULSE_WEB_DIST_DIR)\n\
          \t--project-id <ID>      Default project ID (default: proj_default, env: PULSE_DEFAULT_PROJECT)\n\
-         \t--role <ROLE>          Node role: all | ingest | query | compactor (env: PULSE_NODE_ROLE)\n\
+         \t--role <ROLE>          Node role: all | ingest | writer | query | compactor (env: PULSE_NODE_ROLE)\n\
          \t--node-name <NAME>     Stable node name for multi-node ownership (env: PULSE_NODE_NAME)\n\
          \t--advertise-addr <URL> Advertised HTTP base URL for peer routing (env: PULSE_ADVERTISE_ADDR)\n\
          \t--quic-addr <ADDR>     Enable QUIC ingest listener on <IP:PORT> (env: PULSE_QUIC_ADDR)\n\

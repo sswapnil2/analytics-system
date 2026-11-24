@@ -61,6 +61,8 @@ pub struct AgentTraceStoreConfig {
     pub max_segment_bytes: usize,
     pub gc_grace_secs: i64,
     pub read_only: bool,
+    /// When `true` (e.g. `NodeRole::Writer`), skip eager `list_known_projects()` boot scan.
+    pub skip_boot_scan: bool,
     pub cache_memory_bytes: usize,
     pub cache_disk_bytes: usize,
     pub l0_flush_max_traces: usize,
@@ -97,6 +99,7 @@ impl Default for AgentTraceStoreConfig {
             max_segment_bytes: MAX_PLSS_SEGMENT_BYTES,
             gc_grace_secs: 900,
             read_only: false,
+            skip_boot_scan: false,
             cache_memory_bytes: 64 * 1024 * 1024,
             cache_disk_bytes: 256 * 1024 * 1024,
             l0_flush_max_traces: 4_096,
@@ -261,7 +264,7 @@ impl AgentTraceStore {
         // Discover and recover any existing projects with manifests or uncommitted WALs.
         // In local hot tier + read_only (`NodeRole::Query`), skip eager S3 scanning at boot and
         // load `agent_published/` on demand.
-        if !(is_local_hot && store.config.read_only) {
+        if !store.config.skip_boot_scan && (!is_local_hot || !store.config.read_only) {
             let existing = store.list_known_projects().await?;
             for pid in existing {
                 match store.get_or_open_project(&pid).await {

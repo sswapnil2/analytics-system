@@ -24,10 +24,10 @@ use crate::encrypted_store::{ByokEncryptionStatus, EncryptedObjectStore};
 use crate::erased::ErasedUids;
 use crate::error::{Result, StorageError};
 use crate::manifest::{
-    ColdMergeIntent, ColdMergeIntentStore, IdentitySnapshotRef, Manifest, ManifestStore,
-    PartitionEntry, PendingS3Delete, PendingS3DeleteKind, ProfileSnapshotRef, PublishedManifest,
-    PublishedManifestStore, ReaderPinTracker, SnapshotRef, StorageSnapshot, UploadIntent,
-    UploadIntentBatch, UploadIntentStore,
+    prune_expired_writer_offsets, ColdMergeIntent, ColdMergeIntentStore, IdentitySnapshotRef,
+    Manifest, ManifestStore, PartitionEntry, PendingS3Delete, PendingS3DeleteKind,
+    ProfileSnapshotRef, PublishedManifest, PublishedManifestStore, ReaderPinTracker, SnapshotRef,
+    StorageSnapshot, UploadIntent, UploadIntentBatch, UploadIntentStore, WriterOffsetEntry,
 };
 use crate::mem_bucket::{
     MemBucket, StoredRow, SESSION_FLAG_DEAD_TAP, SESSION_FLAG_ERROR, SESSION_FLAG_RAGE_TAP,
@@ -42,7 +42,7 @@ use crate::snapshot::{
     restore_profiles_from_snapshot_read_only,
 };
 use crate::store_factory::is_hot_routed_store;
-use crate::wal::BucketWal;
+use crate::wal::{BucketWal, WalWriterOffset};
 
 pub const DEFAULT_NUM_BUCKETS: u16 = 16;
 /// Default interval (`PULSE_UPLOAD_INTERVAL_SECS`) between S3 `published/` cycles (300 s; `0` = eager).
@@ -67,6 +67,8 @@ pub const DEFAULT_COLD_MERGE_IDLE_SECS: u64 = 3600;
 pub const DEFAULT_COLD_MERGE_INTERVAL_SECS: u64 = 300;
 /// Default input-byte cap per cold S3 merge batch (`PULSE_COLD_MERGE_MAX_INPUT_BYTES`, 64 MiB).
 pub const DEFAULT_COLD_MERGE_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default retention for `(writer_id, bucket_id)` high-water offsets (`7 days`, strictly `> 6d` writer log max age).
+pub const DEFAULT_WRITER_OFFSET_EXPIRE_SECS: u64 = 7 * 86_400;
 /// Minimum cooldown between upload retries triggered by `1x`/`2x` pressure after an S3 upload failure.
 const UPLOAD_FAILURE_COOLDOWN: Duration = Duration::from_secs(2);
 /// Only seed post-restart dedup from L1 segments whose `max_ts_ms` falls within the 30-min two-window lookback.
@@ -116,6 +118,23 @@ pub fn cold_merge_idle_from_env() -> Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_COLD_MERGE_IDLE_SECS);
     Duration::from_secs(secs)
+}
+
+/// Reads `PULSE_WRITER_OFFSET_EXPIRE_MS` or `PULSE_WRITER_OFFSET_EXPIRE_SECS` (default `7 days`).
+pub fn writer_offset_expire_ms_from_env() -> u64 {
+    if let Ok(raw) = std::env::var("PULSE_WRITER_OFFSET_EXPIRE_MS") {
+        if let Ok(ms) = raw.trim().parse::<u64>() {
+            if ms > 0 {
+                return ms;
+            }
+        }
+    }
+    let secs = std::env::var("PULSE_WRITER_OFFSET_EXPIRE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_WRITER_OFFSET_EXPIRE_SECS);
+    secs.saturating_mul(1_000)
 }
 
 /// Reads `PULSE_COLD_MERGE_INTERVAL_SECS` (default `300`, `0` = disable background cold merge).
@@ -407,6 +426,7 @@ pub struct ProjectStorage {
     last_published_seq: Mutex<Option<u64>>,
     last_published_epoch: Mutex<Option<u64>>,
     last_published_s3_partitions: Mutex<Option<Vec<PartitionEntry>>>,
+    last_published_writer_offsets: Mutex<Option<BTreeMap<(String, u8), WriterOffsetEntry>>>,
     last_snapshot_state: Mutex<LastSnapshotState>,
     restored_snapshot_paths: Mutex<(Option<String>, Option<String>)>,
     closed_date_pending_since_ms: Mutex<HashMap<NaiveDate, i64>>,
@@ -448,6 +468,9 @@ pub struct ProjectStorage {
     #[cfg(test)]
     before_stage: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     erased: RwLock<Arc<ErasedUids>>,
+    writer_offsets: Mutex<BTreeMap<(String, u8), WriterOffsetEntry>>,
+    unflushed_writer_offsets: Vec<Mutex<VecDeque<(u64, String, WriterOffsetEntry)>>>,
+    writer_offset_expire_ms: Arc<AtomicU64>,
 }
 
 impl Drop for ProjectStorage {
@@ -729,6 +752,7 @@ fn manifest_matches_published(m: &Manifest, p: &PublishedManifest) -> bool {
     m.committed_wal_seq == p.committed_wal_seq
         && m.committed_l0_seq == p.committed_l0_seq
         && m.dict_snapshot == p.dict_snapshot
+        && m.writer_offsets == p.writer_offsets
         && m.to_sorted_partitions() == p.partitions
 }
 
@@ -1008,6 +1032,7 @@ impl ProjectStorage {
         let cold_merge_max_input_bytes =
             Arc::new(AtomicU64::new(cold_merge_max_input_bytes_from_env()));
         let upload_signal = Arc::new(UploadSignal::default());
+        let writer_offset_expire_ms = Arc::new(AtomicU64::new(writer_offset_expire_ms_from_env()));
         Self::open_inner(
             project_id.into(),
             config,
@@ -1026,6 +1051,7 @@ impl ProjectStorage {
             cold_merge_idle_ms,
             cold_merge_max_input_bytes,
             upload_signal,
+            writer_offset_expire_ms,
         )
         .await
     }
@@ -1049,6 +1075,7 @@ impl ProjectStorage {
         cold_merge_idle_ms: Arc<AtomicU64>,
         cold_merge_max_input_bytes: Arc<AtomicU64>,
         upload_signal: Arc<UploadSignal>,
+        writer_offset_expire_ms: Arc<AtomicU64>,
     ) -> Result<Arc<Self>> {
         let manifest_store = ManifestStore::new(&project_id, object_store.clone());
         let published_store = PublishedManifestStore::new(&project_id, object_store.clone());
@@ -1241,6 +1268,8 @@ impl ProjectStorage {
 
         let initial_last_published_s3_partitions =
             latest_published.as_ref().map(|p| p.partitions.clone());
+        let initial_last_published_writer_offsets =
+            latest_published.as_ref().map(|p| p.writer_offsets.clone());
 
         let dictionary = Arc::new(ProjectDictionary::from_snapshot(
             manifest.dict_snapshot.clone(),
@@ -1289,6 +1318,7 @@ impl ProjectStorage {
         }
 
         let num_buckets = config.num_buckets as usize;
+        let initial_writer_offsets = manifest.writer_offsets.clone();
         let ps = Arc::new(Self {
             project_id: project_id.clone(),
             config: config.clone(),
@@ -1323,6 +1353,7 @@ impl ProjectStorage {
             last_published_seq: Mutex::new(initial_last_published_seq),
             last_published_epoch: Mutex::new(initial_last_published_epoch),
             last_published_s3_partitions: Mutex::new(initial_last_published_s3_partitions),
+            last_published_writer_offsets: Mutex::new(initial_last_published_writer_offsets),
             last_snapshot_state: Mutex::new(LastSnapshotState {
                 last_snapshot_ref,
                 exported_id_epoch: None,
@@ -1368,6 +1399,11 @@ impl ProjectStorage {
             #[cfg(test)]
             before_stage: Mutex::new(None),
             erased: RwLock::new(Arc::new(ErasedUids::default())),
+            writer_offsets: Mutex::new(initial_writer_offsets),
+            unflushed_writer_offsets: (0..num_buckets)
+                .map(|_| Mutex::new(VecDeque::new()))
+                .collect(),
+            writer_offset_expire_ms,
         });
 
         if !identity_router.is_read_only() {
@@ -1469,10 +1505,20 @@ impl ProjectStorage {
                     .get(&bucket_id)
                     .copied()
                     .unwrap_or(0);
-                let records = ps.wals[b as usize].recover(committed_wal).await?;
-                for (wal_seq, batch) in records {
-                    let mut events = Vec::with_capacity(batch.len());
-                    for ev in &batch.events {
+                let records = ps.wals[b as usize]
+                    .recover_with_offsets(committed_wal)
+                    .await?;
+                for rec in records {
+                    let wal_seq = rec.seq;
+                    if let Some(wo) = rec.writer_offset {
+                        let entry = WriterOffsetEntry {
+                            last_applied_offset: wo.offset,
+                            last_seen_ts_ms: wo.seen_ts_ms,
+                        };
+                        ps.record_writer_offset_in_memory(bucket_id, wal_seq, &wo.writer_id, entry);
+                    }
+                    let mut events = Vec::with_capacity(rec.batch.len());
+                    for ev in &rec.batch.events {
                         let fp = event_uuid_fingerprint(&ev.event_uuid);
                         if !seen_replay_fps.insert(fp) {
                             continue;
@@ -1482,7 +1528,11 @@ impl ProjectStorage {
                         events.push((ev, uid, fp));
                     }
                     let rows = ps.rows_or_dead_letter(bucket_id, wal_seq, &events).await?;
-                    ps.mem_buckets[b as usize].append_batch(rows);
+                    if rows.is_empty() {
+                        ps.mem_buckets[b as usize].record_applied_wal_seq(wal_seq);
+                    } else {
+                        ps.mem_buckets[b as usize].append_batch(rows);
+                    }
                 }
             }
             id_g.flush().await?;
@@ -1715,6 +1765,165 @@ impl ProjectStorage {
         Ok(wal_seq)
     }
 
+    pub fn set_writer_offset_expire(&self, duration: Duration) {
+        self.writer_offset_expire_ms
+            .store(duration.as_millis() as u64, Ordering::Release);
+    }
+
+    fn writer_offset_expire_ms(&self) -> i64 {
+        self.writer_offset_expire_ms
+            .load(Ordering::Acquire)
+            .min(i64::MAX as u64) as i64
+    }
+
+    #[doc(hidden)]
+    pub fn writer_offsets_snapshot(&self) -> BTreeMap<(String, u8), WriterOffsetEntry> {
+        self.writer_offsets.lock().clone()
+    }
+
+    pub fn is_writer_offset_applied(&self, writer_id: &str, bucket_id: u8, offset: u64) -> bool {
+        self.writer_offsets
+            .lock()
+            .get(&(writer_id.to_string(), bucket_id))
+            .is_some_and(|e| offset <= e.last_applied_offset)
+    }
+
+    fn record_writer_offset_in_memory(
+        &self,
+        bucket_id: u8,
+        wal_seq: u64,
+        writer_id: &str,
+        entry: WriterOffsetEntry,
+    ) {
+        let b_idx = bucket_id as usize;
+        if let Some(q) = self.unflushed_writer_offsets.get(b_idx) {
+            q.lock().push_back((wal_seq, writer_id.to_string(), entry));
+        }
+        let mut map = self.writer_offsets.lock();
+        map.entry((writer_id.to_string(), bucket_id))
+            .and_modify(|cur| {
+                cur.last_applied_offset = cur.last_applied_offset.max(entry.last_applied_offset);
+                cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+            })
+            .or_insert(entry);
+    }
+
+    fn promotable_writer_offsets_for_bucket(
+        &self,
+        bucket_id: u8,
+        max_wal: u64,
+    ) -> Vec<(String, WriterOffsetEntry)> {
+        let Some(q) = self.unflushed_writer_offsets.get(bucket_id as usize) else {
+            return Vec::new();
+        };
+        let guard = q.lock();
+        guard
+            .iter()
+            .filter(|(seq, _, _)| *seq <= max_wal)
+            .map(|(_, wid, entry)| (wid.clone(), *entry))
+            .collect()
+    }
+
+    fn has_applied_unflushed_writer_offsets(&self, bucket_id: u8) -> bool {
+        let Some(mb) = self.mem_buckets.get(bucket_id as usize) else {
+            return false;
+        };
+        let applied_wal = mb.last_applied_wal_seq();
+        let Some(q) = self.unflushed_writer_offsets.get(bucket_id as usize) else {
+            return false;
+        };
+        q.lock().iter().any(|(seq, _, _)| *seq <= applied_wal)
+    }
+
+    fn drain_promoted_writer_offsets_for_bucket(&self, bucket_id: u8, max_wal: u64) {
+        if let Some(q) = self.unflushed_writer_offsets.get(bucket_id as usize) {
+            q.lock().retain(|(seq, _, _)| *seq > max_wal);
+        }
+    }
+
+    fn sync_in_memory_writer_offsets(
+        &self,
+        manifest_offsets: &BTreeMap<(String, u8), WriterOffsetEntry>,
+    ) {
+        let mut merged = manifest_offsets.clone();
+        for (b_idx, q) in self.unflushed_writer_offsets.iter().enumerate() {
+            let bucket_id = b_idx as u8;
+            let guard = q.lock();
+            for (_, wid, entry) in guard.iter() {
+                merged
+                    .entry((wid.clone(), bucket_id))
+                    .and_modify(|cur| {
+                        cur.last_applied_offset =
+                            cur.last_applied_offset.max(entry.last_applied_offset);
+                        cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+                    })
+                    .or_insert(*entry);
+            }
+        }
+        *self.writer_offsets.lock() = merged;
+    }
+
+    /// Appends a forwarded writer batch to `bucket_id`'s WAL (`PWL3`) if `(writer_id, bucket_id)`
+    /// has not yet applied `writer_offset`. Returns `Ok(None)` when already applied (idempotent).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_forwarded_events_locked(
+        &self,
+        _append_guard: &AsyncMutexGuard<'_, ()>,
+        bucket_id: u8,
+        writer_id: &str,
+        writer_offset: u64,
+        seen_ts_ms: i64,
+        batch: &WireBatch,
+        approx_bytes: usize,
+    ) -> Result<Option<u64>> {
+        self.check_writer()?;
+        if self.is_writer_offset_applied(writer_id, bucket_id, writer_offset) {
+            return Ok(None);
+        }
+        let wo = WalWriterOffset {
+            writer_id: writer_id.to_string(),
+            offset: writer_offset,
+            seen_ts_ms,
+        };
+        let wal_seq = match self.wals[bucket_id as usize]
+            .append_with_offset(batch, Some(&wo))
+            .await
+        {
+            Err(e @ StorageError::NotWriter { .. }) => {
+                self.fence();
+                return Err(e);
+            }
+            other => other?,
+        };
+        // Checked again AFTER the write: if the lease ran out while the PUT was in flight, a new
+        // holder may already have listed this log without the record, so it must not be acked.
+        self.check_writer()?;
+        let entry = WriterOffsetEntry {
+            last_applied_offset: writer_offset,
+            last_seen_ts_ms: seen_ts_ms,
+        };
+        self.record_writer_offset_in_memory(bucket_id, wal_seq, writer_id, entry);
+
+        let b_idx = bucket_id as usize;
+        let now_ms = Utc::now().timestamp_millis();
+        let ev_count = batch.len() as u64;
+        {
+            let mut q = self.unapplied_record_times[b_idx].lock();
+            if q.is_empty() {
+                self.oldest_unapplied_ms[b_idx].store(now_ms, Ordering::Release);
+            }
+            q.push_back((wal_seq, now_ms, ev_count));
+        }
+        self.logged_events[b_idx].fetch_add(ev_count, Ordering::AcqRel);
+        self.logged_records[b_idx].fetch_add(1, Ordering::AcqRel);
+        self.unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        self.node_load
+            .unapplied_bytes
+            .fetch_add(approx_bytes, Ordering::AcqRel);
+        Ok(Some(wal_seq))
+    }
+
     /// The processor half: turns a logged record's events (already deduplicated and interned by
     /// the caller) into L0 rows. Call once per logged record, in `wal_seq` order per bucket,
     /// with the same `approx_bytes`; an `Err` means nothing was applied and the call can be
@@ -1729,7 +1938,11 @@ impl ProjectStorage {
         let rows = self.rows_or_dead_letter(bucket_id, wal_seq, events).await?;
         let count = rows.len();
         let b_idx = bucket_id as usize;
-        self.mem_buckets[b_idx].append_batch(rows);
+        if rows.is_empty() {
+            self.mem_buckets[b_idx].record_applied_wal_seq(wal_seq);
+        } else {
+            self.mem_buckets[b_idx].append_batch(rows);
+        }
         self.unapplied_bytes
             .fetch_sub(approx_bytes, Ordering::AcqRel);
         self.node_load
@@ -2195,26 +2408,33 @@ impl ProjectStorage {
         };
         let bucket_guard = flush_lock.lock().await;
 
-        let floor_l0 = self
-            .manifest
-            .read()
-            .committed_l0_seq
-            .get(&bucket_id)
-            .copied()
-            .unwrap_or(0);
+        let (floor_l0, floor_wal) = {
+            let mf = self.manifest.read();
+            (
+                mf.committed_l0_seq.get(&bucket_id).copied().unwrap_or(0),
+                mf.committed_wal_seq.get(&bucket_id).copied().unwrap_or(0),
+            )
+        };
 
         #[cfg(test)]
         if let Some(hook) = self.before_stage.lock().take() {
             hook();
         }
-        let Some((max_l0, max_wal, staged_rows)) = self.mem_buckets[b_idx].stage_flush(floor_l0)
+        let Some((max_l0, max_wal, staged_rows)) =
+            self.mem_buckets[b_idx].stage_flush_with_wal(floor_l0, floor_wal)
         else {
             return Ok(Vec::new());
         };
+        let promotable_offsets = self.promotable_writer_offsets_for_bucket(bucket_id, max_wal);
+        if staged_rows.is_empty() && promotable_offsets.is_empty() {
+            return Ok(Vec::new());
+        }
         // AFTER staging: every uid in the staged rows was interned before this point, so this
         // flush makes all of them durable before any segment that holds them is published. The
         // processor interns without flushing, so flushing first would miss ids interned between.
-        self.id_graph().flush().await?;
+        if !staged_rows.is_empty() {
+            self.id_graph().flush().await?;
+        }
 
         let mut by_date: BTreeMap<NaiveDate, Vec<StoredRow>> = BTreeMap::new();
         for row in staged_rows {
@@ -2246,6 +2466,7 @@ impl ProjectStorage {
         }
 
         let flush_ts_ms = Utc::now().timestamp_millis();
+        let expire_ms = self.writer_offset_expire_ms();
         // Atomically commit new MVCC Manifest epoch (without holding `publish_lock`) BEFORE evicting from L0 MemBucket!
         let committed_res = self
             .commit_manifest_cas(|next_manifest| {
@@ -2263,16 +2484,34 @@ impl ProjectStorage {
                         prune_s3_partition_upload_time(next_manifest, key);
                     }
                 }
-                next_manifest
-                    .committed_l0_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_l0))
-                    .or_insert(max_l0);
+                if max_l0 > 0 {
+                    next_manifest
+                        .committed_l0_seq
+                        .entry(bucket_id)
+                        .and_modify(|v| *v = (*v).max(max_l0))
+                        .or_insert(max_l0);
+                }
                 next_manifest
                     .committed_wal_seq
                     .entry(bucket_id)
                     .and_modify(|v| *v = (*v).max(max_wal))
                     .or_insert(max_wal);
+                for (wid, entry) in &promotable_offsets {
+                    next_manifest
+                        .writer_offsets
+                        .entry((wid.clone(), bucket_id))
+                        .and_modify(|cur| {
+                            cur.last_applied_offset =
+                                cur.last_applied_offset.max(entry.last_applied_offset);
+                            cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+                        })
+                        .or_insert(*entry);
+                }
+                prune_expired_writer_offsets(
+                    &mut next_manifest.writer_offsets,
+                    flush_ts_ms,
+                    expire_ms,
+                );
                 next_manifest.dict_snapshot = self.dictionary.snapshot();
                 true
             })
@@ -2293,6 +2532,8 @@ impl ProjectStorage {
 
         if let Some(ref committed) = committed_opt {
             self.wals[b_idx].advance_epoch(committed.epoch);
+            self.drain_promoted_writer_offsets_for_bucket(bucket_id, max_wal);
+            self.sync_in_memory_writer_offsets(&committed.writer_offsets);
         }
 
         self.mem_buckets[b_idx].complete_flush(max_l0);
@@ -2446,11 +2687,22 @@ impl ProjectStorage {
                         != Some(ps.dirty_seq())
             });
 
+        let writer_offsets_dirty = match &*self.last_published_writer_offsets.lock() {
+            Some(published_offsets) => cur_mf.writer_offsets.iter().any(|(k, v)| {
+                published_offsets.get(k).is_none_or(|pv| {
+                    v.last_applied_offset > pv.last_applied_offset
+                        || v.last_seen_ts_ms > pv.last_seen_ts_ms
+                })
+            }),
+            None => !cur_mf.writer_offsets.is_empty(),
+        };
+
         if frozen_groups.is_empty()
             && !s3_state_dirty
             && !has_unstamped_s3_deletes
             && !id_dirty
             && !prof_dirty
+            && !writer_offsets_dirty
         {
             return Ok(None);
         }
@@ -2829,12 +3081,18 @@ impl ProjectStorage {
                     if !any_accepted {
                         return false;
                     }
+                    prune_expired_writer_offsets(
+                        &mut next_manifest.writer_offsets,
+                        now_ms,
+                        self.writer_offset_expire_ms(),
+                    );
                     next_manifest.dict_snapshot = self.dictionary.snapshot();
                     true
                 })
                 .await?
             {
                 committed_mf = (*committed).clone();
+                self.sync_in_memory_writer_offsets(&committed_mf.writer_offsets);
                 let tracked = self.tracked_hot_segments.lock();
                 let mut pending = self.pending_local_deletes.lock();
                 for local_path in maybe_accepted_paths {
@@ -2862,6 +3120,9 @@ impl ProjectStorage {
             profiles: prof_ref,
         };
         let pub_partitions = s3_partitions(&committed_mf);
+        let expire_ms = self.writer_offset_expire_ms();
+        let mut pub_writer_offsets = committed_mf.writer_offsets.clone();
+        prune_expired_writer_offsets(&mut pub_writer_offsets, now_ms, expire_ms);
         let pub_manifest = PublishedManifest {
             publish_seq,
             writer_generation: committed_mf.writer_generation,
@@ -2873,6 +3134,7 @@ impl ProjectStorage {
             committed_wal_seq: committed_mf.committed_wal_seq.clone(),
             committed_l0_seq: committed_mf.committed_l0_seq.clone(),
             snapshot_ref: snapshot_ref.clone(),
+            writer_offsets: pub_writer_offsets,
         };
 
         let published = match self.published_store.publish_next(pub_manifest).await {
@@ -2901,6 +3163,7 @@ impl ProjectStorage {
 
         *self.last_published_seq.lock() = Some(publish_seq);
         *self.last_published_s3_partitions.lock() = Some(pub_partitions);
+        *self.last_published_writer_offsets.lock() = Some(published.writer_offsets.clone());
         {
             let mut st = self.last_snapshot_state.lock();
             st.last_snapshot_ref = Some(snapshot_ref.clone());
@@ -2934,10 +3197,12 @@ impl ProjectStorage {
                         grace_ms,
                     );
                 }
+                prune_expired_writer_offsets(&mut next_manifest.writer_offsets, now_ms, expire_ms);
                 true
             })
             .await?;
         if let Some(ref mf_arc) = post_step6 {
+            self.sync_in_memory_writer_offsets(&mf_arc.writer_offsets);
             *self.last_published_epoch.lock() = Some(mf_arc.epoch);
         }
 
@@ -3043,6 +3308,7 @@ impl ProjectStorage {
             max_l0: u64,
             max_wal: u64,
             by_date: BTreeMap<NaiveDate, Vec<StoredRow>>,
+            promotable_offsets: Vec<(String, WriterOffsetEntry)>,
         }
 
         let mut staged_buckets = Vec::new();
@@ -3051,9 +3317,15 @@ impl ProjectStorage {
             for &bucket_id in &sorted {
                 let b_idx = bucket_id as usize;
                 let floor_l0 = mf.committed_l0_seq.get(&bucket_id).copied().unwrap_or(0);
+                let floor_wal = mf.committed_wal_seq.get(&bucket_id).copied().unwrap_or(0);
                 if let Some((max_l0, max_wal, staged_rows)) =
-                    self.mem_buckets[b_idx].stage_flush(floor_l0)
+                    self.mem_buckets[b_idx].stage_flush_with_wal(floor_l0, floor_wal)
                 {
+                    let promotable_offsets =
+                        self.promotable_writer_offsets_for_bucket(bucket_id, max_wal);
+                    if staged_rows.is_empty() && promotable_offsets.is_empty() {
+                        continue;
+                    }
                     let mut by_date: BTreeMap<NaiveDate, Vec<StoredRow>> = BTreeMap::new();
                     for row in staged_rows {
                         by_date.entry(row.event_date()).or_default().push(row);
@@ -3064,6 +3336,7 @@ impl ProjectStorage {
                         max_l0,
                         max_wal,
                         by_date,
+                        promotable_offsets,
                     });
                 }
             }
@@ -3073,7 +3346,9 @@ impl ProjectStorage {
             return Ok(0);
         }
         // After staging, for the same reason as in `flush_bucket`.
-        self.id_graph().flush().await?;
+        if staged_buckets.iter().any(|sb| !sb.by_date.is_empty()) {
+            self.id_graph().flush().await?;
+        }
 
         let prefix_root = if self.is_local_segment_tier() {
             "hot/segments"
@@ -3083,8 +3358,11 @@ impl ProjectStorage {
         let sem = self.node_load.flush_semaphore.clone();
         let mut join_set = tokio::task::JoinSet::new();
         let mut bucket_watermarks = Vec::with_capacity(staged_buckets.len());
+        let mut promotable_by_bucket: Vec<(u8, Vec<(String, WriterOffsetEntry)>)> =
+            Vec::with_capacity(staged_buckets.len());
         for sb in staged_buckets {
             bucket_watermarks.push((sb.bucket_id, sb.b_idx, sb.max_l0, sb.max_wal));
+            promotable_by_bucket.push((sb.bucket_id, sb.promotable_offsets));
             for (date, rows) in sb.by_date {
                 let sem_c = sem.clone();
                 let store = self.object_store.clone();
@@ -3118,6 +3396,7 @@ impl ProjectStorage {
         }
 
         let flush_ts_ms = Utc::now().timestamp_millis();
+        let expire_ms = self.writer_offset_expire_ms();
         let committed_res = self
             .commit_manifest_cas(|next_manifest| {
                 for meta in &written_segments {
@@ -3135,17 +3414,38 @@ impl ProjectStorage {
                     }
                 }
                 for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
-                    next_manifest
-                        .committed_l0_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_l0))
-                        .or_insert(max_l0);
+                    if max_l0 > 0 {
+                        next_manifest
+                            .committed_l0_seq
+                            .entry(bucket_id)
+                            .and_modify(|v| *v = (*v).max(max_l0))
+                            .or_insert(max_l0);
+                    }
                     next_manifest
                         .committed_wal_seq
                         .entry(bucket_id)
                         .and_modify(|v| *v = (*v).max(max_wal))
                         .or_insert(max_wal);
                 }
+                for (bucket_id, entries) in &promotable_by_bucket {
+                    for (wid, entry) in entries {
+                        next_manifest
+                            .writer_offsets
+                            .entry((wid.clone(), *bucket_id))
+                            .and_modify(|cur| {
+                                cur.last_applied_offset =
+                                    cur.last_applied_offset.max(entry.last_applied_offset);
+                                cur.last_seen_ts_ms =
+                                    cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+                            })
+                            .or_insert(*entry);
+                    }
+                }
+                prune_expired_writer_offsets(
+                    &mut next_manifest.writer_offsets,
+                    flush_ts_ms,
+                    expire_ms,
+                );
                 next_manifest.dict_snapshot = self.dictionary.snapshot();
                 true
             })
@@ -3165,9 +3465,11 @@ impl ProjectStorage {
         };
 
         if let Some(ref committed) = committed_opt {
-            for &(_, b_idx, _, _) in &bucket_watermarks {
+            for &(bucket_id, b_idx, _, max_wal) in &bucket_watermarks {
                 self.wals[b_idx].advance_epoch(committed.epoch);
+                self.drain_promoted_writer_offsets_for_bucket(bucket_id, max_wal);
             }
+            self.sync_in_memory_writer_offsets(&committed.writer_offsets);
         }
 
         for &(_, b_idx, max_l0, max_wal) in &bucket_watermarks {
@@ -3194,7 +3496,9 @@ impl ProjectStorage {
     pub async fn flush_due_buckets(&self) -> Result<usize> {
         let due: Vec<u8> = (0..self.config.num_buckets)
             .map(|b| b as u8)
-            .filter(|&bid| self.should_flush_bucket(bid))
+            .filter(|&bid| {
+                self.should_flush_bucket(bid) || self.has_applied_unflushed_writer_offsets(bid)
+            })
             .collect();
         if due.is_empty() {
             return Ok(0);
@@ -3833,9 +4137,15 @@ impl ProjectStorage {
         self.check_writer()?;
         let _gc_guard = self.gc_lock.lock().await;
 
-        let ready_paths: Vec<String> = {
+        let expire_ms = self.writer_offset_expire_ms();
+        let (ready_paths, has_expired_offsets): (Vec<String>, bool) = {
             let mf = self.manifest.read();
-            if mf.pending_s3_deletes.is_empty() {
+            let has_expired = expire_ms > 0
+                && mf
+                    .writer_offsets
+                    .values()
+                    .any(|e| now_ms.saturating_sub(e.last_seen_ts_ms) > expire_ms);
+            if mf.pending_s3_deletes.is_empty() && !has_expired {
                 return Ok(0);
             }
             let active_paths: HashSet<&str> = mf
@@ -3870,10 +4180,10 @@ impl ProjectStorage {
                     ready.push(entry.object_path.clone());
                 }
             }
-            ready
+            (ready, has_expired)
         };
 
-        if ready_paths.is_empty() {
+        if ready_paths.is_empty() && !has_expired_offsets {
             return Ok(0);
         }
 
@@ -3900,7 +4210,7 @@ impl ProjectStorage {
             }
         }
 
-        if !resolved_paths.is_empty() {
+        if !resolved_paths.is_empty() || has_expired_offsets {
             let mut base_epoch = 0u64;
             if let Some(committed) = self
                 .commit_manifest_cas(|m| {
@@ -3908,10 +4218,13 @@ impl ProjectStorage {
                     let before = m.pending_s3_deletes.len();
                     m.pending_s3_deletes
                         .retain(|e| !resolved_paths.contains(&e.object_path));
-                    m.pending_s3_deletes.len() != before
+                    let pruned_offsets =
+                        prune_expired_writer_offsets(&mut m.writer_offsets, now_ms, expire_ms);
+                    m.pending_s3_deletes.len() != before || pruned_offsets > 0
                 })
                 .await?
             {
+                self.sync_in_memory_writer_offsets(&committed.writer_offsets);
                 let mut lpe = self.last_published_epoch.lock();
                 if committed.epoch == base_epoch.saturating_add(1) && *lpe == Some(base_epoch) {
                     *lpe = Some(committed.epoch);
@@ -4075,6 +4388,7 @@ impl ProjectStorage {
                 mb.complete_flush(committed_l0);
             }
         }
+        self.sync_in_memory_writer_offsets(&next_mf.writer_offsets);
         *self.manifest.write() = Arc::new(next_mf);
         *self.restored_snapshot_paths.lock() = (
             Some(prepared.pub_m.snapshot_ref.identity.object_path.clone()),
@@ -4130,6 +4444,7 @@ impl ProjectStorage {
             }
         }
         *self.last_published_seq.lock() = latest.last_published_seq;
+        self.sync_in_memory_writer_offsets(&latest.writer_offsets);
         *self.manifest.write() = Arc::new(latest);
         Ok(true)
     }
@@ -4224,6 +4539,7 @@ pub struct StorageEngine {
     cold_merge_interval_ms: Arc<AtomicU64>,
     cold_merge_max_input_bytes: Arc<AtomicU64>,
     upload_signal: Arc<UploadSignal>,
+    writer_offset_expire_ms: Arc<AtomicU64>,
 }
 
 impl StorageEngine {
@@ -4270,6 +4586,7 @@ impl StorageEngine {
         let cold_merge_max_input_bytes =
             Arc::new(AtomicU64::new(cold_merge_max_input_bytes_from_env()));
         let upload_signal = Arc::new(UploadSignal::default());
+        let writer_offset_expire_ms = Arc::new(AtomicU64::new(writer_offset_expire_ms_from_env()));
         Arc::new(Self {
             maintenance_errors: MaintenanceErrors::default(),
             config,
@@ -4295,6 +4612,7 @@ impl StorageEngine {
             cold_merge_interval_ms,
             cold_merge_max_input_bytes,
             upload_signal,
+            writer_offset_expire_ms,
         })
     }
 
@@ -4371,6 +4689,15 @@ impl StorageEngine {
             .store(interval.as_millis() as u64, Ordering::Release);
         self.cold_merge_max_input_bytes
             .store(max_input_bytes.max(1), Ordering::Release);
+    }
+
+    /// Overrides the retention window `T_expire` for `(writer_id, bucket_id)` high-water offsets.
+    pub fn set_writer_offset_expire(&self, duration: Duration) {
+        let ms = duration.as_millis() as u64;
+        self.writer_offset_expire_ms.store(ms, Ordering::Release);
+        for p in self.open_projects() {
+            p.set_writer_offset_expire(duration);
+        }
     }
 
     /// Returns a future woken when `1x` `hot/segments/` bounds or closed-date `> 4 MiB` requests an early upload.
@@ -4530,6 +4857,7 @@ impl StorageEngine {
             self.cold_merge_idle_ms.clone(),
             self.cold_merge_max_input_bytes.clone(),
             self.upload_signal.clone(),
+            self.writer_offset_expire_ms.clone(),
         )
         .await?;
         self.projects.insert(project_id.to_string(), ps.clone());
@@ -8582,5 +8910,413 @@ mod t4_cold_merge_tests {
         assert_eq!(cmp_move.snapshot().manifest.epoch, move_epoch_before);
         assert_eq!(cmp_move.snapshot().manifest.total_segments(), 2);
         assert_eq!(cmp_stay.snapshot().manifest.total_segments(), 1);
+    }
+}
+
+#[cfg(test)]
+mod w3_offset_tests {
+    use super::*;
+    use crate::snapshot::restore_project_from_published;
+    use crate::store_factory::with_hot_store;
+    use object_store::memory::InMemory;
+    use pulse_identity::IdentityRouter;
+
+    fn make_ev(id: u64, did: &str, ts_ms: i64) -> WireEvent {
+        WireEvent {
+            event_uuid: WireEvent::deterministic_uuid(did, "s1", "Ev", ts_ms, id),
+            routing_seed: did.to_string(),
+            distinct_id: did.to_string(),
+            session_id: "s1".to_string(),
+            event_name: "Ev".to_string(),
+            client_event_ts_ms: ts_ms,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_offsets_partial_multi_bucket_crash_unflushed_isolation_restore_and_expiry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("node_data");
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed = with_hot_store(s3_raw.clone(), &data_dir).await.unwrap();
+        let enc = Arc::new(EncryptedObjectStore::new(routed));
+        let cfg = StorageConfig {
+            num_buckets: 2,
+            ..StorageConfig::default()
+        };
+
+        let t0 = Utc::now().timestamp_millis();
+        // Phase 1: apply offset 0 to bucket 0 ONLY (simulating crash before bucket 1 WAL write).
+        {
+            let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
+            let engine =
+                StorageEngine::new_with_encrypted(cfg.clone(), enc.clone(), id_router.clone());
+            let ps = engine.get_or_open_project("proj_w3").await.unwrap();
+
+            assert!(!ps.is_writer_offset_applied("writer-1", 0, 0));
+            assert!(!ps.is_writer_offset_applied("writer-1", 1, 0));
+
+            let ev0 = make_ev(1, "u_b0", t0);
+            let batch0 = WireBatch::new(vec![ev0.clone()]);
+            let g0 = ps.lock_bucket_append(0).await;
+            let wal_seq0 = ps
+                .log_forwarded_events_locked(&g0, 0, "writer-1", 0, t0, &batch0, 128)
+                .await
+                .unwrap()
+                .expect("offset 0 must apply");
+            drop(g0);
+            let uid0 = ps.id_graph().get_or_intern(&ev0.distinct_id, 0);
+            ps.apply_logged(0, wal_seq0, &[(&ev0, uid0, 11)], 128)
+                .await
+                .unwrap();
+
+            assert!(ps.is_writer_offset_applied("writer-1", 0, 0));
+            assert!(!ps.is_writer_offset_applied("writer-1", 1, 0));
+
+            // Drop without flushing (simulating abrupt crash before bucket 1 was written).
+            id_router.close_all().await.unwrap();
+        }
+
+        // Phase 2: restart, recover PWL3 WAL -> retry offset 0 skips bucket 0 and applies bucket 1.
+        {
+            let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
+            let engine =
+                StorageEngine::new_with_encrypted(cfg.clone(), enc.clone(), id_router.clone());
+            let ps = engine.get_or_open_project("proj_w3").await.unwrap();
+
+            assert!(ps.is_writer_offset_applied("writer-1", 0, 0));
+            assert!(!ps.is_writer_offset_applied("writer-1", 1, 0));
+
+            let g0 = ps.lock_bucket_append(0).await;
+            let retry_b0 = ps
+                .log_forwarded_events_locked(
+                    &g0,
+                    0,
+                    "writer-1",
+                    0,
+                    t0,
+                    &WireBatch::new(vec![make_ev(1, "u_b0", t0)]),
+                    128,
+                )
+                .await
+                .unwrap();
+            assert!(
+                retry_b0.is_none(),
+                "bucket 0 must skip already-applied offset 0"
+            );
+            drop(g0);
+
+            let ev1 = make_ev(2, "u_b1", t0);
+            let batch1 = WireBatch::new(vec![ev1.clone()]);
+            let g1 = ps.lock_bucket_append(1).await;
+            let wal_seq1 = ps
+                .log_forwarded_events_locked(&g1, 1, "writer-1", 0, t0, &batch1, 128)
+                .await
+                .unwrap()
+                .expect("bucket 1 must apply offset 0");
+            drop(g1);
+            let uid1 = ps.id_graph().get_or_intern(&ev1.distinct_id, 1);
+            ps.apply_logged(1, wal_seq1, &[(&ev1, uid1, 22)], 128)
+                .await
+                .unwrap();
+
+            // Flush bucket 0 ONLY while offset 1 is appended to WAL (not yet staged/flushed).
+            let ev_unflushed = make_ev(3, "u_b0_2", t0);
+            let g0 = ps.lock_bucket_append(0).await;
+            let _wal_seq_2 = ps
+                .log_forwarded_events_locked(
+                    &g0,
+                    0,
+                    "writer-1",
+                    1,
+                    t0 + 100,
+                    &WireBatch::new(vec![ev_unflushed]),
+                    128,
+                )
+                .await
+                .unwrap()
+                .expect("offset 1 must apply to WAL");
+            drop(g0);
+            // Notice: we didn't call apply_logged for offset 1 yet, so flush_bucket(0) stages ONLY wal_seq0 (offset 0)!
+            ps.flush_bucket(0).await.unwrap();
+            let mf_after_b0 = ps.snapshot().manifest.clone();
+            assert_eq!(
+                mf_after_b0
+                    .writer_offsets
+                    .get(&("writer-1".into(), 0))
+                    .map(|e| e.last_applied_offset),
+                Some(0),
+                "unflushed offset 1 must NOT be prematurely promoted into Manifest"
+            );
+
+            // Now apply offset 1 and flush both buckets + publish to S3!
+            let ev_u = make_ev(3, "u_b0_2", t0);
+            let uid_u = ps.id_graph().get_or_intern(&ev_u.distinct_id, 0);
+            ps.apply_logged(0, 2, &[(&ev_u, uid_u, 33)], 128)
+                .await
+                .unwrap();
+            ps.flush_buckets(&[0, 1]).await.unwrap();
+            ps.upload_if_dirty_at(t0 + 1_000, false).await.unwrap();
+
+            let mf = ps.snapshot().manifest.clone();
+            assert_eq!(
+                mf.writer_offsets
+                    .get(&("writer-1".into(), 0))
+                    .unwrap()
+                    .last_applied_offset,
+                1
+            );
+            assert_eq!(
+                mf.writer_offsets
+                    .get(&("writer-1".into(), 1))
+                    .unwrap()
+                    .last_applied_offset,
+                0
+            );
+            id_router.close_all().await.unwrap();
+        }
+
+        // Phase 3: wipe local hot volume completely -> restore from S3 PublishedManifest -> offsets survive!
+        std::fs::remove_dir_all(&data_dir).unwrap();
+        let data_dir2 = tmp.path().join("node_data_restored");
+        let routed_restore =
+            crate::store_factory::open_hot_store_for_restore(s3_raw.clone(), &data_dir2)
+                .await
+                .unwrap();
+        let enc_restore = Arc::new(EncryptedObjectStore::new(routed_restore));
+        let pub_m = PublishedManifestStore::new("proj_w3", enc_restore.as_object_store())
+            .load_latest()
+            .await
+            .unwrap()
+            .expect("published manifest exists");
+        assert_eq!(
+            pub_m
+                .writer_offsets
+                .get(&("writer-1".into(), 0))
+                .unwrap()
+                .last_applied_offset,
+            1
+        );
+        let restored =
+            restore_project_from_published("proj_w3", &pub_m, enc_restore.as_object_store())
+                .await
+                .unwrap();
+        restored.identity_graph.close().await.unwrap();
+        if let Some(p) = restored.profile_store {
+            p.close().await.unwrap();
+        }
+        crate::store_factory::finalize_local_hot_store_marker(&data_dir2)
+            .await
+            .unwrap();
+
+        let routed2 = with_hot_store(s3_raw.clone(), &data_dir2).await.unwrap();
+        let enc2 = Arc::new(EncryptedObjectStore::new(routed2));
+
+        let id_router2 = Arc::new(IdentityRouter::new(enc2.as_object_store()));
+        let engine2 = StorageEngine::new_with_encrypted(cfg, enc2.clone(), id_router2.clone());
+        let ps2 = engine2.get_or_open_project("proj_w3").await.unwrap();
+        assert!(ps2.is_writer_offset_applied("writer-1", 0, 1));
+        assert!(ps2.is_writer_offset_applied("writer-1", 1, 0));
+
+        // Phase 4: 7d expiry (`T_expire`) via run_gc_at
+        engine2.set_writer_offset_expire(Duration::from_secs(60));
+        // Not expired yet -> 0 GC commits
+        assert_eq!(ps2.run_gc_at(t0 + 10_000).await.unwrap(), 0);
+        assert_eq!(ps2.writer_offsets_snapshot().len(), 2);
+
+        // Past expire window -> pruned from Manifest and in-memory writer_offsets!
+        ps2.run_gc_at(t0 + 120_000).await.unwrap();
+        assert!(ps2.snapshot().manifest.writer_offsets.is_empty());
+        assert!(ps2.writer_offsets_snapshot().is_empty());
+        id_router2.close_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trailing_empty_pwl3_offsets_promote_across_flush_publish_and_restore_and_preserve_idle_invariant(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("node_data");
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed = with_hot_store(s3_raw.clone(), &data_dir).await.unwrap();
+        let enc = Arc::new(EncryptedObjectStore::new(routed));
+        let cfg = StorageConfig {
+            num_buckets: 2,
+            ..StorageConfig::default()
+        };
+
+        let t0 = Utc::now().timestamp_millis();
+        {
+            let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
+            let engine =
+                StorageEngine::new_with_encrypted(cfg.clone(), enc.clone(), id_router.clone());
+            let ps = engine.get_or_open_project("proj_empty_pwl3").await.unwrap();
+
+            // 1. writer-A applies ev0, flushes, and publishes pub_0.
+            let ev0 = make_ev(1, "u_same", t0);
+            let g0 = ps.lock_bucket_append(0).await;
+            let wal_seq_a = ps
+                .log_forwarded_events_locked(
+                    &g0,
+                    0,
+                    "writer-A",
+                    0,
+                    t0,
+                    &WireBatch::new(vec![ev0.clone()]),
+                    128,
+                )
+                .await
+                .unwrap()
+                .expect("writer-A offset 0 must apply");
+            drop(g0);
+            let uid0 = ps.id_graph().get_or_intern(&ev0.distinct_id, 0);
+            ps.apply_logged(0, wal_seq_a, &[(&ev0, uid0, 101)], 128)
+                .await
+                .unwrap();
+            ps.flush_all().await.unwrap();
+            let pub0 = ps
+                .upload_if_dirty_at(t0 + 1_000, false)
+                .await
+                .unwrap()
+                .expect("pub_0 must publish");
+            assert_eq!(pub0.publish_seq, 0);
+            let epoch_after_a = ps.snapshot().manifest.epoch;
+            let segs_after_a = ps.snapshot().manifest.total_segments();
+
+            // 2. writer-B sends a 100% client-deduped batch -> empty PWL3 frame + empty apply_logged.
+            let g0 = ps.lock_bucket_append(0).await;
+            let wal_seq_b = ps
+                .log_forwarded_events_locked(
+                    &g0,
+                    0,
+                    "writer-B",
+                    0,
+                    t0 + 2_000,
+                    &WireBatch::new(vec![]),
+                    0,
+                )
+                .await
+                .unwrap()
+                .expect("writer-B empty PWL3 offset 0 must log");
+            drop(g0);
+            assert_eq!(ps.apply_logged(0, wal_seq_b, &[], 0).await.unwrap(), 0);
+
+            // flush_due_buckets (and flush_bucket/flush_all) must promote writer-B without writing
+            // any empty Vortex segment and advance committed_wal_seq.
+            assert_eq!(ps.flush_due_buckets().await.unwrap(), 0);
+            let mf_after_b = ps.snapshot().manifest.clone();
+            assert_eq!(mf_after_b.total_segments(), segs_after_a);
+            assert!(mf_after_b.epoch > epoch_after_a);
+            assert_eq!(
+                mf_after_b.committed_wal_seq.get(&0).copied(),
+                Some(wal_seq_b)
+            );
+            assert_eq!(
+                mf_after_b
+                    .writer_offsets
+                    .get(&("writer-B".into(), 0))
+                    .map(|e| e.last_applied_offset),
+                Some(0)
+            );
+
+            // Idle/NodeRole::All invariant: repeating flush/publish with no pending work commits 0 epochs.
+            let epoch_before_idle = mf_after_b.epoch;
+            assert!(ps.flush_bucket(0).await.unwrap().is_empty());
+            assert_eq!(ps.flush_buckets(&[0, 1]).await.unwrap(), 0);
+            assert_eq!(ps.flush_due_buckets().await.unwrap(), 0);
+            assert_eq!(ps.flush_all().await.unwrap(), 0);
+            assert_eq!(ps.snapshot().manifest.epoch, epoch_before_idle);
+
+            // Empty apply_logged WITHOUT any unflushed_writer_offsets (e.g. NodeRole::All dead-letter)
+            // must also commit 0 manifest epochs on flush.
+            ps.apply_logged(1, 99, &[], 0).await.unwrap();
+            assert!(ps.flush_bucket(1).await.unwrap().is_empty());
+            assert_eq!(ps.flush_all().await.unwrap(), 0);
+            assert_eq!(ps.snapshot().manifest.epoch, epoch_before_idle);
+
+            // publish must emit pub_1 carrying writer-B even though no new segments or IDs were added!
+            let pub1 = ps
+                .upload_if_dirty_at(t0 + 3_000, false)
+                .await
+                .unwrap()
+                .expect("pub_1 must publish promoted writer-B offset");
+            assert_eq!(pub1.publish_seq, 1);
+            assert_eq!(
+                pub1.writer_offsets
+                    .get(&("writer-B".into(), 0))
+                    .map(|e| e.last_applied_offset),
+                Some(0)
+            );
+            // Idle publish immediately afterward must return None (0 S3 calls).
+            assert!(ps
+                .upload_if_dirty_at(t0 + 4_000, false)
+                .await
+                .unwrap()
+                .is_none());
+
+            id_router.close_all().await.unwrap();
+        }
+
+        // 3. Wipe local disk -> restore from published -> writer-B offset 0 survives.
+        std::fs::remove_dir_all(&data_dir).unwrap();
+        let data_dir2 = tmp.path().join("node_data_restored");
+        let routed_restore =
+            crate::store_factory::open_hot_store_for_restore(s3_raw.clone(), &data_dir2)
+                .await
+                .unwrap();
+        let enc_restore = Arc::new(EncryptedObjectStore::new(routed_restore));
+        let pub_m = PublishedManifestStore::new("proj_empty_pwl3", enc_restore.as_object_store())
+            .load_latest()
+            .await
+            .unwrap()
+            .expect("published manifest exists");
+        assert_eq!(
+            pub_m
+                .writer_offsets
+                .get(&("writer-B".into(), 0))
+                .map(|e| e.last_applied_offset),
+            Some(0)
+        );
+        let restored = restore_project_from_published(
+            "proj_empty_pwl3",
+            &pub_m,
+            enc_restore.as_object_store(),
+        )
+        .await
+        .unwrap();
+        restored.identity_graph.close().await.unwrap();
+        if let Some(p) = restored.profile_store {
+            p.close().await.unwrap();
+        }
+        crate::store_factory::finalize_local_hot_store_marker(&data_dir2)
+            .await
+            .unwrap();
+
+        let routed2 = with_hot_store(s3_raw.clone(), &data_dir2).await.unwrap();
+        let enc2 = Arc::new(EncryptedObjectStore::new(routed2));
+        let id_router2 = Arc::new(IdentityRouter::new(enc2.as_object_store()));
+        let engine2 = StorageEngine::new_with_encrypted(cfg, enc2.clone(), id_router2.clone());
+        let ps2 = engine2
+            .get_or_open_project("proj_empty_pwl3")
+            .await
+            .unwrap();
+        assert!(ps2.is_writer_offset_applied("writer-B", 0, 0));
+        let g0 = ps2.lock_bucket_append(0).await;
+        assert!(ps2
+            .log_forwarded_events_locked(
+                &g0,
+                0,
+                "writer-B",
+                0,
+                t0 + 2_100_000,
+                &WireBatch::new(vec![make_ev(1, "u_same", t0)]),
+                128,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        drop(g0);
+        id_router2.close_all().await.unwrap();
     }
 }

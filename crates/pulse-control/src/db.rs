@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
+use dashmap::DashMap;
 use pulse_exec::{CustomEventDef, CustomPropertyDef, LookupTableDef};
+use ring::rand::SecureRandom;
 use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -2628,6 +2630,11 @@ const SQL_UPSERT_WRITER_LEASE: &str =
      WHERE writer_leases.node_id = excluded.node_id OR writer_leases.expires_at_ms < ?";
 const SQL_SELECT_WRITER_LEASE_GEN: &str =
     "SELECT generation FROM writer_leases WHERE project_id = ? AND node_id = ?";
+const SQL_INSERT_INTERNAL_TOKEN: &str =
+    "INSERT INTO cluster_internal_auth (id, token, created_at_ms)
+     VALUES (1, ?, ?)
+     ON CONFLICT(id) DO NOTHING";
+const SQL_SELECT_INTERNAL_TOKEN: &str = "SELECT token FROM cluster_internal_auth WHERE id = 1";
 
 fn normalize_optional_node_name(name: Option<String>) -> Option<String> {
     name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -3009,6 +3016,145 @@ impl MetaStore {
             "UPDATE writer_leases SET expires_at_ms = 0 WHERE node_id = ?",
             node_id,
         ))
+    }
+
+    /// Resolves the shared internal node-to-node forwarding token (`PULSE_INTERNAL_TOKEN` env var
+    /// or `cluster_internal_auth` row `id = 1`, auto-creating a 256-bit random token once).
+    pub async fn resolve_or_create_internal_token(&self) -> Result<String, MetaError> {
+        if let Ok(raw) = std::env::var("PULSE_INTERNAL_TOKEN") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        if let Some(tok) = db_map_opt!(self, SQL_SELECT_INTERNAL_TOKEN, |r| {
+            r.get::<String, _>("token")
+        },)
+        {
+            return Ok(tok);
+        }
+        let mut raw = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut raw)
+            .map_err(|_| MetaError::Conflict("CSPRNG failure generating internal token".into()))?;
+        let generated = hex::encode(raw);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        db_exec!(self, SQL_INSERT_INTERNAL_TOKEN, &generated, now_ms);
+        let tok = db_map_opt!(self, SQL_SELECT_INTERNAL_TOKEN, |r| {
+            r.get::<String, _>("token")
+        },)
+        .unwrap_or(generated);
+        Ok(tok)
+    }
+}
+
+/// Cached `project_owner` directory backed by [`MetaStore`], used by stateless writers'
+/// per-project forwarders and sync callers.
+pub struct MetaOwnerDirectory {
+    meta: MetaStore,
+    cache: DashMap<String, (ProjectOwnerInfo, std::time::Instant)>,
+    ttl: std::time::Duration,
+    stale_after_ms: i64,
+}
+
+impl MetaOwnerDirectory {
+    pub fn new(meta: MetaStore) -> Self {
+        let ttl_ms = std::env::var("PULSE_OWNER_CACHE_TTL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(5_000);
+        let stale_after_ms = std::env::var("PULSE_WRITER_NODE_STALE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or_else(|| {
+                let ttl_secs = std::env::var("PULSE_WRITER_LEASE_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .unwrap_or(15)
+                    .max(3);
+                ttl_secs.saturating_mul(1_000)
+            });
+        Self {
+            meta,
+            cache: DashMap::new(),
+            ttl: std::time::Duration::from_millis(ttl_ms),
+            stale_after_ms,
+        }
+    }
+
+    fn to_info(owner: ProjectOwner) -> ProjectOwnerInfo {
+        ProjectOwnerInfo {
+            project_id: owner.project_id,
+            node_name: owner.node_name,
+            address: owner.address,
+            updated_at_ms: owner.updated_at_ms,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pulse_ingest::OwnerDirectory for MetaOwnerDirectory {
+    async fn resolve_owner(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<Option<ProjectOwnerInfo>, String> {
+        if let Some(entry) = self.cache.get(project_id) {
+            if entry.1.elapsed() < self.ttl {
+                return Ok(Some(entry.0.clone()));
+            }
+        }
+        self.refresh_owner(project_id).await
+    }
+
+    async fn refresh_owner(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<Option<ProjectOwnerInfo>, String> {
+        let owner_opt = self
+            .meta
+            .get_project_owner(project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let owner_opt = match owner_opt {
+            Some(o) => Some(o),
+            None => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.meta
+                    .place_project_if_unassigned(project_id, now_ms, self.stale_after_ms)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        if let Some(owner) = owner_opt {
+            let info = Self::to_info(owner);
+            self.cache.insert(
+                project_id.to_string(),
+                (info.clone(), std::time::Instant::now()),
+            );
+            Ok(Some(info))
+        } else {
+            self.cache.remove(project_id);
+            Ok(None)
+        }
+    }
+
+    async fn refresh_all(&self) -> std::result::Result<(), String> {
+        let owners = self
+            .meta
+            .list_project_owners()
+            .await
+            .map_err(|e| e.to_string())?;
+        let now = std::time::Instant::now();
+        let mut live = std::collections::HashSet::with_capacity(owners.len());
+        for owner in owners {
+            live.insert(owner.project_id.clone());
+            self.cache
+                .insert(owner.project_id.clone(), (Self::to_info(owner), now));
+        }
+        self.cache.retain(|pid, _| live.contains(pid));
+        Ok(())
     }
 }
 
@@ -3410,6 +3556,8 @@ mod writer_lease_tests {
             SQL_LIST_NODE_LOADS,
             SQL_UPSERT_WRITER_LEASE,
             SQL_SELECT_WRITER_LEASE_GEN,
+            SQL_INSERT_INTERNAL_TOKEN,
+            SQL_SELECT_INTERNAL_TOKEN,
         ];
         for sql in queries {
             let rewritten = pg_rewrite(sql);

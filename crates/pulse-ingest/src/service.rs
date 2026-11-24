@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dedup::{normalize_event_timestamp, DedupRegistry};
+use crate::forward_guard::ForwardLoopGuard;
+use crate::forwarder::{OwnerDirectory, OwnerSyncClient, WriterForwarder};
 use crate::governance::{DiscoveredEventSchema, GovernanceProvider, ProjectLexiconRules};
+use crate::writer_log::WriterLogManager;
 
 /// Per-batch and per-project schema cardinality caps preventing dictionary exhaustion.
 pub const MAX_NEW_EVENTS_PER_BATCH: usize = 128;
@@ -358,8 +361,14 @@ struct BufferedBatch {
     bytes: usize,
 }
 
+#[derive(Clone)]
+enum ProjectBufferTarget {
+    LocalStorage(Arc<pulse_storage::ProjectStorage>, RecordSenders),
+    WriterLog,
+}
+
 struct ProjectBufferState {
-    target: Option<(Arc<pulse_storage::ProjectStorage>, RecordSenders)>,
+    target: Option<ProjectBufferTarget>,
     buckets: Vec<VecDeque<BufferedBatch>>,
     reserved_bytes: usize,
     buffered_bytes: usize,
@@ -520,8 +529,16 @@ impl BufferReservation {
         let mut should_wake = false;
         {
             let mut st = self.proj_buf.state.lock();
-            if !ps.is_fenced() && st.target.as_ref().is_none_or(|(cur, _)| cur.is_fenced()) {
-                st.target = Some((ps.clone(), processor.clone()));
+            if !ps.is_fenced()
+                && st.target.as_ref().is_none_or(|t| match t {
+                    ProjectBufferTarget::LocalStorage(cur, _) => cur.is_fenced(),
+                    ProjectBufferTarget::WriterLog => false,
+                })
+            {
+                st.target = Some(ProjectBufferTarget::LocalStorage(
+                    ps.clone(),
+                    processor.clone(),
+                ));
             }
             if st.buckets.len() < num_buckets {
                 st.buckets.resize_with(num_buckets, VecDeque::new);
@@ -547,6 +564,50 @@ impl BufferReservation {
         }
         self.node_events.fetch_add(total_events, Ordering::AcqRel);
         self.node_batches.fetch_add(batch_count, Ordering::AcqRel);
+        if should_wake {
+            self.proj_buf.wake_flusher.notify_one();
+        }
+    }
+
+    fn commit_writer(mut self, events: Vec<Candidate>, total_events: usize, server_now_ms: i64) {
+        self.committed = true;
+        if events.is_empty() {
+            if self.reserved_bytes > 0 {
+                self.node_bytes
+                    .fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+                let mut st = self.proj_buf.state.lock();
+                st.reserved_bytes = st.reserved_bytes.saturating_sub(self.reserved_bytes);
+            }
+            return;
+        }
+        let mut should_wake = false;
+        {
+            let mut st = self.proj_buf.state.lock();
+            if st.target.is_none() {
+                st.target = Some(ProjectBufferTarget::WriterLog);
+            }
+            if st.buckets.is_empty() {
+                st.buckets.push(VecDeque::new());
+            }
+            st.reserved_bytes = st.reserved_bytes.saturating_sub(self.reserved_bytes);
+            st.buckets[0].push_back(BufferedBatch {
+                server_now_ms,
+                events,
+                bytes: self.reserved_bytes,
+            });
+            st.buffered_bytes += self.reserved_bytes;
+            st.buffered_events += total_events;
+            st.buffered_batches += 1;
+            if st.oldest_queued_at.is_none() {
+                st.oldest_queued_at = Some(tokio::time::Instant::now());
+                should_wake = true;
+            }
+            if st.buffered_bytes >= self.flush_bytes || self.flush_ms == 0 {
+                should_wake = true;
+            }
+        }
+        self.node_events.fetch_add(total_events, Ordering::AcqRel);
+        self.node_batches.fetch_add(1, Ordering::AcqRel);
         if should_wake {
             self.proj_buf.wake_flusher.notify_one();
         }
@@ -696,9 +757,20 @@ fn record_discovery(governance: &dyn GovernanceProvider, project_id: &str, event
     }
 }
 
+pub struct StatelessWriterBackend {
+    pub log: Arc<WriterLogManager>,
+    pub forwarder: Arc<WriterForwarder>,
+    pub sync_client: Arc<OwnerSyncClient>,
+}
+
+enum IngestBackend {
+    LocalDirect(Arc<StorageEngine>),
+    StatelessWriter(Arc<StatelessWriterBackend>),
+}
+
 /// Core transport-agnostic Ingestion Pipeline shared by HTTP/1.1, HTTP/2, QUIC, and Seeder.
 pub struct IngestService {
-    storage: Arc<StorageEngine>,
+    backend: IngestBackend,
     governance: Arc<dyn GovernanceProvider>,
     dedup: Arc<DedupRegistry>,
     processors: DashMap<String, Processor>,
@@ -726,7 +798,7 @@ impl IngestService {
         rate_limit: crate::rate_limit::RateLimiter,
     ) -> Arc<Self> {
         let svc = Arc::new(Self {
-            storage,
+            backend: IngestBackend::LocalDirect(storage),
             governance,
             dedup: Arc::new(DedupRegistry::new()),
             processors: DashMap::new(),
@@ -741,6 +813,68 @@ impl IngestService {
         svc
     }
 
+    pub fn new_stateless_writer(
+        log: Arc<WriterLogManager>,
+        owners: Arc<dyn OwnerDirectory>,
+        forwarder: Arc<WriterForwarder>,
+        governance: Arc<dyn GovernanceProvider>,
+        forward_guard: Arc<ForwardLoopGuard>,
+        internal_token: Option<String>,
+    ) -> Arc<Self> {
+        let sync_client = OwnerSyncClient::new(
+            log.writer_id().to_string(),
+            owners,
+            forward_guard,
+            internal_token,
+        );
+        let backend = IngestBackend::StatelessWriter(Arc::new(StatelessWriterBackend {
+            log,
+            forwarder,
+            sync_client,
+        }));
+        let svc = Arc::new(Self {
+            backend,
+            governance,
+            dedup: Arc::new(DedupRegistry::new()),
+            processors: DashMap::new(),
+            buffer: IngestBuffer::from_env(),
+            dict_registry: Arc::new(DictionaryRegistry::default()),
+            metrics: IngestMetrics::default(),
+            rate_limit: crate::rate_limit::RateLimiter::from_env(),
+            wal_groups: DashMap::new(),
+            self_weak: std::sync::OnceLock::new(),
+        });
+        let _ = svc.self_weak.set(Arc::downgrade(&svc));
+        svc
+    }
+
+    pub fn is_stateless_writer(&self) -> bool {
+        matches!(self.backend, IngestBackend::StatelessWriter(_))
+    }
+
+    pub fn writer_log(&self) -> Option<&Arc<WriterLogManager>> {
+        match &self.backend {
+            IngestBackend::StatelessWriter(w) => Some(&w.log),
+            IngestBackend::LocalDirect(_) => None,
+        }
+    }
+
+    pub fn forwarder(&self) -> Option<&Arc<WriterForwarder>> {
+        match &self.backend {
+            IngestBackend::StatelessWriter(w) => Some(&w.forwarder),
+            IngestBackend::LocalDirect(_) => None,
+        }
+    }
+
+    fn local_storage(&self) -> Result<&Arc<StorageEngine>> {
+        match &self.backend {
+            IngestBackend::LocalDirect(s) => Ok(s),
+            IngestBackend::StatelessWriter(_) => Err(IngestError::Storage(
+                StorageError::Unavailable("stateless writer has no local storage".to_string()),
+            )),
+        }
+    }
+
     /// Charges a request from the public SDK endpoints against its project's rate limit.
     fn charge(&self, project_id: &str, units: u64) -> Result<()> {
         self.rate_limit
@@ -748,8 +882,9 @@ impl IngestService {
             .map_err(|retry_after_secs| IngestError::RateLimited { retry_after_secs })
     }
 
-    pub fn storage(&self) -> &Arc<StorageEngine> {
-        &self.storage
+    /// Public wrapper for QUIC ingest rate-limit charging.
+    pub fn charge_for_project(&self, project_id: &str, units: u64) -> Result<()> {
+        self.charge(project_id, units)
     }
 
     pub fn governance(&self) -> &Arc<dyn GovernanceProvider> {
@@ -808,12 +943,14 @@ impl IngestService {
             let mut should_wake = false;
             {
                 let mut st = pb.state.lock();
-                if st
-                    .target
-                    .as_ref()
-                    .is_none_or(|(cur, _)| !Arc::ptr_eq(cur, ps))
-                {
-                    st.target = Some((ps.clone(), processor.clone()));
+                if st.target.as_ref().is_none_or(|t| match t {
+                    ProjectBufferTarget::LocalStorage(cur, _) => !Arc::ptr_eq(cur, ps),
+                    ProjectBufferTarget::WriterLog => true,
+                }) {
+                    st.target = Some(ProjectBufferTarget::LocalStorage(
+                        ps.clone(),
+                        processor.clone(),
+                    ));
                     st.wal_error = None;
                     st.retry_backoff_ms = 0;
                     st.next_retry_at = tokio::time::Instant::now();
@@ -832,7 +969,8 @@ impl IngestService {
         project_id: &str,
         now_ms: i64,
     ) -> Result<Arc<pulse_storage::ProjectStorage>> {
-        let ps = self.storage.get_or_open_project(project_id).await?;
+        let storage = self.local_storage()?;
+        let ps = storage.get_or_open_project(project_id).await?;
         // Empty except right after an open, including a re-open after a writer-lease takeover.
         let recovered = ps.take_recovered_uuid_fps();
         if !recovered.is_empty() {
@@ -855,7 +993,8 @@ impl IngestService {
                 return Ok(p.txs.clone());
             }
         }
-        let id_graph = self.storage.identity_graph(project_id, true).await?;
+        let storage = self.local_storage()?;
+        let id_graph = storage.identity_graph(project_id, true).await?;
         let mut entry = self
             .processors
             .entry(project_id.to_string())
@@ -890,6 +1029,7 @@ impl IngestService {
         project_id: &str,
         num_buckets: usize,
         bytes: usize,
+        writer_log: Option<&WriterLogManager>,
     ) -> Result<BufferReservation> {
         let proj_buf = self.buffer.project(project_id, num_buckets);
         self.ensure_flusher_started(&proj_buf);
@@ -900,14 +1040,18 @@ impl IngestService {
                 std::io::Error::other("ingest service shutting down"),
             )));
         }
-        // Check sticky WAL failure BEFORE `ingest_buffer` 429 backpressure so disk/WAL errors
+        // Check sticky WAL/disk failure BEFORE `ingest_buffer` 429 backpressure so disk/WAL errors
         // surface as 503 Service Unavailable even if the buffer backed up while WAL was failing.
         if let Some(ref err) = st.wal_error {
             return Err(err.to_ingest_error());
         }
+        let proj_used = st.reserved_bytes + st.buffered_bytes;
+        if let Some(wl) = writer_log {
+            let node_used = self.buffer.node_bytes.load(Ordering::Acquire);
+            wl.check_admission(project_id, proj_used, node_used, bytes)?;
+        }
         let proj_max = self.buffer.project_max_bytes.load(Ordering::Relaxed);
         let node_max = self.buffer.node_max_bytes.load(Ordering::Relaxed);
-        let proj_used = st.reserved_bytes + st.buffered_bytes;
         if bytes > 0 && proj_used + bytes > proj_max {
             return Err(IngestError::Storage(StorageError::Backpressure {
                 project_id: project_id.to_string(),
@@ -953,7 +1097,7 @@ impl IngestService {
         })
     }
 
-    /// Flushes any queued W1 buffer batches for `project_id` to the durable WAL.
+    /// Flushes any queued W1 buffer batches for `project_id` to the durable WAL (or `writer_log/`).
     pub async fn flush_project_buffer(&self, project_id: &str) -> Result<()> {
         let Some(proj_buf) = self.buffer.projects.get(project_id).map(|e| e.clone()) else {
             return Ok(());
@@ -962,7 +1106,7 @@ impl IngestService {
             let st = proj_buf.state.lock();
             !st.shutting_down && st.wal_error.as_ref().is_some_and(|e| e.is_fenced())
         };
-        if try_rebind {
+        if try_rebind && !self.is_stateless_writer() {
             self.ensure_project_ready(project_id, Utc::now().timestamp_millis())
                 .await?;
         }
@@ -1010,8 +1154,10 @@ impl IngestService {
     /// Flushes buffered W1 events for `project_id` to WAL and waits for the processor to apply them.
     pub async fn flush_project(&self, project_id: &str) -> Result<()> {
         self.flush_project_buffer(project_id).await?;
-        if let Some(ps) = self.storage.get_project(project_id) {
-            ps.wait_applied(Duration::from_secs(10)).await;
+        if let IngestBackend::LocalDirect(ref storage) = self.backend {
+            if let Some(ps) = storage.get_project(project_id) {
+                ps.wait_applied(Duration::from_secs(10)).await;
+            }
         }
         Ok(())
     }
@@ -1027,8 +1173,10 @@ impl IngestService {
         for pid in pids {
             self.flush_project_buffer(&pid).await?;
         }
-        for ps in self.storage.open_projects() {
-            ps.wait_applied(Duration::from_secs(10)).await;
+        if let IngestBackend::LocalDirect(ref storage) = self.backend {
+            for ps in storage.open_projects() {
+                ps.wait_applied(Duration::from_secs(10)).await;
+            }
         }
         Ok(())
     }
@@ -1116,16 +1264,103 @@ impl IngestService {
         mut batch: WireBatch,
         server_now_ms: i64,
     ) -> Result<IngestResponse> {
-        let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
-        let rules = self.governance.lexicon_rules(project_id);
-        let num_buckets = ps.config().num_buckets;
+        let w = match &self.backend {
+            IngestBackend::StatelessWriter(w) => w,
+            IngestBackend::LocalDirect(_) => {
+                let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
+                let rules = self.governance.lexicon_rules(project_id);
+                let num_buckets = ps.config().num_buckets;
 
+                let mut accepted = 0usize;
+                let mut dropped = 0usize;
+                let rejected = std::mem::take(&mut batch.rejected);
+                let profile_calls = std::mem::take(&mut batch.profile_calls);
+
+                let mut by_bucket: BTreeMap<u8, (Vec<Candidate>, usize)> = BTreeMap::new();
+                let mut total_bytes = 0usize;
+
+                for mut ev in batch.events {
+                    if !rules.apply(&mut ev) {
+                        dropped += 1;
+                        continue;
+                    }
+                    let seed = if ev.routing_seed.is_empty() {
+                        ev.distinct_id.as_str()
+                    } else {
+                        ev.routing_seed.as_str()
+                    };
+                    let bucket_id = route_bucket(seed, num_buckets);
+                    let fp = event_uuid_fingerprint(&ev.event_uuid);
+                    ev.client_event_ts_ms = normalize_event_timestamp(
+                        ev.client_event_ts_ms,
+                        ev.client_sent_ts_ms,
+                        server_now_ms,
+                    );
+                    let ev_bytes = approx_event_bytes(&ev);
+                    total_bytes += ev_bytes;
+                    accepted += 1;
+                    let entry = by_bucket
+                        .entry(bucket_id)
+                        .or_insert_with(|| (Vec::new(), 0));
+                    entry.0.push((ev, fp));
+                    entry.1 += ev_bytes;
+                }
+
+                // Check sticky WAL failure BEFORE backpressure checks so WAL outages return 503.
+                if let Some(pb) = self.buffer.projects.get(project_id) {
+                    if let Some(ref err) = pb.state.lock().wal_error {
+                        return Err(err.to_ingest_error());
+                    }
+                }
+
+                if !by_bucket.is_empty() {
+                    ps.check_hot_segment_backpressure()?;
+                }
+                for &bucket_id in by_bucket.keys() {
+                    ps.check_l0_backpressure(bucket_id)?;
+                }
+
+                let processor = self.processor_for(project_id, &ps).await?;
+                let reservation =
+                    self.reserve_buffer(project_id, num_buckets as usize, total_bytes, None)?;
+
+                let profiles_updated = if !profile_calls.is_empty() {
+                    self.flush_project_buffer(project_id).await?;
+                    ps.wait_applied(Duration::from_secs(1)).await;
+                    self.apply_segment_profile_calls(project_id, profile_calls)
+                        .await?
+                } else {
+                    0
+                };
+
+                reservation.commit(by_bucket, accepted, &ps, &processor, server_now_ms);
+                self.metrics.record_receipt(dropped as u64);
+
+                return Ok(IngestResponse {
+                    status: "ok".to_string(),
+                    accepted,
+                    deduped: 0,
+                    dropped,
+                    server_ts_ms: server_now_ms,
+                    rejected,
+                    profiles_updated,
+                });
+            }
+        };
+
+        // Stateless Writer path:
+        // 1. Lexicon drops + PII masking (`rules.apply`)
+        // 2. Server event timestamping (`normalize_event_timestamp`, zeroing `client_sent_ts_ms` so owner never double-shifts)
+        // 3. Capacity / disk admission (`429 writer_log_backpressure` / `ingest_buffer_backpressure` / `503`)
+        // 4. Synchronous `identify`/`alias` forward to owner while holding `BufferReservation`
+        // 5. Commit events to memory buffer only if sync call succeeded
+        let rules = self.governance.lexicon_rules(project_id);
         let mut accepted = 0usize;
         let mut dropped = 0usize;
         let rejected = std::mem::take(&mut batch.rejected);
         let profile_calls = std::mem::take(&mut batch.profile_calls);
 
-        let mut by_bucket: BTreeMap<u8, (Vec<Candidate>, usize)> = BTreeMap::new();
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(batch.events.len());
         let mut total_bytes = 0usize;
 
         for mut ev in batch.events {
@@ -1133,55 +1368,30 @@ impl IngestService {
                 dropped += 1;
                 continue;
             }
-            let seed = if ev.routing_seed.is_empty() {
-                ev.distinct_id.as_str()
-            } else {
-                ev.routing_seed.as_str()
-            };
-            let bucket_id = route_bucket(seed, num_buckets);
-            let fp = event_uuid_fingerprint(&ev.event_uuid);
             ev.client_event_ts_ms = normalize_event_timestamp(
                 ev.client_event_ts_ms,
                 ev.client_sent_ts_ms,
                 server_now_ms,
             );
-            let ev_bytes = approx_event_bytes(&ev);
-            total_bytes += ev_bytes;
+            // Zero out `client_sent_ts_ms` so owner does not shift again after forwarding lag.
+            ev.client_sent_ts_ms = 0;
+            let fp = event_uuid_fingerprint(&ev.event_uuid);
+            total_bytes += approx_event_bytes(&ev);
             accepted += 1;
-            let entry = by_bucket
-                .entry(bucket_id)
-                .or_insert_with(|| (Vec::new(), 0));
-            entry.0.push((ev, fp));
-            entry.1 += ev_bytes;
+            candidates.push((ev, fp));
         }
 
-        // Check sticky WAL failure BEFORE backpressure checks so WAL outages return 503.
-        if let Some(pb) = self.buffer.projects.get(project_id) {
-            if let Some(ref err) = pb.state.lock().wal_error {
-                return Err(err.to_ingest_error());
-            }
-        }
-
-        if !by_bucket.is_empty() {
-            ps.check_hot_segment_backpressure()?;
-        }
-        for &bucket_id in by_bucket.keys() {
-            ps.check_l0_backpressure(bucket_id)?;
-        }
-
-        let processor = self.processor_for(project_id, &ps).await?;
-        let reservation = self.reserve_buffer(project_id, num_buckets as usize, total_bytes)?;
+        let reservation = self.reserve_buffer(project_id, 1, total_bytes, Some(&w.log))?;
 
         let profiles_updated = if !profile_calls.is_empty() {
-            self.flush_project_buffer(project_id).await?;
-            ps.wait_applied(Duration::from_secs(1)).await;
-            self.apply_segment_profile_calls(project_id, profile_calls)
+            w.sync_client
+                .forward_profile_calls(project_id, profile_calls)
                 .await?
         } else {
             0
         };
 
-        reservation.commit(by_bucket, accepted, &ps, &processor, server_now_ms);
+        reservation.commit_writer(candidates, accepted, server_now_ms);
         self.metrics.record_receipt(dropped as u64);
 
         Ok(IngestResponse {
@@ -1195,6 +1405,148 @@ impl IngestService {
         })
     }
 
+    /// Owner internal endpoint handler: receives a forwarded writer batch (`writer_id, batch_offset, events`),
+    /// checks `(writer_id, bucket_id)` high-water offsets per bucket, runs client dedup, writes & fsyncs
+    /// `PWL3` WAL records BEFORE returning `Ok`, and queues records to the per-bucket processor.
+    pub async fn ingest_forwarded_batch(
+        &self,
+        writer_id: &str,
+        project_id: &str,
+        batch_offset: u64,
+        events: Vec<WireEvent>,
+        server_now_ms: i64,
+    ) -> Result<usize> {
+        let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
+        let num_buckets = ps.config().num_buckets;
+
+        let mut by_bucket: BTreeMap<u8, (Vec<(WireEvent, u64)>, usize)> = BTreeMap::new();
+        for ev in events {
+            let seed = if ev.routing_seed.is_empty() {
+                ev.distinct_id.as_str()
+            } else {
+                ev.routing_seed.as_str()
+            };
+            let bucket_id = route_bucket(seed, num_buckets);
+            let fp = event_uuid_fingerprint(&ev.event_uuid);
+            let ev_bytes = approx_event_bytes(&ev);
+            let entry = by_bucket
+                .entry(bucket_id)
+                .or_insert_with(|| (Vec::new(), 0));
+            entry.0.push((ev, fp));
+            entry.1 += ev_bytes;
+        }
+
+        if by_bucket.is_empty() {
+            return Ok(0);
+        }
+
+        let mut any_pending_bucket = false;
+        for &bucket_id in by_bucket.keys() {
+            if !ps.is_writer_offset_applied(writer_id, bucket_id, batch_offset) {
+                any_pending_bucket = true;
+                ps.check_l0_backpressure(bucket_id)?;
+            }
+        }
+        if !any_pending_bucket {
+            return Ok(0);
+        }
+        ps.check_hot_segment_backpressure()?;
+
+        let processor = self.processor_for(project_id, &ps).await?;
+        let bucket_outcomes = futures::future::try_join_all(by_bucket.into_iter().map(
+            |(bucket_id, (candidates, slice_bytes))| {
+                let ps = ps.clone();
+                let dedup = self.dedup.clone();
+                let processor = processor.clone();
+                let project_id = project_id.to_string();
+                let writer_id = writer_id.to_string();
+                async move {
+                    let append_guard = ps.lock_bucket_append(bucket_id).await;
+                    if ps.is_writer_offset_applied(&writer_id, bucket_id, batch_offset) {
+                        return Ok::<_, IngestError>((0usize, 0usize));
+                    }
+
+                    let mut seen_in_group: HashSet<u64> = HashSet::new();
+                    let mut to_append = Vec::with_capacity(candidates.len());
+                    let mut committed_fps = Vec::with_capacity(candidates.len());
+                    let mut deduped_count = 0usize;
+
+                    for (ev, fp) in candidates {
+                        if dedup.contains(&project_id, bucket_id, fp, server_now_ms)
+                            || !seen_in_group.insert(fp)
+                        {
+                            deduped_count += 1;
+                            continue;
+                        }
+                        committed_fps.push(fp);
+                        to_append.push(ev);
+                    }
+
+                    let appended_count = to_append.len();
+                    let batch = WireBatch::new(to_append);
+                    let approx_bytes = if appended_count == 0 { 0 } else { slice_bytes };
+                    let Some(wal_seq) = ps
+                        .log_forwarded_events_locked(
+                            &append_guard,
+                            bucket_id,
+                            &writer_id,
+                            batch_offset,
+                            server_now_ms,
+                            &batch,
+                            approx_bytes,
+                        )
+                        .await?
+                    else {
+                        return Ok((0usize, 0usize));
+                    };
+
+                    dedup.commit_batch(&project_id, bucket_id, &committed_fps, server_now_ms);
+                    let _ = processor[bucket_id as usize]
+                        .send(LoggedRecord {
+                            bucket_id,
+                            wal_seq,
+                            events: batch.events,
+                            fps: committed_fps,
+                            bytes: approx_bytes,
+                        })
+                        .await;
+                    drop(append_guard);
+                    if ps.should_flush_bucket(bucket_id) {
+                        ps.schedule_background_flush(bucket_id);
+                    }
+                    Ok((appended_count, deduped_count))
+                }
+            },
+        ))
+        .await?;
+
+        let mut total_accepted = 0usize;
+        let mut total_deduped = 0usize;
+        for (a, d) in bucket_outcomes {
+            total_accepted += a;
+            total_deduped += d;
+        }
+        self.metrics.record_accepted_and_deduped(
+            total_accepted as u64,
+            total_deduped as u64,
+            server_now_ms,
+        );
+        Ok(total_accepted)
+    }
+
+    pub async fn apply_forwarded_profile_calls(
+        &self,
+        project_id: &str,
+        calls: Vec<serde_json::Value>,
+    ) -> Result<usize> {
+        let ps = self
+            .ensure_project_ready(project_id, Utc::now().timestamp_millis())
+            .await?;
+        self.flush_project_buffer(project_id).await?;
+        ps.wait_applied(Duration::from_secs(1)).await;
+        self.apply_segment_profile_calls(project_id, calls).await
+    }
+
     /// Synchronous event ingestion used by bulk import (`/v1/projects/:id/import`), the demo
     /// seeder, and synchronous tests. Flushes any buffered W1 events for `project_id` first to
     /// preserve FIFO ordering, then runs synchronous WAL group commit + L0 insertion.
@@ -1206,7 +1558,10 @@ impl IngestService {
     ) -> Result<IngestResponse> {
         self.flush_project_buffer(project_id).await?;
         let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
-        let id_graph = self.storage.identity_graph(project_id, true).await?;
+        let id_graph = self
+            .local_storage()?
+            .identity_graph(project_id, true)
+            .await?;
         let rules = self.governance.lexicon_rules(project_id);
         let num_buckets = ps.config().num_buckets;
         let dict = ps.dictionary();
@@ -1587,6 +1942,9 @@ impl IngestService {
         project_id: &str,
         req: IdentifyRequest,
     ) -> Result<IdentifyResponse> {
+        if let IngestBackend::StatelessWriter(ref w) = self.backend {
+            return w.sync_client.forward_identify(project_id, req).await;
+        }
         self.flush_project_buffer(project_id).await?;
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
@@ -1594,7 +1952,10 @@ impl IngestService {
         // Keep the old order: events acknowledged before this call get their ids first.
         ps.wait_applied(Duration::from_secs(1)).await;
         let num_buckets = ps.config().num_buckets;
-        let id_graph = self.storage.identity_graph(project_id, true).await?;
+        let id_graph = self
+            .local_storage()?
+            .identity_graph(project_id, true)
+            .await?;
 
         let anon_seed = req
             .anon_routing_seed
@@ -1649,10 +2010,16 @@ impl IngestService {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<EngageResponse> {
+        if let IngestBackend::StatelessWriter(ref w) = self.backend {
+            return w.sync_client.forward_engage(project_id, payload).await;
+        }
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
             .await?;
-        let id_graph = self.storage.identity_graph(project_id, true).await?;
+        let id_graph = self
+            .local_storage()?
+            .identity_graph(project_id, true)
+            .await?;
         let num_buckets = ps.config().num_buckets;
 
         let items: Vec<serde_json::Value> = match payload {
@@ -1752,6 +2119,12 @@ impl IngestService {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<usize> {
+        if let IngestBackend::StatelessWriter(ref w) = self.backend {
+            return w
+                .sync_client
+                .forward_group_engage(project_id, payload)
+                .await;
+        }
         let items: Vec<serde_json::Value> = match payload {
             serde_json::Value::Array(arr) => arr,
             serde_json::Value::Object(_) => vec![payload],
@@ -1805,11 +2178,17 @@ impl IngestService {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<ReplayIngestResponse> {
+        if let IngestBackend::StatelessWriter(ref w) = self.backend {
+            return w
+                .sync_client
+                .forward_replay(project_id, content_type, body)
+                .await;
+        }
         let mut chunk = ReplayChunk::decode_auto(body, content_type)?;
         chunk.project_id = project_id.to_string();
         let rules = self.governance.lexicon_rules(project_id);
         apply_lexicon_to_replay_chunk(&mut chunk, &rules);
-        let res = self.storage.append_replay_chunk(&chunk).await?;
+        let res = self.local_storage()?.append_replay_chunk(&chunk).await?;
         Ok(ReplayIngestResponse {
             status: "ok".to_string(),
             object_path: res.object_path,
@@ -1984,13 +2363,9 @@ async fn drain_project_buffer_once(
     let num_buckets = { proj_buf.state.lock().buckets.len() };
     for b_idx in 0..num_buckets {
         loop {
-            let popped: Option<(
-                Arc<pulse_storage::ProjectStorage>,
-                RecordSenders,
-                Vec<BufferedBatch>,
-            )> = {
+            let popped: Option<(ProjectBufferTarget, Vec<BufferedBatch>)> = {
                 let mut st = proj_buf.state.lock();
-                let Some((ps, processor)) = st.target.clone() else {
+                let Some(target) = st.target.clone() else {
                     return;
                 };
                 let Some(q) = st.buckets.get_mut(b_idx) else {
@@ -2013,63 +2388,92 @@ async fn drain_project_buffer_once(
                 if out.is_empty() {
                     None
                 } else {
-                    Some((ps, processor, out))
+                    Some((target, out))
                 }
             };
 
-            let Some((ps, processor, slice)) = popped else {
+            let Some((target, slice)) = popped else {
                 break;
             };
 
-            if let Err((err, slice)) = flush_bucket_slice(
-                svc,
-                &proj_buf.project_id,
-                b_idx as u8,
-                &ps,
-                &processor,
-                slice,
-            )
-            .await
-            {
-                let mut evict_ps = false;
-                {
-                    let mut st = proj_buf.state.lock();
-                    for item in slice.into_iter().rev() {
-                        st.buckets[b_idx].push_front(item);
-                    }
-                    if st
-                        .target
-                        .as_ref()
-                        .is_some_and(|(cur, _)| !Arc::ptr_eq(cur, &ps))
+            match target {
+                ProjectBufferTarget::LocalStorage(ps, processor) => {
+                    if let Err((err, slice)) = flush_bucket_slice(
+                        svc,
+                        &proj_buf.project_id,
+                        b_idx as u8,
+                        &ps,
+                        &processor,
+                        slice,
+                    )
+                    .await
                     {
+                        let mut evict_ps = false;
+                        {
+                            let mut st = proj_buf.state.lock();
+                            for item in slice.into_iter().rev() {
+                                st.buckets[b_idx].push_front(item);
+                            }
+                            if st.target.as_ref().is_some_and(|cur| match cur {
+                                ProjectBufferTarget::LocalStorage(cur_ps, _) => {
+                                    !Arc::ptr_eq(cur_ps, &ps)
+                                }
+                                ProjectBufferTarget::WriterLog => true,
+                            }) {
+                                return;
+                            }
+                            let fenced = ps.is_fenced()
+                                || matches!(
+                                    err,
+                                    StorageError::NotOwner { .. }
+                                        | StorageError::StaleWriter { .. }
+                                );
+                            st.wal_error = Some(StoredWalFailure::from_storage_err(&err, fenced));
+                            if fenced {
+                                st.target = None;
+                                evict_ps = true;
+                            }
+                            let next_ms = if st.retry_backoff_ms == 0 {
+                                20
+                            } else {
+                                (st.retry_backoff_ms * 2).min(1_000)
+                            };
+                            st.retry_backoff_ms = next_ms;
+                            st.next_retry_at =
+                                tokio::time::Instant::now() + Duration::from_millis(next_ms);
+                            st.flush_seq += 1;
+                            proj_buf.flush_done.notify_waiters();
+                        }
+                        if evict_ps {
+                            svc.processors.remove_if(&proj_buf.project_id, |_, p| {
+                                Arc::ptr_eq(&p.ps, &ps) || p.ps.is_fenced()
+                            });
+                        }
                         return;
                     }
-                    let fenced = ps.is_fenced()
-                        || matches!(
-                            err,
-                            StorageError::NotOwner { .. } | StorageError::StaleWriter { .. }
-                        );
-                    st.wal_error = Some(StoredWalFailure::from_storage_err(&err, fenced));
-                    if fenced {
-                        st.target = None;
-                        evict_ps = true;
+                }
+                ProjectBufferTarget::WriterLog => {
+                    if let Err((err, slice)) =
+                        flush_writer_log_slice(svc, &proj_buf.project_id, slice).await
+                    {
+                        let mut st = proj_buf.state.lock();
+                        for item in slice.into_iter().rev() {
+                            st.buckets[b_idx].push_front(item);
+                        }
+                        st.wal_error = Some(StoredWalFailure::from_storage_err(&err, false));
+                        let next_ms = if st.retry_backoff_ms == 0 {
+                            20
+                        } else {
+                            (st.retry_backoff_ms * 2).min(1_000)
+                        };
+                        st.retry_backoff_ms = next_ms;
+                        st.next_retry_at =
+                            tokio::time::Instant::now() + Duration::from_millis(next_ms);
+                        st.flush_seq += 1;
+                        proj_buf.flush_done.notify_waiters();
+                        return;
                     }
-                    let next_ms = if st.retry_backoff_ms == 0 {
-                        20
-                    } else {
-                        (st.retry_backoff_ms * 2).min(1_000)
-                    };
-                    st.retry_backoff_ms = next_ms;
-                    st.next_retry_at = tokio::time::Instant::now() + Duration::from_millis(next_ms);
-                    st.flush_seq += 1;
-                    proj_buf.flush_done.notify_waiters();
                 }
-                if evict_ps {
-                    svc.processors.remove_if(&proj_buf.project_id, |_, p| {
-                        Arc::ptr_eq(&p.ps, &ps) || p.ps.is_fenced()
-                    });
-                }
-                return;
             }
         }
     }
@@ -2087,6 +2491,64 @@ async fn drain_project_buffer_once(
     }
     st.flush_seq += 1;
     proj_buf.flush_done.notify_waiters();
+}
+
+async fn flush_writer_log_slice(
+    svc: &IngestService,
+    project_id: &str,
+    slice: Vec<BufferedBatch>,
+) -> std::result::Result<(), (StorageError, Vec<BufferedBatch>)> {
+    let IngestBackend::StatelessWriter(ref w) = svc.backend else {
+        return Err((
+            StorageError::Unavailable("not a stateless writer".to_string()),
+            slice,
+        ));
+    };
+
+    let mut events = Vec::new();
+    let mut slice_bytes = 0usize;
+    let mut max_now_ms = i64::MIN;
+    for b in &slice {
+        slice_bytes += b.bytes;
+        max_now_ms = max_now_ms.max(b.server_now_ms);
+        for (ev, _) in &b.events {
+            events.push(ev.clone());
+        }
+    }
+    let slice_events = events.len();
+    if slice_events > 0 {
+        let log = w.log.clone();
+        let pid = project_id.to_string();
+        let batch = WireBatch::new(events);
+        let res = tokio::task::spawn_blocking(move || log.append_batch(&pid, &batch, max_now_ms))
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))
+            .and_then(|r| r);
+        if let Err(e) = res {
+            return Err((e, slice));
+        }
+        w.forwarder.notify_project(project_id);
+        svc.metrics
+            .record_accepted_and_deduped(slice_events as u64, 0, max_now_ms);
+    }
+
+    let batch_len = slice.len();
+    if let Some(proj_buf) = svc.buffer.projects.get(project_id) {
+        let mut st = proj_buf.state.lock();
+        st.buffered_bytes = st.buffered_bytes.saturating_sub(slice_bytes);
+        st.buffered_events = st.buffered_events.saturating_sub(slice_events);
+        st.buffered_batches = st.buffered_batches.saturating_sub(batch_len);
+    }
+    svc.buffer
+        .node_bytes
+        .fetch_sub(slice_bytes, Ordering::AcqRel);
+    svc.buffer
+        .node_events
+        .fetch_sub(slice_events, Ordering::AcqRel);
+    svc.buffer
+        .node_batches
+        .fetch_sub(batch_len, Ordering::AcqRel);
+    Ok(())
 }
 
 async fn flush_bucket_slice(
@@ -2237,7 +2699,7 @@ mod tests {
         let proc2: RecordSenders = Arc::new(vec![tx2]);
 
         let proj_buf = ProjectBuffer::new("proj_race".to_string(), 1);
-        proj_buf.state.lock().target = Some((ps2.clone(), proc2));
+        proj_buf.state.lock().target = Some(ProjectBufferTarget::LocalStorage(ps2.clone(), proc2));
 
         let res = BufferReservation {
             proj_buf: proj_buf.clone(),
@@ -2274,10 +2736,142 @@ mod tests {
         res.commit(by_bucket, 1, &ps1, &proc1, 1_000);
 
         let st = proj_buf.state.lock();
-        let (cur_ps, _) = st.target.as_ref().expect("target must remain bound");
+        let cur_target = st.target.as_ref().expect("target must remain bound");
+        let ProjectBufferTarget::LocalStorage(cur_ps, _) = cur_target else {
+            panic!("expected LocalStorage target");
+        };
         assert!(
             Arc::ptr_eq(cur_ps, &ps2),
             "in-flight commit with fenced ps1 must not overwrite rebound ps2"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_3b_client_deduped_empty_pwl3_survives_publish_restore_and_dedup_expiry() {
+        use crate::governance::InMemoryGovernance;
+        use pulse_storage::store_factory::{
+            finalize_local_hot_store_marker, open_hot_store_for_restore, with_hot_store,
+        };
+        use pulse_storage::{
+            restore_project_from_published, EncryptedObjectStore, PublishedManifestStore,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir1 = tmp.path().join("node1");
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            ..StorageConfig::default()
+        };
+        let t0 = Utc::now().timestamp_millis();
+        let ev0 = WireEvent {
+            event_uuid: WireEvent::deterministic_uuid("u1", "s1", "Ev", t0, 1),
+            routing_seed: "u1".to_string(),
+            distinct_id: "u1".to_string(),
+            session_id: "s1".to_string(),
+            event_name: "Ev".to_string(),
+            client_event_ts_ms: t0,
+            client_sent_ts_ms: 0,
+            props: vec![],
+            replay_offset_kb: 0,
+        };
+
+        {
+            let routed = with_hot_store(s3_raw.clone(), &data_dir1).await.unwrap();
+            let enc = Arc::new(EncryptedObjectStore::new(routed));
+            let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
+            let engine = StorageEngine::new_with_encrypted(cfg.clone(), enc, id_router.clone());
+            let svc = IngestService::new(engine.clone(), Arc::new(InMemoryGovernance::default()));
+
+            assert_eq!(
+                svc.ingest_forwarded_batch("writer-A", "proj_3b", 0, vec![ev0.clone()], t0)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let ps = engine.get_or_open_project("proj_3b").await.unwrap();
+            ps.wait_applied(Duration::from_secs(5)).await;
+            ps.flush_all().await.unwrap();
+
+            // writer-B forwards identical ev0 -> client-deduped (accepted == 0), empty PWL3 frame.
+            assert_eq!(
+                svc.ingest_forwarded_batch(
+                    "writer-B",
+                    "proj_3b",
+                    0,
+                    vec![ev0.clone()],
+                    t0 + 1_000,
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            ps.wait_applied(Duration::from_secs(5)).await;
+            ps.flush_all().await.unwrap();
+            let pub_m = ps
+                .upload_if_dirty_at(t0 + 2_000, true)
+                .await
+                .unwrap()
+                .expect("published manifest must exist");
+            assert_eq!(
+                pub_m
+                    .writer_offsets
+                    .get(&("writer-B".into(), 0))
+                    .map(|e| e.last_applied_offset),
+                Some(0),
+                "PublishedManifest must retain trailing empty PWL3 offset for writer-B"
+            );
+
+            svc.shutdown().await;
+            id_router.close_all().await.unwrap();
+        }
+
+        // Wipe local node1 and restore from published onto node2.
+        std::fs::remove_dir_all(&data_dir1).unwrap();
+        let data_dir2 = tmp.path().join("node2_restored");
+        let routed_restore = open_hot_store_for_restore(s3_raw.clone(), &data_dir2)
+            .await
+            .unwrap();
+        let enc_restore = Arc::new(EncryptedObjectStore::new(routed_restore));
+        let pub_m = PublishedManifestStore::new("proj_3b", enc_restore.as_object_store())
+            .load_latest()
+            .await
+            .unwrap()
+            .expect("published manifest exists");
+        let restored =
+            restore_project_from_published("proj_3b", &pub_m, enc_restore.as_object_store())
+                .await
+                .unwrap();
+        restored.identity_graph.close().await.unwrap();
+        if let Some(p) = restored.profile_store {
+            p.close().await.unwrap();
+        }
+        finalize_local_hot_store_marker(&data_dir2).await.unwrap();
+
+        let routed2 = with_hot_store(s3_raw, &data_dir2).await.unwrap();
+        let enc2 = Arc::new(EncryptedObjectStore::new(routed2));
+        let id_router2 = Arc::new(IdentityRouter::new(enc2.as_object_store()));
+        let engine2 = StorageEngine::new_with_encrypted(cfg, enc2, id_router2.clone());
+        let svc2 = IngestService::new(engine2.clone(), Arc::new(InMemoryGovernance::default()));
+
+        let ps2 = engine2.get_or_open_project("proj_3b").await.unwrap();
+        assert_eq!(
+            ps2.snapshot()
+                .manifest
+                .writer_offsets
+                .get(&("writer-B".into(), 0))
+                .map(|e| e.last_applied_offset),
+            Some(0)
+        );
+
+        // Resend ev0 from writer-B after DedupRegistry window (>30m): must be idempotently dropped (0 accepted).
+        let accepted_after_expiry = svc2
+            .ingest_forwarded_batch("writer-B", "proj_3b", 0, vec![ev0], t0 + 2_100_000)
+            .await
+            .unwrap();
+        assert_eq!(accepted_after_expiry, 0);
+
+        svc2.shutdown().await;
+        id_router2.close_all().await.unwrap();
     }
 }

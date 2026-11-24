@@ -1,13 +1,22 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use chrono::Utc;
+use pulse_wire::WireBatch;
+use serde::Deserialize;
 
 use crate::forward_guard::{forward_loop_middleware, ForwardLoopGuard};
+use crate::forwarder::{
+    decode_forward_events_envelope, ForwardGroupEngageResponse, ForwardIdentifyRequest,
+    ForwardJsonPayloadRequest, ForwardProfileCallsRequest, ForwardProfileCallsResponse,
+    HEADER_INTERNAL_TOKEN,
+};
 use crate::service::{IdentifyRequest, IngestError, IngestService};
 
 /// Builds the Axum router serving `/v1/ingest`, `/v1/identify`, `/v1/engage`, `/v1/groups`, and `/v1/replay/chunk`.
@@ -33,6 +42,159 @@ pub fn build_ingest_router_with_guard(
             forward_loop_middleware,
         ))
         .with_state(service)
+}
+
+/// Builds the internal node-to-node forwarding router mounted on storage-owning nodes (`All | Ingest`).
+pub fn build_internal_forward_router(
+    service: Arc<IngestService>,
+    guard: Arc<ForwardLoopGuard>,
+    internal_token: Option<String>,
+) -> Router {
+    let expected_token: Option<Arc<String>> = internal_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    Router::new()
+        .route("/internal/v1/forward/events", post(handle_forward_events))
+        .route(
+            "/internal/v1/forward/profile-calls",
+            post(handle_forward_profile_calls),
+        )
+        .route(
+            "/internal/v1/forward/identify",
+            post(handle_forward_identify),
+        )
+        .route("/internal/v1/forward/engage", post(handle_forward_engage))
+        .route("/internal/v1/forward/groups", post(handle_forward_groups))
+        .route(
+            "/internal/v1/forward/replay-chunk",
+            post(handle_forward_replay_chunk),
+        )
+        .route_layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .route_layer(axum::middleware::from_fn_with_state(
+            guard,
+            forward_loop_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            expected_token,
+            internal_token_middleware,
+        ))
+        .with_state(service)
+}
+
+async fn internal_token_middleware(
+    State(expected): State<Option<Arc<String>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref token) = expected {
+        let presented = req
+            .headers()
+            .get(HEADER_INTERNAL_TOKEN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let ok = presented
+            .is_some_and(|p| constant_time_eq::constant_time_eq(p.as_bytes(), token.as_bytes()));
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "code": "unauthorized_internal",
+                    "message": "missing or invalid x-pulse-internal-token",
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ForwardReplayQuery {
+    project_id: String,
+}
+
+async fn handle_forward_events(
+    State(service): State<Arc<IngestService>>,
+    body: Bytes,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let (writer_id, project_id, batch_offset, plsb_bytes) =
+        decode_forward_events_envelope(&body)
+            .map_err(|msg| IngestError::Wire(pulse_wire::WireError::InvalidPayload(msg)))?;
+    let batch = WireBatch::decode_binary(plsb_bytes).map_err(IngestError::Wire)?;
+    let accepted = service
+        .ingest_forwarded_batch(
+            &writer_id,
+            &project_id,
+            batch_offset,
+            batch.events,
+            Utc::now().timestamp_millis(),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "accepted": accepted,
+    })))
+}
+
+async fn handle_forward_profile_calls(
+    State(service): State<Arc<IngestService>>,
+    Json(req): Json<ForwardProfileCallsRequest>,
+) -> std::result::Result<Json<ForwardProfileCallsResponse>, ApiError> {
+    let profiles_updated = service
+        .apply_forwarded_profile_calls(&req.project_id, req.calls)
+        .await?;
+    Ok(Json(ForwardProfileCallsResponse {
+        status: "ok".to_string(),
+        profiles_updated,
+    }))
+}
+
+async fn handle_forward_identify(
+    State(service): State<Arc<IngestService>>,
+    Json(req): Json<ForwardIdentifyRequest>,
+) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
+    let resp = service
+        .identify_for_project(&req.project_id, req.req)
+        .await?;
+    Ok(Json(resp))
+}
+
+async fn handle_forward_engage(
+    State(service): State<Arc<IngestService>>,
+    Json(req): Json<ForwardJsonPayloadRequest>,
+) -> std::result::Result<Json<crate::service::EngageResponse>, ApiError> {
+    let resp = service
+        .engage_for_project(&req.project_id, req.payload)
+        .await?;
+    Ok(Json(resp))
+}
+
+async fn handle_forward_groups(
+    State(service): State<Arc<IngestService>>,
+    Json(req): Json<ForwardJsonPayloadRequest>,
+) -> std::result::Result<Json<ForwardGroupEngageResponse>, ApiError> {
+    let updated = service
+        .group_engage_for_project(&req.project_id, req.payload)
+        .await?;
+    Ok(Json(ForwardGroupEngageResponse {
+        status: "ok".to_string(),
+        updated,
+    }))
+}
+
+async fn handle_forward_replay_chunk(
+    State(service): State<Arc<IngestService>>,
+    Query(q): Query<ForwardReplayQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<crate::service::ReplayIngestResponse>, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let resp = service
+        .ingest_replay_for_project(&q.project_id, content_type, &body)
+        .await?;
+    Ok(Json(resp))
 }
 
 /// Extracts the public `pk_` API key strictly from HTTP headers (never URL query strings, `P3-05`).
@@ -266,5 +428,71 @@ impl IntoResponse for ApiError {
             "message": message,
         });
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forward_guard::{HEADER_FORWARDED_BY, HEADER_FORWARDED_HOP};
+    use crate::governance::InMemoryGovernance;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method};
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use pulse_identity::IdentityRouter;
+    use pulse_storage::{StorageConfig, StorageEngine};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn internal_router_checks_token_before_forward_loop_guard() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store)),
+        );
+        let svc = IngestService::new(engine, Arc::new(InMemoryGovernance::default()));
+        let guard = Arc::new(ForwardLoopGuard::new(Some("storage-a".into())));
+        let app = build_internal_forward_router(svc, guard, Some("secret-token".into()));
+
+        // Unauthenticated request carrying a loop-exceeding hop header must return 401, not 503.
+        let unauth_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/internal/v1/forward/events")
+            .header(HEADER_FORWARDED_HOP, HeaderValue::from_static("2"))
+            .body(Body::empty())
+            .unwrap();
+        let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token carrying a self-loop header must also return 401.
+        let bad_tok_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/internal/v1/forward/events")
+            .header(HEADER_INTERNAL_TOKEN, HeaderValue::from_static("wrong"))
+            .header(HEADER_FORWARDED_HOP, HeaderValue::from_static("1"))
+            .header(HEADER_FORWARDED_BY, HeaderValue::from_static("storage-a"))
+            .body(Body::empty())
+            .unwrap();
+        let bad_tok_resp = app.clone().oneshot(bad_tok_req).await.unwrap();
+        assert_eq!(bad_tok_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Valid token carrying hop=2 reaches forward_loop_middleware and returns 503.
+        let auth_loop_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/internal/v1/forward/events")
+            .header(
+                HEADER_INTERNAL_TOKEN,
+                HeaderValue::from_static("secret-token"),
+            )
+            .header(HEADER_FORWARDED_HOP, HeaderValue::from_static("2"))
+            .body(Body::empty())
+            .unwrap();
+        let auth_loop_resp = app.oneshot(auth_loop_req).await.unwrap();
+        assert_eq!(auth_loop_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

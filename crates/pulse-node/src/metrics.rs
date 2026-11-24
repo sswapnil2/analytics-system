@@ -152,33 +152,38 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
     p.http.render(&mut out);
 
     let ing = p.ingest.metrics();
-    let mut counter = |name: &str, help: &str, v: u64| {
+    let write_counter = |out: &mut String, name: &str, help: &str, v: u64| {
         let _ = writeln!(
             out,
             "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}"
         );
     };
-    counter(
+    write_counter(
+        &mut out,
         "pulse_ingest_events_accepted_total",
         "Events stored.",
         ing.accepted_total.load(Ordering::Relaxed),
     );
-    counter(
+    write_counter(
+        &mut out,
         "pulse_ingest_events_deduped_total",
         "Events dropped as retries of ones already stored.",
         ing.deduped_total.load(Ordering::Relaxed),
     );
-    counter(
+    write_counter(
+        &mut out,
         "pulse_ingest_events_dropped_total",
         "Events rejected by validation or schema limits.",
         ing.dropped_total.load(Ordering::Relaxed),
     );
-    counter(
+    write_counter(
+        &mut out,
         "pulse_ingest_dead_lettered_events_total",
         "Events that could not be applied and were written to wal_dead/ instead.",
         pulse_storage::DEAD_LETTERED_EVENTS.load(Ordering::Relaxed),
     );
-    counter(
+    write_counter(
+        &mut out,
         "pulse_ingest_batches_total",
         "Ingest batches processed.",
         ing.batches_total.load(Ordering::Relaxed),
@@ -216,9 +221,10 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
             &agent.eval_queue_dropped,
         ),
     ] {
-        counter(name, help, v.load(Ordering::Relaxed));
+        write_counter(&mut out, name, help, v.load(Ordering::Relaxed));
     }
-    counter(
+    write_counter(
+        &mut out,
         "pulse_queries_executed_total",
         "Analytics queries completed.",
         p.qengine.queries_executed(),
@@ -261,95 +267,183 @@ async fn handle_metrics(State(p): State<Probe>, headers: HeaderMap) -> Response 
         let _ = writeln!(out, "pulse_writer_flushes_total{{reason=\"{reason}\"}} {c}");
     }
 
-    let mut gauge = |name: &str, help: &str, v: f64| {
+    let write_gauge = |out: &mut String, name: &str, help: &str, v: f64| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
     };
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_flush_bound_ms",
         "Configured writer buffer max flush delay in milliseconds.",
         buf.flush_ms as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_flush_bound_bytes",
         "Configured writer buffer flush byte threshold.",
         buf.flush_bytes as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_buffer_bytes",
         "Estimated bytes queued in the writer memory buffer awaiting WAL write.",
         buf.buffer_bytes as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_buffer_capacity_bytes",
         "Configured node-wide writer memory buffer byte capacity.",
         buf.capacity_bytes as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_buffer_events",
         "Events queued in the writer memory buffer awaiting WAL write.",
         buf.buffer_events as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_writer_buffer_batches",
         "Pending batch entries in the writer memory buffer awaiting WAL write.",
         buf.buffer_batches as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_wal_bytes",
         "Total bytes of active WAL files across open projects on this node.",
         p.storage.wal_bytes() as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_l0_bytes",
         "Estimated bytes of rows buffered in memory, not yet flushed to segments.",
         l0_bytes as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ingest_log_lag_bytes",
         "Estimated bytes of events written to the WAL and not yet applied by the processor.",
         log_lag_bytes as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ingest_log_lag_limit_bytes",
         "Configured node-wide limit in bytes for unapplied WAL records.",
         p.storage.log_lag_limit_bytes() as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ingest_apply_lag_seconds",
         "Age in seconds of the oldest unapplied WAL record across open projects.",
         p.storage.max_apply_lag_seconds(),
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ingest_apply_queue_records",
         "Number of WAL records queued in per-bucket processor channels.",
         apply_queue_records as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ingest_apply_queue_events",
         "Number of events queued in per-bucket processor channels.",
         apply_queue_events as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_hot_segment_bytes",
         "Bytes of local hot/segments files awaiting upload to S3.",
         p.storage.hot_segment_bytes() as f64,
     );
-    gauge(
+    let wl = p.ingest.writer_log().map(|w| w.stats()).unwrap_or_default();
+    let fwd = p.ingest.forwarder().map(|f| f.stats()).unwrap_or_default();
+    write_gauge(
+        &mut out,
+        "pulse_writer_log_bytes",
+        "Bytes currently persisted in per-project writer_log segments on disk.",
+        wl.bytes as f64,
+    );
+    write_gauge(
+        &mut out,
+        "pulse_writer_log_capacity_bytes",
+        "Configured node-wide writer_log byte capacity.",
+        wl.capacity_bytes as f64,
+    );
+    write_gauge(
+        &mut out,
+        "pulse_writer_log_unforwarded_batches",
+        "Unforwarded batches queued across all project writer logs.",
+        wl.unforwarded_batches as f64,
+    );
+    write_gauge(
+        &mut out,
+        "pulse_writer_log_unforwarded_events",
+        "Unforwarded events queued across all project writer logs.",
+        wl.unforwarded_events as f64,
+    );
+    write_gauge(
+        &mut out,
+        "pulse_writer_forwarding_lag_seconds",
+        "Age in seconds of the oldest unforwarded batch in writer_log (0 when caught up).",
+        wl.forwarding_lag_seconds,
+    );
+    write_gauge(
+        &mut out,
+        "pulse_writer_log_open_handles",
+        "Number of currently open writer_log segment file handles.",
+        wl.open_handles as f64,
+    );
+    write_counter(
+        &mut out,
+        "pulse_writer_log_expired_batches_dropped_total",
+        "Batches dropped from writer_log after exceeding the max batch age (< storage offset T_expire).",
+        wl.expired_batches_dropped_total,
+    );
+    write_counter(
+        &mut out,
+        "pulse_writer_log_expired_events_dropped_total",
+        "Events dropped from writer_log after exceeding the max batch age (< storage offset T_expire).",
+        wl.expired_events_dropped_total,
+    );
+    out.push_str(
+        "# HELP pulse_writer_forward_batches_total Forwarded writer_log batch attempts by result.\n\
+         # TYPE pulse_writer_forward_batches_total counter\n",
+    );
+    for (result, c) in [
+        ("ok", fwd.batches_ok),
+        ("not_owner", fwd.batches_not_owner),
+        ("retry_error", fwd.batches_retry_error),
+    ] {
+        let _ = writeln!(
+            out,
+            "pulse_writer_forward_batches_total{{result=\"{result}\"}} {c}"
+        );
+    }
+    write_counter(
+        &mut out,
+        "pulse_writer_forward_retries_total",
+        "Total writer forwarder batch retries across all projects.",
+        fwd.retries_total,
+    );
+    write_gauge(
+        &mut out,
         "pulse_l0_rows",
         "Rows buffered in memory, not yet flushed to segments.",
         l0_rows as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_open_projects",
         "Projects open on this node.",
         projects.len() as f64,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_last_query_latency_seconds",
         "Latency of the most recent query.",
         p.qengine.last_query_latency_us() as f64 / 1e6,
     );
-    gauge(
+    write_gauge(
+        &mut out,
         "pulse_ready",
         "1 while the node accepts traffic, 0 while it drains.",
         if p.ready.load(Ordering::Relaxed) {
@@ -378,14 +472,22 @@ async fn handle_readyz(State(p): State<Probe>) -> Response {
         }
         Err(_) => failures.push("metadata database: timed out".into()),
     }
-    let probe_path = ObjectPath::from("_pulse_readyz");
-    match tokio::time::timeout(CHECK_TIMEOUT, p.storage.object_store().head(&probe_path)).await {
-        Ok(Ok(_)) | Ok(Err(object_store::Error::NotFound { .. })) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "readyz object store check failed");
-            failures.push("object store: unavailable".into());
+    if let Some(wl) = p.ingest.writer_log() {
+        if let Err(e) = wl.health_check() {
+            tracing::warn!(error = %e, "readyz writer_log check failed");
+            failures.push(format!("writer_log: {e}"));
         }
-        Err(_) => failures.push("object store: timed out".into()),
+    } else {
+        let probe_path = ObjectPath::from("_pulse_readyz");
+        match tokio::time::timeout(CHECK_TIMEOUT, p.storage.object_store().head(&probe_path)).await
+        {
+            Ok(Ok(_)) | Ok(Err(object_store::Error::NotFound { .. })) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "readyz object store check failed");
+                failures.push("object store: unavailable".into());
+            }
+            Err(_) => failures.push("object store: timed out".into()),
+        }
     }
     if failures.is_empty() {
         (StatusCode::OK, "ready").into_response()
