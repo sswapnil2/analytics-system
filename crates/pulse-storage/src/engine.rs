@@ -102,12 +102,18 @@ pub fn closed_date_max_bytes_from_env() -> u64 {
         .unwrap_or(DEFAULT_CLOSED_DATE_MAX_BYTES)
 }
 
-/// Reads `PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES` (default `64 MiB`).
+/// Reads `PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES` (or legacy `PULSE_MERGE_PART_MAX_BYTES`, default `64 MiB`).
 pub fn upload_merge_max_input_bytes_from_env() -> u64 {
     std::env::var("PULSE_UPLOAD_MERGE_MAX_INPUT_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&b| b > 0)
+        .or_else(|| {
+            std::env::var("PULSE_MERGE_PART_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&b| b > 0)
+        })
         .unwrap_or(DEFAULT_UPLOAD_MERGE_MAX_INPUT_BYTES)
 }
 
@@ -203,13 +209,26 @@ fn env_mb(name: &str, default_mb: usize) -> usize {
         .saturating_mul(1024 * 1024)
 }
 
-fn env_mb_u64(name: &str, default_mb: u64) -> u64 {
-    std::env::var(name)
-        .ok()
+fn parse_bytes_or_mb_u64(bytes_raw: Option<&str>, mb_raw: Option<&str>, default_mb: u64) -> u64 {
+    if let Some(bytes) = bytes_raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+    {
+        return bytes;
+    }
+    mb_raw
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&mb| mb > 0)
         .unwrap_or(default_mb)
         .saturating_mul(1024 * 1024)
+}
+
+fn env_bytes_or_mb_u64(bytes_name: &str, mb_name: &str, default_mb: u64) -> u64 {
+    parse_bytes_or_mb_u64(
+        std::env::var(bytes_name).ok().as_deref(),
+        std::env::var(mb_name).ok().as_deref(),
+        default_mb,
+    )
 }
 
 fn env_usize(name: &str, default_val: usize) -> usize {
@@ -249,11 +268,13 @@ impl NodeLoad {
             log_max_project: AtomicUsize::new(env_mb("PULSE_LOG_LAG_PROJECT_MAX_MB", 256)),
             log_max_node: AtomicUsize::new(env_mb("PULSE_LOG_LAG_MAX_MB", 512)),
             hot_segment_bytes: Arc::new(AtomicU64::new(0)),
-            hot_seg_max_project: AtomicU64::new(env_mb_u64(
+            hot_seg_max_project: AtomicU64::new(env_bytes_or_mb_u64(
+                "PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES",
                 "PULSE_HOT_SEGMENTS_PROJECT_MAX_MB",
                 DEFAULT_HOT_SEGMENTS_PROJECT_MAX_MB,
             )),
-            hot_seg_max_node: AtomicU64::new(env_mb_u64(
+            hot_seg_max_node: AtomicU64::new(env_bytes_or_mb_u64(
+                "PULSE_HOT_SEGMENTS_MAX_BYTES",
                 "PULSE_HOT_SEGMENTS_MAX_MB",
                 DEFAULT_HOT_SEGMENTS_MAX_MB,
             )),
@@ -9394,5 +9415,22 @@ mod w3_offset_tests {
             .is_none());
         drop(g0);
         id_router2.close_all().await.unwrap();
+    }
+
+    #[test]
+    fn parse_bytes_or_mb_prefers_positive_bytes_override() {
+        assert_eq!(
+            parse_bytes_or_mb_u64(Some("65536"), Some("10"), 512),
+            65_536
+        );
+        assert_eq!(
+            parse_bytes_or_mb_u64(Some("0"), Some("10"), 512),
+            10 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bytes_or_mb_u64(None, Some("10"), 512),
+            10 * 1024 * 1024
+        );
+        assert_eq!(parse_bytes_or_mb_u64(None, None, 512), 512 * 1024 * 1024);
     }
 }

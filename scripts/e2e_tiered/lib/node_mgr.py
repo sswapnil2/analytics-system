@@ -18,10 +18,10 @@ from typing import Any, IO
 from lib.client import PulseHttpClient
 from lib.mock_s3 import MockS3Server
 
-VALID_NODE_ROLES: tuple[str, ...] = ("all", "ingest", "query", "compactor")
+VALID_NODE_ROLES: tuple[str, ...] = ("all", "ingest", "writer", "query", "compactor")
 _PK_KEY_RE = re.compile(r"\b(pk_live_[A-Za-z0-9_]+)\b")
 _FLAG_RE = re.compile(r"(--[a-zA-Z0-9][a-zA-Z0-9-]*)")
-_SUBCMD_LINE_RE = re.compile(r"^\s{2,8}([a-z][a-z0-9_-]{1,31})\s{2,}\S", re.MULTILINE)
+_SUBCMD_LINE_RE = re.compile(r"^(?:[ \t]{1,8})([a-z][a-z0-9_-]{1,31})\s{2,}\S", re.MULTILINE)
 
 
 def _repo_root() -> Path:
@@ -257,6 +257,7 @@ class NodeManager:
         self._instances: list[NodeInstance] = []
         self._owned_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
         self._capabilities_cache: Capabilities | None = None
+        self._postgres_urls: set[str] = set()
 
     @staticmethod
     def free_port(host: str = "127.0.0.1") -> int:
@@ -520,6 +521,17 @@ class NodeManager:
         if extra_env:
             env.update(extra_env)
 
+        effective_db_url = env.get("DATABASE_URL", "").strip()
+        if effective_db_url.startswith(("postgres://", "postgresql://")):
+            configured_pg_urls = {
+                os.environ.get(var, "").strip()
+                for var in ("E2E_POSTGRES_URL", "DATABASE_URL")
+                if os.environ.get(var, "").strip()
+            }
+            if effective_db_url in configured_pg_urls and effective_db_url not in self._postgres_urls:
+                self._reset_postgres_db(effective_db_url)
+                self._postgres_urls.add(effective_db_url)
+
         if expect_fail:
             proc = subprocess.Popen(
                 [str(bin_path), *cli_args],
@@ -677,6 +689,40 @@ class NodeManager:
         finally:
             conn.close()
 
+    @staticmethod
+    def _reset_postgres_db(pg_url: str) -> None:
+        psql_bin = shutil.which("psql")
+        if psql_bin is None:
+            for candidate in (
+                "/opt/homebrew/opt/postgresql@17/bin/psql",
+                "/opt/homebrew/bin/psql",
+            ):
+                if Path(candidate).is_file():
+                    psql_bin = candidate
+                    break
+        if psql_bin is None:
+            raise RuntimeError("psql binary not found on PATH or in Homebrew PostgreSQL paths")
+        sql = (
+            "DO $$ DECLARE tbls text; BEGIN "
+            "SELECT string_agg(quote_ident(schemaname) || '.' || quote_ident(tablename), ', ') "
+            "INTO tbls FROM pg_tables "
+            "WHERE schemaname = 'public' AND tablename <> '_sqlx_migrations'; "
+            "IF tbls IS NOT NULL THEN "
+            "EXECUTE 'TRUNCATE TABLE ' || tbls || ' RESTART IDENTITY CASCADE'; "
+            "END IF; END $$;"
+        )
+        res = subprocess.run(
+            [psql_bin, pg_url, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to reset Postgres DB via psql (rc={res.returncode}): {res.stderr.strip() or res.stdout.strip()}"
+            )
+
     def cleanup(self) -> None:
         for inst in reversed(self._instances):
             try:
@@ -684,6 +730,9 @@ class NodeManager:
             except OSError:
                 pass
         self._instances.clear()
+        for pg_url in self._postgres_urls:
+            self._reset_postgres_db(pg_url)
+        self._postgres_urls.clear()
         for td in reversed(self._owned_temp_dirs):
             p = Path(td.name)
             _chmod_writable_tree(p)
@@ -783,7 +832,7 @@ class ClusterHarness:
         for idx in range(num_writers):
             w_dir = self.node_mgr.make_temp_data_dir(f"pulse_w3_writer_{idx}_")
             node = self.start_node(
-                role="ingest",
+                role="writer",
                 data_dir=w_dir,
                 database_url=shared_meta,
                 hot_store=hot_store,

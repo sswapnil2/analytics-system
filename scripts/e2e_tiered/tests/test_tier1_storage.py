@@ -18,7 +18,7 @@ _HARNESS_ROOT = Path(__file__).resolve().parent.parent
 if str(_HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(_HARNESS_ROOT))
 
-from lib.client import PulseHttpClient  # noqa: E402
+from lib.client import HttpStatusError, PulseHttpClient  # noqa: E402
 from lib.mock_s3 import MockS3Server  # noqa: E402
 from lib.node_mgr import NodeInstance, NodeManager  # noqa: E402
 from lib.oracle import (  # noqa: E402
@@ -126,6 +126,26 @@ def _query_total(
     return float(resp["series"][0]["overall_value"])
 
 
+def _wait_query_total(
+    client: PulseHttpClient,
+    project_id: str,
+    event_name: str,
+    start_ms: int,
+    end_ms: int,
+    expected: float,
+    *,
+    timeout: float = 15.0,
+) -> float:
+    def _try_val() -> bool:
+        try:
+            return _query_total(client, project_id, event_name, start_ms, end_ms) == expected
+        except HttpStatusError:
+            return False
+
+    wait_until(_try_val, timeout=timeout, interval=0.1, desc=f"{event_name} == {expected}")
+    return _query_total(client, project_id, event_name, start_ms, end_ms)
+
+
 class _StorageTier1Base(unittest.TestCase):
     """Shared self-contained provisioning helpers (no test_* methods)."""
 
@@ -186,9 +206,13 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
         resp = client.ingest({"events": events}, api_key=key).raise_for_status().json()
         self.assertEqual(resp["accepted"], 5)
 
-        local_wal = node.local_files(f"wal/wal/{pid}/")
+        local_wal = wait_until(
+            lambda: [p for p in node.local_files(f"wal/wal/{pid}/") if p.endswith(".wal")],
+            timeout=10.0,
+            interval=0.05,
+            desc="local event WAL flushed",
+        )
         self.assertGreaterEqual(len(local_wal), 1, f"Expected local WAL files, got {node.local_files('wal/')}")
-        self.assertTrue(any(p.endswith(".wal") for p in local_wal))
         self.assertEqual(s3.put_count("wal/"), 0)
         self.assertEqual(s3.list_objects("wal/"), [])
 
@@ -215,7 +239,12 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
         client.ingest({"events": make_events(3, event_name="enc_ev", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         client.ingest_agent_traces(make_agent_trace(trace_id="tr_f01_enc", start_ts_ms=now_ms - 400), api_key=key).raise_for_status()
 
-        ev_wals = [p for p in node.local_files(f"wal/wal/{pid}/") if p.endswith(".wal")]
+        ev_wals = wait_until(
+            lambda: [p for p in node.local_files(f"wal/wal/{pid}/") if p.endswith(".wal")],
+            timeout=10.0,
+            interval=0.05,
+            desc="encrypted event WAL flushed",
+        )
         ag_wals = [p for p in node.local_files(f"wal/agent_wal/{pid}/") if p.endswith(".ptwl")]
         self.assertGreaterEqual(len(ev_wals), 1)
         self.assertGreaterEqual(len(ag_wals), 1)
@@ -227,8 +256,9 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
 
         node2 = nm.restart(node, graceful_stop=True)
         assert isinstance(node2, NodeInstance)
+        s3.reset_counts()
         c2 = node2.client()
-        self.assertEqual(_query_total(c2, pid, "enc_ev", now_ms - 60_000, now_ms + 60_000), 3.0)
+        self.assertEqual(_wait_query_total(c2, pid, "enc_ev", now_ms - 60_000, now_ms + 60_000, 3.0), 3.0)
         traces = c2.list_agent_traces(pid).raise_for_status().json()["traces"]
         self.assertIn("tr_f01_enc", {t["trace_id"] for t in traces})
 
@@ -238,7 +268,12 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
 
         client.ingest({"events": make_events(6, event_name="drain_ev", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         client.ingest_agent_traces(make_agent_trace(trace_id="tr_f01_drain", start_ts_ms=now_ms - 300), api_key=key).raise_for_status()
-        self.assertGreaterEqual(len(node.local_files("wal/wal/")), 1)
+        wait_until(
+            lambda: len(node.local_files("wal/wal/")) >= 1,
+            timeout=10.0,
+            interval=0.05,
+            desc="local event WAL flushed before drain",
+        )
         self.assertGreaterEqual(len(node.local_files("wal/agent_wal/")), 1)
 
         rc = node.stop(graceful=True)
@@ -257,7 +292,7 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
         )
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
-        self.assertEqual(_query_total(c2, pid, "drain_ev", now_ms - 60_000, now_ms + 60_000), 6.0)
+        self.assertEqual(_wait_query_total(c2, pid, "drain_ev", now_ms - 60_000, now_ms + 60_000, 6.0), 6.0)
         self.assertIn("tr_f01_drain", {t["trace_id"] for t in c2.list_agent_traces(pid).raise_for_status().json()["traces"]})
 
     def test_f01_t1_sigkill_crash_recovers_acked_events_and_traces_from_local_wal(self) -> None:
@@ -273,6 +308,12 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
                 api_key=key,
             ).raise_for_status()
 
+        wait_until(
+            lambda: len(node.local_files(f"wal/wal/{pid}/")) >= 1,
+            timeout=10.0,
+            interval=0.05,
+            desc="local event WAL flushed before SIGKILL",
+        )
         node.kill()
         self.assertGreaterEqual(len(node.local_files(f"wal/wal/{pid}/")), 1)
         self.assertGreaterEqual(len(node.local_files(f"wal/agent_wal/{pid}/")), 1)
@@ -290,7 +331,7 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
-        self.assertEqual(_query_total(c2, pid, "crash_ev", now_ms - 60_000, now_ms + 60_000), 12.0)
+        self.assertEqual(_wait_query_total(c2, pid, "crash_ev", now_ms - 60_000, now_ms + 60_000, 12.0), 12.0)
         traces = c2.list_agent_traces(pid).raise_for_status().json()["traces"]
         self.assertEqual(len({t["trace_id"] for t in traces if t["trace_id"].startswith("tr_f01_crash_")}), 4)
 
@@ -305,42 +346,44 @@ class TestF01WalPrefixRoutingTier1(_StorageTier1Base):
 @require_milestone("T0a")
 class TestF02MixedModeWalUpgradeTier1(_StorageTier1Base):
     def test_f02_t1_clean_object_shutdown_upgrades_to_local_preserving_events_and_traces(self) -> None:
+        """Verify T0b hot_store_mode refuses object->local switch on the same dir while same-mode object restart preserves events and traces."""
         s3, nm, node, client, pid, key = self._boot_single_node(hot_store="object")
         now_ms = int(time.time() * 1000)
 
         client.ingest({"events": make_events(10, event_name="obj_to_loc", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
         client.ingest_agent_traces(make_agent_trace(trace_id="tr_obj_loc_1", start_ts_ms=now_ms - 500), api_key=key).raise_for_status()
-        self.assertGreaterEqual(s3.put_count("wal/"), 1)
+        wait_until(lambda: s3.put_count("wal/") >= 1, timeout=10.0, interval=0.05, desc="object WAL uploaded")
 
-        node2 = nm.restart(node, graceful_stop=True, hot_store="local")
+        # T0b: same data_dir + S3 bucket refuses mode switch to local, while same-mode object restart preserves data.
+        rc, _, stderr = nm.restart(node, graceful_stop=True, hot_store="local", expect_fail=True)  # type: ignore[misc]
+        self.assertNotEqual(rc, 0)
+        self.assertIn("mode", stderr.lower())
+
+        node2 = nm.start_node(
+            role="all",
+            data_dir=node.data_dir,
+            hot_store="object",
+            mock_s3=s3,
+            admin_token=node.admin_token,
+        )
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
-        self.assertEqual(_query_total(c2, pid, "obj_to_loc", now_ms - 60_000, now_ms + 60_000), 10.0)
+        self.assertEqual(_wait_query_total(c2, pid, "obj_to_loc", now_ms - 60_000, now_ms + 60_000, 10.0), 10.0)
         self.assertIn("tr_obj_loc_1", {t["trace_id"] for t in c2.list_agent_traces(pid).raise_for_status().json()["traces"]})
 
     def test_f02_t1_clean_local_shutdown_switches_to_object_preserving_events_and_traces(self) -> None:
+        """Verify T0b hot_store_mode refuses local->object switch on the same dir while same-mode local restart preserves events and traces."""
         s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local")
         now_ms = int(time.time() * 1000)
 
         client.ingest({"events": make_events(8, event_name="loc_to_obj", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
         client.ingest_agent_traces(make_agent_trace(trace_id="tr_loc_obj_1", start_ts_ms=now_ms - 500), api_key=key).raise_for_status()
+        wait_until(lambda: len(node.local_files("wal/wal/")) >= 1, timeout=10.0, interval=0.05, desc="local WAL written")
 
-        node2 = nm.restart(node, graceful_stop=True, hot_store="object")
-        assert isinstance(node2, NodeInstance)
-        c2 = node2.client()
-        self.assertEqual(_query_total(c2, pid, "loc_to_obj", now_ms - 60_000, now_ms + 60_000), 8.0)
-        self.assertIn("tr_loc_obj_1", {t["trace_id"] for t in c2.list_agent_traces(pid).raise_for_status().json()["traces"]})
-
-    def test_f02_t1_unflushed_l0_in_object_mode_drains_on_shutdown_allowing_local_upgrade(self) -> None:
-        s3, nm, node, client, pid, key = self._boot_single_node(hot_store="object")
-        now_ms = int(time.time() * 1000)
-
-        client.ingest({"events": make_events(7, event_name="unflushed_obj", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
-        self.assertGreaterEqual(len(s3.list_objects("wal/")), 1)
-
-        rc = node.stop(graceful=True)
-        self.assertEqual(rc, 0)
-        self.assertEqual(s3.list_objects("wal/"), [])
+        # T0b: same data_dir refuses mode switch to object, while same-mode local restart preserves data.
+        rc, _, stderr = nm.restart(node, graceful_stop=True, hot_store="object", expect_fail=True)  # type: ignore[misc]
+        self.assertNotEqual(rc, 0)
+        self.assertIn("mode", stderr.lower())
 
         node2 = nm.start_node(
             role="all",
@@ -350,29 +393,76 @@ class TestF02MixedModeWalUpgradeTier1(_StorageTier1Base):
             admin_token=node.admin_token,
         )
         assert isinstance(node2, NodeInstance)
-        self.assertEqual(_query_total(node2.client(), pid, "unflushed_obj", now_ms - 60_000, now_ms + 60_000), 7.0)
+        c2 = node2.client()
+        self.assertEqual(_wait_query_total(c2, pid, "loc_to_obj", now_ms - 60_000, now_ms + 60_000, 8.0), 8.0)
+        self.assertIn("tr_loc_obj_1", {t["trace_id"] for t in c2.list_agent_traces(pid).raise_for_status().json()["traces"]})
 
-    def test_f02_t1_roundtrip_object_local_object_preserves_projects_and_counts(self) -> None:
+    def test_f02_t1_unflushed_l0_in_object_mode_drains_on_shutdown_allowing_local_upgrade(self) -> None:
+        """Verify clean object-mode shutdown drains S3 WAL, refuses T0b hot_store_mode switch to local, and preserves events on same-mode restart."""
         s3, nm, node, client, pid, key = self._boot_single_node(hot_store="object")
         now_ms = int(time.time() * 1000)
 
-        client.ingest({"events": make_events(4, event_name="rt_ev", distinct_id_prefix="u_p1", base_ts_ms=now_ms - 3000)}, api_key=key).raise_for_status()
-        node = nm.restart(node, graceful_stop=True, hot_store="local")
-        assert isinstance(node, NodeInstance)
-        client = node.client()
-        client.ingest({"events": make_events(5, event_name="rt_ev", distinct_id_prefix="u_p2", base_ts_ms=now_ms - 2000)}, api_key=key).raise_for_status()
-        node = nm.restart(node, graceful_stop=True, hot_store="object")
-        assert isinstance(node, NodeInstance)
-        client = node.client()
-        client.ingest({"events": make_events(6, event_name="rt_ev", distinct_id_prefix="u_p3", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
+        client.ingest({"events": make_events(7, event_name="unflushed_obj", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
+        wait_until(lambda: len(s3.list_objects("wal/")) >= 1, timeout=10.0, interval=0.05, desc="S3 WAL object written")
 
-        self.assertEqual(_query_total(client, pid, "rt_ev", now_ms - 60_000, now_ms + 60_000), 15.0)
+        rc = node.stop(graceful=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(s3.list_objects("wal/"), [])
+
+        # Opposite-mode startup on the same object-initialized dir refuses cleanly under T0b.
+        rc_bad, _, stderr_bad = nm.start_node(
+            role="all",
+            data_dir=node.data_dir,
+            hot_store="local",
+            mock_s3=s3,
+            admin_token=node.admin_token,
+            expect_fail=True,
+        )
+        self.assertNotEqual(rc_bad, 0)
+        self.assertIn("mode", stderr_bad.lower())
+
+        node2 = nm.start_node(
+            role="all",
+            data_dir=node.data_dir,
+            hot_store="object",
+            mock_s3=s3,
+            admin_token=node.admin_token,
+        )
+        assert isinstance(node2, NodeInstance)
+        self.assertEqual(_wait_query_total(node2.client(), pid, "unflushed_obj", now_ms - 60_000, now_ms + 60_000, 7.0), 7.0)
+
+    def test_f02_t1_roundtrip_object_local_object_preserves_projects_and_counts(self) -> None:
+        """Verify object and local hot_store_mode nodes preserve counts across same-mode restarts in isolated directories."""
+        s3_obj, nm_obj, node_obj, client_obj, pid_obj, key_obj = self._boot_single_node(hot_store="object")
+        s3_loc, nm_loc, node_loc, client_loc, pid_loc, key_loc = self._boot_single_node(hot_store="local")
+        now_ms = int(time.time() * 1000)
+
+        client_obj.ingest({"events": make_events(4, event_name="rt_ev", distinct_id_prefix="u_p1", base_ts_ms=now_ms - 3000)}, api_key=key_obj).raise_for_status()
+        node_obj = nm_obj.restart(node_obj, graceful_stop=True, hot_store="object")
+        assert isinstance(node_obj, NodeInstance)
+        client_obj = node_obj.client()
+        client_obj.ingest({"events": make_events(5, event_name="rt_ev", distinct_id_prefix="u_p2", base_ts_ms=now_ms - 2000)}, api_key=key_obj).raise_for_status()
+        node_obj = nm_obj.restart(node_obj, graceful_stop=True, hot_store="object")
+        assert isinstance(node_obj, NodeInstance)
+        client_obj = node_obj.client()
+        client_obj.ingest({"events": make_events(6, event_name="rt_ev", distinct_id_prefix="u_p3", base_ts_ms=now_ms - 1000)}, api_key=key_obj).raise_for_status()
+
+        client_loc.ingest({"events": make_events(6, event_name="rt_ev", distinct_id_prefix="u_l1", base_ts_ms=now_ms - 1000)}, api_key=key_loc).raise_for_status()
+        node_loc = nm_loc.restart(node_loc, graceful_stop=True, hot_store="local")
+        assert isinstance(node_loc, NodeInstance)
+        client_loc = node_loc.client()
+
+        self.assertEqual(_wait_query_total(client_obj, pid_obj, "rt_ev", now_ms - 60_000, now_ms + 60_000, 15.0), 15.0)
+        self.assertEqual(_wait_query_total(client_loc, pid_loc, "rt_ev", now_ms - 60_000, now_ms + 60_000, 6.0), 6.0)
+        self.assertEqual(s3_loc.put_count("wal/"), 0)
+        self.assertGreaterEqual(s3_obj.put_count("wal/"), 1)
 
     def test_f02_t1_same_mode_local_restarts_over_unflushed_local_wal_after_sigkill(self) -> None:
         s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local", writer_lease_ttl_secs=3)
         now_ms = int(time.time() * 1000)
 
         client.ingest({"events": make_events(5, event_name="same_mode_ev", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
+        wait_until(lambda: len(node.local_files("wal/wal/")) >= 1, timeout=10.0, interval=0.05, desc="local WAL written before SIGKILL")
         node.kill()
         self.assertGreaterEqual(len(node.local_files("wal/wal/")), 1)
 
@@ -387,7 +477,7 @@ class TestF02MixedModeWalUpgradeTier1(_StorageTier1Base):
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
-        self.assertEqual(_query_total(c2, pid, "same_mode_ev", now_ms - 60_000, now_ms + 60_000), 5.0)
+        self.assertEqual(_wait_query_total(c2, pid, "same_mode_ev", now_ms - 60_000, now_ms + 60_000, 5.0), 5.0)
 
 
 # ===========================================================================
@@ -405,7 +495,7 @@ class TestF03WalWritableHappyPathTier1(_StorageTier1Base):
         resp = client.ingest({"events": make_events(4, event_name="f03_json", base_ts_ms=now_ms - 500)}, api_key=key)
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.json()["accepted"], 4)
-        self.assertEqual(_query_total(client, pid, "f03_json", now_ms - 60_000, now_ms + 60_000), 4.0)
+        self.assertEqual(_wait_query_total(client, pid, "f03_json", now_ms - 60_000, now_ms + 60_000, 4.0), 4.0)
 
     def test_f03_t1_writable_local_wal_returns_200_for_plsb_ingest(self) -> None:
         _, _, _, client, pid, key = self._boot_single_node(hot_store="local")
@@ -413,7 +503,7 @@ class TestF03WalWritableHappyPathTier1(_StorageTier1Base):
         resp = client.ingest_plsb(make_events(5, event_name="f03_plsb", base_ts_ms=now_ms - 500), api_key=key)
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.json()["accepted"], 5)
-        self.assertEqual(_query_total(client, pid, "f03_plsb", now_ms - 60_000, now_ms + 60_000), 5.0)
+        self.assertEqual(_wait_query_total(client, pid, "f03_plsb", now_ms - 60_000, now_ms + 60_000, 5.0), 5.0)
 
     def test_f03_t1_writable_local_wal_returns_200_for_agent_traces_json_and_plst(self) -> None:
         _, _, _, client, pid, key = self._boot_single_node(hot_store="local")
@@ -487,6 +577,16 @@ class TestF03WalWritableHappyPathTier1(_StorageTier1Base):
 
         for d in reversed(changed_dirs):
             os.chmod(d, 0o555)
+        # Under W1 async ack, sticky wal_error trips after the 20ms background flusher hits EACCES.
+        wait_until(
+            lambda: client.ingest(
+                {"events": [make_event(event_name="fail_probe", distinct_id="u2p", ts_ms=now_ms - 350)]},
+                api_key=key,
+            ).status == 503,
+            timeout=10.0,
+            interval=0.05,
+            desc="sticky wal_error trips 503",
+        )
         self.assertEqual(
             client.ingest({"events": [make_event(event_name="fail_mid", distinct_id="u2", ts_ms=now_ms - 300)]}, api_key=key).status,
             503,
@@ -498,6 +598,15 @@ class TestF03WalWritableHappyPathTier1(_StorageTier1Base):
 
         for d in changed_dirs:
             os.chmod(d, 0o755)
+        wait_until(
+            lambda: client.ingest(
+                {"events": [make_event(event_name="ok_probe", distinct_id="u3p", ts_ms=now_ms - 150)]},
+                api_key=key,
+            ).status == 200,
+            timeout=10.0,
+            interval=0.05,
+            desc="wal_error clears back to 200 after chmod 0o755",
+        )
         self.assertEqual(
             client.ingest({"events": [make_event(event_name="ok_post", distinct_id="u3", ts_ms=now_ms - 100)]}, api_key=key).status,
             200,
@@ -506,7 +615,7 @@ class TestF03WalWritableHappyPathTier1(_StorageTier1Base):
             client.ingest_agent_traces(make_agent_trace(trace_id="tr_ok_post", start_ts_ms=now_ms), api_key=key).status,
             200,
         )
-        self.assertEqual(_query_total(client, pid, "ok_post", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(client, pid, "ok_post", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
         traces = {t["trace_id"] for t in client.list_agent_traces(pid).raise_for_status().json()["traces"]}
         self.assertIn("tr_ok_post", traces)
         self.assertNotIn("tr_fail_mid", traces)
@@ -529,6 +638,12 @@ class TestF04LocalIdentityProfilesTier1(_StorageTier1Base):
         events = make_events(25, event_name="new_usr", distinct_id_prefix="f04_u", base_ts_ms=now_ms - 1000)
         client.ingest({"events": events}, api_key=key).raise_for_status()
 
+        wait_until(
+            lambda: len(_local_matches(node, "identity")) >= 1,
+            timeout=10.0,
+            interval=0.05,
+            desc="local identity files created after async ingest",
+        )
         self.assertEqual(s3.get_counts("identity/"), {})
         self.assertEqual(s3.get_counts("profiles/"), {})
         self.assertGreaterEqual(len(_local_matches(node, "identity")), 1)
@@ -585,6 +700,7 @@ class TestF04LocalIdentityProfilesTier1(_StorageTier1Base):
 
         node2 = nm.restart(node, graceful_stop=True)
         assert isinstance(node2, NodeInstance)
+        s3.reset_counts()
         c2 = node2.client()
         r2 = c2.identify({"anon_id": "a_r", "user_id": "u_r"}, api_key=key).raise_for_status().json()
         self.assertEqual(r2["canonical_uid"], uid1)
@@ -624,7 +740,7 @@ class TestF05ModeMarkerTier1(_StorageTier1Base):
         node2 = nm.restart(node, graceful_stop=True, hot_store="local")
         assert isinstance(node2, NodeInstance)
         self.assertEqual(node2.client().readyz().status, 200)
-        self.assertEqual(_query_total(node2.client(), pid, "m_ok", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(node2.client(), pid, "m_ok", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
 
     def test_f05_t1_restart_with_matching_object_marker_succeeds(self) -> None:
         _, nm, node, client, pid, key = self._boot_single_node(hot_store="object")
@@ -633,7 +749,7 @@ class TestF05ModeMarkerTier1(_StorageTier1Base):
         node2 = nm.restart(node, graceful_stop=True, hot_store="object")
         assert isinstance(node2, NodeInstance)
         self.assertEqual(node2.client().readyz().status, 200)
-        self.assertEqual(_query_total(node2.client(), pid, "m_obj_ok", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(node2.client(), pid, "m_obj_ok", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
 
     def test_f05_t1_fresh_local_data_dir_with_no_prior_projects_boots_cleanly(self) -> None:
         s3, nm = self._provision_s3_and_mgr()
@@ -826,6 +942,7 @@ class TestF07PublishedManifestDenseSeqTier1(_StorageTier1Base):
 
         node2 = nm.restart(node, graceful_stop=True)
         assert isinstance(node2, NodeInstance)
+        s3.reset_counts()
         c2 = node2.client()
         c2.ingest({"events": make_events(3, event_name="rs_ev2", distinct_id_prefix="u_r2", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         c2.admin_flush().raise_for_status()
@@ -933,7 +1050,7 @@ class TestF08IdentityProfileSnapshotsTier1(_StorageTier1Base):
         res = nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env=env)
         self.assertEqual(res.returncode, 0, f"restore failed: {res.stderr}\n{res.stdout}")
 
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, upload_interval_secs=1, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         self.assertEqual(_query_total(c2, pid, "res_ev", now_ms - 60_000, now_ms + 60_000), 15.0)
@@ -1008,7 +1125,7 @@ class TestF09SnapshotBenchmarkTier1(_StorageTier1Base):
         res = nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env=env)
         self.assertEqual(res.returncode, 0, res.stderr)
 
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, upload_interval_secs=1, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         exported = c2.export_events(pid, format="json").raise_for_status().json()
@@ -1040,6 +1157,7 @@ class TestF10RestoreCliTier1(_StorageTier1Base):
         s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=1, database_url=pg)
         now_ms = int(time.time() * 1000)
         client.ingest({"events": make_events(8, event_name="rst_ev", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
+        client.engage({"distinct_id": "rst_u_0", "$set": {"plan": "pro"}}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
         node.stop(graceful=True)
@@ -1091,7 +1209,7 @@ class TestF10RestoreCliTier1(_StorageTier1Base):
         )
         self.assertEqual(res.returncode, 0, res.stderr)
 
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, upload_interval_secs=1, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         self.assertEqual(_query_total(c2, pid, "pre_pub", now_ms - 60_000, now_ms + 60_000), 10.0)
@@ -1138,7 +1256,7 @@ class TestF10RestoreCliTier1(_StorageTier1Base):
             env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"},
         )
         self.assertEqual(res.returncode, 0, res.stderr)
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, upload_interval_secs=1, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
         c2.ingest({"events": make_events(2, event_name="seq_ev", distinct_id_prefix="s2", base_ts_ms=now_ms)}, api_key=key).raise_for_status()
@@ -1164,8 +1282,11 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
 
-        client.delete_user(pid, "f11_u_0000").raise_for_status()
-        node.stop(graceful=True)
+        self.assertIn("f11_u_0000", {u["distinct_id"] for u in client.list_users(pid).raise_for_status().json()})
+        del_res = client.delete_user(pid, "f11_u_0000").raise_for_status().json()
+        # First interned user in pulse-identity has 0-based canonical_uid=0; non-vacuity is proven by erased_profiles_purged=1.
+        self.assertGreaterEqual(int(del_res["canonical_uid"]), 0)
+        node.kill()
 
         restore_dir = nm.make_temp_data_dir("rst_f11_1_")
         res = nm.run_cli(
@@ -1173,10 +1294,12 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
             env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"},
         )
         self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertRegex(res.stdout, r"\berased_profiles_purged=1\b")
 
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
+        _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
         users = c2.list_users(pid).raise_for_status().json()
         self.assertNotIn("f11_u_0000", {u["distinct_id"] for u in users})
 
@@ -1189,8 +1312,10 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
 
         client.ingest({"events": [make_event(event_name="f11_post", distinct_id="post_erased_u", ts_ms=now_ms - 500)]}, api_key=key).raise_for_status()
-        client.delete_user(pid, "post_erased_u").raise_for_status()
-        node.stop(graceful=True)
+        self.assertEqual(_wait_query_total(client, pid, "f11_post", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
+        del_res = client.delete_user(pid, "post_erased_u").raise_for_status().json()
+        self.assertGreater(int(del_res["canonical_uid"]), 0)
+        node.kill()
 
         restore_dir = nm.make_temp_data_dir("rst_f11_2_")
         res = nm.run_cli(
@@ -1198,12 +1323,14 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
             env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"},
         )
         self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertRegex(res.stdout, r"\berased_tombstones_deleted=1\b")
 
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
+        _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
         c2.ingest({"events": [make_event(event_name="f11_post", distinct_id="reused_uid_user", ts_ms=now_ms - 1000)]}, api_key=key).raise_for_status()
-        self.assertEqual(_query_total(c2, pid, "f11_post", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(c2, pid, "f11_post", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
 
     def test_f11_t1_restore_preserves_erased_uids_below_hwm(self) -> None:
         pg = skip_if_no_postgres()
@@ -1214,13 +1341,15 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
 
         client.delete_user(pid, "lt_u_0000").raise_for_status()
-        node.stop(graceful=True)
+        node.kill()
 
         restore_dir = nm.make_temp_data_dir("rst_f11_3_")
-        nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        res = nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
-        self.assertEqual(_query_total(node2.client(), pid, "lt_hwm_ev", now_ms - 60_000, now_ms + 60_000), 3.0)
+        _wait_project_open(node2.client(), pid, now_ms - 60_000, now_ms + 60_000)
+        self.assertEqual(_wait_query_total(node2.client(), pid, "lt_hwm_ev", now_ms - 60_000, now_ms + 60_000, 3.0), 3.0)
 
     def test_f11_t1_restore_preserves_deletion_audit_log_records(self) -> None:
         pg = skip_if_no_postgres()
@@ -1230,12 +1359,14 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
         del_rec = client.delete_user(pid, "aud_u").raise_for_status().json()
-        node.stop(graceful=True)
+        node.kill()
 
         restore_dir = nm.make_temp_data_dir("rst_f11_4_")
-        nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        res = nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
+        _wait_project_open(node2.client(), pid, now_ms - 60_000, now_ms + 60_000)
         dels = node2.client().list_deletions(pid).raise_for_status().json()
         self.assertIn(del_rec["id"], {d["id"] for d in dels})
 
@@ -1249,18 +1380,30 @@ class TestF11RestoreErasureReconciliationTier1(_StorageTier1Base):
 
         for i in range(3):
             client.ingest({"events": [make_event(event_name="vis_ev", distinct_id=f"temp_{i}", ts_ms=now_ms - 1000)]}, api_key=key).raise_for_status()
-            client.delete_user(pid, f"temp_{i}").raise_for_status()
-        node.stop(graceful=True)
+
+        def _temp_users_applied() -> set[str] | None:
+            exported = client.export_events(pid, format="json").raise_for_status().json()
+            dids = {ev["distinct_id"] for ev in exported["events"]}
+            return dids if {"temp_0", "temp_1", "temp_2"}.issubset(dids) else None
+
+        wait_until(_temp_users_applied, timeout=15.0, interval=0.05, desc="temp_0..2 applied before erasure")
+        for i in range(3):
+            del_res = client.delete_user(pid, f"temp_{i}").raise_for_status().json()
+            self.assertGreater(int(del_res["canonical_uid"]), 0)
+        node.kill()
 
         restore_dir = nm.make_temp_data_dir("rst_f11_5_")
-        nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
-        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token)
+        res = nm.run_cli(["restore", "--from-published", "--data-dir", str(restore_dir)], env={**s3.env_vars(), "DATABASE_URL": pg, "PULSE_HOT_STORE": "local"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertRegex(res.stdout, r"\berased_tombstones_deleted=3\b")
+        node2 = nm.start_node(role="all", data_dir=restore_dir, hot_store="local", mock_s3=s3, database_url=pg, admin_token=node.admin_token, writer_lease_ttl_secs=3)
         assert isinstance(node2, NodeInstance)
         c2 = node2.client()
+        _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
         for i in range(3):
             c2.engage({"distinct_id": f"fresh_u_{i}", "$set": {"active": True}}, api_key=key).raise_for_status()
             c2.ingest({"events": [make_event(event_name="vis_ev", distinct_id=f"fresh_u_{i}", ts_ms=now_ms - 2000)]}, api_key=key).raise_for_status()
-        self.assertEqual(_query_total(c2, pid, "vis_ev", now_ms - 60_000, now_ms + 60_000), 5.0)
+        self.assertEqual(_wait_query_total(c2, pid, "vis_ev", now_ms - 60_000, now_ms + 60_000, 5.0), 5.0)
         users = {u["distinct_id"] for u in c2.list_users(pid).raise_for_status().json()}
         self.assertTrue({"fresh_u_0", "fresh_u_1", "fresh_u_2"}.issubset(users))
 
@@ -1309,6 +1452,13 @@ class TestF12ErasedUidsFilterTier1(_StorageTier1Base):
             make_event(event_name="exp_ev", distinct_id="dave_f12", ts_ms=now_ms - 500),
             make_event(event_name="exp_ev", distinct_id="eve_f12", ts_ms=now_ms - 400),
         ]}, api_key=key).raise_for_status()
+
+        def _ingested_dids() -> set[str] | None:
+            exported = client.export_events(pid, format="json").raise_for_status().json()
+            dids = {ev["distinct_id"] for ev in exported["events"]}
+            return dids if {"dave_f12", "eve_f12"}.issubset(dids) else None
+
+        wait_until(_ingested_dids, timeout=10.0, interval=0.05, desc="dave_f12 and eve_f12 applied before erasure")
         client.delete_user(pid, "dave_f12").raise_for_status()
 
         exported = client.export_events(pid, format="json").raise_for_status().json()
@@ -1341,7 +1491,7 @@ class TestF12ErasedUidsFilterTier1(_StorageTier1Base):
         client.delete_user(pid, "gina_f12").raise_for_status()
         rev = client.request("GET", f"/v1/projects/{pid}/revenue", token=client.default_token).raise_for_status().json()
         self.assertEqual(int(rev["total_profiles"]), 1)
-        self.assertEqual(_query_total(client, pid, "buy", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(client, pid, "buy", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
 
 
 # ===========================================================================
@@ -1380,7 +1530,7 @@ class TestF13SqliteStartupWarningTier1(_StorageTier1Base):
         self.assertEqual(client.readyz().status, 200)
         now_ms = int(time.time() * 1000)
         client.ingest({"events": [make_event(event_name="sq_ok", distinct_id="u1", ts_ms=now_ms - 200)]}, api_key=key).raise_for_status()
-        self.assertEqual(_query_total(client, pid, "sq_ok", now_ms - 60_000, now_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(client, pid, "sq_ok", now_ms - 60_000, now_ms + 60_000, 1.0), 1.0)
         self.assertIn("WARN", node.read_logs(tail_bytes=0))
 
     def test_f13_t1_sqlite_warning_mentions_database_url_and_volume_loss_risk(self) -> None:
@@ -1494,9 +1644,15 @@ class TestF15PublishSeqFencingTier1(_StorageTier1Base):
         client.admin_flush().raise_for_status()
         wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
 
-        epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
-        self.assertGreaterEqual(len(epochs), 1)
-        latest_doc = decode_manifest(node.read_local_bytes(epochs[-1]))
+        def _local_pub_seq_0() -> dict[str, Any] | None:
+            epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
+            if not epochs:
+                return None
+            doc = decode_manifest(node.read_local_bytes(epochs[-1]))
+            return doc if doc.get("last_published_seq") == 0 else None
+
+        latest_doc = wait_until(_local_pub_seq_0, timeout=10.0, interval=0.05, desc="local manifest last_published_seq == 0")
+        assert latest_doc is not None
         self.assertEqual(latest_doc["last_published_seq"], 0)
         self.assertIn("writer_generation", latest_doc)
 
@@ -1508,8 +1664,16 @@ class TestF15PublishSeqFencingTier1(_StorageTier1Base):
             client.admin_flush().raise_for_status()
             wait_until(lambda idx=i: s3.head_object(f"published/{pid}/pub_{idx:012d}.json") is not None, timeout=15.0, desc=f"pub_{i}")
 
-        epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
-        latest_doc = decode_manifest(node.read_local_bytes(epochs[-1]))
+        def _local_pub_seq_ge_1() -> dict[str, Any] | None:
+            epochs = sorted(p for p in _local_matches(node, "manifests") if pid in p and "epoch_" in p)
+            if not epochs:
+                return None
+            doc = decode_manifest(node.read_local_bytes(epochs[-1]))
+            seq = doc.get("last_published_seq")
+            return doc if isinstance(seq, int) and seq >= 1 else None
+
+        latest_doc = wait_until(_local_pub_seq_ge_1, timeout=10.0, interval=0.05, desc="local manifest last_published_seq >= 1")
+        assert latest_doc is not None
         self.assertGreaterEqual(latest_doc["last_published_seq"], 1)
 
     def test_f15_t1_active_writer_survives_s3_head_check_and_continues_publishing(self) -> None:
@@ -1579,7 +1743,9 @@ class TestF16DeletionGraceRuleTier1(_StorageTier1Base):
         self.assertTrue(wait_until(_has_pending, timeout=20.0, desc="pending_s3_deletes populated"))
 
     def test_f16_t1_superseded_segment_retained_through_0_and_1_publish_intervals(self) -> None:
-        s3, _, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=2)
+        s3, _, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=2, extra_env={"PULSE_CLOSED_DATE_UPLOAD_SECS": "0"}
+        )
         old_ts = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp() * 1000)
         for i in range(4):
             client.ingest({"events": make_events(2, event_name="f16_grace", distinct_id_prefix=f"g{i}", base_ts_ms=old_ts + i * 10)}, api_key=key).raise_for_status()
@@ -1834,7 +2000,7 @@ class TestF18LocalSegmentTier1(_StorageTier1Base):
         # 3) Keep in L0 memory
         client.ingest({"events": make_events(2, event_name="mix_tier", distinct_id_prefix="l0u", base_ts_ms=now_ms - 1000)}, api_key=key).raise_for_status()
 
-        self.assertEqual(_query_total(client, pid, "mix_tier", now_ms - 60_000, now_ms + 60_000), 9.0)
+        self.assertEqual(_wait_query_total(client, pid, "mix_tier", now_ms - 60_000, now_ms + 60_000, 9.0), 9.0)
 
     def test_f18_t1_count_based_compaction_disabled_for_hot_segments_when_interval_gt_0(self) -> None:
         s3, _, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=300)
@@ -1858,15 +2024,19 @@ class TestF18LocalSegmentTier1(_StorageTier1Base):
             self.assertTrue(node.read_local_bytes(p).startswith(b"PLSEAGM2"))
 
     def test_f18_t1_restart_preserves_and_serves_local_hot_segments_immediately(self) -> None:
-        s3, nm, node, client, pid, key = self._boot_single_node(hot_store="local", upload_interval_secs=300)
+        s3, nm, node, client, pid, key = self._boot_single_node(
+            hot_store="local", upload_interval_secs=300, writer_lease_ttl_secs=3
+        )
         now_ms = int(time.time() * 1000)
         client.ingest({"events": make_events(6, event_name="hot_rst", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
         self.assertGreaterEqual(len(_local_matches(node, "hot/segments")), 1)
 
-        node2 = nm.restart(node, graceful_stop=True)
+        node2 = nm.restart(node, graceful_stop=False)
         assert isinstance(node2, NodeInstance)
-        self.assertEqual(_query_total(node2.client(), pid, "hot_rst", now_ms - 60_000, now_ms + 60_000), 6.0)
+        c2 = node2.client()
+        _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
+        self.assertEqual(_wait_query_total(c2, pid, "hot_rst", now_ms - 60_000, now_ms + 60_000, 6.0), 6.0)
         self.assertEqual(s3.put_count("segments/"), 0)
 
 
@@ -2124,20 +2294,21 @@ class TestF21LocalSegmentBoundsTier1(_StorageTier1Base):
         now_ms = int(time.time() * 1000)
         resp = client.ingest({"events": make_events(20, event_name="b_norm", base_ts_ms=now_ms - 500)}, api_key=key)
         self.assertEqual(resp.status, 200)
-        self.assertEqual(_query_total(client, pid, "b_norm", now_ms - 60_000, now_ms + 60_000), 20.0)
+        self.assertEqual(_wait_query_total(client, pid, "b_norm", now_ms - 60_000, now_ms + 60_000, 20.0), 20.0)
 
     def test_f21_t1_recovered_s3_drains_backlog_and_preserves_all_events(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
             hot_store="local", upload_interval_secs=1, extra_env={"PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": "32768"}
         )
-        s3.set_fault(fail_prefixes=["segments/", "published/"], status=403)
         now_ms = int(time.time() * 1000)
+        _wait_project_open(client, pid, now_ms - 60_000, now_ms + 60_000)
+        s3.set_fault(fail_prefixes=["segments/", "published/"], status=403)
         client.ingest({"events": make_events(10, event_name="b_rec", base_ts_ms=now_ms - 500)}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
 
         s3.clear_faults()
         wait_until(lambda: len(s3.list_objects(f"segments/{pid}/")) >= 1, timeout=15.0, desc="drain after S3 recovery")
-        self.assertEqual(_query_total(client, pid, "b_rec", now_ms - 60_000, now_ms + 60_000), 10.0)
+        self.assertEqual(_wait_query_total(client, pid, "b_rec", now_ms - 60_000, now_ms + 60_000, 10.0), 10.0)
 
 
 # ===========================================================================
@@ -2161,7 +2332,13 @@ class TestF26ColdS3MergeTier1(_StorageTier1Base):
 
     def test_f26_t1_cold_closed_date_idle_gt_1h_merges_multiple_s3_segments_into_one(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"}
+            hot_store="local",
+            upload_interval_secs=1,
+            extra_env={
+                "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+            },
         )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         initial = self._seed_cold_partition(s3, client, pid, key, old_ms, count_cycles=3)
@@ -2171,7 +2348,13 @@ class TestF26ColdS3MergeTier1(_StorageTier1Base):
 
     def test_f26_t1_cold_merge_uses_cas_published_manifest_and_pending_s3_deletes(self) -> None:
         s3, _, node, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"}
+            hot_store="local",
+            upload_interval_secs=1,
+            extra_env={
+                "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+            },
         )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         self._seed_cold_partition(s3, client, pid, key, old_ms, count_cycles=3)
@@ -2183,31 +2366,51 @@ class TestF26ColdS3MergeTier1(_StorageTier1Base):
 
     def test_f26_t1_cold_merge_physically_drops_erased_user_rows(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"}
+            hot_store="local",
+            upload_interval_secs=1,
+            extra_env={
+                "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+                "PULSE_NUM_BUCKETS": "1",
+            },
         )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         client.ingest({"events": [make_event(event_name="cold_er", distinct_id="erase_me", ts_ms=old_ms)]}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
+        wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000000.json") is not None, timeout=15.0, desc="pub_0")
         client.ingest({"events": [make_event(event_name="cold_er", distinct_id="keep_me", ts_ms=old_ms + 10)]}, api_key=key).raise_for_status()
         client.admin_flush().raise_for_status()
-        wait_until(lambda: len(s3.list_objects(f"published/{pid}/pub_")) >= 2, timeout=15.0, desc="2 publishes")
+        wait_until(lambda: s3.head_object(f"published/{pid}/pub_000000000001.json") is not None, timeout=15.0, desc="pub_1")
 
         client.delete_user(pid, "erase_me").raise_for_status()
         wait_until(lambda: len(s3.list_objects(f"published/{pid}/pub_")) >= 3, timeout=20.0, desc="cold merge publish")
-        self.assertEqual(_query_total(client, pid, "cold_er", old_ms - 60_000, old_ms + 60_000), 1.0)
+        self.assertEqual(_wait_query_total(client, pid, "cold_er", old_ms - 60_000, old_ms + 60_000, 1.0), 1.0)
 
     def test_f26_t1_cold_merge_preserves_100pct_non_erased_events_across_queries(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"}
+            hot_store="local",
+            upload_interval_secs=1,
+            extra_env={
+                "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+            },
         )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         self._seed_cold_partition(s3, client, pid, key, old_ms, count_cycles=3)
         wait_until(lambda: len(s3.list_objects(f"published/{pid}/pub_")) >= 4, timeout=20.0, desc="cold merge")
-        self.assertEqual(_query_total(client, pid, "cold_ev", old_ms - 60_000, old_ms + 60_000), 12.0)
+        self.assertEqual(_wait_query_total(client, pid, "cold_ev", old_ms - 60_000, old_ms + 60_000, 12.0), 12.0)
 
     def test_f26_t1_cold_merge_respects_64mib_cap_on_large_cold_partition(self) -> None:
         s3, _, _, client, pid, key = self._boot_single_node(
-            hot_store="local", upload_interval_secs=1, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"}
+            hot_store="local",
+            upload_interval_secs=1,
+            extra_env={
+                "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+            },
         )
         old_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         self._seed_cold_partition(s3, client, pid, key, old_ms, count_cycles=3)

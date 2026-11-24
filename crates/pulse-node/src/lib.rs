@@ -821,8 +821,14 @@ pub async fn start_pulse_node_with_store_and_identity(
     if config.role.serves_query_and_admin() {
         let alerts_control = control.clone();
         let mut alerts_shutdown = shutdown_bg_rx.clone();
+        let alert_interval = std::env::var("PULSE_ALERT_EVAL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(300));
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            let mut ticker = tokio::time::interval(alert_interval);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {

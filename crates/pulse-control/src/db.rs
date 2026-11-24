@@ -1190,7 +1190,9 @@ impl MetaStore {
     /// Accounts with an organisation; sign-ups still waiting to verify their email don't count.
     /// One round trip to the database, for readiness checks.
     pub async fn ping(&self) -> Result<(), MetaError> {
-        let _ = db_map_opt!(self, "SELECT 1 AS n", |r| { r.get::<i64, _>("n") });
+        let _ = db_map_opt!(self, "SELECT CAST(1 AS BIGINT) AS n", |r| {
+            r.get::<i64, _>("n")
+        });
         Ok(())
     }
 
@@ -2354,7 +2356,7 @@ impl MetaStore {
             "SELECT key_id, salt_hex, sealed_key_hex, is_active, created_at_ms
              FROM system_keyring ORDER BY created_at_ms ASC",
             |r| {
-                let active_i: i64 = r.get("is_active");
+                let active_i: i32 = r.get("is_active");
                 SystemKeyringRecord {
                     key_id: r.get("key_id"),
                     salt_hex: r.get("salt_hex"),
@@ -2374,7 +2376,7 @@ impl MetaStore {
         if rec.is_active {
             let _ = db_exec!(self, "UPDATE system_keyring SET is_active = 0");
         }
-        let active_val: i64 = if rec.is_active { 1 } else { 0 };
+        let active_val = i32::from(rec.is_active);
         let _ = db_exec!(
             self,
             "INSERT INTO system_keyring (key_id, salt_hex, sealed_key_hex, is_active, created_at_ms)
@@ -3806,5 +3808,24 @@ mod writer_lease_tests {
 
         stop.store(true, std::sync::atomic::Ordering::Release);
         bg_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_and_system_keyring_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        meta.ping().await.unwrap();
+        let rec = crate::models::SystemKeyringRecord {
+            key_id: "key-1".to_string(),
+            salt_hex: "00112233".to_string(),
+            sealed_key_hex: "aabbccdd".to_string(),
+            is_active: true,
+            created_at_ms: 1_000,
+        };
+        meta.upsert_system_keyring_key(&rec).await.unwrap();
+        let rows = meta.list_system_keyring().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key_id, "key-1");
+        assert!(rows[0].is_active);
     }
 }

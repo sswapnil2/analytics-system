@@ -464,6 +464,7 @@ class TestLiveMockS3PulseNodeIntegration(unittest.TestCase):
             node = cluster.start_node(
                 role="all",
                 hot_store="local",
+                upload_interval_secs=0,
                 writer_lease_ttl_secs=3,
             )
             assert isinstance(node, NodeInstance)

@@ -25,7 +25,7 @@ _HARNESS_ROOT = Path(__file__).resolve().parent.parent
 if str(_HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(_HARNESS_ROOT))
 
-from lib.client import MetricsParser, PulseHttpClient  # noqa: E402
+from lib.client import HttpStatusError, MetricsParser, PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance, free_port  # noqa: E402
 from lib.oracle import (  # noqa: E402
     decode_manifest,
@@ -35,6 +35,7 @@ from lib.oracle import (  # noqa: E402
     make_event,
     make_events,
     make_replay_chunk,
+    random_byok_hex,
     require_milestone,
     tier,
     wait_until,
@@ -95,7 +96,7 @@ def _transfer_project_for_failover(
         if proc.returncode != 0:
             raise AssertionError(f"restore --from-published failed: {proc.stderr}")
         return
-    for prefix in ("identity", "profiles", "manifests", "hot/segments", "wal/identity", "wal/profiles", "wal/manifests", "wal/hot/segments"):
+    for prefix in ("hot/identity", "hot/profiles", "hot/manifests", "hot/hot/segments"):
         src_p = src_node.data_dir / prefix / project_id
         dst_p = dst_node.data_dir / prefix / project_id
         if src_p.exists():
@@ -142,7 +143,10 @@ def _fill_event_dictionary(
 
     def _lag_drained() -> bool:
         m = client.parsed_metrics()
-        return m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
+        return (
+            m.sum_by_name("pulse_writer_buffer_events") == 0.0
+            and m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
+        )
 
     wait_until(_lag_drained, timeout=30.0, interval=0.1, desc="dictionary fill drain")
 
@@ -281,6 +285,7 @@ class TestTier1F22AsyncEventAck(unittest.TestCase):
             node = cluster.start_node(
                 role="all",
                 hot_store="local",
+                writer_lease_ttl_secs=3,
                 extra_env={"PULSE_WRITER_FLUSH_MS": "20", "PULSE_WRITER_FLUSH_BYTES": "1048576"},
             )
             assert isinstance(node, NodeInstance)
@@ -299,8 +304,15 @@ class TestTier1F22AsyncEventAck(unittest.TestCase):
             restarted = node.restart(graceful_stop=False)
             assert isinstance(restarted, NodeInstance)
             r_client = restarted.client()
+
+            def _durable_total_ready() -> bool:
+                try:
+                    return _insights_total(r_client, pid, "f22_durable", now_ms - 60_000, now_ms + 60_000) == 5.0
+                except HttpStatusError:
+                    return False
+
             wait_until(
-                lambda: _insights_total(r_client, pid, "f22_durable", now_ms - 60_000, now_ms + 60_000) == 5.0,
+                _durable_total_ready,
                 timeout=15.0,
                 desc="WAL-flushed events survive SIGKILL",
             )
@@ -788,7 +800,7 @@ class TestTier1F25SyncProfileEndpoint(unittest.TestCase):
     @require_milestone("W2")
     def test_sigkill_immediately_after_identify_and_engage_preserves_profile(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            node = cluster.start_node(role="all", hot_store="local")
+            node = cluster.start_node(role="all", hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node, NodeInstance)
             client = node.client()
             pid, api_key = _create_project(client, "F25 Crash Durable")
@@ -806,8 +818,16 @@ class TestTier1F25SyncProfileEndpoint(unittest.TestCase):
             node.kill()
             restarted = node.restart(graceful_stop=False)
             assert isinstance(restarted, NodeInstance)
+            r_client = restarted.client()
 
-            detail = restarted.client().get_user(pid, "u_kill_1").raise_for_status().json()
+            def _get_user_after_lease() -> dict[str, Any] | None:
+                resp = r_client.get_user(pid, "u_kill_1")
+                if resp.status == 200:
+                    return resp.json()
+                return None
+
+            detail = wait_until(_get_user_after_lease, timeout=15.0, desc="user profile readable after lease expiry")
+            assert detail is not None
             self.assertEqual(detail["canonical_uid"], id_res["canonical_uid"])
             self.assertTrue(detail["profile"]["props"]["durable"])
             self.assertEqual(detail["profile"]["props"]["level"], 7)
@@ -1229,12 +1249,27 @@ class TestTier1F30ProjectOwnerAndPlacement(unittest.TestCase):
                 num_writers=1,
                 num_storage=2,
                 database_url=db_url,
-                extra_env={"PULSE_ALERT_EVAL_INTERVAL_SECS": "1"},
+                extra_env={
+                    "PULSE_ALERT_EVAL_INTERVAL_SECS": "1",
+                    "PULSE_VAULT_KEK": random_byok_hex(),
+                },
             )
             s1 = topo["storages"][0]
             writer = topo["writers"][0]
             pid, api_key = _create_project(s1.client(), "F30 Alert Once")
             now_ms = int(time.time() * 1000)
+
+            s1.client().request(
+                "PUT",
+                f"/v1/projects/{pid}/byok",
+                json_body={
+                    "category": "webhook",
+                    "provider": "custom_webhook",
+                    "secret": f"http://127.0.0.1:{port}/hook",
+                    "config_json": {"signing_secret": "e2e_webhook_signing_secret_12345"},
+                },
+                token=s1.admin_token,
+            ).raise_for_status()
 
             s1.client().create_alert(
                 pid,
