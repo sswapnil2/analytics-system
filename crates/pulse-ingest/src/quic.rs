@@ -170,6 +170,22 @@ async fn read_exact_bounded(recv: &mut RecvStream, len: usize) -> std::result::R
 }
 
 fn quic_error_json(e: &IngestError) -> Vec<u8> {
+    if let IngestError::Storage(pulse_storage::StorageError::NotOwner {
+        project_id,
+        owner_node,
+        owner_address,
+    }) = e
+    {
+        let val = serde_json::json!({
+            "status": "error",
+            "code": "not_owner",
+            "project_id": project_id,
+            "owner_node": owner_node,
+            "owner_address": owner_address,
+            "message": e.to_string(),
+        });
+        return serde_json::to_vec(&val).unwrap_or_default();
+    }
     let code: Option<std::borrow::Cow<'static, str>> = match e {
         IngestError::Storage(pulse_storage::StorageError::HotSegmentBackpressure { .. }) => {
             Some("hot_segment_backpressure".into())

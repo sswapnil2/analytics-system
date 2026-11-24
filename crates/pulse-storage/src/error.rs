@@ -55,6 +55,13 @@ pub enum StorageError {
     #[error("this node does not hold the writer lease for project '{project_id}'")]
     NotWriter { project_id: String },
 
+    #[error("this node is not the owner for project '{project_id}'")]
+    NotOwner {
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    },
+
     #[error("stale local state for project '{project_id}': published seq {pub_seq} (gen {pub_gen}) is ahead of local last_published_seq {local_last_pub_seq:?} (gen {local_gen}); recover with `pulse-node restore --from-published`")]
     StaleWriter {
         project_id: String,
@@ -98,6 +105,7 @@ impl StorageError {
             Self::Io(_)
             | Self::ObjectStore(_)
             | Self::NotWriter { .. }
+            | Self::NotOwner { .. }
             | Self::StaleWriter { .. }
             | Self::Unavailable(_) => true,
             Self::Identity(e) => e.is_store_unavailable(),

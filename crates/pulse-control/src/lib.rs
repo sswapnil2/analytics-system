@@ -19,7 +19,10 @@ pub use api::{
 };
 pub use api_agent::{build_agent_ingest_router, AgentRetentionStats};
 pub use copilot::{copilot_revenue_summary, CopilotRequest, CopilotResponse};
-pub use db::{DbWriterLeases, MetaError, MetaStore, OrgInvite, SessionInfo, SessionUser};
+pub use db::{
+    DbProjectOwnerChecker, DbWriterLeases, MetaError, MetaStore, OrgInvite, SessionInfo,
+    SessionUser,
+};
 pub use experiments::{
     build_edge_flag_bundle, build_edge_flag_bundle_with_cohorts, compute_sample_ratio_mismatch,
     compute_statistical_lift_table, evaluate_edge_flag, evaluate_experiment_results,

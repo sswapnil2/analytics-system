@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, SecondsFormat};
 use pulse_node::{
-    inspect_dead_letters, restore_from_published, start_pulse_node, NodeConfig, NodeRole,
+    inspect_dead_letters, restore_from_published, start_pulse_node_with_identity, NodeConfig,
+    NodeIdentity, NodeRole,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut cfg = NodeConfig::default();
+    let mut cli_node_name: Option<String> = None;
+    let mut cli_advertise_addr: Option<String> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
@@ -108,6 +111,20 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            "--node-name" => {
+                let raw = next_val("--node-name", &mut i)?.trim();
+                if raw.is_empty() {
+                    anyhow::bail!("--node-name must not be empty");
+                }
+                cli_node_name = Some(raw.to_string());
+            }
+            "--advertise-addr" => {
+                let raw = next_val("--advertise-addr", &mut i)?.trim();
+                if raw.is_empty() {
+                    anyhow::bail!("--advertise-addr must not be empty");
+                }
+                cli_advertise_addr = Some(raw.to_string());
+            }
             other => {
                 anyhow::bail!("unknown argument '{other}' (run with --help for usage)");
             }
@@ -115,7 +132,21 @@ async fn main() -> anyhow::Result<()> {
         i += 1;
     }
 
-    let node = start_pulse_node(cfg).await?;
+    let env_identity = NodeIdentity::from_env();
+    let identity = match cli_node_name {
+        Some(name) => NodeIdentity::new(
+            name,
+            cli_advertise_addr.or_else(|| env_identity.and_then(|e| e.advertise_addr)),
+        ),
+        None => env_identity.map(|mut id| {
+            if let Some(addr) = cli_advertise_addr {
+                id.advertise_addr = Some(addr);
+            }
+            id
+        }),
+    };
+
+    let node = start_pulse_node_with_identity(cfg, identity).await?;
     info!(
         url = %format!("http://{}:{}", node.http_addr.ip(), node.http_addr.port()),
         "Pulse Analytics Studio & Engine Ready"
@@ -161,9 +192,11 @@ fn print_usage() {
          \t--port <PORT>        HTTP bind port (default: 8080, env: PORT)\n\
          \t--data-dir <PATH>    Data directory (default: ./pulse_data, env: PULSE_DATA_DIR)\n\
          \t--web-dir <PATH>     Studio dist directory (default: ./web/dist, env: PULSE_WEB_DIST_DIR)\n\
-         \t--project-id <ID>    Default project ID (default: proj_default, env: PULSE_DEFAULT_PROJECT)\n\
-         \t--role <ROLE>        Node role: all | ingest | query | compactor (env: PULSE_NODE_ROLE)\n\
-         \t--quic-addr <ADDR>   Enable QUIC ingest listener on <IP:PORT> (env: PULSE_QUIC_ADDR)\n\
+         \t--project-id <ID>      Default project ID (default: proj_default, env: PULSE_DEFAULT_PROJECT)\n\
+         \t--role <ROLE>          Node role: all | ingest | query | compactor (env: PULSE_NODE_ROLE)\n\
+         \t--node-name <NAME>     Stable node name for multi-node ownership (env: PULSE_NODE_NAME)\n\
+         \t--advertise-addr <URL> Advertised HTTP base URL for peer routing (env: PULSE_ADVERTISE_ADDR)\n\
+         \t--quic-addr <ADDR>     Enable QUIC ingest listener on <IP:PORT> (env: PULSE_QUIC_ADDR)\n\
          \t--no-quic            Disable QUIC ingest listener (default)\n\
          \t--seed               Seed demo dataset on startup (env: PULSE_SEED=1)\n\
          \t--no-seed            Disable demo dataset seeding (default)\n\

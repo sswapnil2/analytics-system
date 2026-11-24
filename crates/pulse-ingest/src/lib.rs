@@ -1,4 +1,5 @@
 pub mod dedup;
+pub mod forward_guard;
 pub mod governance;
 pub mod http;
 pub mod quic;
@@ -6,10 +7,15 @@ pub mod rate_limit;
 pub mod service;
 
 pub use dedup::{normalize_event_timestamp, DedupRegistry, DEDUP_WINDOW_MS};
+pub use forward_guard::{
+    apply_outgoing_forward_headers, check_incoming_forward, forward_loop_middleware,
+    ForwardCheckError, ForwardLoopGuard, DEFAULT_MAX_FORWARD_HOPS, HEADER_FORWARDED,
+    HEADER_FORWARDED_BY, HEADER_FORWARDED_HOP,
+};
 pub use governance::{
     DiscoveredEventSchema, GovernanceProvider, InMemoryGovernance, ProjectLexiconRules,
 };
-pub use http::build_ingest_router;
+pub use http::{build_ingest_router, build_ingest_router_with_guard};
 pub use quic::{
     send_quic_ingest_batch, spawn_quic_listener, QuicIngestHandle, QUIC_OP_IDENTIFY,
     QUIC_OP_INGEST, QUIC_OP_REPLAY,
@@ -243,7 +249,7 @@ mod tests {
                     session_id: format!("late_sess_{wave}_{j}"),
                     event_name: "Common_Step_1".to_string(),
                     client_event_ts_ms: base_ts + 5_000 + (j as i64),
-                    client_sent_ts_ms: base_ts + 10_000,
+                    client_sent_ts_ms: base_ts + 25_000_000,
                     props: vec![("amount".to_string(), PropValue::Int(777))],
                     replay_offset_kb: 0,
                 });

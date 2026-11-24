@@ -429,9 +429,9 @@ fn insert_pending(
         map.retain(|_, (_, exp)| *exp > now);
     }
     if map.len() >= MAX_PENDING_ENTRIES {
-        return Err(CtrlError(
+        return Err(CtrlError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "too many pending sign-ins, try again shortly".to_string(),
+            "too many pending sign-ins, try again shortly",
         ));
     }
     map.insert(key, (value, expires_at_ms));
@@ -644,9 +644,9 @@ async fn handle_login(
         })
         .unwrap_or(false);
     if throttled {
-        return Err(CtrlError(
+        return Err(CtrlError::new(
             StatusCode::TOO_MANY_REQUESTS,
-            "Too many attempts. Try again in a few minutes.".to_string(),
+            "Too many attempts. Try again in a few minutes.",
         ));
     }
 

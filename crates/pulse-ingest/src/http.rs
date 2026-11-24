@@ -7,10 +7,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
+use crate::forward_guard::{forward_loop_middleware, ForwardLoopGuard};
 use crate::service::{IdentifyRequest, IngestError, IngestService};
 
 /// Builds the Axum router serving `/v1/ingest`, `/v1/identify`, `/v1/engage`, `/v1/groups`, and `/v1/replay/chunk`.
 pub fn build_ingest_router(service: Arc<IngestService>) -> Router {
+    build_ingest_router_with_guard(service, Arc::new(ForwardLoopGuard::default()))
+}
+
+/// Builds the ingest Axum router with a configured [`ForwardLoopGuard`].
+pub fn build_ingest_router_with_guard(
+    service: Arc<IngestService>,
+    guard: Arc<ForwardLoopGuard>,
+) -> Router {
     Router::new()
         .route("/v1/ingest", post(handle_ingest))
         .route("/v1/identify", post(handle_identify))
@@ -19,6 +28,10 @@ pub fn build_ingest_router(service: Arc<IngestService>) -> Router {
         .route("/v1/replay/chunk", post(handle_replay_chunk))
         // ponytail: one cap for every ingest route; the SDKs send batches and replay chunks far below it.
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            forward_loop_middleware,
+        ))
         .with_state(service)
 }
 
@@ -173,6 +186,27 @@ impl IntoResponse for ApiError {
             let body = serde_json::json!({
                 "status": "error",
                 "code": "not_writer",
+                "message": self.0.to_string(),
+            });
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                Json(body),
+            )
+                .into_response();
+        }
+        if let IngestError::Storage(pulse_storage::StorageError::NotOwner {
+            project_id,
+            owner_node,
+            owner_address,
+        }) = &self.0
+        {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "not_owner",
+                "project_id": project_id,
+                "owner_node": owner_node,
+                "owner_address": owner_address,
                 "message": self.0.to_string(),
             });
             return (

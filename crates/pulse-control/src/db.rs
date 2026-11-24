@@ -13,9 +13,10 @@ use crate::models::DashboardCard;
 use crate::models::{
     AlertRule, Annotation, ApiKeyRecord, ByokCredentialRecord, CohortRecord, Dashboard,
     DeletionAuditRecord, EnterpriseAuditRecord, Experiment, FeatureFlag, GroupProfileRecord,
-    LexiconEvent, LexiconProperty, LookupTableSummary, Organization, Project, Role, SavedReport,
-    SystemKeyringRecord, User, UserProfileRecord,
+    LexiconEvent, LexiconProperty, LookupTableSummary, NodeLoad, Organization, Project,
+    ProjectOwner, Role, SavedReport, SystemKeyringRecord, User, UserProfileRecord, WriterNode,
 };
+use pulse_storage::{LeaseAcquireOutcome, OwnerCheck, ProjectOwnerChecker, ProjectOwnerInfo};
 
 /// A row of the active-sessions list; `id` is a prefix of the token hash, never the token.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2570,7 +2571,313 @@ impl MetaStore {
     }
 }
 
+const SQL_SELECT_PROJECT_OWNER: &str =
+    "SELECT project_id, node_name, address, updated_at_ms FROM project_owner WHERE project_id = ?";
+const SQL_LIST_PROJECT_OWNERS: &str =
+    "SELECT project_id, node_name, address, updated_at_ms FROM project_owner ORDER BY project_id ASC";
+const SQL_LIST_OWNED_PROJECTS: &str =
+    "SELECT project_id, node_name, address, updated_at_ms FROM project_owner WHERE node_name = ? ORDER BY project_id ASC";
+const SQL_UPSERT_PROJECT_OWNER: &str =
+    "INSERT INTO project_owner (project_id, node_name, address, updated_at_ms)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(project_id) DO UPDATE SET
+        node_name = excluded.node_name,
+        address = excluded.address,
+        updated_at_ms = excluded.updated_at_ms";
+const SQL_INSERT_PROJECT_OWNER_IF_UNASSIGNED: &str =
+    "INSERT INTO project_owner (project_id, node_name, address, updated_at_ms)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(project_id) DO NOTHING";
+const SQL_REASSIGN_PROJECT_OWNER_CAS: &str =
+    "UPDATE project_owner SET node_name = ?, address = ?, updated_at_ms = ? WHERE project_id = ? AND node_name = ?";
+const SQL_SYNC_PROJECT_OWNER_ADDRESS: &str =
+    "UPDATE project_owner SET address = ?, updated_at_ms = ? WHERE node_name = ? AND address <> ?";
+const SQL_UPSERT_WRITER_NODE: &str =
+    "INSERT INTO writer_nodes (node_name, address, role, last_heartbeat_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(node_name) DO UPDATE SET
+        address = excluded.address,
+        role = excluded.role,
+        last_heartbeat_ms = excluded.last_heartbeat_ms,
+        updated_at_ms = excluded.updated_at_ms";
+const SQL_HEARTBEAT_WRITER_NODE: &str =
+    "UPDATE writer_nodes SET last_heartbeat_ms = ?, updated_at_ms = ? WHERE node_name = ?";
+const SQL_DEREGISTER_WRITER_NODE: &str = "DELETE FROM writer_nodes WHERE node_name = ?";
+const SQL_LIST_HEALTHY_WRITER_NODES: &str =
+    "SELECT node_name, address, role, last_heartbeat_ms, updated_at_ms
+     FROM writer_nodes
+     WHERE role IN ('all', 'ingest', 'storage')
+       AND last_heartbeat_ms >= ?
+     ORDER BY node_name ASC";
+const SQL_LIST_NODE_LOADS: &str = "SELECT wn.node_name, wn.address, wn.role, wn.last_heartbeat_ms,
+            COUNT(po.project_id) AS project_count
+     FROM writer_nodes wn
+     LEFT JOIN project_owner po ON po.node_name = wn.node_name
+     WHERE wn.role IN ('all', 'ingest', 'storage')
+       AND wn.last_heartbeat_ms >= ?
+     GROUP BY wn.node_name, wn.address, wn.role, wn.last_heartbeat_ms
+     ORDER BY COUNT(po.project_id) ASC, wn.node_name ASC";
+const SQL_UPSERT_WRITER_LEASE: &str =
+    "INSERT INTO writer_leases (project_id, node_id, generation, expires_at_ms)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(project_id) DO UPDATE SET
+        generation = CASE WHEN writer_leases.node_id = excluded.node_id
+            THEN writer_leases.generation ELSE writer_leases.generation + 1 END,
+        node_id = excluded.node_id,
+        expires_at_ms = excluded.expires_at_ms
+     WHERE writer_leases.node_id = excluded.node_id OR writer_leases.expires_at_ms < ?";
+const SQL_SELECT_WRITER_LEASE_GEN: &str =
+    "SELECT generation FROM writer_leases WHERE project_id = ? AND node_id = ?";
+
+fn normalize_optional_node_name(name: Option<String>) -> Option<String> {
+    name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn project_owner_from_row<R>(r: &R) -> ProjectOwner
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    ProjectOwner {
+        project_id: r.get("project_id"),
+        node_name: r.get("node_name"),
+        address: r.get("address"),
+        updated_at_ms: r.get("updated_at_ms"),
+    }
+}
+
+fn owner_permitted(
+    owner: Option<&ProjectOwner>,
+    owner_node_name: Option<&str>,
+) -> Result<(), LeaseAcquireOutcome> {
+    match (owner, owner_node_name) {
+        (Some(row), Some(me)) if row.node_name == me => Ok(()),
+        (Some(row), _) => Err(LeaseAcquireOutcome::NotOwner {
+            owner_node: Some(row.node_name.clone()),
+            owner_address: Some(row.address.clone()),
+        }),
+        (None, Some(_)) => Err(LeaseAcquireOutcome::NotOwner {
+            owner_node: None,
+            owner_address: None,
+        }),
+        (None, None) => Ok(()),
+    }
+}
+
 impl MetaStore {
+    pub async fn get_project_owner(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectOwner>, MetaError> {
+        Ok(db_map_opt!(
+            self,
+            SQL_SELECT_PROJECT_OWNER,
+            |r| { project_owner_from_row(&r) },
+            project_id,
+        ))
+    }
+
+    pub async fn list_project_owners(&self) -> Result<Vec<ProjectOwner>, MetaError> {
+        Ok(db_map_all!(self, SQL_LIST_PROJECT_OWNERS, |r| {
+            project_owner_from_row(&r)
+        }))
+    }
+
+    pub async fn list_owned_projects(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<ProjectOwner>, MetaError> {
+        Ok(db_map_all!(
+            self,
+            SQL_LIST_OWNED_PROJECTS,
+            |r| { project_owner_from_row(&r) },
+            node_name,
+        ))
+    }
+
+    pub async fn upsert_project_owner(&self, owner: &ProjectOwner) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            SQL_UPSERT_PROJECT_OWNER,
+            &owner.project_id,
+            &owner.node_name,
+            &owner.address,
+            owner.updated_at_ms,
+        );
+        Ok(())
+    }
+
+    pub async fn set_project_owner(
+        &self,
+        project_id: &str,
+        node_name: &str,
+        address: &str,
+        updated_at_ms: i64,
+    ) -> Result<ProjectOwner, MetaError> {
+        let owner = ProjectOwner {
+            project_id: project_id.to_string(),
+            node_name: node_name.to_string(),
+            address: address.to_string(),
+            updated_at_ms,
+        };
+        self.upsert_project_owner(&owner).await?;
+        Ok(owner)
+    }
+
+    pub async fn reassign_project_owner(
+        &self,
+        project_id: &str,
+        new_node_name: &str,
+        new_address: &str,
+        expected_current_node: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<bool, MetaError> {
+        if let Some(expected) = expected_current_node {
+            let affected = db_exec!(
+                self,
+                SQL_REASSIGN_PROJECT_OWNER_CAS,
+                new_node_name,
+                new_address,
+                updated_at_ms,
+                project_id,
+                expected,
+            );
+            Ok(affected > 0)
+        } else {
+            self.set_project_owner(project_id, new_node_name, new_address, updated_at_ms)
+                .await?;
+            Ok(true)
+        }
+    }
+
+    pub async fn register_writer_node(&self, node: &WriterNode) -> Result<(), MetaError> {
+        db_exec!(
+            self,
+            SQL_UPSERT_WRITER_NODE,
+            &node.node_name,
+            &node.address,
+            &node.role,
+            node.last_heartbeat_ms,
+            node.updated_at_ms,
+        );
+        db_exec!(
+            self,
+            SQL_SYNC_PROJECT_OWNER_ADDRESS,
+            &node.address,
+            node.updated_at_ms,
+            &node.node_name,
+            &node.address,
+        );
+        Ok(())
+    }
+
+    pub async fn heartbeat_writer_node(
+        &self,
+        node_name: &str,
+        now_ms: i64,
+    ) -> Result<bool, MetaError> {
+        let affected = db_exec!(self, SQL_HEARTBEAT_WRITER_NODE, now_ms, now_ms, node_name,);
+        Ok(affected > 0)
+    }
+
+    pub async fn deregister_writer_node(&self, node_name: &str) -> Result<bool, MetaError> {
+        let affected = db_exec!(self, SQL_DEREGISTER_WRITER_NODE, node_name);
+        Ok(affected > 0)
+    }
+
+    pub async fn list_healthy_writer_nodes(
+        &self,
+        now_ms: i64,
+        stale_after_ms: i64,
+    ) -> Result<Vec<WriterNode>, MetaError> {
+        let cutoff = now_ms.saturating_sub(stale_after_ms.max(0));
+        Ok(db_map_all!(
+            self,
+            SQL_LIST_HEALTHY_WRITER_NODES,
+            |r| {
+                WriterNode {
+                    node_name: r.get("node_name"),
+                    address: r.get("address"),
+                    role: r.get("role"),
+                    last_heartbeat_ms: r.get("last_heartbeat_ms"),
+                    updated_at_ms: r.get("updated_at_ms"),
+                }
+            },
+            cutoff,
+        ))
+    }
+
+    pub async fn list_node_loads(
+        &self,
+        now_ms: i64,
+        stale_after_ms: i64,
+    ) -> Result<Vec<NodeLoad>, MetaError> {
+        let cutoff = now_ms.saturating_sub(stale_after_ms.max(0));
+        Ok(db_map_all!(
+            self,
+            SQL_LIST_NODE_LOADS,
+            |r| {
+                NodeLoad {
+                    node_name: r.get("node_name"),
+                    address: r.get("address"),
+                    role: r.get("role"),
+                    last_heartbeat_ms: r.get("last_heartbeat_ms"),
+                    project_count: r.get::<i64, _>("project_count").max(0) as u64,
+                }
+            },
+            cutoff,
+        ))
+    }
+
+    pub async fn place_project_on_node_if_unassigned(
+        &self,
+        project_id: &str,
+        node_name: &str,
+        address: &str,
+        now_ms: i64,
+    ) -> Result<Option<ProjectOwner>, MetaError> {
+        db_exec!(
+            self,
+            SQL_INSERT_PROJECT_OWNER_IF_UNASSIGNED,
+            project_id,
+            node_name,
+            address,
+            now_ms,
+        );
+        self.get_project_owner(project_id).await
+    }
+
+    pub async fn place_project_if_unassigned(
+        &self,
+        project_id: &str,
+        now_ms: i64,
+        stale_after_ms: i64,
+    ) -> Result<Option<ProjectOwner>, MetaError> {
+        for _attempt in 0..2 {
+            if let Some(existing) = self.get_project_owner(project_id).await? {
+                return Ok(Some(existing));
+            }
+            let loads = self.list_node_loads(now_ms, stale_after_ms).await?;
+            let Some(least) = loads.into_iter().next() else {
+                return Ok(None);
+            };
+            if let Some(winner) = self
+                .place_project_on_node_if_unassigned(
+                    project_id,
+                    &least.node_name,
+                    &least.address,
+                    now_ms,
+                )
+                .await?
+            {
+                return Ok(Some(winner));
+            }
+        }
+        self.get_project_owner(project_id).await
+    }
+
     /// Takes or renews `node_id`'s writer lease on a project. `Some(generation)` when the node
     /// holds it afterwards; the generation grows by one each time the holder changes.
     pub async fn acquire_writer_lease(
@@ -2580,29 +2887,119 @@ impl MetaStore {
         now_ms: i64,
         expires_at_ms: i64,
     ) -> Result<Option<u64>, MetaError> {
-        // A single statement, so two nodes racing for an expired lease cannot both win.
-        db_exec!(
-            self,
-            "INSERT INTO writer_leases (project_id, node_id, generation, expires_at_ms)
-             VALUES (?, ?, 1, ?)
-             ON CONFLICT(project_id) DO UPDATE SET
-                generation = CASE WHEN writer_leases.node_id = excluded.node_id
-                    THEN writer_leases.generation ELSE writer_leases.generation + 1 END,
-                node_id = excluded.node_id,
-                expires_at_ms = excluded.expires_at_ms
-             WHERE writer_leases.node_id = excluded.node_id OR writer_leases.expires_at_ms < ?",
-            project_id,
-            node_id,
-            expires_at_ms,
-            now_ms,
-        );
-        Ok(db_map_opt!(
-            self,
-            "SELECT generation FROM writer_leases WHERE project_id = ? AND node_id = ?",
-            |r| { r.get::<i64, _>("generation") as u64 },
-            project_id,
-            node_id,
-        ))
+        match self
+            .acquire_writer_lease_checked(project_id, node_id, None, now_ms, expires_at_ms)
+            .await?
+        {
+            LeaseAcquireOutcome::Acquired(gen) => Ok(Some(gen)),
+            LeaseAcquireOutcome::HeldByOther | LeaseAcquireOutcome::NotOwner { .. } => Ok(None),
+        }
+    }
+
+    /// Transactionally verifies `project_owner` ownership before and after acquiring/renewing
+    /// `writer_leases` so a non-owner can never insert or renew a lease row.
+    pub async fn acquire_writer_lease_checked(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        owner_node_name: Option<&str>,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<LeaseAcquireOutcome, MetaError> {
+        let owner_node_name = owner_node_name.map(str::trim).filter(|s| !s.is_empty());
+        match self {
+            MetaStore::Sqlite(pool) => {
+                // Use BEGIN IMMEDIATE so SQLite acquires the write lock up front and honors
+                // busy_timeout instead of failing mid-transaction with SQLITE_BUSY_SNAPSHOT (517)
+                // when upgrading a deferred read snapshot under concurrent writes.
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                let pre_owner = sqlx::query(SQL_SELECT_PROJECT_OWNER)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| project_owner_from_row(&r));
+                if let Err(outcome) = owner_permitted(pre_owner.as_ref(), owner_node_name) {
+                    tx.rollback().await?;
+                    return Ok(outcome);
+                }
+
+                sqlx::query(SQL_UPSERT_WRITER_LEASE)
+                    .bind(project_id)
+                    .bind(node_id)
+                    .bind(expires_at_ms)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await?;
+
+                let post_owner = sqlx::query(SQL_SELECT_PROJECT_OWNER)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| project_owner_from_row(&r));
+                if let Err(outcome) = owner_permitted(post_owner.as_ref(), owner_node_name) {
+                    tx.rollback().await?;
+                    return Ok(outcome);
+                }
+
+                let gen_opt = sqlx::query(SQL_SELECT_WRITER_LEASE_GEN)
+                    .bind(project_id)
+                    .bind(node_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.get::<i64, _>("generation") as u64);
+                tx.commit().await?;
+                Ok(match gen_opt {
+                    Some(gen) => LeaseAcquireOutcome::Acquired(gen),
+                    None => LeaseAcquireOutcome::HeldByOther,
+                })
+            }
+            MetaStore::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let q_owner = pg_rewrite(SQL_SELECT_PROJECT_OWNER);
+                let q_upsert = pg_rewrite(SQL_UPSERT_WRITER_LEASE);
+                let q_gen = pg_rewrite(SQL_SELECT_WRITER_LEASE_GEN);
+
+                let pre_owner = sqlx::query(&q_owner)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| project_owner_from_row(&r));
+                if let Err(outcome) = owner_permitted(pre_owner.as_ref(), owner_node_name) {
+                    tx.rollback().await?;
+                    return Ok(outcome);
+                }
+
+                sqlx::query(&q_upsert)
+                    .bind(project_id)
+                    .bind(node_id)
+                    .bind(expires_at_ms)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await?;
+
+                let post_owner = sqlx::query(&q_owner)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| project_owner_from_row(&r));
+                if let Err(outcome) = owner_permitted(post_owner.as_ref(), owner_node_name) {
+                    tx.rollback().await?;
+                    return Ok(outcome);
+                }
+
+                let gen_opt = sqlx::query(&q_gen)
+                    .bind(project_id)
+                    .bind(node_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.get::<i64, _>("generation") as u64);
+                tx.commit().await?;
+                Ok(match gen_opt {
+                    Some(gen) => LeaseAcquireOutcome::Acquired(gen),
+                    None => LeaseAcquireOutcome::HeldByOther,
+                })
+            }
+        }
     }
 
     /// Expires every lease `node_id` holds so another node can take over at once.
@@ -2615,10 +3012,53 @@ impl MetaStore {
     }
 }
 
+/// Ownership checker backed by the `project_owner` table in [`MetaStore`].
+#[derive(Clone)]
+pub struct DbProjectOwnerChecker {
+    meta: MetaStore,
+    node_name: Option<String>,
+}
+
+impl DbProjectOwnerChecker {
+    pub fn new(meta: MetaStore, node_name: Option<String>) -> Self {
+        Self {
+            meta,
+            node_name: normalize_optional_node_name(node_name),
+        }
+    }
+
+    pub fn node_name(&self) -> Option<&str> {
+        self.node_name.as_deref()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectOwnerChecker for DbProjectOwnerChecker {
+    async fn check_owner(&self, project_id: &str) -> std::result::Result<OwnerCheck, String> {
+        let owner = self
+            .meta
+            .get_project_owner(project_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(match (owner, self.node_name.as_deref()) {
+            (Some(row), Some(me)) if row.node_name == me => OwnerCheck::Owned,
+            (Some(row), _) => OwnerCheck::NotOwner(ProjectOwnerInfo {
+                project_id: row.project_id,
+                node_name: row.node_name,
+                address: row.address,
+                updated_at_ms: row.updated_at_ms,
+            }),
+            (None, Some(_)) => OwnerCheck::Unassigned,
+            (None, None) => OwnerCheck::Owned,
+        })
+    }
+}
+
 /// Writer leases kept in the metadata database, shared by every node of a deployment.
 pub struct DbWriterLeases {
     meta: MetaStore,
     node_id: String,
+    node_name: Option<String>,
     ttl: std::time::Duration,
 }
 
@@ -2626,6 +3066,12 @@ impl DbWriterLeases {
     /// `PULSE_WRITER_LEASE_TTL_SECS` (default 15, minimum 3) sets how long a dead writer blocks
     /// a takeover. Node clocks must agree to within a third of it.
     pub fn from_env(meta: MetaStore) -> Self {
+        Self::from_env_with_node(meta, None)
+    }
+
+    /// Creates a [`DbWriterLeases`] tied to an optional stable `node_name` (`PULSE_NODE_NAME`).
+    /// `node_id` remains ephemeral per process so crash-restarts still fence via lease TTL.
+    pub fn from_env_with_node(meta: MetaStore, node_name: Option<String>) -> Self {
         let ttl_secs = std::env::var("PULSE_WRITER_LEASE_TTL_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -2636,8 +3082,13 @@ impl DbWriterLeases {
             // Per process, never reused: a restarted node is a new holder and waits out its
             // old lease unless it released it on a clean shutdown.
             node_id: uuid::Uuid::new_v4().simple().to_string(),
+            node_name: normalize_optional_node_name(node_name),
             ttl: std::time::Duration::from_secs(ttl_secs),
         }
+    }
+
+    pub fn node_name(&self) -> Option<&str> {
+        self.node_name.as_deref()
     }
 
     pub async fn release_all(&self) -> Result<u64, MetaError> {
@@ -2648,11 +3099,22 @@ impl DbWriterLeases {
 #[async_trait::async_trait]
 impl pulse_storage::WriterLeases for DbWriterLeases {
     async fn acquire(&self, project_id: &str) -> std::result::Result<Option<u64>, String> {
+        match self.acquire_checked(project_id).await? {
+            LeaseAcquireOutcome::Acquired(gen) => Ok(Some(gen)),
+            LeaseAcquireOutcome::HeldByOther | LeaseAcquireOutcome::NotOwner { .. } => Ok(None),
+        }
+    }
+
+    async fn acquire_checked(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<LeaseAcquireOutcome, String> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.meta
-            .acquire_writer_lease(
+            .acquire_writer_lease_checked(
                 project_id,
                 &self.node_id,
+                self.node_name.as_deref(),
                 now_ms,
                 now_ms + self.ttl.as_millis() as i64,
             )
@@ -2748,5 +3210,394 @@ mod writer_lease_tests {
         let audit = meta.list_deletion_audit("proj_a").await.unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].id, "del_1");
+    }
+
+    #[tokio::test]
+    async fn project_owner_and_writer_nodes_crud_and_address_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+
+        let n_a = WriterNode {
+            node_name: "node-a".into(),
+            address: "http://10.0.0.1:8080".into(),
+            role: "all".into(),
+            last_heartbeat_ms: 10_000,
+            updated_at_ms: 10_000,
+        };
+        let n_b = WriterNode {
+            node_name: "node-b".into(),
+            address: "http://10.0.0.2:8080".into(),
+            role: "ingest".into(),
+            last_heartbeat_ms: 10_000,
+            updated_at_ms: 10_000,
+        };
+        let n_q = WriterNode {
+            node_name: "node-q".into(),
+            address: "http://10.0.0.3:8080".into(),
+            role: "query".into(),
+            last_heartbeat_ms: 10_000,
+            updated_at_ms: 10_000,
+        };
+        let n_stale = WriterNode {
+            node_name: "node-stale".into(),
+            address: "http://10.0.0.4:8080".into(),
+            role: "storage".into(),
+            last_heartbeat_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        for n in [&n_a, &n_b, &n_q, &n_stale] {
+            meta.register_writer_node(n).await.unwrap();
+        }
+
+        let healthy = meta.list_healthy_writer_nodes(10_500, 5_000).await.unwrap();
+        let healthy_names: Vec<_> = healthy.iter().map(|n| n.node_name.as_str()).collect();
+        assert_eq!(healthy_names, vec!["node-a", "node-b"]);
+
+        assert!(meta
+            .heartbeat_writer_node("node-stale", 10_400)
+            .await
+            .unwrap());
+        assert!(!meta
+            .heartbeat_writer_node("missing-node", 10_400)
+            .await
+            .unwrap());
+        let healthy_after_hb = meta.list_healthy_writer_nodes(10_500, 5_000).await.unwrap();
+        assert_eq!(healthy_after_hb.len(), 3);
+
+        let po = meta
+            .set_project_owner("proj_1", "node-a", "http://10.0.0.1:8080", 11_000)
+            .await
+            .unwrap();
+        assert_eq!(meta.get_project_owner("proj_1").await.unwrap(), Some(po));
+
+        // Node restart at a new address updates writer_nodes AND project_owner.address.
+        meta.register_writer_node(&WriterNode {
+            node_name: "node-a".into(),
+            address: "http://10.0.0.99:9090".into(),
+            role: "all".into(),
+            last_heartbeat_ms: 12_000,
+            updated_at_ms: 12_000,
+        })
+        .await
+        .unwrap();
+        let synced = meta.get_project_owner("proj_1").await.unwrap().unwrap();
+        assert_eq!(synced.address, "http://10.0.0.99:9090");
+        assert_eq!(synced.updated_at_ms, 12_000);
+
+        // CAS reassign checks expected_current_node.
+        assert!(!meta
+            .reassign_project_owner(
+                "proj_1",
+                "node-b",
+                "http://10.0.0.2:8080",
+                Some("node-stale"),
+                13_000
+            )
+            .await
+            .unwrap());
+        assert!(meta
+            .reassign_project_owner(
+                "proj_1",
+                "node-b",
+                "http://10.0.0.2:8080",
+                Some("node-a"),
+                13_000
+            )
+            .await
+            .unwrap());
+        assert_eq!(meta.list_owned_projects("node-a").await.unwrap().len(), 0);
+        assert_eq!(meta.list_owned_projects("node-b").await.unwrap().len(), 1);
+
+        // Deregistering removes writer_nodes entry without deleting project_owner rows.
+        assert!(meta.deregister_writer_node("node-b").await.unwrap());
+        assert!(!meta.deregister_writer_node("node-b").await.unwrap());
+        assert_eq!(
+            meta.get_project_owner("proj_1")
+                .await
+                .unwrap()
+                .unwrap()
+                .node_name,
+            "node-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn least_loaded_placement_and_concurrent_race_is_conflict_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+
+        // Empty writer_nodes returns Ok(None).
+        assert!(meta
+            .place_project_if_unassigned("proj_empty", 1_000, 5_000)
+            .await
+            .unwrap()
+            .is_none());
+
+        for (name, addr, hb) in [
+            ("node-b", "http://127.0.0.1:8082", 10_000),
+            ("node-a", "http://127.0.0.1:8081", 10_000),
+            ("node-c", "http://127.0.0.1:8083", 1_000), // stale
+        ] {
+            meta.register_writer_node(&WriterNode {
+                node_name: name.into(),
+                address: addr.into(),
+                role: "all".into(),
+                last_heartbeat_ms: hb,
+                updated_at_ms: hb,
+            })
+            .await
+            .unwrap();
+        }
+
+        // COUNT(po.project_id) must report 0 for nodes owning zero projects, deterministic tie-break by node_name.
+        let loads0 = meta.list_node_loads(10_500, 5_000).await.unwrap();
+        assert_eq!(loads0.len(), 2);
+        assert_eq!(loads0[0].node_name, "node-a");
+        assert_eq!(loads0[0].project_count, 0);
+        assert_eq!(loads0[1].node_name, "node-b");
+        assert_eq!(loads0[1].project_count, 0);
+
+        let p1 = meta
+            .place_project_if_unassigned("proj_1", 10_500, 5_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p1.node_name, "node-a");
+        let p2 = meta
+            .place_project_if_unassigned("proj_2", 10_500, 5_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p2.node_name, "node-b");
+        let p3 = meta
+            .place_project_if_unassigned("proj_3", 10_500, 5_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p3.node_name, "node-a");
+
+        // Concurrent placement race on the same project must yield one identical winner.
+        let (r1, r2, r3, r4) = tokio::join!(
+            meta.place_project_if_unassigned("proj_race", 10_500, 5_000),
+            meta.place_project_if_unassigned("proj_race", 10_500, 5_000),
+            meta.place_project_if_unassigned("proj_race", 10_500, 5_000),
+            meta.place_project_if_unassigned("proj_race", 10_500, 5_000),
+        );
+        let winners: Vec<ProjectOwner> = [r1, r2, r3, r4]
+            .into_iter()
+            .map(|r| r.unwrap().unwrap())
+            .collect();
+        for w in &winners[1..] {
+            assert_eq!(w, &winners[0]);
+        }
+        assert_eq!(winners[0].node_name, "node-b");
+    }
+
+    #[test]
+    fn pg_rewrite_rewrites_all_project_owner_and_writer_node_queries_cleanly() {
+        let queries = [
+            SQL_SELECT_PROJECT_OWNER,
+            SQL_LIST_PROJECT_OWNERS,
+            SQL_LIST_OWNED_PROJECTS,
+            SQL_UPSERT_PROJECT_OWNER,
+            SQL_INSERT_PROJECT_OWNER_IF_UNASSIGNED,
+            SQL_REASSIGN_PROJECT_OWNER_CAS,
+            SQL_SYNC_PROJECT_OWNER_ADDRESS,
+            SQL_UPSERT_WRITER_NODE,
+            SQL_HEARTBEAT_WRITER_NODE,
+            SQL_DEREGISTER_WRITER_NODE,
+            SQL_LIST_HEALTHY_WRITER_NODES,
+            SQL_LIST_NODE_LOADS,
+            SQL_UPSERT_WRITER_LEASE,
+            SQL_SELECT_WRITER_LEASE_GEN,
+        ];
+        for sql in queries {
+            let rewritten = pg_rewrite(sql);
+            assert!(
+                !rewritten.contains('?'),
+                "residual '?' in pg_rewrite({sql}) -> {rewritten}"
+            );
+            let q_count = sql.matches('?').count();
+            for i in 1..=q_count {
+                assert!(
+                    rewritten.contains(&format!("${i}")),
+                    "missing ${i} in {rewritten}"
+                );
+            }
+        }
+        let healthy_pg = pg_rewrite(SQL_LIST_HEALTHY_WRITER_NODES);
+        assert!(healthy_pg.contains("WHERE role IN ('all', 'ingest', 'storage')"));
+        assert!(healthy_pg.contains("AND last_heartbeat_ms >= $1"));
+        let loads_pg = pg_rewrite(SQL_LIST_NODE_LOADS);
+        assert!(loads_pg.contains("LEFT JOIN project_owner po ON po.node_name = wn.node_name"));
+        assert!(
+            loads_pg.contains("GROUP BY wn.node_name, wn.address, wn.role, wn.last_heartbeat_ms")
+        );
+        assert!(loads_pg.contains("ORDER BY COUNT(po.project_id) ASC, wn.node_name ASC"));
+    }
+
+    #[tokio::test]
+    async fn writer_leases_and_owner_checker_enforce_project_owner() {
+        use pulse_storage::WriterLeases;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+
+        let leases_a = DbWriterLeases::from_env_with_node(meta.clone(), Some("node-a".into()));
+        let leases_b = DbWriterLeases::from_env_with_node(meta.clone(), Some("node-b".into()));
+        let leases_anon = DbWriterLeases::from_env(meta.clone());
+
+        // Multi-node mode: unassigned project cannot be acquired.
+        assert_eq!(
+            leases_a.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::NotOwner {
+                owner_node: None,
+                owner_address: None,
+            }
+        );
+
+        // Unconfigured single-node mode: unassigned project can still acquire lease.
+        assert_eq!(
+            leases_anon.acquire_checked("p_legacy").await.unwrap(),
+            LeaseAcquireOutcome::Acquired(1)
+        );
+        leases_anon.release_all().await.unwrap();
+
+        // Assign p_owned to node-b.
+        meta.set_project_owner("p_owned", "node-b", "http://node-b:8080", 1_000)
+            .await
+            .unwrap();
+
+        // node-a and unconfigured node are both refused without touching writer_leases.
+        assert_eq!(
+            leases_a.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::NotOwner {
+                owner_node: Some("node-b".into()),
+                owner_address: Some("http://node-b:8080".into()),
+            }
+        );
+        assert_eq!(
+            leases_anon.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::NotOwner {
+                owner_node: Some("node-b".into()),
+                owner_address: Some("http://node-b:8080".into()),
+            }
+        );
+        // node-b acquires normally.
+        assert_eq!(
+            leases_b.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::Acquired(1)
+        );
+
+        // Checker semantics:
+        let checker_a = DbProjectOwnerChecker::new(meta.clone(), Some("node-a".into()));
+        let checker_b = DbProjectOwnerChecker::new(meta.clone(), Some("node-b".into()));
+        let checker_anon = DbProjectOwnerChecker::new(meta.clone(), None);
+
+        assert!(matches!(
+            checker_a.check_owner("p_owned").await.unwrap(),
+            OwnerCheck::NotOwner(info) if info.node_name == "node-b"
+        ));
+        assert_eq!(
+            checker_b.check_owner("p_owned").await.unwrap(),
+            OwnerCheck::Owned
+        );
+        assert_eq!(
+            checker_a.check_owner("p_missing").await.unwrap(),
+            OwnerCheck::Unassigned
+        );
+        assert_eq!(
+            checker_anon.check_owner("p_missing").await.unwrap(),
+            OwnerCheck::Owned
+        );
+        assert!(matches!(
+            checker_anon.check_owner("p_owned").await.unwrap(),
+            OwnerCheck::NotOwner(info) if info.node_name == "node-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquire_writer_lease_checked_concurrent_sqlite_writes_never_hit_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        let meta_writer = MetaStore::connect_auto(dir.path()).await.unwrap();
+        assert!(meta.is_sqlite());
+
+        meta.register_writer_node(&WriterNode {
+            node_name: "node-a".into(),
+            address: "http://127.0.0.1:8081".into(),
+            role: "all".into(),
+            last_heartbeat_ms: 1_000,
+            updated_at_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        for idx in 0..4 {
+            meta.set_project_owner(
+                &format!("proj_stress_{idx}"),
+                "node-a",
+                "http://127.0.0.1:8081",
+                1_000,
+            )
+            .await
+            .unwrap();
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bg_stop = stop.clone();
+        let bg_meta = meta_writer.clone();
+        let bg_handle = tokio::spawn(async move {
+            let mut tick = 2_000i64;
+            while !bg_stop.load(std::sync::atomic::Ordering::Acquire) {
+                bg_meta
+                    .register_writer_node(&WriterNode {
+                        node_name: "node-a".into(),
+                        address: "http://127.0.0.1:8081".into(),
+                        role: "all".into(),
+                        last_heartbeat_ms: tick,
+                        updated_at_ms: tick,
+                    })
+                    .await
+                    .unwrap();
+                let _ = bg_meta
+                    .heartbeat_writer_node("node-a", tick + 1)
+                    .await
+                    .unwrap();
+                tick += 2;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut handles = Vec::with_capacity(240);
+        for i in 0..240 {
+            let m = if i % 2 == 0 {
+                meta.clone()
+            } else {
+                meta_writer.clone()
+            };
+            handles.push(tokio::spawn(async move {
+                let pid = format!("proj_stress_{}", i % 4);
+                let now_ms = 10_000 + i as i64;
+                m.acquire_writer_lease_checked(
+                    &pid,
+                    "holder-a",
+                    Some("node-a"),
+                    now_ms,
+                    now_ms + 15_000,
+                )
+                .await
+            }));
+        }
+
+        for h in handles {
+            let outcome = h
+                .await
+                .unwrap()
+                .expect("acquire_writer_lease_checked must not fail with SQLITE_BUSY");
+            assert!(matches!(outcome, LeaseAcquireOutcome::Acquired(_)));
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        bg_handle.await.unwrap();
     }
 }

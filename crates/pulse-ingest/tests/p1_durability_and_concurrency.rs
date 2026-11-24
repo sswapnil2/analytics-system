@@ -2349,3 +2349,195 @@ async fn w2_quic_error_codes_for_identify_and_replay() {
     endpoint.wait_idle().await;
     ingest.shutdown().await;
 }
+
+#[tokio::test]
+async fn w1_fenced_not_writer_recovers_after_ownership_reacquired() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pulse_ingest::{build_ingest_router, IdentifyRequest};
+    use tower::ServiceExt;
+
+    #[derive(Debug)]
+    struct ReacquireLeases {
+        ttl: Duration,
+        fenced_away: AtomicBool,
+        generation: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl pulse_storage::WriterLeases for ReacquireLeases {
+        async fn acquire(&self, _project_id: &str) -> std::result::Result<Option<u64>, String> {
+            if self.fenced_away.load(Ordering::SeqCst) {
+                Ok(None)
+            } else {
+                Ok(Some(self.generation.load(Ordering::SeqCst)))
+            }
+        }
+
+        fn ttl(&self) -> Duration {
+            self.ttl
+        }
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let id_router = Arc::new(IdentityRouter::new(store.clone()));
+    let storage = StorageEngine::new(
+        StorageConfig {
+            num_buckets: 4,
+            l0_flush_row_threshold: 1000,
+            l0_flush_max_age: Duration::from_secs(60),
+            compaction_min_segments: 4,
+        },
+        store,
+        id_router,
+    );
+    let leases = Arc::new(ReacquireLeases {
+        ttl: Duration::from_secs(30),
+        fenced_away: AtomicBool::new(false),
+        generation: std::sync::atomic::AtomicU64::new(1),
+    });
+    storage.set_writer_leases(leases.clone());
+
+    let gov = InMemoryGovernance::new();
+    gov.register_api_key("pk_rebind", "proj_rebind");
+    let ingest = IngestService::new(storage.clone(), gov);
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5, 128);
+    let app = build_ingest_router(ingest.clone());
+
+    // 1) Initial batch succeeds and opens ps1 (gen 1).
+    let b1 = WireBatch::new(vec![make_event(1, "s1", "u1", 1_762_000_000_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_rebind")
+                .body(Body::from(b1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    ingest.flush_all().await.unwrap();
+    let ps1 = storage.get_project("proj_rebind").unwrap();
+
+    // 2) Keep ps1 in buffer target, then fence ps1 while queuing b2 -> flusher hits NotWriter { fenced: true }.
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5_000, 64 * 1024);
+    let b2 = WireBatch::new(vec![make_event(2, "s1", "u2", 1_762_000_001_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_rebind")
+                .body(Body::from(b2))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    // Fence away from this node!
+    leases.fenced_away.store(true, Ordering::SeqCst);
+    storage.renew_writer_leases().await;
+    assert!(ps1.is_fenced());
+
+    // Trigger explicit flush_project_buffer which hits fenced ps1 -> WaitIndefinite + 503 not_writer.
+    let err = ingest
+        .flush_project_buffer("proj_rebind")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        pulse_ingest::IngestError::Storage(pulse_storage::StorageError::NotWriter { .. })
+    ));
+
+    // Subsequent ingest while still fenced returns 503 not_writer.
+    let b_fail = WireBatch::new(vec![make_event(3, "s1", "u3", 1_762_000_002_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r_fail = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_rebind")
+                .body(Body::from(b_fail))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_fail.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 3) Re-acquire ownership at generation 2 -> new /v1/ingest rebinds ProjectBuffer & drains b2 + b3!
+    leases.generation.store(2, Ordering::SeqCst);
+    leases.fenced_away.store(false, Ordering::SeqCst);
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5, 128);
+
+    let b3 = WireBatch::new(vec![make_event(4, "s1", "u4", 1_762_000_003_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_rebind")
+                .body(Body::from(b3))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+
+    ingest.flush_all().await.unwrap();
+    assert_eq!(ingest.buffer_stats().buffer_bytes, 0);
+    let ps2 = storage.get_project("proj_rebind").unwrap();
+    assert!(!Arc::ptr_eq(&ps1, &ps2));
+
+    // 4) Also verify sync identify_for_project recovers after fenced NotWriter -> re-acquire!
+    ingest.set_buffer_limits_for_test(64 * 1024, 64 * 1024, 5_000, 64 * 1024);
+    let b4 = WireBatch::new(vec![make_event(5, "s1", "u5", 1_762_000_004_000)])
+        .encode_binary(1)
+        .unwrap();
+    let r4 = app
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("x-pulse-key", "pk_rebind")
+                .body(Body::from(b4))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+
+    leases.fenced_away.store(true, Ordering::SeqCst);
+    storage.renew_writer_leases().await;
+    assert!(ingest.flush_project_buffer("proj_rebind").await.is_err());
+
+    leases.generation.store(3, Ordering::SeqCst);
+    leases.fenced_away.store(false, Ordering::SeqCst);
+    ingest
+        .identify_for_project(
+            "proj_rebind",
+            IdentifyRequest {
+                anon_id: "anon_rebind".into(),
+                user_id: "u5".into(),
+                anon_routing_seed: None,
+                routing_seed: None,
+                user_properties: None,
+                operations: None,
+            },
+        )
+        .await
+        .expect("identify_for_project must rebind fenced buffer and drain cleanly");
+
+    ingest.flush_all().await.unwrap();
+    let ps3 = storage.open_for_read("proj_rebind").await.unwrap();
+    assert_eq!(ps3.total_l0_rows(), 4);
+    assert_eq!(ingest.buffer_stats().buffer_bytes, 0);
+
+    tokio::time::timeout(Duration::from_secs(2), ingest.shutdown())
+        .await
+        .expect("IngestService::shutdown hung after rebind recovery");
+}

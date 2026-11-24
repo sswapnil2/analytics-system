@@ -262,6 +262,11 @@ enum StoredWalFailure {
         project_id: String,
         fenced: bool,
     },
+    NotOwner {
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    },
     StaleWriter {
         project_id: String,
         pub_seq: u64,
@@ -278,6 +283,15 @@ impl StoredWalFailure {
             StorageError::NotWriter { project_id } => Self::NotWriter {
                 project_id: project_id.clone(),
                 fenced,
+            },
+            StorageError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => Self::NotOwner {
+                project_id: project_id.clone(),
+                owner_node: owner_node.clone(),
+                owner_address: owner_address.clone(),
             },
             StorageError::StaleWriter {
                 project_id,
@@ -299,7 +313,7 @@ impl StoredWalFailure {
     fn is_fenced(&self) -> bool {
         match self {
             Self::NotWriter { fenced, .. } => *fenced,
-            Self::StaleWriter { .. } => true,
+            Self::NotOwner { .. } | Self::StaleWriter { .. } => true,
             Self::Io(_) => false,
         }
     }
@@ -308,6 +322,15 @@ impl StoredWalFailure {
         match self {
             Self::NotWriter { project_id, .. } => IngestError::Storage(StorageError::NotWriter {
                 project_id: project_id.clone(),
+            }),
+            Self::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => IngestError::Storage(StorageError::NotOwner {
+                project_id: project_id.clone(),
+                owner_node: owner_node.clone(),
+                owner_address: owner_address.clone(),
             }),
             Self::StaleWriter {
                 project_id,
@@ -330,14 +353,13 @@ impl StoredWalFailure {
 }
 
 struct BufferedBatch {
-    ps: Arc<pulse_storage::ProjectStorage>,
-    processor: RecordSenders,
     server_now_ms: i64,
     events: Vec<Candidate>,
     bytes: usize,
 }
 
 struct ProjectBufferState {
+    target: Option<(Arc<pulse_storage::ProjectStorage>, RecordSenders)>,
     buckets: Vec<VecDeque<BufferedBatch>>,
     reserved_bytes: usize,
     buffered_bytes: usize,
@@ -367,6 +389,7 @@ impl ProjectBuffer {
         Arc::new(Self {
             project_id,
             state: Mutex::new(ProjectBufferState {
+                target: None,
                 buckets: (0..num_buckets).map(|_| VecDeque::new()).collect(),
                 reserved_bytes: 0,
                 buffered_bytes: 0,
@@ -497,14 +520,15 @@ impl BufferReservation {
         let mut should_wake = false;
         {
             let mut st = self.proj_buf.state.lock();
+            if !ps.is_fenced() && st.target.as_ref().is_none_or(|(cur, _)| cur.is_fenced()) {
+                st.target = Some((ps.clone(), processor.clone()));
+            }
             if st.buckets.len() < num_buckets {
                 st.buckets.resize_with(num_buckets, VecDeque::new);
             }
             st.reserved_bytes = st.reserved_bytes.saturating_sub(self.reserved_bytes);
             for (bucket_id, (events, bytes)) in by_bucket {
                 st.buckets[bucket_id as usize].push_back(BufferedBatch {
-                    ps: ps.clone(),
-                    processor: processor.clone(),
                     server_now_ms,
                     events,
                     bytes,
@@ -552,6 +576,16 @@ fn spawn_processor(
                 // it was acknowledged. The only failure is the object store refusing a
                 // dead-letter write.
                 while let Err(e) = apply_record(&ps, &id_graph, &rec).await {
+                    if ps.is_fenced() {
+                        tracing::warn!(
+                            project_id = %ps.project_id(),
+                            bucket_id = rec.bucket_id,
+                            wal_seq = rec.wal_seq,
+                            error = %e,
+                            "processor stopping because ProjectStorage was fenced"
+                        );
+                        return;
+                    }
                     tracing::error!(
                         project_id = %ps.project_id(),
                         bucket_id = rec.bucket_id,
@@ -764,6 +798,35 @@ impl IngestService {
             .store(flush_bytes.max(1), Ordering::Relaxed);
     }
 
+    async fn rebind_project_buffer(
+        &self,
+        project_id: &str,
+        ps: &Arc<pulse_storage::ProjectStorage>,
+    ) -> Result<RecordSenders> {
+        let processor = self.processor_for(project_id, ps).await?;
+        if let Some(pb) = self.buffer.projects.get(project_id) {
+            let mut should_wake = false;
+            {
+                let mut st = pb.state.lock();
+                if st
+                    .target
+                    .as_ref()
+                    .is_none_or(|(cur, _)| !Arc::ptr_eq(cur, ps))
+                {
+                    st.target = Some((ps.clone(), processor.clone()));
+                    st.wal_error = None;
+                    st.retry_backoff_ms = 0;
+                    st.next_retry_at = tokio::time::Instant::now();
+                    should_wake = st.buffered_batches > 0;
+                }
+            }
+            if should_wake {
+                pb.wake_flusher.notify_one();
+            }
+        }
+        Ok(processor)
+    }
+
     async fn ensure_project_ready(
         &self,
         project_id: &str,
@@ -774,6 +837,9 @@ impl IngestService {
         let recovered = ps.take_recovered_uuid_fps();
         if !recovered.is_empty() {
             self.dedup.seed_recovered(project_id, &recovered, now_ms);
+        }
+        if self.buffer.projects.contains_key(project_id) {
+            let _ = self.rebind_project_buffer(project_id, &ps).await?;
         }
         Ok(ps)
     }
@@ -892,6 +958,14 @@ impl IngestService {
         let Some(proj_buf) = self.buffer.projects.get(project_id).map(|e| e.clone()) else {
             return Ok(());
         };
+        let try_rebind = {
+            let st = proj_buf.state.lock();
+            !st.shutting_down && st.wal_error.as_ref().is_some_and(|e| e.is_fenced())
+        };
+        if try_rebind {
+            self.ensure_project_ready(project_id, Utc::now().timestamp_millis())
+                .await?;
+        }
         let mut target_seq = {
             let mut st = proj_buf.state.lock();
             if st.buffered_batches == 0 {
@@ -978,6 +1052,7 @@ impl IngestService {
             {
                 let mut st = pb.state.lock();
                 st.shutting_down = true;
+                st.target = None;
             }
             pb.wake_flusher.notify_one();
             let handle = pb.flusher_handle.lock().take();
@@ -1806,6 +1881,7 @@ async fn project_flusher_loop(
         let action = {
             let mut st = proj_buf.state.lock();
             if st.shutting_down && (st.buffered_batches == 0 || st.wal_error.is_some()) {
+                st.target = None;
                 if st.buffered_batches > 0 {
                     let dropped_batches = st.buffered_batches;
                     let dropped_events = st.buffered_events;
@@ -1908,8 +1984,15 @@ async fn drain_project_buffer_once(
     let num_buckets = { proj_buf.state.lock().buckets.len() };
     for b_idx in 0..num_buckets {
         loop {
-            let slice: Vec<BufferedBatch> = {
+            let popped: Option<(
+                Arc<pulse_storage::ProjectStorage>,
+                RecordSenders,
+                Vec<BufferedBatch>,
+            )> = {
                 let mut st = proj_buf.state.lock();
+                let Some((ps, processor)) = st.target.clone() else {
+                    return;
+                };
                 let Some(q) = st.buckets.get_mut(b_idx) else {
                     break;
                 };
@@ -1919,44 +2002,73 @@ async fn drain_project_buffer_once(
                 let mut out = Vec::new();
                 let mut slice_bytes = 0usize;
                 while let Some(front) = q.front() {
-                    if let Some(first) = out.first() as Option<&BufferedBatch> {
-                        if !Arc::ptr_eq(&first.ps, &front.ps) {
-                            break;
-                        }
-                        if slice_bytes + front.bytes > WAL_GROUP_MAX_BYTES {
-                            break;
-                        }
+                    if !out.is_empty() && slice_bytes + front.bytes > WAL_GROUP_MAX_BYTES {
+                        break;
                     }
                     slice_bytes += front.bytes;
                     if let Some(item) = q.pop_front() {
                         out.push(item);
                     }
                 }
-                out
+                if out.is_empty() {
+                    None
+                } else {
+                    Some((ps, processor, out))
+                }
             };
 
-            if slice.is_empty() {
+            let Some((ps, processor, slice)) = popped else {
                 break;
-            }
+            };
 
-            if let Err((err, slice)) =
-                flush_bucket_slice(svc, &proj_buf.project_id, b_idx as u8, slice).await
+            if let Err((err, slice)) = flush_bucket_slice(
+                svc,
+                &proj_buf.project_id,
+                b_idx as u8,
+                &ps,
+                &processor,
+                slice,
+            )
+            .await
             {
-                let fenced = slice.first().is_some_and(|b| b.ps.is_fenced());
-                let mut st = proj_buf.state.lock();
-                for item in slice.into_iter().rev() {
-                    st.buckets[b_idx].push_front(item);
+                let mut evict_ps = false;
+                {
+                    let mut st = proj_buf.state.lock();
+                    for item in slice.into_iter().rev() {
+                        st.buckets[b_idx].push_front(item);
+                    }
+                    if st
+                        .target
+                        .as_ref()
+                        .is_some_and(|(cur, _)| !Arc::ptr_eq(cur, &ps))
+                    {
+                        return;
+                    }
+                    let fenced = ps.is_fenced()
+                        || matches!(
+                            err,
+                            StorageError::NotOwner { .. } | StorageError::StaleWriter { .. }
+                        );
+                    st.wal_error = Some(StoredWalFailure::from_storage_err(&err, fenced));
+                    if fenced {
+                        st.target = None;
+                        evict_ps = true;
+                    }
+                    let next_ms = if st.retry_backoff_ms == 0 {
+                        20
+                    } else {
+                        (st.retry_backoff_ms * 2).min(1_000)
+                    };
+                    st.retry_backoff_ms = next_ms;
+                    st.next_retry_at = tokio::time::Instant::now() + Duration::from_millis(next_ms);
+                    st.flush_seq += 1;
+                    proj_buf.flush_done.notify_waiters();
                 }
-                st.wal_error = Some(StoredWalFailure::from_storage_err(&err, fenced));
-                let next_ms = if st.retry_backoff_ms == 0 {
-                    20
-                } else {
-                    (st.retry_backoff_ms * 2).min(1_000)
-                };
-                st.retry_backoff_ms = next_ms;
-                st.next_retry_at = tokio::time::Instant::now() + Duration::from_millis(next_ms);
-                st.flush_seq += 1;
-                proj_buf.flush_done.notify_waiters();
+                if evict_ps {
+                    svc.processors.remove_if(&proj_buf.project_id, |_, p| {
+                        Arc::ptr_eq(&p.ps, &ps) || p.ps.is_fenced()
+                    });
+                }
                 return;
             }
         }
@@ -1981,10 +2093,10 @@ async fn flush_bucket_slice(
     svc: &IngestService,
     project_id: &str,
     bucket_id: u8,
+    ps: &Arc<pulse_storage::ProjectStorage>,
+    processor: &RecordSenders,
     slice: Vec<BufferedBatch>,
 ) -> std::result::Result<(), (StorageError, Vec<BufferedBatch>)> {
-    let ps = slice[0].ps.clone();
-    let processor = slice[0].processor.clone();
     let append_guard = ps.lock_bucket_append(bucket_id).await;
 
     let mut seen_in_group: HashSet<u64> = HashSet::new();
@@ -2061,4 +2173,111 @@ async fn flush_bucket_slice(
         .fetch_sub(batch_len, Ordering::AcqRel);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use pulse_identity::IdentityRouter;
+    use pulse_storage::{OwnerCheck, ProjectOwnerChecker, ProjectOwnerInfo, StorageConfig};
+
+    struct FlipOwnerChecker {
+        owner: parking_lot::RwLock<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectOwnerChecker for FlipOwnerChecker {
+        async fn check_owner(&self, project_id: &str) -> std::result::Result<OwnerCheck, String> {
+            let owner = *self.owner.read();
+            if owner == "node-a" {
+                Ok(OwnerCheck::Owned)
+            } else {
+                Ok(OwnerCheck::NotOwner(ProjectOwnerInfo {
+                    project_id: project_id.to_string(),
+                    node_name: owner.to_string(),
+                    address: "http://node-b:8080".to_string(),
+                    updated_at_ms: 1,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_reservation_commit_does_not_overwrite_rebound_target_with_fenced_ps() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(IdentityRouter::new(store)),
+        );
+        let checker = Arc::new(FlipOwnerChecker {
+            owner: parking_lot::RwLock::new("node-a"),
+        });
+        engine.set_owner_checker(checker.clone());
+
+        let ps1 = engine.get_or_open_project("proj_race").await.unwrap();
+        // Fence ps1 via ownership transfer, then transfer back so engine opens a fresh ps2.
+        *checker.owner.write() = "node-b";
+        engine.reconcile_ownership().await;
+        assert!(ps1.is_fenced());
+
+        *checker.owner.write() = "node-a";
+        let ps2 = engine.get_or_open_project("proj_race").await.unwrap();
+        assert!(!ps2.is_fenced());
+        assert!(!Arc::ptr_eq(&ps1, &ps2));
+
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(1);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
+        let proc1: RecordSenders = Arc::new(vec![tx1]);
+        let proc2: RecordSenders = Arc::new(vec![tx2]);
+
+        let proj_buf = ProjectBuffer::new("proj_race".to_string(), 1);
+        proj_buf.state.lock().target = Some((ps2.clone(), proc2));
+
+        let res = BufferReservation {
+            proj_buf: proj_buf.clone(),
+            node_bytes: Arc::new(AtomicUsize::new(128)),
+            node_events: Arc::new(AtomicUsize::new(0)),
+            node_batches: Arc::new(AtomicUsize::new(0)),
+            flush_ms: 20,
+            flush_bytes: 1024,
+            reserved_bytes: 128,
+            committed: false,
+        };
+        let mut by_bucket = BTreeMap::new();
+        by_bucket.insert(
+            0u8,
+            (
+                vec![(
+                    WireEvent {
+                        event_uuid: WireEvent::deterministic_uuid("u1", "s1", "ev", 1_000, 1),
+                        routing_seed: "u1".to_string(),
+                        distinct_id: "u1".to_string(),
+                        session_id: "s1".to_string(),
+                        event_name: "ev".to_string(),
+                        client_event_ts_ms: 1_000,
+                        client_sent_ts_ms: 0,
+                        props: vec![],
+                        replay_offset_kb: 0,
+                    },
+                    42u64,
+                )],
+                128usize,
+            ),
+        );
+
+        res.commit(by_bucket, 1, &ps1, &proc1, 1_000);
+
+        let st = proj_buf.state.lock();
+        let (cur_ps, _) = st.target.as_ref().expect("target must remain bound");
+        assert!(
+            Arc::ptr_eq(cur_ps, &ps2),
+            "in-flight commit with fenced ps1 must not overwrite rebound ps2"
+        );
+    }
 }

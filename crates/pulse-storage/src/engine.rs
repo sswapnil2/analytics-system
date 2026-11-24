@@ -289,13 +289,67 @@ impl Drop for UploadInProgressGuard<'_> {
     }
 }
 
+/// Ownership record surfaced by [`ProjectOwnerChecker`] when a project is assigned to a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectOwnerInfo {
+    pub project_id: String,
+    pub node_name: String,
+    pub address: String,
+    pub updated_at_ms: i64,
+}
+
+/// Outcome of checking whether the local node owns `project_id` for writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerCheck {
+    /// This node owns the project (or single-node unconfigured fallback applies).
+    Owned,
+    /// Multi-node owner-enforced mode and `project_owner` has no row for this project.
+    Unassigned,
+    /// `project_owner` names a different node.
+    NotOwner(ProjectOwnerInfo),
+}
+
+/// Shared ownership lookup used by `StorageEngine`, `AgentTraceStore`, and `ControlPlaneService`.
+#[async_trait::async_trait]
+pub trait ProjectOwnerChecker: Send + Sync {
+    async fn check_owner(&self, project_id: &str) -> std::result::Result<OwnerCheck, String>;
+
+    async fn is_owned_locally(&self, project_id: &str) -> bool {
+        matches!(self.check_owner(project_id).await, Ok(OwnerCheck::Owned))
+    }
+}
+
+/// Outcome of attempting to acquire or renew a project's writer lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseAcquireOutcome {
+    Acquired(u64),
+    HeldByOther,
+    NotOwner {
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    },
+}
+
 /// Grants one node at a time the right to write a project's event store (`P0-1`).
 #[async_trait::async_trait]
 pub trait WriterLeases: Send + Sync {
     /// Takes or renews this node's lease on `project_id`. `Ok(Some(generation))` when this node
     /// holds it; the generation grows every time the holder changes. `Ok(None)` when another
-    /// node holds an unexpired lease.
+    /// node holds an unexpired lease or this node is not the project's owner.
     async fn acquire(&self, project_id: &str) -> std::result::Result<Option<u64>, String>;
+
+    /// Takes or renews this node's lease while preserving ownership distinction (`NotOwner` vs
+    /// `HeldByOther`). Defaults to delegating to [`Self::acquire`].
+    async fn acquire_checked(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<LeaseAcquireOutcome, String> {
+        match self.acquire(project_id).await? {
+            Some(gen) => Ok(LeaseAcquireOutcome::Acquired(gen)),
+            None => Ok(LeaseAcquireOutcome::HeldByOther),
+        }
+    }
+
     /// How long a lease stays valid without renewal.
     fn ttl(&self) -> Duration;
 }
@@ -331,6 +385,8 @@ pub struct ProjectStorage {
     query_snapshot_store: Option<Arc<dyn ObjectStore>>,
     /// `None` when no lease is configured (embedded use, tests) or the project is read-only here.
     writer: Option<WriterFence>,
+    /// Set when ownership moved away in `project_owner` (works even when `writer` is `None`).
+    ownership_fenced: AtomicBool,
     manifest_store: ManifestStore,
     published_store: PublishedManifestStore,
     manifest: RwLock<Arc<Manifest>>,
@@ -1246,6 +1302,7 @@ impl ProjectStorage {
                 valid_until: Mutex::new(valid_until),
                 fenced: AtomicBool::new(false),
             }),
+            ownership_fenced: AtomicBool::new(false),
             manifest_store,
             published_store,
             manifest: RwLock::new(Arc::new(manifest)),
@@ -1557,6 +1614,9 @@ impl ProjectStorage {
     /// Fails unless this node may still acknowledge writes: no lease configured, or the lease
     /// is held and was renewed recently enough.
     pub fn check_writer(&self) -> Result<()> {
+        if self.ownership_fenced.load(Ordering::Acquire) {
+            return Err(self.not_writer());
+        }
         match &self.writer {
             Some(w)
                 if w.fenced.load(Ordering::Acquire) || Instant::now() >= *w.valid_until.lock() =>
@@ -1574,12 +1634,15 @@ impl ProjectStorage {
     }
 
     pub fn is_fenced(&self) -> bool {
-        self.writer
-            .as_ref()
-            .is_some_and(|w| w.fenced.load(Ordering::Acquire))
+        self.ownership_fenced.load(Ordering::Acquire)
+            || self
+                .writer
+                .as_ref()
+                .is_some_and(|w| w.fenced.load(Ordering::Acquire))
     }
 
     fn fence(&self) {
+        self.ownership_fenced.store(true, Ordering::Release);
         if let Some(w) = &self.writer {
             w.fenced.store(true, Ordering::Release);
         }
@@ -2915,6 +2978,9 @@ impl ProjectStorage {
         let _commit_guard = self.manifest_commit_lock.lock().await;
         for attempt in 0..8u8 {
             let mut candidate = (**self.manifest.read()).clone();
+            if self.ownership_fenced.load(Ordering::Acquire) {
+                return Err(self.not_writer());
+            }
             if let Some(w) = &self.writer {
                 // A newer generation means another node took the lease and is replaying our WAL.
                 // Merging on top of it (as a compactor may) would flush rows it also replays and
@@ -3161,6 +3227,7 @@ impl ProjectStorage {
         const COMPACTION_COMMIT_BATCH: usize = 32;
         const COMPACTION_CONCURRENCY: usize = 2;
 
+        self.check_writer()?;
         if self.is_local_segment_tier() && !self.upload_interval().is_zero() {
             return Ok(0);
         }
@@ -3763,6 +3830,7 @@ impl ProjectStorage {
         if self.query_snapshot_store.is_some() {
             return Ok(0);
         }
+        self.check_writer()?;
         let _gc_guard = self.gc_lock.lock().await;
 
         let ready_paths: Vec<String> = {
@@ -4145,6 +4213,7 @@ pub struct StorageEngine {
     erased: DashMap<String, Arc<ErasedUids>>,
     open_lock: AsyncMutex<()>,
     writer_leases: OnceLock<Arc<dyn WriterLeases>>,
+    owner_checker: OnceLock<Arc<dyn ProjectOwnerChecker>>,
     node_load: Arc<NodeLoad>,
     local_segment_tier: Arc<AtomicBool>,
     upload_interval_ms: Arc<AtomicU64>,
@@ -4215,6 +4284,7 @@ impl StorageEngine {
             erased: DashMap::new(),
             open_lock: AsyncMutex::new(()),
             writer_leases: OnceLock::new(),
+            owner_checker: OnceLock::new(),
             node_load: NodeLoad::from_env(),
             local_segment_tier,
             upload_interval_ms,
@@ -4366,22 +4436,68 @@ impl StorageEngine {
         &self.replay_store
     }
 
+    async fn ensure_writable_owner(&self, project_id: &str) -> Result<()> {
+        if self.is_published_reader() {
+            return Ok(());
+        }
+        let Some(checker) = self.owner_checker.get() else {
+            return Ok(());
+        };
+        match checker.check_owner(project_id).await {
+            Ok(OwnerCheck::Owned) => Ok(()),
+            Ok(OwnerCheck::Unassigned) => Err(StorageError::NotOwner {
+                project_id: project_id.to_string(),
+                owner_node: None,
+                owner_address: None,
+            }),
+            Ok(OwnerCheck::NotOwner(info)) => Err(StorageError::NotOwner {
+                project_id: project_id.to_string(),
+                owner_node: Some(info.node_name),
+                owner_address: Some(info.address),
+            }),
+            Err(e) => Err(StorageError::Unavailable(format!(
+                "project owner check failed: {e}"
+            ))),
+        }
+    }
+
     pub async fn get_or_open_project(&self, project_id: &str) -> Result<Arc<ProjectStorage>> {
+        let is_read_only = self.identity_router.is_read_only();
+        let is_published_reader = self.is_published_reader();
         if let Some(p) = self.projects.get(project_id) {
-            return Ok(p.clone());
+            if is_published_reader || !p.is_fenced() {
+                return Ok(p.clone());
+            }
         }
         let _guard = self.open_lock.lock().await;
         if let Some(p) = self.projects.get(project_id) {
-            return Ok(p.clone());
+            if is_published_reader || !p.is_fenced() {
+                return Ok(p.clone());
+            }
+            let p = p.clone();
+            self.drop_fenced(&p);
+        }
+        if !is_published_reader {
+            self.ensure_writable_owner(project_id).await?;
         }
         let lease = match self.writer_leases.get() {
-            Some(leases) if !self.identity_router.is_read_only() => {
+            Some(leases) if !is_read_only => {
                 let started = Instant::now();
-                match leases.acquire(project_id).await {
-                    Ok(Some(generation)) => {
+                match leases.acquire_checked(project_id).await {
+                    Ok(LeaseAcquireOutcome::Acquired(generation)) => {
                         Some((generation, started + local_lease_validity(leases.ttl())))
                     }
-                    Ok(None) => {
+                    Ok(LeaseAcquireOutcome::NotOwner {
+                        owner_node,
+                        owner_address,
+                    }) => {
+                        return Err(StorageError::NotOwner {
+                            project_id: project_id.to_string(),
+                            owner_node,
+                            owner_address,
+                        })
+                    }
+                    Ok(LeaseAcquireOutcome::HeldByOther) => {
                         return Err(StorageError::NotWriter {
                             project_id: project_id.to_string(),
                         })
@@ -4571,9 +4687,15 @@ impl StorageEngine {
         let _ = self.writer_leases.set(leases);
     }
 
+    /// Configures a `project_owner` lookup used to refuse non-owner writes and fence open handles
+    /// if ownership moves away.
+    pub fn set_owner_checker(&self, checker: Arc<dyn ProjectOwnerChecker>) {
+        let _ = self.owner_checker.set(checker);
+    }
+
     /// Renews the lease of every project open for writing; call a few times per TTL. A project
-    /// whose lease went to another node is fenced and dropped, so the next request re-opens it
-    /// from storage once this node holds the lease again.
+    /// whose lease went to another node or whose ownership moved away is fenced and dropped, so
+    /// the next request re-opens it from storage once this node holds the lease and ownership.
     pub async fn renew_writer_leases(&self) {
         let Some(leases) = self.writer_leases.get() else {
             return;
@@ -4585,11 +4707,16 @@ impl StorageEngine {
                 continue;
             }
             let started = Instant::now();
-            match leases.acquire(&ps.project_id).await {
-                Ok(Some(generation)) if generation == w.generation => {
+            match leases.acquire_checked(&ps.project_id).await {
+                Ok(LeaseAcquireOutcome::Acquired(generation)) if generation == w.generation => {
                     *w.valid_until.lock() = started + local_lease_validity(leases.ttl());
                 }
-                Ok(_) => {
+                Ok(LeaseAcquireOutcome::NotOwner { .. }) => {
+                    tracing::error!(project_id = %ps.project_id, "project ownership lost to another node; fencing writer");
+                    ps.fence();
+                    self.drop_fenced(&ps);
+                }
+                Ok(LeaseAcquireOutcome::HeldByOther | LeaseAcquireOutcome::Acquired(_)) => {
                     tracing::error!(project_id = %ps.project_id, "writer lease lost to another node; refusing writes");
                     ps.fence();
                     self.drop_fenced(&ps);
@@ -4603,34 +4730,78 @@ impl StorageEngine {
         }
     }
 
-    /// Whether this node may write `project_id`'s identity and profile stores: always without
-    /// writer leases; with them, only while it holds the project open as its writer.
-    fn writes_project(&self, project_id: &str) -> bool {
-        if self.writer_leases.get().is_none() {
-            return true;
+    /// Fences and evicts any locally open writable project whose ownership moved away in
+    /// `project_owner` (including setups where `owner_checker` is configured without `writer_leases`).
+    pub async fn reconcile_ownership(&self) {
+        if self.is_published_reader() {
+            return;
         }
-        self.projects
-            .get(project_id)
-            .is_some_and(|p| !p.is_fenced())
+        let Some(checker) = self.owner_checker.get() else {
+            return;
+        };
+        for ps in self.open_projects() {
+            if ps.is_fenced() {
+                self.drop_fenced(&ps);
+                continue;
+            }
+            match checker.check_owner(&ps.project_id).await {
+                Ok(OwnerCheck::Owned) => {}
+                Ok(OwnerCheck::NotOwner(_) | OwnerCheck::Unassigned) => {
+                    tracing::error!(
+                        project_id = %ps.project_id,
+                        "project ownership lost to another node; fencing writer"
+                    );
+                    ps.fence();
+                    self.drop_fenced(&ps);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %ps.project_id,
+                        error = %e,
+                        "project ownership check failed during background reconcile"
+                    );
+                }
+            }
+        }
     }
 
-    /// The project's user-profile store. `write` takes the writer lease first (opening the
-    /// project), so a node that does not hold it gets `NotWriter` instead of taking the store
-    /// from the writer. A read on such a node gets a read-only store.
+    /// Whether this node may write `project_id`'s identity and profile stores.
+    async fn writes_project(&self, project_id: &str) -> bool {
+        if let Some(p) = self.projects.get(project_id) {
+            return !p.is_fenced();
+        }
+        if self.writer_leases.get().is_some() {
+            return false;
+        }
+        if let Some(checker) = self.owner_checker.get() {
+            return checker.is_owned_locally(project_id).await;
+        }
+        true
+    }
+
+    /// The project's user-profile store. `write` takes the writer lease and checks ownership first
+    /// (opening the project), so a non-owner gets `NotOwner` / `NotWriter` instead of fencing
+    /// the owner's SlateDB handle. A read on a non-owner gets a read-only store.
     pub async fn profile_store(
         &self,
         project_id: &str,
         write: bool,
     ) -> Result<Arc<crate::ProjectProfileStore>> {
         if self.profile_router.is_read_only() {
+            if write {
+                return Err(StorageError::NotWriter {
+                    project_id: project_id.to_string(),
+                });
+            }
             if self.is_published_reader() && !self.projects.contains_key(project_id) {
                 self.get_or_open_project(project_id).await?;
             }
             return self.profile_router.get_or_open(project_id).await;
         }
         if write {
-            self.get_or_open_project(project_id).await?;
-        } else if !self.writes_project(project_id) {
+            let ps = self.get_or_open_project(project_id).await?;
+            ps.check_writer()?;
+        } else if !self.writes_project(project_id).await {
             return Ok(self.profile_router.open_reader(project_id));
         }
         self.profile_router.get_or_open(project_id).await
@@ -4644,12 +4815,18 @@ impl StorageEngine {
     ) -> Result<Arc<ProjectIdentityGraph>> {
         let router = &self.identity_router;
         if router.is_read_only() {
+            if write {
+                return Err(StorageError::NotWriter {
+                    project_id: project_id.to_string(),
+                });
+            }
             if self.is_published_reader() && !self.projects.contains_key(project_id) {
                 self.get_or_open_project(project_id).await?;
             }
         } else if write {
-            self.get_or_open_project(project_id).await?;
-        } else if !self.writes_project(project_id) {
+            let ps = self.get_or_open_project(project_id).await?;
+            ps.check_writer()?;
+        } else if !self.writes_project(project_id).await {
             return router
                 .open_reader(project_id)
                 .await
@@ -4686,7 +4863,7 @@ impl StorageEngine {
         for p in self.open_projects() {
             match p.flush_all().await {
                 // Its rows are in the WAL the new writer replays; do not hold up the others.
-                Err(StorageError::NotWriter { .. }) => {}
+                Err(StorageError::NotWriter { .. }) | Err(StorageError::NotOwner { .. }) => {}
                 other => total += other?,
             }
         }
@@ -4696,7 +4873,11 @@ impl StorageEngine {
     pub async fn compact_all_projects(&self) -> Result<usize> {
         let mut total = 0usize;
         for p in self.open_projects() {
-            total += p.compact_overdue(&self.segment_reader).await?;
+            match p.compact_overdue(&self.segment_reader).await {
+                Ok(n) => total += n,
+                Err(StorageError::NotWriter { .. } | StorageError::NotOwner { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(total)
     }
@@ -4704,9 +4885,14 @@ impl StorageEngine {
     pub async fn compact_all_with_min_segments(&self, min_segments: usize) -> Result<usize> {
         let mut total = 0usize;
         for p in self.open_projects() {
-            total += p
+            match p
                 .compact_min_segments(&self.segment_reader, min_segments)
-                .await?;
+                .await
+            {
+                Ok(n) => total += n,
+                Err(StorageError::NotWriter { .. } | StorageError::NotOwner { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(total)
     }
@@ -4747,8 +4933,9 @@ impl StorageEngine {
                             allowed_pids.insert(pid);
                         }
                     }
-                    Err(StorageError::NotWriter { .. }) | Err(StorageError::StaleWriter { .. }) => {
-                    }
+                    Err(StorageError::NotWriter { .. })
+                    | Err(StorageError::NotOwner { .. })
+                    | Err(StorageError::StaleWriter { .. }) => {}
                     Err(e) => {
                         if first_err.is_none() {
                             first_err = Some(e);
@@ -4760,7 +4947,13 @@ impl StorageEngine {
                     allowed_pids.insert(pid);
                 }
             } else {
-                allowed_pids.insert(pid);
+                let owned = match self.owner_checker.get() {
+                    Some(checker) => checker.is_owned_locally(&pid).await,
+                    None => true,
+                };
+                if owned {
+                    allowed_pids.insert(pid);
+                }
             }
         }
 
@@ -4805,7 +4998,7 @@ impl StorageEngine {
             match p.upload_if_dirty_at(now_ms, force_closed).await {
                 Ok(Some(_)) => published += 1,
                 Ok(None) => {}
-                Err(StorageError::NotWriter { .. }) => {}
+                Err(StorageError::NotWriter { .. }) | Err(StorageError::NotOwner { .. }) => {}
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -4830,8 +5023,15 @@ impl StorageEngine {
     pub async fn run_gc_all_projects(&self) -> Result<usize> {
         let mut deleted = self.replay_store.drain_pending_local_deletes().await;
         for p in self.open_projects() {
+            if p.check_writer().is_err() {
+                continue;
+            }
             deleted += p.drain_pending_local_deletes().await;
-            deleted += p.run_gc().await?;
+            match p.run_gc().await {
+                Ok(n) => deleted += n,
+                Err(StorageError::NotWriter { .. }) | Err(StorageError::NotOwner { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(deleted)
     }
@@ -4863,7 +5063,7 @@ impl StorageEngine {
         for p in self.open_projects() {
             match p.cold_merge_at(now_ms).await {
                 Ok(n) => merged += n,
-                Err(StorageError::NotWriter { .. }) => {}
+                Err(StorageError::NotWriter { .. }) | Err(StorageError::NotOwner { .. }) => {}
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -4882,6 +5082,16 @@ impl StorageEngine {
         self: &Arc<Self>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        fn ignore_not_writer<T>(r: Result<T>) -> Result<Option<T>> {
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(StorageError::NotWriter { .. }) | Err(StorageError::NotOwner { .. }) => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
         let engine = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -4905,18 +5115,22 @@ impl StorageEngine {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        engine.reconcile_ownership().await;
                         let errs = &engine.maintenance_errors;
                         errs.check(MaintenanceKind::IdentityFlush, engine.identity_router.flush_all().await);
                         let projects: Vec<Arc<ProjectStorage>> =
                             engine.projects.iter().map(|e| e.value().clone()).collect();
                         for p in projects {
-                            errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
+                            if p.is_fenced() {
+                                continue;
+                            }
+                            errs.check(MaintenanceKind::Flush, ignore_not_writer(p.flush_due_buckets().await));
                             errs.check(
                                 MaintenanceKind::Compaction,
-                                p.compact_overdue(&engine.segment_reader).await,
+                                ignore_not_writer(p.compact_overdue(&engine.segment_reader).await),
                             );
                             p.drain_pending_local_deletes().await;
-                            errs.check(MaintenanceKind::Compaction, p.run_gc().await);
+                            errs.check(MaintenanceKind::Compaction, ignore_not_writer(p.run_gc().await));
                         }
                         engine.replay_store.drain_pending_local_deletes().await;
                         if engine.upload_interval().is_zero()
@@ -8105,5 +8319,268 @@ mod t4_cold_merge_tests {
             reader.replay_store().has_session("p_a", "s1").await,
             "unchanged ErasedUids must not invalidate cached discovery"
         );
+    }
+
+    struct MapOwnerChecker {
+        self_node: String,
+        owners: parking_lot::RwLock<HashMap<String, ProjectOwnerInfo>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectOwnerChecker for MapOwnerChecker {
+        async fn check_owner(&self, project_id: &str) -> std::result::Result<OwnerCheck, String> {
+            let guard = self.owners.read();
+            match guard.get(project_id) {
+                Some(info) if info.node_name == self.self_node => Ok(OwnerCheck::Owned),
+                Some(info) => Ok(OwnerCheck::NotOwner(info.clone())),
+                None => Ok(OwnerCheck::Unassigned),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_owner_refuses_writable_opens_while_reads_stay_read_only() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id_router = IdentityRouter::new(store.clone());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(id_router),
+        );
+
+        let owners = HashMap::from([(
+            "proj_remote".to_string(),
+            ProjectOwnerInfo {
+                project_id: "proj_remote".to_string(),
+                node_name: "node-b".to_string(),
+                address: "http://node-b:8080".to_string(),
+                updated_at_ms: 1000,
+            },
+        )]);
+        let checker = Arc::new(MapOwnerChecker {
+            self_node: "node-a".to_string(),
+            owners: parking_lot::RwLock::new(owners),
+        });
+        engine.set_owner_checker(checker.clone());
+
+        for res in [
+            engine.get_or_open_project("proj_remote").await.err(),
+            engine.open_for_read("proj_remote").await.err(),
+            engine.identity_graph("proj_remote", true).await.err(),
+            engine.profile_store("proj_remote", true).await.err(),
+            engine
+                .append_replay_chunk(&pulse_wire::ReplayChunk {
+                    project_id: "proj_remote".into(),
+                    session_id: "s1".into(),
+                    chunk_start_ts_ms: 1_762_000_000_000,
+                    ops: vec![],
+                })
+                .await
+                .err(),
+        ] {
+            match res {
+                Some(StorageError::NotOwner {
+                    project_id,
+                    owner_node,
+                    owner_address,
+                }) => {
+                    assert_eq!(project_id, "proj_remote");
+                    assert_eq!(owner_node.as_deref(), Some("node-b"));
+                    assert_eq!(owner_address.as_deref(), Some("http://node-b:8080"));
+                }
+                other => panic!("expected NotOwner, got {other:?}"),
+            }
+        }
+
+        // Unassigned project in owner-enforced mode must also be refused with owner_node=None.
+        match engine.get_or_open_project("proj_unassigned").await.err() {
+            Some(StorageError::NotOwner {
+                owner_node: None,
+                owner_address: None,
+                ..
+            }) => {}
+            other => panic!("expected NotOwner(None), got {other:?}"),
+        }
+
+        // Non-owner must not have written any manifest for proj_remote.
+        let mf_list: Vec<_> = store
+            .list(Some(&ObjectPath::from("manifests/proj_remote")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(mf_list.is_empty());
+
+        // Read-only identity_graph(pid, false) and profile_store(pid, false) open as read-only
+        // without fencing any remote writer.
+        let ig_ro = engine.identity_graph("proj_remote", false).await.unwrap();
+        assert!(ig_ro.is_read_only());
+        let ps_ro = engine.profile_store("proj_remote", false).await.unwrap();
+        assert!(ps_ro.is_read_only());
+        assert!(engine.profile_router.get_if_open("proj_remote").is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_ownership_fences_and_drops_open_project_and_blocks_run_gc_at() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id_router = IdentityRouter::new(store.clone());
+        let engine = StorageEngine::new(
+            StorageConfig {
+                num_buckets: 1,
+                ..StorageConfig::default()
+            },
+            store.clone(),
+            Arc::new(id_router),
+        );
+
+        let checker = Arc::new(MapOwnerChecker {
+            self_node: "node-a".to_string(),
+            owners: parking_lot::RwLock::new(HashMap::from([(
+                "proj_move".to_string(),
+                ProjectOwnerInfo {
+                    project_id: "proj_move".to_string(),
+                    node_name: "node-a".to_string(),
+                    address: "http://node-a:8080".to_string(),
+                    updated_at_ms: 1000,
+                },
+            )])),
+        });
+        engine.set_owner_checker(checker.clone());
+
+        let ps = engine.get_or_open_project("proj_move").await.unwrap();
+        assert!(!ps.is_fenced());
+
+        // Transfer ownership to node-b.
+        checker.owners.write().insert(
+            "proj_move".to_string(),
+            ProjectOwnerInfo {
+                project_id: "proj_move".to_string(),
+                node_name: "node-b".to_string(),
+                address: "http://node-b:8080".to_string(),
+                updated_at_ms: 2000,
+            },
+        );
+        engine.reconcile_ownership().await;
+
+        assert!(ps.is_fenced());
+        assert!(engine.get_project("proj_move").is_none());
+        assert!(matches!(
+            ps.run_gc_at(Utc::now().timestamp_millis()).await,
+            Err(StorageError::NotWriter { .. })
+        ));
+        assert!(matches!(
+            engine.get_or_open_project("proj_move").await,
+            Err(StorageError::NotOwner {
+                owner_node: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compactor_reconcile_ownership_fences_and_blocks_compact_all_projects() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cfg = StorageConfig {
+            num_buckets: 1,
+            compaction_min_segments: 2,
+            ..StorageConfig::default()
+        };
+
+        // Writer on node-a creates 2 segments in both proj_move and proj_stay.
+        let writer = StorageEngine::new(
+            cfg.clone(),
+            store.clone(),
+            Arc::new(IdentityRouter::new(store.clone())),
+        );
+        for pid in ["proj_move", "proj_stay"] {
+            let ps = writer.get_or_open_project(pid).await.unwrap();
+            let uid = ps.id_graph().get_or_intern("u1", 0);
+            for ts in [1_762_000_000_000i64, 1_762_000_001_000i64] {
+                let ev = WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid("u1", "s1", "App_Open", ts, 1),
+                    routing_seed: "u1".to_string(),
+                    distinct_id: "u1".to_string(),
+                    session_id: "s1".to_string(),
+                    event_name: "App_Open".to_string(),
+                    client_event_ts_ms: ts,
+                    client_sent_ts_ms: 0,
+                    props: vec![],
+                    replay_offset_kb: 0,
+                };
+                ps.append_bucket_events(0, vec![(ev, uid)]).await.unwrap();
+                ps.flush_all().await.unwrap();
+            }
+            assert_eq!(ps.snapshot().manifest.total_segments(), 2);
+        }
+
+        // Compactor engine: read-only IdentityRouter, NOT published_reader.
+        let compactor = StorageEngine::new(
+            cfg,
+            store.clone(),
+            Arc::new(IdentityRouter::new_read_only(store.clone())),
+        );
+        assert!(!compactor.is_published_reader());
+
+        let checker = Arc::new(MapOwnerChecker {
+            self_node: "node-a".to_string(),
+            owners: parking_lot::RwLock::new(HashMap::from([
+                (
+                    "proj_move".to_string(),
+                    ProjectOwnerInfo {
+                        project_id: "proj_move".to_string(),
+                        node_name: "node-a".to_string(),
+                        address: "http://node-a:8080".to_string(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+                (
+                    "proj_stay".to_string(),
+                    ProjectOwnerInfo {
+                        project_id: "proj_stay".to_string(),
+                        node_name: "node-a".to_string(),
+                        address: "http://node-a:8080".to_string(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+            ])),
+        });
+        compactor.set_owner_checker(checker.clone());
+
+        let cmp_move = compactor.get_or_open_project("proj_move").await.unwrap();
+        let cmp_stay = compactor.get_or_open_project("proj_stay").await.unwrap();
+        let move_epoch_before = cmp_move.snapshot().manifest.epoch;
+
+        // Transfer proj_move away to node-b.
+        checker.owners.write().insert(
+            "proj_move".to_string(),
+            ProjectOwnerInfo {
+                project_id: "proj_move".to_string(),
+                node_name: "node-b".to_string(),
+                address: "http://node-b:8080".to_string(),
+                updated_at_ms: 2000,
+            },
+        );
+        compactor.reconcile_ownership().await;
+
+        assert!(cmp_move.is_fenced());
+        assert!(compactor.get_project("proj_move").is_none());
+        assert!(!cmp_stay.is_fenced());
+        assert!(matches!(
+            cmp_move.compact_overdue(compactor.segment_reader()).await,
+            Err(StorageError::NotWriter { .. })
+        ));
+        assert!(matches!(
+            compactor.get_or_open_project("proj_move").await,
+            Err(StorageError::NotOwner { .. })
+        ));
+
+        // compact_all_projects compacts proj_stay (1 partition) and does NOT compact proj_move.
+        let compacted = compactor.compact_all_projects().await.unwrap();
+        assert_eq!(compacted, 1);
+        assert_eq!(cmp_move.snapshot().manifest.epoch, move_epoch_before);
+        assert_eq!(cmp_move.snapshot().manifest.total_segments(), 2);
+        assert_eq!(cmp_stay.snapshot().manifest.total_segments(), 1);
     }
 }

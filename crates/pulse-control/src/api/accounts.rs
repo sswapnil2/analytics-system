@@ -637,9 +637,9 @@ async fn handle_delete_invite(
 }
 
 fn invite_gone() -> CtrlError {
-    CtrlError(
+    CtrlError::new(
         StatusCode::GONE,
-        "This invite has expired or was already used. Ask for a new one.".to_string(),
+        "This invite has expired or was already used. Ask for a new one.",
     )
 }
 
@@ -804,9 +804,9 @@ async fn handle_reset_password(
         .await
         .map_err(CtrlError::meta)?
         .ok_or_else(|| {
-            CtrlError(
+            CtrlError::new(
                 StatusCode::GONE,
-                "This reset link has expired or was already used.".to_string(),
+                "This reset link has expired or was already used.",
             )
         })?;
     ctrl.meta
@@ -847,9 +847,9 @@ async fn handle_verify_email(
     Json(req): Json<TokenReq>,
 ) -> std::result::Result<Response, CtrlError> {
     let gone = || {
-        CtrlError(
+        CtrlError::new(
             StatusCode::GONE,
-            "This link has expired or was already used. Sign up again for a new one.".to_string(),
+            "This link has expired or was already used. Sign up again for a new one.",
         )
     };
     let (uid, org_name) = ctrl

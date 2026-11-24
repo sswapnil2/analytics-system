@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -418,6 +418,7 @@ pub struct AgentWalWriter {
     project_id: String,
     writer_id: String,
     next_seq: Arc<AtomicU64>,
+    fenced: Arc<AtomicBool>,
     tx: Mutex<Option<mpsc::Sender<WalWriteReq>>>,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -430,6 +431,26 @@ impl AgentWalWriter {
         config: WalConfig,
         object_store: Arc<dyn ObjectStore>,
         memtable: Arc<ShardedMemTable>,
+    ) -> StoreResult<Self> {
+        Self::spawn_with_fence(
+            project_id,
+            writer_id,
+            initial_next_seq,
+            config,
+            object_store,
+            memtable,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn spawn_with_fence(
+        project_id: impl Into<String>,
+        writer_id: impl Into<String>,
+        initial_next_seq: u64,
+        config: WalConfig,
+        object_store: Arc<dyn ObjectStore>,
+        memtable: Arc<ShardedMemTable>,
+        fenced: Arc<AtomicBool>,
     ) -> StoreResult<Self> {
         let project_id = project_id.into();
         let writer_id = writer_id.into();
@@ -449,6 +470,7 @@ impl AgentWalWriter {
             project_id: project_id.clone(),
             writer_id: writer_id.clone(),
             next_seq: next_seq.clone(),
+            fenced: fenced.clone(),
             window: Duration::from_millis(clamped_ms),
             max_items,
             max_bytes,
@@ -461,6 +483,7 @@ impl AgentWalWriter {
             project_id,
             writer_id,
             next_seq,
+            fenced,
             tx: Mutex::new(Some(tx)),
             task: tokio::sync::Mutex::new(Some(handle)),
         })
@@ -475,6 +498,11 @@ impl AgentWalWriter {
     }
 
     pub async fn write(&self, batch: TraceIngestBatch) -> StoreResult<WalCommitResult> {
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(StoreError::NotWriter {
+                project_id: self.project_id.clone(),
+            });
+        }
         let est_bytes = estimate_batch_bytes(&batch);
         let (ack_tx, ack_rx) = oneshot::channel();
         let req = WalWriteReq {
@@ -526,6 +554,7 @@ struct GroupCommitCtx {
     project_id: String,
     writer_id: String,
     next_seq: Arc<AtomicU64>,
+    fenced: Arc<AtomicBool>,
     window: Duration,
     max_items: usize,
     max_bytes: usize,
@@ -569,6 +598,7 @@ async fn run_group_commit_loop(ctx: GroupCommitCtx, mut rx: mpsc::Receiver<WalWr
             &ctx.project_id,
             &ctx.writer_id,
             &ctx.next_seq,
+            &ctx.fenced,
             ctx.max_bytes,
             &ctx.object_store,
             &ctx.memtable,
@@ -578,15 +608,25 @@ async fn run_group_commit_loop(ctx: GroupCommitCtx, mut rx: mpsc::Receiver<WalWr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_wal_group(
     project_id: &str,
     writer_id: &str,
     next_seq: &AtomicU64,
+    fenced: &AtomicBool,
     max_bytes: usize,
     object_store: &Arc<dyn ObjectStore>,
     memtable: &Arc<ShardedMemTable>,
     group: Vec<WalWriteReq>,
 ) {
+    if fenced.load(Ordering::Acquire) {
+        for req in group {
+            let _ = req.ack.send(Err(StoreError::NotWriter {
+                project_id: project_id.to_string(),
+            }));
+        }
+        return;
+    }
     let mut chunks: Vec<Vec<WalWriteReq>> = Vec::new();
     let mut cur_chunk: Vec<WalWriteReq> = Vec::new();
     let mut cur_traces = 0usize;
@@ -952,10 +992,12 @@ mod tests {
             acks.push(rx);
         }
         let next_seq = AtomicU64::new(1);
+        let fenced = AtomicBool::new(false);
         flush_wal_group(
             "proj_wal",
             "w1",
             &next_seq,
+            &fenced,
             DEFAULT_WAL_MAX_GROUP_BYTES,
             &os,
             &memtable,

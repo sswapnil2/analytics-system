@@ -40,6 +40,12 @@ pub enum StoreError {
     Shutdown,
     #[error("node is not the active agent writer for project '{project_id}'")]
     NotWriter { project_id: String },
+    #[error("this node is not the owner for project '{project_id}'")]
+    NotOwner {
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    },
     #[error(
         "stale agent writer for project '{project_id}' \
          (published seq={pub_seq} gen={pub_gen}, local seq={local_last_pub_seq:?} gen={local_gen})"

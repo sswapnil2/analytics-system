@@ -76,6 +76,7 @@ pub(crate) async fn compact_and_gc_impl(
         return Ok(());
     }
 
+    let single_project = project_id.is_some();
     let targets: Vec<String> = match project_id {
         Some(pid) => {
             validate_identifier("project_id", pid)?;
@@ -85,9 +86,16 @@ pub(crate) async fn compact_and_gc_impl(
     };
 
     for pid in targets {
-        let state = store.get_or_open_project(&pid).await?;
+        if !single_project && !store.is_owned_locally(&pid).await {
+            continue;
+        }
+        let state = match store.get_or_open_project(&pid).await {
+            Ok(s) => s,
+            Err(StoreError::NotOwner { .. }) if !single_project => continue,
+            Err(e) => return Err(e),
+        };
         let _pub_guard = state.publish_lock.lock().await;
-        compact_project_locked(
+        match compact_project_locked(
             store,
             &state,
             tombstones,
@@ -95,7 +103,12 @@ pub(crate) async fn compact_and_gc_impl(
             None,
             chrono::Utc::now().timestamp_millis(),
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(StoreError::NotOwner { .. }) if !single_project => continue,
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -995,6 +1008,7 @@ pub(crate) async fn prune_expired_segments_impl(
     if store.config.read_only {
         return Ok(0);
     }
+    store.ensure_writable_owner(project_id).await?;
     let is_local_hot = store.is_local_hot_tier();
     if is_local_hot && !store.local_project_has_manifest_or_wal(project_id).await? {
         return Ok(0);

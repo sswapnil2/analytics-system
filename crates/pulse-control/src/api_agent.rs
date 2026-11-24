@@ -65,11 +65,16 @@ pub struct AgentRetentionStats {
 /// `Authorization: Bearer ...` fallback), permissive CORS, `8 MiB` body cap, and
 /// per-project rate limiting.
 pub fn build_agent_ingest_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
     Router::new()
         .route("/v1/agent/traces", post(handle_ingest_agent_traces))
         .route("/v1/otel/v1/traces", post(handle_ingest_otel_traces))
         .layer(DefaultBodyLimit::max(MAX_AGENT_INGEST_BODY_BYTES))
         .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            forward_guard,
+            pulse_ingest::forward_loop_middleware,
+        ))
         .with_state(ctrl)
 }
 
@@ -193,6 +198,12 @@ enum IngestError {
     BadRequest(String),
     PayloadTooLarge(String),
     RateLimited(u64, &'static str),
+    NotOwner {
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+        message: String,
+    },
     ServiceUnavailable(String),
     Internal(String),
 }
@@ -231,6 +242,24 @@ impl IntoResponse for IngestError {
                 }
                 resp
             }
+            Self::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+                message,
+            } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({
+                    "status": "error",
+                    "code": "not_owner",
+                    "project_id": project_id,
+                    "owner_node": owner_node,
+                    "owner_address": owner_address,
+                    "message": message,
+                })),
+            )
+                .into_response(),
             Self::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "status": "error", "code": "service_unavailable", "message": msg })),
@@ -466,6 +495,16 @@ async fn ingest_canonical_batch(
             StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
                 IngestError::RateLimited(1, "l0_backpressure")
             }
+            StoreError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => IngestError::NotOwner {
+                message: format!("this node is not the owner for project '{project_id}'"),
+                project_id,
+                owner_node,
+                owner_address,
+            },
             StoreError::Shutdown
             | StoreError::NotWriter { .. }
             | StoreError::StaleWriter { .. } => IngestError::ServiceUnavailable(e.to_string()),
@@ -676,9 +715,14 @@ fn map_store_err(err: StoreError) -> CtrlError {
         StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
             CtrlError::new(StatusCode::TOO_MANY_REQUESTS, err.to_string())
         }
-        StoreError::Shutdown | StoreError::NotWriter { .. } | StoreError::StaleWriter { .. } => {
-            CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
-        }
+        StoreError::NotOwner {
+            project_id,
+            owner_node,
+            owner_address,
+        } => CtrlError::not_owner(project_id, owner_node, owner_address),
+        StoreError::NotWriter { .. } => CtrlError::not_writer(err.to_string()),
+        StoreError::StaleWriter { .. } => CtrlError::stale_writer(err.to_string()),
+        StoreError::Shutdown => CtrlError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
         other => CtrlError::internal(other),
     }
 }
@@ -3066,8 +3110,11 @@ impl ControlPlaneService {
             return;
         };
         for proj in projects {
+            if !self.is_project_owner_for_background(&proj.id).await {
+                continue;
+            }
             if let Err(err) = self.evaluate_agent_alerts_for_project(&proj.id, None).await {
-                tracing::warn!(project_id = %proj.id, "agent alert evaluation error: {}", err.1);
+                tracing::warn!(project_id = %proj.id, "agent alert evaluation error: {}", err.message);
             }
         }
     }
@@ -3382,6 +3429,9 @@ impl ControlPlaneService {
         let mut any_concurrent_ingest = false;
 
         for (pid, tbs) in by_project {
+            if !self.is_project_owner_for_background(&pid).await {
+                continue;
+            }
             match store.purge_erased_in_project(&pid, &tbs).await {
                 Ok(outcome) => {
                     if let Some(dl) = outcome.next_urgent_gc_deadline_ms {
@@ -3478,6 +3528,9 @@ impl ControlPlaneService {
                     .push(tb);
             }
             for (pid, tbs) in by_project {
+                if !self.is_project_owner_for_background(&pid).await {
+                    continue;
+                }
                 match store.purge_erased_in_project(&pid, &tbs).await {
                     Ok(outcome) => {
                         let concurrent_ingest = store
@@ -3517,6 +3570,9 @@ impl ControlPlaneService {
         // 3. Prune expired `.plss` segments ONLY for known agent projects (never opening event-only projects).
         if let Ok(agent_pids) = store.known_project_ids().await {
             for pid in agent_pids {
+                if !self.is_project_owner_for_background(&pid).await {
+                    continue;
+                }
                 let policy = self
                     .meta()
                     .get_agent_privacy_policy(&pid)
@@ -3527,6 +3583,7 @@ impl ControlPlaneService {
                 let cutoff_date = cutoff.date_naive();
                 match store.prune_expired_segments(&pid, cutoff_date).await {
                     Ok(n) => stats.segments_pruned += n,
+                    Err(StoreError::NotOwner { .. }) => {}
                     Err(err) => tracing::warn!(
                         project_id = %pid,
                         error = %err,
@@ -3539,6 +3596,9 @@ impl ControlPlaneService {
         // 4. Prune expired SQL evaluations across projects (pure SQL, 0 S3 calls).
         if let Ok(projects) = self.meta().list_projects().await {
             for proj in projects {
+                if !self.is_project_owner_for_background(&proj.id).await {
+                    continue;
+                }
                 stats.projects_checked += 1;
                 let policy = self
                     .meta()

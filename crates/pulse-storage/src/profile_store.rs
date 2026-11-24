@@ -418,6 +418,10 @@ impl ProjectProfileStore {
         &self.db_prefix
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Monotonic counter incremented after every flushed write or delete (used to skip idle snapshots).
     pub fn dirty_seq(&self) -> u64 {
         self.dirty_seq.load(Ordering::Acquire)

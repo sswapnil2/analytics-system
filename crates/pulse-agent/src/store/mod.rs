@@ -21,7 +21,7 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode};
-use pulse_storage::EncryptedObjectStore;
+use pulse_storage::{EncryptedObjectStore, OwnerCheck, ProjectOwnerChecker, StorageError};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
@@ -147,7 +147,7 @@ pub(crate) struct ProjectAgentState {
     pub applied_wal_seq: AsyncMutex<HashMap<String, u64>>,
     pub flush_lock: AsyncMutex<()>,
     pub publish_lock: AsyncMutex<()>,
-    pub fenced: AtomicBool,
+    pub fenced: Arc<AtomicBool>,
     pub last_published_seq: parking_lot::Mutex<Option<u64>>,
     pub last_published_s3_segments: parking_lot::Mutex<Option<Vec<String>>>,
     pub last_published_erased_traces: parking_lot::Mutex<Option<BTreeMap<String, i64>>>,
@@ -182,6 +182,7 @@ pub struct AgentTraceStore {
     cold_merge_idle_ms: AtomicU64,
     projects: DashMap<String, Arc<ProjectAgentState>>,
     project_init_lock: AsyncMutex<()>,
+    owner_checker: Option<Arc<dyn ProjectOwnerChecker>>,
     closed: AtomicBool,
     flush_notify: Notify,
     /// Set when ingest was refused for memory: the next flush takes every shard, not only the
@@ -200,7 +201,16 @@ impl AgentTraceStore {
     pub async fn open_with_encrypted(
         object_store: Arc<dyn ObjectStore>,
         encrypted_store: Option<Arc<EncryptedObjectStore>>,
+        config: AgentTraceStoreConfig,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_encrypted_and_owner(object_store, encrypted_store, config, None).await
+    }
+
+    pub async fn open_with_encrypted_and_owner(
+        object_store: Arc<dyn ObjectStore>,
+        encrypted_store: Option<Arc<EncryptedObjectStore>>,
         mut config: AgentTraceStoreConfig,
+        owner_checker: Option<Arc<dyn ProjectOwnerChecker>>,
     ) -> Result<Self, StoreError> {
         config.wal_group_commit_ms = config
             .wal_group_commit_ms
@@ -242,6 +252,7 @@ impl AgentTraceStore {
             cold_merge_idle_ms: AtomicU64::new(cold_merge_idle_ms),
             projects: DashMap::new(),
             project_init_lock: AsyncMutex::new(()),
+            owner_checker,
             closed: AtomicBool::new(false),
             flush_notify: Notify::new(),
             flush_all_next: AtomicBool::new(false),
@@ -253,11 +264,89 @@ impl AgentTraceStore {
         if !(is_local_hot && store.config.read_only) {
             let existing = store.list_known_projects().await?;
             for pid in existing {
-                store.get_or_open_project(&pid).await?;
+                match store.get_or_open_project(&pid).await {
+                    Ok(_) => {}
+                    Err(StoreError::NotOwner { .. }) => {
+                        tracing::debug!(project_id = %pid, "skipping foreign agent project on boot");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
         Ok(store)
+    }
+
+    pub(crate) async fn ensure_writable_owner(&self, project_id: &str) -> StoreResult<()> {
+        if self.config.read_only {
+            return Ok(());
+        }
+        let Some(ref checker) = self.owner_checker else {
+            return Ok(());
+        };
+        match checker.check_owner(project_id).await {
+            Ok(OwnerCheck::Owned) => Ok(()),
+            Ok(OwnerCheck::Unassigned) => Err(StoreError::NotOwner {
+                project_id: project_id.to_string(),
+                owner_node: None,
+                owner_address: None,
+            }),
+            Ok(OwnerCheck::NotOwner(info)) => Err(StoreError::NotOwner {
+                project_id: project_id.to_string(),
+                owner_node: Some(info.node_name),
+                owner_address: Some(info.address),
+            }),
+            Err(e) => Err(StoreError::Storage(StorageError::Unavailable(format!(
+                "project owner check failed: {e}"
+            )))),
+        }
+    }
+
+    pub(crate) async fn is_owned_locally(&self, project_id: &str) -> bool {
+        if self.config.read_only {
+            return false;
+        }
+        match &self.owner_checker {
+            Some(checker) => checker.is_owned_locally(project_id).await,
+            None => true,
+        }
+    }
+
+    /// Fences and evicts any open writable project whose ownership moved away in `project_owner`,
+    /// shutting down its WAL writer without flushing L0 or committing manifests.
+    pub async fn reconcile_ownership(&self) {
+        if self.config.read_only {
+            return;
+        }
+        let Some(ref checker) = self.owner_checker else {
+            return;
+        };
+        let open_states: Vec<Arc<ProjectAgentState>> =
+            self.projects.iter().map(|e| e.value().clone()).collect();
+        for state in open_states {
+            match checker.check_owner(&state.project_id).await {
+                Ok(OwnerCheck::Owned) => {}
+                Ok(OwnerCheck::NotOwner(_) | OwnerCheck::Unassigned) => {
+                    tracing::error!(
+                        project_id = %state.project_id,
+                        "agent project ownership lost to another node; fencing writer"
+                    );
+                    state.fenced.store(true, Ordering::Release);
+                    self.projects
+                        .remove_if(&state.project_id, |_, cur| Arc::ptr_eq(cur, &state));
+                    if let Some(ref writer) = state.wal_writer {
+                        writer.shutdown().await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %state.project_id,
+                        error = %e,
+                        "agent project ownership check failed during background reconcile"
+                    );
+                }
+            }
+        }
     }
 
     pub fn is_local_hot_tier(&self) -> bool {
@@ -319,6 +408,9 @@ impl AgentTraceStore {
         let Some(state) = self.projects.get(project_id).map(|e| e.value().clone()) else {
             return Ok(0);
         };
+        if state.fenced.load(Ordering::Acquire) || !self.is_owned_locally(project_id).await {
+            return Ok(0);
+        }
         let effective: Vec<AgentErasureTombstone> = tombstones
             .iter()
             .cloned()
@@ -588,18 +680,28 @@ impl AgentTraceStore {
         let mut first_err = None;
         let eager_upload = self.is_local_hot_tier() && self.upload_interval().is_zero();
         for state in states {
+            if state.fenced.load(Ordering::Acquire)
+                || !self.is_owned_locally(&state.project_id).await
+            {
+                continue;
+            }
             match self.flush_project_l0(&state, force_all).await {
                 Ok(committed) => {
                     if committed && eager_upload {
                         let now_ms = chrono::Utc::now().timestamp_millis();
-                        if let Err(e) = self
+                        match self
                             .upload_project_at(&state.project_id, now_ms, false)
                             .await
                         {
-                            first_err.get_or_insert(e);
+                            Ok(_) => {}
+                            Err(StoreError::NotOwner { .. } | StoreError::NotWriter { .. }) => {}
+                            Err(e) => {
+                                first_err.get_or_insert(e);
+                            }
                         }
                     }
                 }
+                Err(StoreError::NotOwner { .. } | StoreError::NotWriter { .. }) => {}
                 Err(e) => {
                     first_err.get_or_insert(e);
                 }
@@ -854,7 +956,20 @@ impl AgentTraceStore {
         if !self.config.read_only {
             let now_ms = chrono::Utc::now().timestamp_millis();
             for state in &states {
-                let _ = self.flush_project_l0(state, true).await?;
+                if state.fenced.load(Ordering::Acquire)
+                    || !self.is_owned_locally(&state.project_id).await
+                {
+                    continue;
+                }
+                match self.flush_project_l0(state, true).await {
+                    Ok(_) => {}
+                    Err(
+                        StoreError::NotWriter { .. }
+                        | StoreError::NotOwner { .. }
+                        | StoreError::StaleWriter { .. },
+                    ) => continue,
+                    Err(e) => return Err(e),
+                }
                 if self.is_local_hot_tier() && !state.fenced.load(Ordering::Acquire) {
                     self.upload_project_state(state, now_ms, true, &[], None)
                         .await?;
@@ -896,6 +1011,10 @@ impl AgentTraceStore {
             return Ok(st);
         }
 
+        if !self.config.read_only {
+            self.ensure_writable_owner(project_id).await?;
+        }
+
         let is_local_hot = self.is_local_hot_tier();
         let manifest_store = Arc::new(ManifestStore::new(
             project_id,
@@ -919,7 +1038,7 @@ impl AgentTraceStore {
                 applied_wal_seq: AsyncMutex::new(HashMap::new()),
                 flush_lock: AsyncMutex::new(()),
                 publish_lock: AsyncMutex::new(()),
-                fenced: AtomicBool::new(false),
+                fenced: Arc::new(AtomicBool::new(false)),
                 last_published_seq: parking_lot::Mutex::new(None),
                 last_published_s3_segments: parking_lot::Mutex::new(None),
                 last_published_erased_traces: parking_lot::Mutex::new(None),
@@ -1069,6 +1188,7 @@ impl AgentTraceStore {
         }
 
         let memtable_bytes = memtable.byte_stats().0;
+        let fenced = Arc::new(AtomicBool::new(false));
         let wal_writer = if self.config.read_only {
             None
         } else {
@@ -1081,7 +1201,7 @@ impl AgentTraceStore {
                 .max_existing_seq_for_writer(&self.writer_id_str)
                 .await?;
             let initial_next_seq = committed_for_me.max(existing_max).saturating_add(1);
-            let writer = AgentWalWriter::spawn(
+            let writer = AgentWalWriter::spawn_with_fence(
                 project_id,
                 &self.writer_id_str,
                 initial_next_seq,
@@ -1092,6 +1212,7 @@ impl AgentTraceStore {
                 },
                 self.object_store.clone(),
                 memtable.clone(),
+                fenced.clone(),
             )?;
             Some(Arc::new(writer))
         };
@@ -1112,7 +1233,7 @@ impl AgentTraceStore {
             applied_wal_seq: AsyncMutex::new(applied),
             flush_lock: AsyncMutex::new(()),
             publish_lock: AsyncMutex::new(()),
-            fenced: AtomicBool::new(false),
+            fenced,
             last_published_seq: parking_lot::Mutex::new(initial_pub_seq),
             last_published_s3_segments: parking_lot::Mutex::new(initial_pub_s3),
             last_published_erased_traces: parking_lot::Mutex::new(initial_pub_erased),
@@ -1357,9 +1478,13 @@ impl AgentTraceStore {
         let mut published_count = 0usize;
         let mut first_err: Option<StoreError> = None;
         for pid in pids {
+            if !self.is_owned_locally(&pid).await {
+                continue;
+            }
             match self.upload_project_at(&pid, now_ms, false).await {
                 Ok(Some(_)) => published_count += 1,
                 Ok(None) => {}
+                Err(StoreError::NotOwner { .. }) => {}
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -2017,8 +2142,10 @@ impl AgentTraceStore {
             return Ok(ProjectErasureOutcome::default());
         }
         validate_identifier("project_id", project_id)?;
+        self.ensure_writable_owner(project_id).await?;
 
         let pass_started_at_ms = chrono::Utc::now().timestamp_millis();
+
         let is_local_hot = self.is_local_hot_tier();
 
         // Fast-path when `project_id` has no open state and no agent manifests/WALs anywhere:
@@ -3585,6 +3712,169 @@ mod tests {
             matches!(err, StoreError::NotWriter { .. }),
             "expected NotWriter when S3 agent_published exists without local manifest/WAL, got {err:?}"
         );
+        store_b.close().await.unwrap();
+    }
+
+    struct MapAgentOwnerChecker {
+        self_node: String,
+        owners: parking_lot::RwLock<HashMap<String, pulse_storage::ProjectOwnerInfo>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectOwnerChecker for MapAgentOwnerChecker {
+        async fn check_owner(&self, project_id: &str) -> std::result::Result<OwnerCheck, String> {
+            let guard = self.owners.read();
+            match guard.get(project_id) {
+                Some(info) if info.node_name == self.self_node => Ok(OwnerCheck::Owned),
+                Some(info) => Ok(OwnerCheck::NotOwner(info.clone())),
+                None => Ok(OwnerCheck::Unassigned),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_checker_guards_boot_ingest_purge_prune_and_reconcile() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let checker_a = Arc::new(MapAgentOwnerChecker {
+            self_node: "node-a".into(),
+            owners: parking_lot::RwLock::new(HashMap::from([(
+                "proj_a".into(),
+                pulse_storage::ProjectOwnerInfo {
+                    project_id: "proj_a".into(),
+                    node_name: "node-a".into(),
+                    address: "http://node-a:8080".into(),
+                    updated_at_ms: 1000,
+                },
+            )])),
+        });
+        let checker_b = Arc::new(MapAgentOwnerChecker {
+            self_node: "node-b".into(),
+            owners: parking_lot::RwLock::new(HashMap::from([
+                (
+                    "proj_a".into(),
+                    pulse_storage::ProjectOwnerInfo {
+                        project_id: "proj_a".into(),
+                        node_name: "node-a".into(),
+                        address: "http://node-a:8080".into(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+                (
+                    "proj_b".into(),
+                    pulse_storage::ProjectOwnerInfo {
+                        project_id: "proj_b".into(),
+                        node_name: "node-b".into(),
+                        address: "http://node-b:8080".into(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+            ])),
+        });
+
+        let routed_a = pulse_storage::with_hot_store_for_role(s3_raw.clone(), dir_a.path(), false)
+            .await
+            .unwrap();
+        let store_a = AgentTraceStore::open_with_encrypted_and_owner(
+            routed_a,
+            None,
+            AgentTraceStoreConfig::default(),
+            Some(checker_a.clone()),
+        )
+        .await
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store_a
+            .ingest_batch("proj_a", sample_batch("tr_a1", now_ms))
+            .await
+            .unwrap();
+        store_a.flush_all_l0().await.unwrap();
+        assert_eq!(store_a.publish_all_projects().await.unwrap(), 1);
+
+        // Node B initializes its local hot store (for proj_b), while shared S3 has proj_a published.
+        let _init_b =
+            pulse_storage::with_hot_store_for_role(Arc::new(InMemory::new()), dir_b.path(), false)
+                .await
+                .unwrap();
+        std::fs::create_dir_all(dir_b.path().join("hot/identity/proj_b")).unwrap();
+        std::fs::write(dir_b.path().join("hot/identity/proj_b/marker"), b"1").unwrap();
+        let routed_b = pulse_storage::with_hot_store_for_role(s3_raw.clone(), dir_b.path(), false)
+            .await
+            .unwrap();
+        let store_b = AgentTraceStore::open_with_encrypted_and_owner(
+            routed_b,
+            None,
+            AgentTraceStoreConfig::default(),
+            Some(checker_b.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Non-owner ingest, purge_erased_in_project (even before any local files exist!), and prune_expired_segments refuse with NotOwner.
+        assert!(matches!(
+            store_b.ingest_batch("proj_a", sample_batch("tr_bad", now_ms)).await,
+            Err(StoreError::NotOwner { owner_node: Some(ref n), .. }) if n == "node-a"
+        ));
+        let tb = AgentErasureTombstone {
+            id: "tb_1".into(),
+            project_id: "proj_a".into(),
+            level: ErasureLevel::Trace,
+            target_id: "tr_a1".into(),
+            created_at: now_ms,
+            expires_at: Some(now_ms + 5_000),
+        };
+        assert!(matches!(
+            store_b.purge_erased_in_project("proj_a", &[tb]).await,
+            Err(StoreError::NotOwner { owner_node: Some(ref n), .. }) if n == "node-a"
+        ));
+        let cutoff = chrono::Utc::now().date_naive();
+        assert!(matches!(
+            store_b.prune_expired_segments("proj_a", cutoff).await,
+            Err(StoreError::NotOwner { owner_node: Some(ref n), .. }) if n == "node-a"
+        ));
+
+        // Unowned project in owner-enforced mode also returns NotOwner(None).
+        assert!(matches!(
+            store_b
+                .ingest_batch("proj_unassigned", sample_batch("tr_un", now_ms))
+                .await,
+            Err(StoreError::NotOwner {
+                owner_node: None,
+                owner_address: None,
+                ..
+            })
+        ));
+
+        // Background ops (publish_all_projects, compact_and_gc(None)) skip foreign projects and succeed for owned proj_b.
+        store_b
+            .ingest_batch("proj_b", sample_batch("tr_b1", now_ms))
+            .await
+            .unwrap();
+        store_b.flush_all_l0().await.unwrap();
+        assert_eq!(store_b.publish_all_projects().await.unwrap(), 1);
+        store_b.compact_and_gc(None, &[]).await.unwrap();
+
+        // Ownership transfer away from node-a -> reconcile_ownership fences and evicts proj_a on node-a.
+        checker_a.owners.write().insert(
+            "proj_a".into(),
+            pulse_storage::ProjectOwnerInfo {
+                project_id: "proj_a".into(),
+                node_name: "node-b".into(),
+                address: "http://node-b:8080".into(),
+                updated_at_ms: 2000,
+            },
+        );
+        store_a.reconcile_ownership().await;
+        assert!(!store_a.projects.contains_key("proj_a"));
+        assert!(matches!(
+            store_a.ingest_batch("proj_a", sample_batch("tr_after_move", now_ms)).await,
+            Err(StoreError::NotOwner { owner_node: Some(ref n), .. }) if n == "node-b"
+        ));
+
+        store_a.close().await.unwrap();
         store_b.close().await.unwrap();
     }
 }

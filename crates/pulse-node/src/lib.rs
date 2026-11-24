@@ -13,11 +13,13 @@ use axum::routing::get;
 use axum::Router;
 use pulse_control::{
     build_admin_control_router, build_agent_ingest_router, build_public_flag_router,
-    BootstrapCredentials, ControlPlaneService, MetaStore,
+    BootstrapCredentials, ControlPlaneService, MetaStore, WriterNode,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
-use pulse_ingest::{build_ingest_router, spawn_quic_listener, IngestService, QuicIngestHandle};
+use pulse_ingest::{
+    build_ingest_router_with_guard, spawn_quic_listener, IngestService, QuicIngestHandle,
+};
 use pulse_storage::{
     build_object_store, with_hot_store_for_role, DurableLocalObjectStore, MaintenanceKind,
     StorageConfig, StorageEngine, DEFAULT_NUM_BUCKETS,
@@ -179,6 +181,52 @@ impl Default for NodeConfig {
     }
 }
 
+/// Optional stable node identity (`PULSE_NODE_NAME` / `--node-name`) and advertised address
+/// (`PULSE_ADVERTISE_ADDR` / `--advertise-addr`) for multi-node `project_owner` placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentity {
+    pub node_name: String,
+    pub advertise_addr: Option<String>,
+}
+
+impl NodeIdentity {
+    pub fn new(node_name: impl Into<String>, advertise_addr: Option<String>) -> Option<Self> {
+        let name = node_name.into().trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let addr = advertise_addr
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some(Self {
+            node_name: name,
+            advertise_addr: addr,
+        })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let name = std::env::var("PULSE_NODE_NAME").ok()?;
+        let addr = std::env::var("PULSE_ADVERTISE_ADDR").ok();
+        Self::new(name, addr)
+    }
+}
+
+fn normalize_advertise_addr(explicit: Option<&str>, bound_addr: SocketAddr) -> String {
+    if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return trimmed.to_string();
+        }
+        return format!("http://{trimmed}");
+    }
+    match bound_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => format!("http://127.0.0.1:{}", bound_addr.port()),
+        IpAddr::V4(ip) => format!("http://{ip}:{}", bound_addr.port()),
+        IpAddr::V6(ip) if ip.is_unspecified() => format!("http://[::1]:{}", bound_addr.port()),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{}", bound_addr.port()),
+    }
+}
+
 pub struct RunningNode {
     pub http_addr: SocketAddr,
     pub quic: Option<QuicIngestHandle>,
@@ -187,6 +235,8 @@ pub struct RunningNode {
     pub storage: Arc<StorageEngine>,
     pub qengine: Arc<QueryEngine>,
     pub bootstrap_credentials: BootstrapCredentials,
+    node_name: Option<String>,
+    meta: MetaStore,
     writer_leases: Option<Arc<pulse_control::DbWriterLeases>>,
     shutdown_bg_tx: watch::Sender<bool>,
     shutdown_http_tx: Option<oneshot::Sender<()>>,
@@ -251,6 +301,11 @@ impl RunningNode {
             if let Some(leases) = &self.writer_leases {
                 if let Err(e) = leases.release_all().await {
                     tracing::warn!(error = %e, "releasing writer leases on shutdown failed");
+                }
+            }
+            if let Some(ref name) = self.node_name {
+                if let Err(e) = self.meta.deregister_writer_node(name).await {
+                    tracing::warn!(node_name = %name, error = %e, "deregistering writer node on shutdown failed");
                 }
             }
         } else {
@@ -398,15 +453,32 @@ pub async fn run_query_refresh_tick(
 
 /// Boots the Pulse Analytics Node (`All`, `Ingest`, `Query`, or `Compactor` role).
 pub async fn start_pulse_node(config: NodeConfig) -> anyhow::Result<RunningNode> {
+    start_pulse_node_with_identity(config, NodeIdentity::from_env()).await
+}
+
+/// [`start_pulse_node`] with explicit optional [`NodeIdentity`].
+pub async fn start_pulse_node_with_identity(
+    config: NodeConfig,
+    identity: Option<NodeIdentity>,
+) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
     let segment_store = build_object_store(&config.data_dir)?;
-    start_pulse_node_with_store(config, segment_store).await
+    start_pulse_node_with_store_and_identity(config, segment_store, identity).await
 }
 
 /// [`start_pulse_node`] on a given segment store (tests count or share it).
 pub async fn start_pulse_node_with_store(
     config: NodeConfig,
     raw_store: Arc<dyn object_store::ObjectStore>,
+) -> anyhow::Result<RunningNode> {
+    start_pulse_node_with_store_and_identity(config, raw_store, NodeIdentity::from_env()).await
+}
+
+/// [`start_pulse_node_with_store`] with explicit optional [`NodeIdentity`].
+pub async fn start_pulse_node_with_store_and_identity(
+    config: NodeConfig,
+    raw_store: Arc<dyn object_store::ObjectStore>,
+    identity: Option<NodeIdentity>,
 ) -> anyhow::Result<RunningNode> {
     std::fs::create_dir_all(&config.data_dir)?;
     let raw_store =
@@ -473,12 +545,75 @@ pub async fn start_pulse_node_with_store(
              Set DATABASE_URL to an external PostgreSQL database for recoverable deployments."
         );
     }
-    // Set before anything can open a project: only the lease holder may write one.
-    let writer_leases = config
-        .role
-        .serves_ingest()
-        .then(|| Arc::new(pulse_control::DbWriterLeases::from_env(meta.clone())));
+
+    // Bind HTTP listener early so `:0` ports resolve before writer registration & placement.
+    let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
+    let bound_http_addr = listener.local_addr()?;
+
+    let node_name = identity.as_ref().map(|id| id.node_name.clone());
+    let effective_advertise_addr = normalize_advertise_addr(
+        identity
+            .as_ref()
+            .and_then(|id| id.advertise_addr.as_deref()),
+        bound_http_addr,
+    );
+
+    // Set before anything can open a project: only the lease holder (and owner) may write one.
+    let writer_leases = config.role.serves_ingest().then(|| {
+        Arc::new(pulse_control::DbWriterLeases::from_env_with_node(
+            meta.clone(),
+            node_name.clone(),
+        ))
+    });
     let (shutdown_bg_tx, mut shutdown_bg_rx) = watch::channel(false);
+    if let Some(ref name) = node_name {
+        if config.role.serves_ingest() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let reg_node = WriterNode {
+                node_name: name.clone(),
+                address: effective_advertise_addr.clone(),
+                role: config.role.as_str().to_string(),
+                last_heartbeat_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            meta.register_writer_node(&reg_node).await?;
+            let hb_meta = meta.clone();
+            let mut hb_shutdown = shutdown_bg_rx.clone();
+            let every = writer_leases.as_ref().map_or(Duration::from_secs(5), |l| {
+                use pulse_storage::WriterLeases;
+                l.ttl() / 3
+            });
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            match hb_meta.heartbeat_writer_node(&reg_node.node_name, now_ms).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let mut refreshed = reg_node.clone();
+                                    refreshed.last_heartbeat_ms = now_ms;
+                                    refreshed.updated_at_ms = now_ms;
+                                    if let Err(e) = hb_meta.register_writer_node(&refreshed).await {
+                                        tracing::warn!(node_name = %reg_node.node_name, error = %e, "re-registering writer node failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(node_name = %reg_node.node_name, error = %e, "writer node heartbeat failed");
+                                }
+                            }
+                        }
+                        changed = hb_shutdown.changed() => {
+                            if changed.is_err() || *hb_shutdown.borrow() { break; }
+                        }
+                    }
+                }
+            });
+        }
+    }
     if let Some(leases) = &writer_leases {
         use pulse_storage::WriterLeases;
         storage.set_writer_leases(leases.clone());
@@ -499,12 +634,15 @@ pub async fn start_pulse_node_with_store(
             }
         });
     }
-    let control = ControlPlaneService::new_with_admin(
-        meta,
+    let control = ControlPlaneService::new_with_node_identity(
+        meta.clone(),
         qengine.clone(),
         &config.default_project_id,
         &config.default_api_key,
         config.admin_token.clone(),
+        None,
+        node_name.clone(),
+        Some(effective_advertise_addr),
     )
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -543,6 +681,13 @@ pub async fn start_pulse_node_with_store(
                 .get_or_open_project(&config.default_project_id)
                 .await
             {
+                Err(pulse_storage::StorageError::NotOwner { .. }) => {
+                    break Err(pulse_storage::StorageError::NotOwner {
+                        project_id: config.default_project_id.clone(),
+                        owner_node: None,
+                        owner_address: None,
+                    });
+                }
                 Err(pulse_storage::StorageError::NotWriter { .. })
                     if std::time::Instant::now() < deadline =>
                 {
@@ -561,6 +706,10 @@ pub async fn start_pulse_node_with_store(
                     seeder::seed_agent_demo(&control, &config.default_project_id).await?;
                 }
             }
+            Err(pulse_storage::StorageError::NotOwner { .. }) => tracing::warn!(
+                project_id = %config.default_project_id,
+                "another node owns this project; not seeding"
+            ),
             Err(pulse_storage::StorageError::NotWriter { .. }) => tracing::warn!(
                 project_id = %config.default_project_id,
                 "another node holds the writer lease; not seeding"
@@ -610,7 +759,9 @@ pub async fn start_pulse_node_with_store(
                             _ = store.flush_requested() => {}
                         }
                     } => {
-                        if let Err(e) = flush_control.agent_store().flush_l0().await {
+                        let store = flush_control.agent_store();
+                        store.reconcile_ownership().await;
+                        if let Err(e) = store.flush_l0().await {
                             tracing::warn!(error = %e, "agent L0 flush failed");
                         }
                     }
@@ -654,6 +805,7 @@ pub async fn start_pulse_node_with_store(
                 tokio::select! {
                     _ = compact_ticker.tick() => {
                         let store = agent_control.agent_store();
+                        store.reconcile_ownership().await;
                         if !store.is_local_hot_tier() || store.has_dirty_projects_for_compact() {
                             let now_ms = chrono::Utc::now().timestamp_millis();
                             match agent_control.meta().list_all_active_erasure_tombstones(now_ms).await {
@@ -678,7 +830,9 @@ pub async fn start_pulse_node_with_store(
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Err(e) = agent_control.agent_store().publish_all_projects().await {
+                        let store = agent_control.agent_store();
+                        store.reconcile_ownership().await;
+                        if let Err(e) = store.publish_all_projects().await {
                             tracing::warn!(error = %e, "agent upload/publish cycle failed");
                         }
                     }
@@ -699,20 +853,21 @@ pub async fn start_pulse_node_with_store(
         });
     }
     let _bg_handle = if config.role == NodeRole::All {
-        let keyring_control = control.clone();
-        let mut keyring_shutdown = shutdown_bg_rx.clone();
+        let reload_control = control.clone();
+        let mut reload_shutdown = shutdown_bg_rx.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            let period = Duration::from_secs(5);
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        if let Err(e) = keyring_control.refresh_encryption_keyring().await {
-                            tracing::warn!(error = %e, "failed to refresh BYOK keyring");
+                        if let Err(e) = reload_control.reload_caches_from_db().await {
+                            tracing::warn!(error = %e, "failed to reload control caches");
                         }
                     }
-                    changed = keyring_shutdown.changed() => {
-                        if changed.is_err() || *keyring_shutdown.borrow() { break; }
+                    changed = reload_shutdown.changed() => {
+                        if changed.is_err() || *reload_shutdown.borrow() { break; }
                     }
                 }
             }
@@ -763,10 +918,18 @@ pub async fn start_pulse_node_with_store(
                         match role {
                             NodeRole::All => {}
                             NodeRole::Ingest => {
+                                bg_storage.reconcile_ownership().await;
                                 let errs = bg_storage.maintenance_errors();
                                 errs.check(MaintenanceKind::IdentityFlush, bg_storage.identity_router().flush_all().await);
                                 for p in bg_storage.open_projects() {
-                                    errs.check(MaintenanceKind::Flush, p.flush_due_buckets().await);
+                                    if p.is_fenced() {
+                                        continue;
+                                    }
+                                    match p.flush_due_buckets().await {
+                                        Err(pulse_storage::StorageError::NotWriter { .. })
+                                        | Err(pulse_storage::StorageError::NotOwner { .. }) => {}
+                                        other => errs.check(MaintenanceKind::Flush, other),
+                                    }
                                 }
                                 errs.check(MaintenanceKind::Compaction, bg_storage.run_gc_all_projects().await);
                                 if bg_storage.upload_interval().is_zero()
@@ -782,6 +945,7 @@ pub async fn start_pulse_node_with_store(
                                 }
                             }
                             NodeRole::Compactor => {
+                                bg_storage.reconcile_ownership().await;
                                 if let Err(e) = bg_control.refresh_encryption_keyring().await {
                                     tracing::warn!(error = %e, "compactor failed to refresh BYOK keyring");
                                 }
@@ -798,8 +962,15 @@ pub async fn start_pulse_node_with_store(
                                 match bg_control.meta().list_projects().await {
                                     Ok(projects) => {
                                         for p in projects {
-                                            if let Err(e) = bg_storage.get_or_open_project(&p.id).await {
-                                                tracing::warn!(project_id = %p.id, error = %e, "compactor failed to open project");
+                                            if !bg_control.is_project_owner_for_background(&p.id).await {
+                                                continue;
+                                            }
+                                            match bg_storage.get_or_open_project(&p.id).await {
+                                                Ok(_)
+                                                | Err(pulse_storage::StorageError::NotOwner { .. }) => {}
+                                                Err(e) => {
+                                                    tracing::warn!(project_id = %p.id, error = %e, "compactor failed to open project");
+                                                }
                                             }
                                         }
                                     }
@@ -891,7 +1062,10 @@ pub async fn start_pulse_node_with_store(
         }));
     if config.role.serves_ingest() {
         let mut ingest_routes = Router::new()
-            .merge(build_ingest_router(ingest.clone()))
+            .merge(build_ingest_router_with_guard(
+                ingest.clone(),
+                control.forward_guard(),
+            ))
             .merge(build_agent_ingest_router(control.clone()));
         if let Some(cap) = ingest_inflight_cap() {
             ingest_routes = ingest_routes.layer(axum::middleware::from_fn_with_state(
@@ -974,10 +1148,9 @@ pub async fn start_pulse_node_with_store(
         ))
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind(config.http_addr).await?;
-    let bound_http_addr = listener.local_addr()?;
     info!(
         role = config.role.as_str(),
+        node_name = node_name.as_deref().unwrap_or("<single>"),
         http = %bound_http_addr,
         "Pulse Analytics HTTP/2 server listening"
     );
@@ -999,6 +1172,8 @@ pub async fn start_pulse_node_with_store(
         storage,
         qengine,
         bootstrap_credentials,
+        node_name,
+        meta,
         writer_leases,
         shutdown_bg_tx,
         shutdown_http_tx: Some(shutdown_http_tx),
@@ -2374,5 +2549,37 @@ mod tests {
         assert_eq!(urgent_gc_wait_ms(500, 1_000), URGENT_GC_MIN_RETRY_MS);
         assert_eq!(urgent_gc_wait_ms(1_050, 1_000), URGENT_GC_MIN_RETRY_MS);
         assert_eq!(urgent_gc_wait_ms(2_500, 1_000), 1_500);
+    }
+
+    #[test]
+    fn node_identity_and_advertise_addr_normalization() {
+        assert!(NodeIdentity::new("   ", None).is_none());
+        let id = NodeIdentity::new(" node-a ", Some(" 10.0.0.5:8080/ ".into())).unwrap();
+        assert_eq!(id.node_name, "node-a");
+        assert_eq!(id.advertise_addr.as_deref(), Some("10.0.0.5:8080/"));
+
+        let bound_v4: SocketAddr = "0.0.0.0:9123".parse().unwrap();
+        assert_eq!(
+            normalize_advertise_addr(None, bound_v4),
+            "http://127.0.0.1:9123"
+        );
+        let bound_v4_loop: SocketAddr = "127.0.0.1:4321".parse().unwrap();
+        assert_eq!(
+            normalize_advertise_addr(None, bound_v4_loop),
+            "http://127.0.0.1:4321"
+        );
+        let bound_v6: SocketAddr = "[::]:8080".parse().unwrap();
+        assert_eq!(
+            normalize_advertise_addr(None, bound_v6),
+            "http://[::1]:8080"
+        );
+        assert_eq!(
+            normalize_advertise_addr(id.advertise_addr.as_deref(), bound_v4),
+            "http://10.0.0.5:8080"
+        );
+        assert_eq!(
+            normalize_advertise_addr(Some("https://storage-a.internal:8443/"), bound_v4),
+            "https://storage-a.internal:8443"
+        );
     }
 }

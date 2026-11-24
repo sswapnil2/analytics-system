@@ -21,12 +21,12 @@ use pulse_exec::{
     TimeRange,
 };
 use pulse_ingest::{
-    rate_limit::RateLimiter, DiscoveredEventSchema, GovernanceProvider, IngestError, IngestService,
-    ProjectLexiconRules,
+    forward_loop_middleware, rate_limit::RateLimiter, DiscoveredEventSchema, ForwardLoopGuard,
+    GovernanceProvider, IngestError, IngestService, ProjectLexiconRules,
 };
 use pulse_storage::{
     build_customer_object_store, make_key_id, parse_or_derive_master_key,
-    validate_object_store_connection, validate_outbound_url_ssrf,
+    validate_object_store_connection, validate_outbound_url_ssrf, ProjectOwnerChecker,
 };
 use pulse_wire::{mask_user_identifier, PropValue, WireBatch, WireEvent, WireframeOp};
 use ring::hmac;
@@ -46,7 +46,7 @@ use crate::agent_eval_worker::{
 };
 
 use crate::copilot::{run_byok_copilot, CopilotError, CopilotRequest};
-use crate::db::{MetaError, MetaStore};
+use crate::db::{DbProjectOwnerChecker, MetaError, MetaStore};
 use crate::experiments::{build_edge_flag_bundle_with_cohorts, evaluate_experiment_results};
 use crate::mcp::JsonRpcRequest;
 use crate::models::{
@@ -186,6 +186,26 @@ pub struct ControlPlaneService {
     outbox_path: parking_lot::RwLock<Option<std::path::PathBuf>>,
     agent_rate_limit: RateLimiter,
     pub(crate) agent_erasure_notify: Arc<tokio::sync::Notify>,
+    node_name: Option<String>,
+    advertise_addr: Option<String>,
+    owner_checker: Arc<DbProjectOwnerChecker>,
+    forward_guard: Arc<ForwardLoopGuard>,
+}
+
+fn writer_node_stale_after_ms() -> i64 {
+    if let Ok(v) = std::env::var("PULSE_WRITER_NODE_STALE_MS") {
+        if let Ok(ms) = v.trim().parse::<i64>() {
+            if ms > 0 {
+                return ms;
+            }
+        }
+    }
+    let ttl_secs = std::env::var("PULSE_WRITER_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(15)
+        .max(3);
+    ttl_secs.saturating_mul(1000)
 }
 
 impl ControlPlaneService {
@@ -212,6 +232,8 @@ impl ControlPlaneService {
             initial_ingest_key,
             explicit_admin_token,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -231,10 +253,37 @@ impl ControlPlaneService {
             initial_ingest_key,
             explicit_admin_token,
             Some(agent_store_config),
+            None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_node_identity(
+        meta: MetaStore,
+        qengine: Arc<QueryEngine>,
+        default_project_id: impl Into<String>,
+        initial_ingest_key: impl Into<String>,
+        explicit_admin_token: Option<String>,
+        agent_store_config: Option<AgentTraceStoreConfig>,
+        node_name: Option<String>,
+        advertise_addr: Option<String>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_options(
+            meta,
+            qengine,
+            default_project_id,
+            initial_ingest_key,
+            explicit_admin_token,
+            agent_store_config,
+            node_name,
+            advertise_addr,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn new_with_options(
         meta: MetaStore,
         qengine: Arc<QueryEngine>,
@@ -242,9 +291,17 @@ impl ControlPlaneService {
         initial_ingest_key: impl Into<String>,
         explicit_admin_token: Option<String>,
         agent_config: Option<AgentTraceStoreConfig>,
+        node_name: Option<String>,
+        advertise_addr: Option<String>,
     ) -> Result<Arc<Self>, String> {
         let default_project_id = default_project_id.into();
         let initial_ingest_key = initial_ingest_key.into();
+        let node_name = node_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let advertise_addr = advertise_addr
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let (admin_token_plain, generated_admin_token) = match explicit_admin_token
             .filter(|s| !s.trim().is_empty())
@@ -275,21 +332,26 @@ impl ControlPlaneService {
         // encrypted manifests and WAL segments decrypt cleanly on restart.
         Self::restore_encryption_keyring_inner(&meta, &vault_kek, &qengine).await?;
 
+        let owner_checker = Arc::new(DbProjectOwnerChecker::new(meta.clone(), node_name.clone()));
+        qengine.storage().set_owner_checker(owner_checker.clone());
+
         let store_cfg = agent_config.unwrap_or_else(|| AgentTraceStoreConfig {
             read_only: qengine.storage().identity_router().is_read_only(),
             ..Default::default()
         });
         let agent_store = Arc::new(
-            AgentTraceStore::open_with_encrypted(
+            AgentTraceStore::open_with_encrypted_and_owner(
                 qengine.storage().object_store().clone(),
                 Some(qengine.storage().encrypted_store().clone()),
                 store_cfg,
+                Some(owner_checker.clone()),
             )
             .await
             .map_err(|e| format!("failed to open AgentTraceStore: {e}"))?,
         );
         let (eval_tx, eval_rx) = mpsc::channel::<EvalJob>(EVAL_QUEUE_CAPACITY);
         let agent_metrics = Arc::new(AgentIngestMetrics::default());
+        let forward_guard = Arc::new(ForwardLoopGuard::new(node_name.clone()));
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<DiscoveredEventSchema>>();
         let svc = Arc::new(Self {
@@ -320,6 +382,10 @@ impl ControlPlaneService {
             outbox_path: parking_lot::RwLock::new(None),
             agent_rate_limit: RateLimiter::from_env(),
             agent_erasure_notify: Arc::new(tokio::sync::Notify::new()),
+            node_name,
+            advertise_addr,
+            owner_checker,
+            forward_guard,
         });
 
         let generated_ingest = svc
@@ -449,6 +515,39 @@ impl ControlPlaneService {
         &self.default_project_id
     }
 
+    pub fn node_name(&self) -> Option<&str> {
+        self.node_name.as_deref()
+    }
+
+    pub fn advertise_addr(&self) -> Option<&str> {
+        self.advertise_addr.as_deref()
+    }
+
+    pub fn owner_checker(&self) -> &Arc<DbProjectOwnerChecker> {
+        &self.owner_checker
+    }
+
+    pub fn forward_guard(&self) -> Arc<ForwardLoopGuard> {
+        self.forward_guard.clone()
+    }
+
+    pub fn writer_stale_after_ms(&self) -> i64 {
+        writer_node_stale_after_ms()
+    }
+
+    pub async fn is_project_owner_for_background(&self, project_id: &str) -> bool {
+        self.owner_checker.is_owned_locally(project_id).await
+    }
+
+    fn evict_non_owned_profile_cache(&self, project_id: &str) {
+        self.profile_catalog_ts.remove(project_id);
+        self.profiles_synced_ms.remove(project_id);
+        self.synced_published_seq.remove(project_id);
+        if let Some(cat) = self.qengine.catalogs().get_project(project_id) {
+            cat.set_user_profiles_with_ts(HashMap::new(), HashMap::new());
+        }
+    }
+
     async fn ensure_default_org_and_project(
         &self,
         initial_ingest_key: &str,
@@ -472,6 +571,16 @@ impl ControlPlaneService {
                 timezone: "UTC".to_string(),
                 created_at_ms: now,
             })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let _ = self
+            .meta
+            .place_project_if_unassigned(
+                &self.default_project_id,
+                now,
+                self.writer_stale_after_ms(),
+            )
             .await
             .map_err(|e| e.to_string())?;
 
@@ -557,14 +666,43 @@ impl ControlPlaneService {
         let live_projects: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
         self.known_projects
             .retain(|id, _| live_projects.contains(id.as_str()));
+
+        let is_published_reader = self.qengine.storage().is_published_reader();
+        let owner_map: HashMap<String, String> = if !is_published_reader {
+            self.meta
+                .list_project_owners()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|o| (o.project_id, o.node_name))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // One project's broken catalog must not stop the others from reloading.
         let mut first_err = None;
         for proj in &projects {
             self.known_projects
                 .insert(proj.id.clone(), proj.org_id.clone());
+            let should_sync_virtual_catalog = if is_published_reader {
+                true
+            } else {
+                match (owner_map.get(&proj.id), self.node_name.as_deref()) {
+                    (Some(owner), Some(me)) => owner == me,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => false,
+                    (None, None) => true,
+                }
+            };
             let res = async {
                 self.refresh_project_lexicon_cache(&proj.id).await?;
-                self.refresh_project_virtual_catalog(&proj.id).await
+                if should_sync_virtual_catalog {
+                    self.refresh_project_virtual_catalog(&proj.id).await
+                } else {
+                    self.evict_non_owned_profile_cache(&proj.id);
+                    Ok(())
+                }
             }
             .await;
             if let Err(e) = res {
@@ -1818,6 +1956,34 @@ impl GovernanceProvider for ControlPlaneService {
         group_id: &str,
         ops: &Value,
     ) -> std::result::Result<(), IngestError> {
+        match self.owner_checker.check_owner(project_id).await {
+            Ok(pulse_storage::OwnerCheck::Owned) => {}
+            Ok(pulse_storage::OwnerCheck::Unassigned) => {
+                return Err(IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner {
+                        project_id: project_id.to_string(),
+                        owner_node: None,
+                        owner_address: None,
+                    },
+                ));
+            }
+            Ok(pulse_storage::OwnerCheck::NotOwner(info)) => {
+                return Err(IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner {
+                        project_id: project_id.to_string(),
+                        owner_node: Some(info.node_name),
+                        owner_address: Some(info.address),
+                    },
+                ));
+            }
+            Err(e) => {
+                return Err(IngestError::Storage(
+                    pulse_storage::StorageError::Unavailable(format!(
+                        "project owner check failed: {e}"
+                    )),
+                ));
+            }
+        }
         let existing = self
             .meta
             .get_group_profile(project_id, group_type, group_id)
@@ -2046,13 +2212,19 @@ async fn require_admin_auth(
 
 /// Builds the public SDK Flag Bundle router (`GET /v1/flags/:project_api_key`), safe for permissive CORS.
 pub fn build_public_flag_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
     Router::new()
         .route("/v1/flags/:project_api_key", get(handle_edge_flag_bundle))
+        .layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
         .with_state(ctrl)
 }
 
 /// Builds the authenticated Control Plane + Query + Replay + MCP router.
 pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
     Router::new()
         .route("/v1/status", get(handle_status))
         .route("/v1/admin/flush", post(handle_admin_flush))
@@ -2249,6 +2421,10 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
         // but share the admin CORS policy.
         .merge(auth::public_auth_router())
         .merge(accounts::public_router())
+        .layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
         .with_state(ctrl)
 }
 
@@ -2263,70 +2439,117 @@ pub fn build_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
 pub(crate) type ApiRes<T> = std::result::Result<Json<T>, CtrlError>;
 
 #[derive(Debug)]
-pub(crate) struct CtrlError(pub(crate) StatusCode, pub(crate) String);
+pub(crate) struct CtrlError {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    pub(crate) code: Option<&'static str>,
+    pub(crate) not_owner: Option<(String, Option<String>, Option<String>)>,
+}
 
 impl CtrlError {
     pub(crate) fn new(status: StatusCode, msg: impl Into<String>) -> Self {
-        Self(status, msg.into())
+        Self {
+            status,
+            message: msg.into(),
+            code: None,
+            not_owner: None,
+        }
     }
     pub(crate) fn bad(msg: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, msg.into())
+        Self::new(StatusCode::BAD_REQUEST, msg)
     }
     pub(crate) fn unauthorized(msg: impl Into<String>) -> Self {
-        Self(StatusCode::UNAUTHORIZED, msg.into())
+        Self::new(StatusCode::UNAUTHORIZED, msg)
     }
     pub(crate) fn forbidden(msg: impl Into<String>) -> Self {
-        Self(StatusCode::FORBIDDEN, msg.into())
+        Self::new(StatusCode::FORBIDDEN, msg)
     }
     pub(crate) fn not_found(msg: impl Into<String>) -> Self {
-        Self(StatusCode::NOT_FOUND, msg.into())
+        Self::new(StatusCode::NOT_FOUND, msg)
     }
     pub(crate) fn conflict(msg: impl Into<String>) -> Self {
-        Self(StatusCode::CONFLICT, msg.into())
+        Self::new(StatusCode::CONFLICT, msg)
     }
     pub(crate) fn bad_gateway(msg: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_GATEWAY, msg.into())
+        Self::new(StatusCode::BAD_GATEWAY, msg)
+    }
+    pub(crate) fn not_writer(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+            code: Some("not_writer"),
+            not_owner: None,
+        }
+    }
+    pub(crate) fn stale_writer(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+            code: Some("stale_writer"),
+            not_owner: None,
+        }
+    }
+    pub(crate) fn not_owner(
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    ) -> Self {
+        let message = format!("this node is not the owner for project '{project_id}'");
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message,
+            code: Some("not_owner"),
+            not_owner: Some((project_id, owner_node, owner_address)),
+        }
     }
     pub(crate) fn meta(err: MetaError) -> Self {
         match err {
             MetaError::Conflict(msg) => Self::conflict(msg),
             MetaError::Sqlx(ref e) if is_sqlx_unavailable(e) => {
-                Self(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
             }
             other => Self::internal(other),
         }
     }
     pub(crate) fn storage(err: pulse_storage::StorageError) -> Self {
-        if err.is_unavailable() {
-            Self(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
-        } else if matches!(
-            err,
+        match err {
+            pulse_storage::StorageError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => Self::not_owner(project_id, owner_node, owner_address),
+            pulse_storage::StorageError::NotWriter { .. } => Self::not_writer(err.to_string()),
+            pulse_storage::StorageError::StaleWriter { .. } => Self::stale_writer(err.to_string()),
+            ref e if e.is_unavailable() => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+            }
             pulse_storage::StorageError::Identity(
-                pulse_identity::IdentityError::IdentifiedMergeConflict
-            )
-        ) {
-            Self::conflict(err.to_string())
-        } else if matches!(err, pulse_storage::StorageError::InvalidIdentifier(_)) {
-            Self::bad(err.to_string())
-        } else if matches!(err, pulse_storage::StorageError::DictionaryFull { .. }) {
-            Self(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
-        } else {
-            Self::internal(err)
+                pulse_identity::IdentityError::IdentifiedMergeConflict,
+            ) => Self::conflict(err.to_string()),
+            pulse_storage::StorageError::InvalidIdentifier(_) => Self::bad(err.to_string()),
+            pulse_storage::StorageError::DictionaryFull { .. } => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+            }
+            other => Self::internal(other),
         }
     }
     pub(crate) fn ingest(err: IngestError) -> Self {
         match err {
             IngestError::Unauthorized => Self::unauthorized(err.to_string()),
             IngestError::Wire(_) | IngestError::Json(_) => Self::bad(err.to_string()),
-            IngestError::SchemaGovernanceLimit(msg) => Self(StatusCode::UNPROCESSABLE_ENTITY, msg),
-            IngestError::RateLimited { .. } => Self(StatusCode::TOO_MANY_REQUESTS, err.to_string()),
+            IngestError::SchemaGovernanceLimit(msg) => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, msg)
+            }
+            IngestError::RateLimited { .. } => {
+                Self::new(StatusCode::TOO_MANY_REQUESTS, err.to_string())
+            }
             IngestError::Conflict(msg) => Self::conflict(msg),
             IngestError::Identity(pulse_identity::IdentityError::IdentifiedMergeConflict) => {
                 Self::conflict(err.to_string())
             }
-            IngestError::Unavailable(msg) => Self(StatusCode::SERVICE_UNAVAILABLE, msg),
+            IngestError::Unavailable(msg) => Self::new(StatusCode::SERVICE_UNAVAILABLE, msg),
             IngestError::Identity(ref e) if e.is_store_unavailable() => {
-                Self(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
             }
             IngestError::Storage(se) => Self::storage(se),
             other => Self::internal(other),
@@ -2335,16 +2558,17 @@ impl CtrlError {
     #[allow(dead_code)]
     pub(crate) fn exec(err: pulse_exec::ExecError) -> Self {
         match err {
-            pulse_exec::ExecError::QueryTimeout(ms) => Self(
+            pulse_exec::ExecError::Storage(se) => Self::storage(se),
+            pulse_exec::ExecError::QueryTimeout(ms) => Self::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("query exceeded deadline ({ms} ms)"),
             ),
             e @ pulse_exec::ExecError::QueryTooLarge { .. }
             | e @ pulse_exec::ExecError::QueryMemoryExceeded { .. } => {
-                Self(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
             }
             e @ pulse_exec::ExecError::Overloaded(_) => {
-                Self(StatusCode::TOO_MANY_REQUESTS, e.to_string())
+                Self::new(StatusCode::TOO_MANY_REQUESTS, e.to_string())
             }
             pulse_exec::ExecError::InvalidQuery(msg) | pulse_exec::ExecError::Expression(msg) => {
                 Self::bad(msg)
@@ -2353,15 +2577,42 @@ impl CtrlError {
         }
     }
     pub(crate) fn internal(msg: impl std::fmt::Display) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
     }
 }
 
 impl IntoResponse for CtrlError {
     fn into_response(self) -> Response {
+        if let Some((project_id, owner_node, owner_address)) = self.not_owner {
+            return (
+                self.status,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({
+                    "status": "error",
+                    "code": "not_owner",
+                    "project_id": project_id,
+                    "owner_node": owner_node,
+                    "owner_address": owner_address,
+                    "message": self.message,
+                })),
+            )
+                .into_response();
+        }
+        if let Some(code) = self.code {
+            return (
+                self.status,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({
+                    "status": "error",
+                    "code": code,
+                    "message": self.message,
+                })),
+            )
+                .into_response();
+        }
         (
-            self.0,
-            Json(json!({ "status": "error", "message": self.1 })),
+            self.status,
+            Json(json!({ "status": "error", "message": self.message })),
         )
             .into_response()
     }
@@ -2391,7 +2642,7 @@ async fn handle_status(
             .storage()
             .open_for_read(&pid)
             .await
-            .map_err(CtrlError::internal)?;
+            .map_err(CtrlError::storage)?;
         let snap = ps.snapshot();
         let l0_rows = ps.total_l0_rows();
         let id_graph = ctrl
@@ -2399,7 +2650,7 @@ async fn handle_status(
             .storage()
             .identity_graph(&pid, false)
             .await
-            .map_err(CtrlError::internal)?;
+            .map_err(CtrlError::storage)?;
         (snap, l0_rows, id_graph.user_count())
     };
 
@@ -2611,6 +2862,12 @@ impl ControlPlaneService {
             .await
             .map_err(CtrlError::meta)?;
 
+        let _ = self
+            .meta
+            .place_project_if_unassigned(&id, now, self.writer_stale_after_ms())
+            .await
+            .map_err(CtrlError::meta)?;
+
         let (plaintext_key, key_hash, key_prefix) =
             generate_random_api_key(KEY_ROLE_INGEST_AND_FLAGS);
         let key = ApiKeyRecord {
@@ -2639,9 +2896,13 @@ impl ControlPlaneService {
         self.refresh_project_lexicon_cache(&id)
             .await
             .map_err(CtrlError::internal)?;
-        self.refresh_project_virtual_catalog(&id)
-            .await
-            .map_err(CtrlError::internal)?;
+        if self.qengine.storage().is_published_reader()
+            || self.is_project_owner_for_background(&id).await
+        {
+            self.refresh_project_virtual_catalog(&id)
+                .await
+                .map_err(CtrlError::internal)?;
+        }
         Ok((
             proj,
             CreatedApiKeyResponse {
@@ -5256,6 +5517,9 @@ impl ControlPlaneService {
             return;
         };
         for proj in projects {
+            if !self.is_project_owner_for_background(&proj.id).await {
+                continue;
+            }
             let Ok(rules) = self.meta.list_alert_rules(&proj.id).await else {
                 continue;
             };
@@ -6341,11 +6605,116 @@ mod agent_service_wiring_tests {
     fn ctrl_error_maps_dictionary_full_to_422() {
         let direct =
             CtrlError::storage(pulse_storage::StorageError::DictionaryFull { kind: "events" });
-        assert_eq!(direct.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(direct.status, StatusCode::UNPROCESSABLE_ENTITY);
 
         let via_ingest = CtrlError::ingest(IngestError::Storage(
             pulse_storage::StorageError::DictionaryFull { kind: "prop_keys" },
         ));
-        assert_eq!(via_ingest.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(via_ingest.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let not_owner = CtrlError::exec(pulse_exec::ExecError::Storage(
+            pulse_storage::StorageError::NotOwner {
+                project_id: "proj_x".into(),
+                owner_node: Some("node-b".into()),
+                owner_address: Some("http://node-b:8080".into()),
+            },
+        ));
+        assert_eq!(not_owner.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(not_owner.code, Some("not_owner"));
+    }
+
+    #[tokio::test]
+    async fn create_project_places_on_least_loaded_healthy_writer_and_admin_router_blocks_loops() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        meta.register_writer_node(&crate::models::WriterNode {
+            node_name: "node-a".into(),
+            address: "http://127.0.0.1:8081".into(),
+            role: "all".into(),
+            last_heartbeat_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .await
+        .unwrap();
+        meta.register_writer_node(&crate::models::WriterNode {
+            node_name: "node-b".into(),
+            address: "http://127.0.0.1:8082".into(),
+            role: "ingest".into(),
+            last_heartbeat_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .await
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let id_router = Arc::new(pulse_identity::IdentityRouter::new(store.clone()));
+        let storage = pulse_storage::StorageEngine::new(
+            pulse_storage::StorageConfig::default(),
+            store,
+            id_router,
+        );
+        let qengine = QueryEngine::new(
+            storage,
+            4 * 1024 * 1024,
+            None,
+            0,
+            pulse_exec::CatalogRegistry::new(),
+        )
+        .await
+        .unwrap();
+
+        let svc = ControlPlaneService::new_with_node_identity(
+            meta.clone(),
+            qengine,
+            "proj_default",
+            "pk_default",
+            Some("adm_tok".into()),
+            None,
+            Some("node-a".into()),
+            Some("http://127.0.0.1:8081".into()),
+        )
+        .await
+        .unwrap();
+
+        // Default project placed on node-a (tie break), so next created project goes to node-b (0 projects).
+        let def_owner = meta
+            .get_project_owner("proj_default")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(def_owner.node_name, "node-a");
+
+        let (proj2, _) = svc
+            .create_project_in_org("org_default", "Second Project", None)
+            .await
+            .unwrap();
+        let p2_owner = meta.get_project_owner(&proj2.id).await.unwrap().unwrap();
+        assert_eq!(p2_owner.node_name, "node-b");
+
+        // Forward-loop middleware on build_admin_control_router returns 503 forward_loop_detected.
+        let app = build_admin_control_router(svc.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/v1/status")
+                    .header("authorization", "Bearer adm_tok")
+                    .header(pulse_ingest::HEADER_FORWARDED_HOP, "1")
+                    .header(pulse_ingest::HEADER_FORWARDED_BY, "node-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "forward_loop_detected");
+
+        svc.agent_store().close().await.unwrap();
     }
 }

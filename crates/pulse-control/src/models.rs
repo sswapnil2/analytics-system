@@ -25,6 +25,32 @@ pub struct Project {
     pub created_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOwner {
+    pub project_id: String,
+    pub node_name: String,
+    pub address: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterNode {
+    pub node_name: String,
+    pub address: String,
+    pub role: String,
+    pub last_heartbeat_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLoad {
+    pub node_name: String,
+    pub address: String,
+    pub role: String,
+    pub last_heartbeat_ms: i64,
+    pub project_count: u64,
+}
+
 /// Dashboard user account. Deliberately not `Serialize` so `password_hash` can never leak into a response.
 #[derive(Debug, Clone)]
 pub struct User {
