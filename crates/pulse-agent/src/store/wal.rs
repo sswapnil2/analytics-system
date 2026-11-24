@@ -706,6 +706,11 @@ impl AgentWalWriter {
             let _ = h.await;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.tx.lock().is_none() && self.task.try_lock().is_ok_and(|g| g.is_none())
+    }
 }
 
 /// Sizes a batch from its actual payloads, so groups are cut on real bytes. A per-span

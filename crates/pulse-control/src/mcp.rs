@@ -94,7 +94,15 @@ pub async fn handle_mcp_request_with_agent_store(
     agent_store: Option<&AgentTraceStore>,
 ) -> JsonRpcResponse {
     let req_id = req.id.clone();
-    match handle_mcp_request_checked(req, bound_project_id, meta, qengine, agent_store).await {
+    match Box::pin(handle_mcp_request_checked(
+        req,
+        bound_project_id,
+        meta,
+        qengine,
+        agent_store,
+    ))
+    .await
+    {
         Ok(resp) => resp,
         Err(err) => JsonRpcResponse::ok(
             req_id,
@@ -351,14 +359,14 @@ pub(crate) async fn handle_mcp_request_checked(
                 }
             }
 
-            match invoke_tool_with_agent_store(
+            match Box::pin(invoke_tool_with_agent_store(
                 tool_name,
                 bound_project_id,
                 &args,
                 meta,
                 qengine,
                 agent_store,
-            )
+            ))
             .await
             {
                 Ok(payload) => Ok(JsonRpcResponse::ok(

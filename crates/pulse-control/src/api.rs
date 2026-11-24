@@ -2568,7 +2568,9 @@ impl ControlPlaneService {
                 Err(e) => {
                     if attempt == 0 {
                         if let Ok(Some(refreshed)) = dir.refresh_owner(project_id).await {
-                            if refreshed.address != owner.address {
+                            if refreshed.node_name != owner.node_name
+                                || refreshed.address != owner.address
+                            {
                                 if !is_pub_reader
                                     && !is_writer
                                     && self.node_name.as_deref()
@@ -5793,13 +5795,13 @@ async fn handle_mcp(
     } else {
         ctrl.load_erased_for_project_ctrl(&bound_pid).await?;
     }
-    match crate::mcp::handle_mcp_request_checked(
+    match Box::pin(crate::mcp::handle_mcp_request_checked(
         req,
         &bound_pid,
         &ctrl.meta,
         &ctrl.qengine,
         Some(ctrl.agent_store().as_ref()),
-    )
+    ))
     .await
     {
         Ok(resp) => Ok(Json(resp).into_response()),

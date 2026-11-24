@@ -1235,8 +1235,7 @@ impl AgentTraceStore {
             .owner_checker
             .as_ref()
             .is_none_or(|c| c.is_single_node_passthrough());
-        if let Some(existing) = self.projects.get(project_id) {
-            let st = existing.value().clone();
+        if let Some(st) = self.projects.get(project_id).map(|e| e.value().clone()) {
             if !self.config.read_only {
                 if st.fenced.load(Ordering::Acquire) {
                     return Err(StoreError::NotWriter {
@@ -1256,8 +1255,7 @@ impl AgentTraceStore {
         }
 
         let _init_guard = self.project_init_lock.lock().await;
-        if let Some(existing) = self.projects.get(project_id) {
-            let st = existing.value().clone();
+        if let Some(st) = self.projects.get(project_id).map(|e| e.value().clone()) {
             if !self.config.read_only {
                 if st.fenced.load(Ordering::Acquire) {
                     return Err(StoreError::NotWriter {
@@ -4435,5 +4433,186 @@ mod tests {
             .unwrap();
         assert_eq!(dup.accepted_traces, 0);
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_or_open_project_cached_deposed_owner_evicts_without_deadlock_and_preserves_siblings(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let checker = Arc::new(MapAgentOwnerChecker {
+            self_node: "node-a".into(),
+            owners: parking_lot::RwLock::new(HashMap::from([
+                (
+                    "proj_move".into(),
+                    pulse_storage::ProjectOwnerInfo {
+                        project_id: "proj_move".into(),
+                        node_name: "node-a".into(),
+                        address: "http://node-a:8080".into(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+                (
+                    "proj_keep".into(),
+                    pulse_storage::ProjectOwnerInfo {
+                        project_id: "proj_keep".into(),
+                        node_name: "node-a".into(),
+                        address: "http://node-a:8080".into(),
+                        updated_at_ms: 1000,
+                    },
+                ),
+            ])),
+        });
+
+        let routed = pulse_storage::with_hot_store_for_role(s3_raw, dir.path(), false)
+            .await
+            .unwrap();
+        let store = AgentTraceStore::open_with_encrypted_and_owner(
+            routed,
+            None,
+            AgentTraceStoreConfig::default(),
+            Some(checker.clone()),
+        )
+        .await
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .ingest_batch("proj_move", sample_batch("tr_move_warm", now_ms))
+            .await
+            .unwrap();
+        store
+            .ingest_batch("proj_keep", sample_batch("tr_keep_warm", now_ms))
+            .await
+            .unwrap();
+
+        let st_move = store.projects.get("proj_move").unwrap().value().clone();
+        assert!(st_move.wal_writer.is_some());
+        assert!(!st_move.fenced.load(Ordering::Acquire));
+
+        // Move proj_move to node-b WITHOUT calling reconcile_ownership().
+        checker.owners.write().insert(
+            "proj_move".into(),
+            pulse_storage::ProjectOwnerInfo {
+                project_id: "proj_move".into(),
+                node_name: "node-b".into(),
+                address: "http://node-b:8080".into(),
+                updated_at_ms: 2000,
+            },
+        );
+
+        // Fast-path cached get_or_open_project via ingest_batch must NOT deadlock on DashMap shard.
+        let res_ingest = tokio::time::timeout(
+            Duration::from_secs(3),
+            store.ingest_batch("proj_move", sample_batch("tr_move_deposed", now_ms + 1)),
+        )
+        .await
+        .expect("ingest_batch on cached deposed project must not deadlock");
+        assert!(matches!(
+            res_ingest,
+            Err(StoreError::NotOwner {
+                owner_node: Some(ref n),
+                ..
+            }) if n == "node-b"
+        ));
+        assert!(st_move.fenced.load(Ordering::Acquire));
+        assert!(!store.projects.contains_key("proj_move"));
+        assert!(
+            st_move.wal_writer.as_ref().unwrap().is_shutdown(),
+            "wal_writer must be shut down on eviction"
+        );
+
+        // Sibling project proj_keep continues ingesting normally.
+        store
+            .ingest_batch("proj_keep", sample_batch("tr_keep_2", now_ms + 2))
+            .await
+            .unwrap();
+        assert!(store
+            .get_trace_detail("proj_keep", "tr_keep_2", &[])
+            .await
+            .unwrap()
+            .is_some());
+
+        // Move proj_move back to node-a, re-warm it in cache, then move to node-b again and test
+        // ingest_forwarded_batch while proj_move is still cached in store.projects.
+        checker.owners.write().insert(
+            "proj_move".into(),
+            pulse_storage::ProjectOwnerInfo {
+                project_id: "proj_move".into(),
+                node_name: "node-a".into(),
+                address: "http://node-a:8080".into(),
+                updated_at_ms: 3000,
+            },
+        );
+        store
+            .ingest_batch("proj_move", sample_batch("tr_move_reopened", now_ms + 3))
+            .await
+            .unwrap();
+        assert!(store
+            .get_trace_detail("proj_move", "tr_move_reopened", &[])
+            .await
+            .unwrap()
+            .is_some());
+        let st_move_2 = store.projects.get("proj_move").unwrap().value().clone();
+
+        checker.owners.write().insert(
+            "proj_move".into(),
+            pulse_storage::ProjectOwnerInfo {
+                project_id: "proj_move".into(),
+                node_name: "node-b".into(),
+                address: "http://node-b:8080".into(),
+                updated_at_ms: 4000,
+            },
+        );
+        let res_fwd = tokio::time::timeout(
+            Duration::from_secs(3),
+            store.ingest_forwarded_batch(
+                "writer_1",
+                "proj_move",
+                0,
+                sample_batch("tr_move_fwd_deposed", now_ms + 4),
+                now_ms + 4,
+            ),
+        )
+        .await
+        .expect("ingest_forwarded_batch on cached deposed project must not deadlock");
+        assert!(matches!(
+            res_fwd,
+            Err(StoreError::NotOwner {
+                owner_node: Some(ref n),
+                ..
+            }) if n == "node-b"
+        ));
+        assert!(st_move_2.fenced.load(Ordering::Acquire));
+        assert!(!store.projects.contains_key("proj_move"));
+        assert!(st_move_2.wal_writer.as_ref().unwrap().is_shutdown());
+
+        // Returning ownership back to node-a re-opens cleanly.
+        checker.owners.write().insert(
+            "proj_move".into(),
+            pulse_storage::ProjectOwnerInfo {
+                project_id: "proj_move".into(),
+                node_name: "node-a".into(),
+                address: "http://node-a:8080".into(),
+                updated_at_ms: 5000,
+            },
+        );
+        store
+            .ingest_forwarded_batch(
+                "writer_1",
+                "proj_move",
+                0,
+                sample_batch("tr_move_back_ok", now_ms + 5),
+                now_ms + 5,
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .get_trace_detail("proj_move", "tr_move_back_ok", &[])
+            .await
+            .unwrap()
+            .is_some());
+
+        store.close().await.unwrap();
     }
 }

@@ -2148,3 +2148,299 @@ fn w3_live_ownership_migration_prevents_split_brain_and_stale_lease_errors() {
         owner_a.shutdown().await;
     });
 }
+
+#[test]
+fn w3_cached_agent_store_deposed_owner_no_deadlock_before_identify() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("owner_a");
+    let dir_b = tmp.path().join("node_b");
+    let dir_w = tmp.path().join("writer");
+    let meta_db = tmp.path().join("meta.db");
+    let meta_url = format!("sqlite://{}", meta_db.display());
+
+    let _env = EnvGuard::set(&[
+        ("DATABASE_URL", Some(&meta_url)),
+        ("PULSE_VAULT_KEK", Some(TEST_VAULT_KEK)),
+        ("PULSE_HOT_STORE", Some("local")),
+        ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
+        ("PULSE_WRITER_FLUSH_MS", Some("10")),
+        ("PULSE_WRITER_LEASE_TTL_SECS", Some("15")),
+        ("PULSE_OWNER_CACHE_TTL_MS", Some("60000")),
+    ]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let owner_a = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_a, "proj_default", NodeRole::All),
+            s3.clone(),
+            NodeIdentity::new("owner-a", None),
+        )
+        .await
+        .unwrap();
+        let node_b = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_b, "proj_default", NodeRole::All),
+            s3.clone(),
+            NodeIdentity::new("node-b", None),
+        )
+        .await
+        .unwrap();
+        let writer = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_w, "proj_default", NodeRole::Writer),
+            Arc::new(InMemory::new()),
+            NodeIdentity::new("writer-ag", None),
+        )
+        .await
+        .unwrap();
+
+        let url_a = format!("http://{}", owner_a.http_addr);
+        let url_b = format!("http://{}", node_b.http_addr);
+        let url_w = format!("http://{}", writer.http_addr);
+
+        // Three projects allow testing all three cached AgentTraceStore eviction paths
+        // independently (direct POST, stale-cache GET, and stale-cache WriterForwarder)
+        // WITHOUT calling `/v1/identify` first.
+        let (pid_direct, pk_direct) = create_project_on(&http, &url_a, "proj-ag-direct").await;
+        let (pid_get, pk_get) = create_project_on(&http, &url_a, "proj-ag-get").await;
+        let (pid_fwd, pk_fwd) = create_project_on(&http, &url_a, "proj-ag-fwd").await;
+
+        let now_ms = Utc::now().timestamp_millis();
+        for pid in [&pid_direct, &pid_get, &pid_fwd] {
+            owner_a
+                .control
+                .meta()
+                .set_project_owner(pid, "owner-a", &url_a, now_ms)
+                .await
+                .unwrap();
+        }
+
+        // Warm AgentTraceStore on owner-a for pid_direct & pid_get, and warm owner-a's
+        // MetaOwnerDirectory cache via GET /v1/projects/:id/agent/traces.
+        assert_eq!(
+            http.post(format!("{url_a}/v1/agent/traces"))
+                .header("x-pulse-key", &pk_direct)
+                .json(&make_trace_batch(
+                    "tr_dir_warm",
+                    "s_dir",
+                    "u_1",
+                    now_ms,
+                    "bot"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_a}/v1/agent/traces"))
+                .header("x-pulse-key", &pk_get)
+                .json(&make_trace_batch(
+                    "tr_get_warm",
+                    "s_get",
+                    "u_1",
+                    now_ms,
+                    "bot"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/agent/traces"))
+                .header("x-pulse-key", &pk_fwd)
+                .json(&make_trace_batch(
+                    "tr_fwd_warm",
+                    "s_fwd",
+                    "u_1",
+                    now_ms,
+                    "bot"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        poll_until(Duration::from_secs(10), || async {
+            list_agent_trace_ids(&http, &url_a, &pid_direct)
+                .await
+                .contains(&"tr_dir_warm".to_string())
+                && list_agent_trace_ids(&http, &url_a, &pid_get)
+                    .await
+                    .contains(&"tr_get_warm".to_string())
+                && list_agent_trace_ids(&http, &url_a, &pid_fwd)
+                    .await
+                    .contains(&"tr_fwd_warm".to_string())
+        })
+        .await;
+
+        // Snapshot pre-migration WAL file count on owner-a for pid_fwd and pid_direct, and verify
+        // all three projects are cached in owner-a's AgentTraceStore.
+        let count_wal_files = |base: &Path, pid: &str| -> usize {
+            let root = base.join("wal/agent_wal").join(pid);
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter_map(|e| std::fs::read_dir(e.path()).ok())
+                .map(|d| d.count())
+                .sum()
+        };
+        let pre_mig_wal_direct = count_wal_files(&dir_a, &pid_direct);
+        let pre_mig_wal_fwd = count_wal_files(&dir_a, &pid_fwd);
+        assert!(pre_mig_wal_direct > 0 && pre_mig_wal_fwd > 0);
+        assert!(owner_a
+            .control
+            .agent_store()
+            .last_ingest_ms(&pid_direct)
+            .is_some());
+        assert!(owner_a
+            .control
+            .agent_store()
+            .last_ingest_ms(&pid_get)
+            .is_some());
+        assert!(owner_a
+            .control
+            .agent_store()
+            .last_ingest_ms(&pid_fwd)
+            .is_some());
+
+        // Migrate all three projects to node-b WITHOUT restarting owner-a or reconciling.
+        let mig_ms = Utc::now().timestamp_millis();
+        for pid in [&pid_direct, &pid_get, &pid_fwd] {
+            node_b
+                .control
+                .meta()
+                .set_project_owner(pid, "node-b", &url_b, mig_ms)
+                .await
+                .unwrap();
+        }
+
+        // 1. Direct POST /v1/agent/traces on deposed owner-a (without /v1/identify) -> 503 not_owner promptly.
+        let direct_post = tokio::time::timeout(
+            Duration::from_secs(5),
+            http.post(format!("{url_a}/v1/agent/traces"))
+                .header("x-pulse-key", &pk_direct)
+                .json(&make_trace_batch(
+                    "tr_dir_after",
+                    "s_dir",
+                    "u_1",
+                    now_ms + 10,
+                    "bot",
+                ))
+                .send(),
+        )
+        .await
+        .expect("direct POST /v1/agent/traces on deposed owner-a must not hang")
+        .unwrap();
+        assert_eq!(direct_post.status(), 503);
+        let direct_body: Value = direct_post.json().await.unwrap();
+        assert_eq!(direct_body["code"], json!("not_owner"), "{direct_body}");
+
+        // 2. Stale-cache GET /v1/projects/:id/agent/traces on deposed owner-a (while pid_get is still
+        //    cached in owner-a's AgentTraceStore) -> forwards cleanly to node-b -> 200, zero hang.
+        let stale_get = tokio::time::timeout(
+            Duration::from_secs(5),
+            http.get(format!(
+                "{url_a}/v1/projects/{pid_get}/agent/traces?limit=10"
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send(),
+        )
+        .await
+        .expect("GET /v1/projects/:id/agent/traces on deposed owner-a must not hang")
+        .unwrap();
+        assert_eq!(stale_get.status(), 200);
+
+        // 3. Stale-cache POST /v1/agent/traces via Writer (whose MetaOwnerDirectory still points to
+        //    owner-a; NO /v1/identify called!) hits 503 not_owner from owner-a, refreshes to node-b,
+        //    and delivers cleanly to node-b with zero hang and zero split-brain on owner-a.
+        let writer_post = tokio::time::timeout(
+            Duration::from_secs(5),
+            http.post(format!("{url_w}/v1/agent/traces"))
+                .header("x-pulse-key", &pk_fwd)
+                .json(&make_trace_batch(
+                    "tr_fwd_after",
+                    "s_fwd",
+                    "u_1",
+                    now_ms + 20,
+                    "bot",
+                ))
+                .send(),
+        )
+        .await
+        .expect("POST /v1/agent/traces on writer must not hang")
+        .unwrap();
+        assert_eq!(writer_post.status(), 200);
+
+        poll_until(Duration::from_secs(10), || async {
+            list_agent_trace_ids(&http, &url_b, &pid_fwd)
+                .await
+                .contains(&"tr_fwd_after".to_string())
+        })
+        .await;
+        assert!(
+            owner_a
+                .control
+                .agent_store()
+                .last_ingest_ms(&pid_direct)
+                .is_none(),
+            "deposed owner-a must evict pid_direct from AgentTraceStore"
+        );
+        assert!(
+            owner_a
+                .control
+                .agent_store()
+                .last_ingest_ms(&pid_get)
+                .is_none(),
+            "deposed owner-a must evict pid_get from AgentTraceStore"
+        );
+        assert!(
+            owner_a
+                .control
+                .agent_store()
+                .last_ingest_ms(&pid_fwd)
+                .is_none(),
+            "deposed owner-a must evict pid_fwd from AgentTraceStore"
+        );
+        assert_eq!(
+            count_wal_files(&dir_a, &pid_direct),
+            pre_mig_wal_direct,
+            "deposed owner-a must not write new agent WAL files for pid_direct"
+        );
+        assert_eq!(
+            count_wal_files(&dir_a, &pid_fwd),
+            pre_mig_wal_fwd,
+            "deposed owner-a must not write new agent WAL files for pid_fwd"
+        );
+        assert!(
+            count_wal_files(&dir_b, &pid_fwd) > 0,
+            "new owner node-b must persist agent WAL for pid_fwd"
+        );
+        assert!(
+            list_agent_trace_ids(&http, &url_a, &pid_fwd)
+                .await
+                .contains(&"tr_fwd_after".to_string()),
+            "HTTP GET on deposed owner-a forwards cleanly to node-b"
+        );
+
+        writer.shutdown().await;
+        node_b.shutdown().await;
+        owner_a.shutdown().await;
+    });
+}
