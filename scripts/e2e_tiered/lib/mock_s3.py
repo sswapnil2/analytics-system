@@ -225,15 +225,19 @@ class _MockS3Handler(http.server.BaseHTTPRequestHandler):
     def _apply_fault_and_record(self, op: str, key_or_prefix: str) -> bool:
         """Record call, apply latency/fault injection. Returns True if request was aborted/faulted."""
         mock = self._mock()
+        mock._fire_before_callbacks(op, key_or_prefix)
         mock._record_call(op, key_or_prefix)
         fault = mock._get_fault_snapshot()
-        if fault.latency_ms > 0:
+        op_match = fault.ops is None or op in fault.ops
+        prefix_match = (not fault.fail_prefixes) or any(
+            _prefix_matches(key_or_prefix, p) for p in fault.fail_prefixes
+        )
+        if fault.latency_ms > 0 and op_match and prefix_match:
             time.sleep(fault.latency_ms / 1000.0)
         if fault.unreachable:
             self._drop_connection()
             return True
         if fault.fail_prefixes:
-            op_match = fault.ops is None or op in fault.ops
             if op_match and any(_prefix_matches(key_or_prefix, p) for p in fault.fail_prefixes):
                 self._send_bytes(
                     fault.status,
@@ -446,17 +450,23 @@ class _MockS3Handler(http.server.BaseHTTPRequestHandler):
         # Batch DeleteObjects: POST /<bucket>?delete
         if not key and "delete" in query:
             fault = mock._get_fault_snapshot()
-            if fault.latency_ms > 0:
-                time.sleep(fault.latency_ms / 1000.0)
-            if fault.unreachable:
-                self._drop_connection()
-                return
             keys_to_delete: list[str] = []
             if body:
                 root = ET.fromstring(body)
                 for elem in root.iter():
                     if elem.tag.endswith("Key") and elem.text:
                         keys_to_delete.append(elem.text)
+            for dk in keys_to_delete:
+                mock._fire_before_callbacks("DELETE", dk)
+            if fault.latency_ms > 0 and (fault.ops is None or "DELETE" in fault.ops):
+                if (not fault.fail_prefixes) or any(
+                    any(_prefix_matches(dk, p) for p in fault.fail_prefixes)
+                    for dk in keys_to_delete
+                ):
+                    time.sleep(fault.latency_ms / 1000.0)
+            if fault.unreachable:
+                self._drop_connection()
+                return
             for dk in keys_to_delete:
                 mock._record_call("DELETE", dk)
             if fault.fail_prefixes and (fault.ops is None or "DELETE" in fault.ops):
@@ -645,6 +655,7 @@ class MockS3Server:
         self._counts: Counter[tuple[str, str]] = Counter()
         self._fault = S3FaultConfig()
         self._callbacks: list[Callable[..., Any]] = []
+        self._before_callbacks: list[Callable[..., Any]] = []
 
         self._httpd = _QuietThreadingHTTPServer((host, port), _MockS3Handler, self)
         self.port: int = int(self._httpd.server_address[1])
@@ -708,6 +719,12 @@ class MockS3Server:
     def _fire_callbacks(self, op: str, key: str) -> None:
         with self._lock:
             cbs = list(self._callbacks)
+        for cb in cbs:
+            cb(op, key)
+
+    def _fire_before_callbacks(self, op: str, key: str) -> None:
+        with self._lock:
+            cbs = list(self._before_callbacks)
         for cb in cbs:
             cb(op, key)
 
@@ -936,3 +953,13 @@ class MockS3Server:
         """Remove all registered `on_operation` callbacks."""
         with self._lock:
             self._callbacks.clear()
+
+    def on_before_operation(self, callback: Callable[[str, str], Any]) -> None:
+        """Register a callback `callback(op, key)` invoked before an S3 operation executes."""
+        with self._lock:
+            self._before_callbacks.append(callback)
+
+    def clear_before_operations(self) -> None:
+        """Remove all registered `on_before_operation` callbacks."""
+        with self._lock:
+            self._before_callbacks.clear()

@@ -3078,7 +3078,6 @@ pub struct MetaOwnerDirectory {
     meta: MetaStore,
     cache: DashMap<String, (ProjectOwnerInfo, std::time::Instant)>,
     ttl: std::time::Duration,
-    stale_after_ms: i64,
 }
 
 impl MetaOwnerDirectory {
@@ -3088,23 +3087,10 @@ impl MetaOwnerDirectory {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .unwrap_or(5_000);
-        let stale_after_ms = std::env::var("PULSE_WRITER_NODE_STALE_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|&ms| ms > 0)
-            .unwrap_or_else(|| {
-                let ttl_secs = std::env::var("PULSE_WRITER_LEASE_TTL_SECS")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<i64>().ok())
-                    .unwrap_or(15)
-                    .max(3);
-                ttl_secs.saturating_mul(1_000)
-            });
         Self {
             meta,
             cache: DashMap::new(),
             ttl: std::time::Duration::from_millis(ttl_ms),
-            stale_after_ms,
         }
     }
 
@@ -3141,16 +3127,6 @@ impl pulse_ingest::OwnerDirectory for MetaOwnerDirectory {
             .get_project_owner(project_id)
             .await
             .map_err(|e| e.to_string())?;
-        let owner_opt = match owner_opt {
-            Some(o) => Some(o),
-            None => {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                self.meta
-                    .place_project_if_unassigned(project_id, now_ms, self.stale_after_ms)
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-        };
         if let Some(owner) = owner_opt {
             let info = Self::to_info(owner);
             self.cache.insert(
@@ -3827,5 +3803,75 @@ mod writer_lease_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key_id, "key-1");
         assert!(rows[0].is_active);
+    }
+
+    #[tokio::test]
+    async fn meta_owner_directory_refresh_returns_none_when_owner_missing_or_deleted() {
+        use pulse_ingest::OwnerDirectory;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::connect_auto(dir.path()).await.unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Register a live storage node so lazy placement WOULD succeed if called.
+        meta.register_writer_node(&WriterNode {
+            node_name: "storage-0".into(),
+            address: "http://127.0.0.1:8080".into(),
+            role: "storage".into(),
+            last_heartbeat_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+        .await
+        .unwrap();
+
+        let owner_dir = MetaOwnerDirectory::new(meta.clone());
+
+        // Missing project_owner row must return Ok(None) and NOT lazily place it.
+        assert_eq!(owner_dir.resolve_owner("proj_missing").await.unwrap(), None);
+        assert_eq!(owner_dir.refresh_owner("proj_missing").await.unwrap(), None);
+        assert_eq!(meta.get_project_owner("proj_missing").await.unwrap(), None);
+
+        // Once explicitly assigned, resolve_owner caches and returns it.
+        meta.set_project_owner(
+            "proj_assigned",
+            "storage-0",
+            "http://127.0.0.1:8080",
+            now_ms,
+        )
+        .await
+        .unwrap();
+        let info = owner_dir
+            .resolve_owner("proj_assigned")
+            .await
+            .unwrap()
+            .expect("assigned owner should resolve");
+        assert_eq!(info.node_name, "storage-0");
+
+        // Deleting the project_owner row causes refresh_owner to evict cache and return Ok(None).
+        match &meta {
+            MetaStore::Sqlite(pool) => {
+                sqlx::query("DELETE FROM project_owner WHERE project_id = ?")
+                    .bind("proj_assigned")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            MetaStore::Postgres(pool) => {
+                sqlx::query("DELETE FROM project_owner WHERE project_id = $1")
+                    .bind("proj_assigned")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            owner_dir.refresh_owner("proj_assigned").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            owner_dir.resolve_owner("proj_assigned").await.unwrap(),
+            None
+        );
+        assert_eq!(meta.get_project_owner("proj_assigned").await.unwrap(), None);
     }
 }

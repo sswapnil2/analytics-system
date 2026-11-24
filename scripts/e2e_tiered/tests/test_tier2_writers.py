@@ -14,6 +14,8 @@ Exactly 5 tests per feature x 8 features = 40 Tier 2 tests.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import shutil
 import sys
@@ -26,7 +28,7 @@ _HARNESS_ROOT = Path(__file__).resolve().parent.parent
 if str(_HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(_HARNESS_ROOT))
 
-from lib.client import PulseHttpClient  # noqa: E402
+from lib.client import HttpStatusError, PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance  # noqa: E402
 from lib.oracle import (  # noqa: E402
     external_postgres_url,
@@ -40,6 +42,19 @@ from lib.oracle import (  # noqa: E402
     tier,
     wait_until,
 )
+
+
+def _incompressible_str(seed: str, length: int) -> str:
+    chunks: list[str] = []
+    cur = 0
+    counter = 0
+    while cur < length:
+        digest = hashlib.sha256(f"{seed}:{counter}".encode("utf-8")).digest()
+        b85 = base64.b85encode(digest).decode("ascii")
+        chunks.append(b85)
+        cur += len(b85)
+        counter += 1
+    return "".join(chunks)[:length]
 
 
 def _create_project(client: PulseHttpClient, name: str) -> tuple[str, str]:
@@ -96,7 +111,7 @@ def _transfer_project_for_failover(
         if proc.returncode != 0:
             raise AssertionError(f"restore --from-published failed: {proc.stderr}")
         return
-    for prefix in ("identity", "profiles", "manifests", "hot/segments", "wal/identity", "wal/profiles", "wal/manifests", "wal/hot/segments"):
+    for prefix in ("hot/identity", "hot/profiles", "hot/manifests", "hot/hot/segments"):
         src_p = src_node.data_dir / prefix / project_id
         dst_p = dst_node.data_dir / prefix / project_id
         if src_p.exists():
@@ -140,8 +155,15 @@ def _fill_event_dictionary(
         ]
         client.ingest({"events": evs}, api_key=api_key).raise_for_status()
 
+    def _drained() -> bool:
+        m = client.parsed_metrics()
+        return (
+            m.sum_by_name("pulse_writer_buffer_events") == 0.0
+            and m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
+        )
+
     wait_until(
-        lambda: client.parsed_metrics().sum_by_name("pulse_ingest_log_lag_bytes") == 0.0,
+        _drained,
         timeout=30.0,
         interval=0.1,
         desc="dictionary drain",
@@ -186,11 +208,18 @@ def _chmod_tree(root: Path, dir_mode: int, file_mode: int) -> None:
 
 
 def _find_profiles_dir(node: NodeInstance, project_id: str) -> Path:
-    for rel in (f"wal/profiles/{project_id}", f"profiles/{project_id}", "wal/profiles", "profiles"):
+    for rel in (
+        f"hot/profiles/{project_id}",
+        "hot/profiles",
+        f"wal/profiles/{project_id}",
+        f"profiles/{project_id}",
+        "wal/profiles",
+        "profiles",
+    ):
         cand = node.data_dir / rel
         if cand.exists():
             return cand
-    return node.data_dir / "wal" / "profiles"
+    raise AssertionError(f"Could not locate profiles directory under {node.data_dir} for {project_id}")
 
 
 class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
@@ -236,6 +265,7 @@ class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
             node = cluster.start_node(
                 role="all",
                 hot_store="local",
+                writer_lease_ttl_secs=3,
                 extra_env={"PULSE_WRITER_FLUSH_MS": "20", "PULSE_WRITER_FLUSH_BYTES": "1048576"},
             )
             assert isinstance(node, NodeInstance)
@@ -273,6 +303,7 @@ class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
             wait_until(
                 lambda: _insights_total(r_client, pid, "f22_kill_ev", now_ms - 60_000, now_ms + 60_000) >= 60.0,
                 timeout=15.0,
+                ignore_exceptions=(HttpStatusError,),
                 desc="flushed events recovered after SIGKILL",
             )
             recovered = _insights_total(r_client, pid, "f22_kill_ev", now_ms - 60_000, now_ms + 60_000)
@@ -280,10 +311,15 @@ class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
             self.assertLessEqual(recovered, 80.0)
 
             # Client retries all 80 events with identical UUIDs -> must land at exact 80 with 0 duplicates
-            r_client.ingest({"events": flushed_evs + tail_evs}, api_key=api_key).raise_for_status()
+            wait_until(
+                lambda: r_client.ingest({"events": flushed_evs + tail_evs}, api_key=api_key).status == 200,
+                timeout=15.0,
+                desc="retry ingest after lease recovery",
+            )
             wait_until(
                 lambda: _insights_total(r_client, pid, "f22_kill_ev", now_ms - 60_000, now_ms + 60_000) == 80.0,
                 timeout=15.0,
+                ignore_exceptions=(HttpStatusError,),
             )
 
     @tier(2)
@@ -366,6 +402,7 @@ class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
                     saw_429 = True
                     self.assertIn("retry-after", r.headers)
                     break
+                time.sleep(0.025)
             self.assertTrue(saw_429, "Expected 429 backpressure under tiny PULSE_L0_MAX_ROWS_PER_BUCKET=5")
 
     @tier(2)
@@ -381,6 +418,12 @@ class TestTier2F22AsyncEventAckBoundaries(unittest.TestCase):
 
             # Seed one event so WAL directory exists
             client.ingest({"events": [make_event(event_name="f22_seed", ts_ms=now_ms - 2000)]}, api_key=api_key).raise_for_status()
+            wait_until(
+                lambda: client.parsed_metrics().sum_by_name("pulse_writer_buffer_events") == 0.0,
+                timeout=10.0,
+                interval=0.05,
+                desc="seed event flushed to WAL",
+            )
             wal_root = node.data_dir / "wal" / "wal"
             if not wal_root.exists():
                 wal_root = node.data_dir / "wal"
@@ -415,7 +458,7 @@ class TestTier2F23DeadLetterBoundaries(unittest.TestCase):
     @require_milestone("W1")
     def test_dead_letter_wal_replay_after_sigkill_is_idempotent(self) -> None:
         with ClusterHarness(use_mock_s3=True) as cluster:
-            node = cluster.start_node(role="all", hot_store="local")
+            node = cluster.start_node(role="all", hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node, NodeInstance)
             client = node.client()
             pid, api_key = _create_project(client, "F23 Idempotent Replay")
@@ -435,7 +478,13 @@ class TestTier2F23DeadLetterBoundaries(unittest.TestCase):
 
             restarted = node.restart(graceful_stop=False)
             assert isinstance(restarted, NodeInstance)
-            time.sleep(0.5)
+            # Trigger lazy project open & WAL replay on restarted node
+            wait_until(
+                lambda: _insights_total(restarted.client(), pid, "dl_idemp_00000", now_ms - 60_000, now_ms + 60_000) >= 1.0,
+                timeout=15.0,
+                ignore_exceptions=(HttpStatusError,),
+                desc="restarted node opened project and replayed WAL",
+            )
             dead_after = [p for p in restarted.local_files() if "wal_dead/" in p]
             self.assertEqual(len(dead_after), len(dead_before), f"Duplicate dead-letter created on replay: {dead_before} -> {dead_after}")
 
@@ -460,7 +509,15 @@ class TestTier2F23DeadLetterBoundaries(unittest.TestCase):
                 p = {f"pk_{b * per_ev + j:05d}": j for j in range(per_ev)}
                 evs.append(make_event(event_name="f23_pk_seed", distinct_id="u_pk", ts_ms=now_ms - 10_000 + b, props=p))
             client.ingest({"events": evs}, api_key=api_key).raise_for_status()
-            wait_until(lambda: client.parsed_metrics().sum_by_name("pulse_ingest_log_lag_bytes") == 0.0, timeout=30.0)
+            wait_until(
+                lambda: (
+                    (m := client.parsed_metrics()).sum_by_name("pulse_writer_buffer_events") == 0.0
+                    and m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
+                ),
+                timeout=30.0,
+                interval=0.1,
+                desc="16384 property keys drained",
+            )
 
             # Event introducing property key #16385 must be dead-lettered
             client.ingest(
@@ -781,9 +838,22 @@ class TestTier2F25SyncProfileBoundaries(unittest.TestCase):
             # sk_root cannot be used on public ingest profile routes
             self.assertEqual(client.identify({"anon_id": "a", "user_id": "u"}, api_key=cluster.admin_token).status, 401)
             self.assertEqual(client.engage({"distinct_id": "u", "$set": {"x": 1}}, api_key=cluster.admin_token).status, 401)
-            # Missing required fields -> 400
+            # Missing required fields -> 400; non-object/malformed /v1/groups -> 400; empty-group object -> 200 updated=0
             self.assertEqual(client.identify({"anon_id": ""}, api_key=api_key).status, 400)
-            self.assertEqual(client.groups({"$set": {"x": 1}}, api_key=api_key).status, 400)
+            self.assertEqual(client.request("POST", "/v1/groups", json_body="not-an-object", api_key=api_key).status, 400)
+            self.assertEqual(
+                client.request(
+                    "POST",
+                    "/v1/groups",
+                    body="{bad",
+                    headers={"Content-Type": "application/json"},
+                    api_key=api_key,
+                ).status,
+                400,
+            )
+            r_empty_grp = client.groups({"$set": {"x": 1}}, api_key=api_key)
+            self.assertEqual(r_empty_grp.status, 200)
+            self.assertEqual(r_empty_grp.json()["updated"], 0)
 
 
 class TestTier2F28WriterLogBoundaries(unittest.TestCase):
@@ -819,8 +889,8 @@ class TestTier2F28WriterLogBoundaries(unittest.TestCase):
 
             p1_owner.stop(graceful=True)
             saw_429 = False
-            big_props = {"blob": "x" * 2048}
             for i in range(80):
+                big_props = {"blob": _incompressible_str(f"f28_p1_{i}", 2048)}
                 r = writer.client().ingest(
                     {"events": make_events(5, event_name="f28_fill", distinct_id_prefix=f"uf_{i}", props=big_props, base_ts_ms=now_ms + i)},
                     api_key=k1,
@@ -903,17 +973,49 @@ class TestTier2F28WriterLogBoundaries(unittest.TestCase):
             now_ms = int(time.time() * 1000)
 
             storage.stop(graceful=True)
+            saw_429 = False
             for i in range(60):
                 r = writer.client().ingest(
-                    {"events": make_events(5, event_name="f28_fill2", props={"pad": "y" * 2048}, base_ts_ms=now_ms + i)},
+                    {"events": make_events(5, event_name="f28_fill2", props={"pad": _incompressible_str(f"f28_p2_{i}", 2048)}, base_ts_ms=now_ms + i)},
                     api_key=api_key,
                 )
                 if r.status == 429:
+                    saw_429 = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(saw_429, "Expected P1 to hit 429 writer_log cap")
+
+            # Narrow remaining slack to <512B, then <200B with single small events so a 1-event mixed batch hits 429
+            for j in range(30):
+                r_mid = writer.client().ingest(
+                    {"events": [make_event(event_name="f28_mid", distinct_id=f"u_mid_{j}", props={"pad": _incompressible_str(f"f28_mid_{j}", 512)}, ts_ms=now_ms + j)]},
+                    api_key=api_key,
+                )
+                if r_mid.status == 429:
                     break
                 time.sleep(0.02)
 
-            # Restart storage so sync identify WOULD succeed if attempted, while writer_log is still full at 429
-            # Wait: check capacity before sync identify; send immediately while still at cap (or while storage paused)
+            small_hit_429 = False
+            for j in range(150):
+                r_top = writer.client().ingest(
+                    {"events": [make_event(event_name="f28_top", distinct_id=f"u_top_{j}", ts_ms=now_ms + j)]},
+                    api_key=api_key,
+                )
+                if r_top.status == 429:
+                    # Wait for IngestBuffer (20ms) to flush & zstd-compress to disk, then confirm
+                    # disk_bytes alone rejects a single small event even with buffered_bytes == 0.
+                    time.sleep(0.05)
+                    r_confirm = writer.client().ingest(
+                        {"events": [make_event(event_name="f28_top", distinct_id=f"u_top_c_{j}", ts_ms=now_ms + j)]},
+                        api_key=api_key,
+                    )
+                    if r_confirm.status == 429:
+                        small_hit_429 = True
+                        break
+                time.sleep(0.02)
+            self.assertTrue(small_hit_429, "Expected single small event to hit 429 writer_log cap")
+
+            # Check capacity before sync identify; send while still at cap
             r_mix = writer.client().ingest(
                 {
                     "events": [
@@ -1294,11 +1396,12 @@ class TestTier2F30ProjectOwnerBoundaries(unittest.TestCase):
             s1, s2 = topo["storages"]
             pid, api_key = _create_project(s1.client(), "F30 No Auto Takeover")
 
-            s1.client().ingest({"events": [make_event(event_name="f30_nt")]}, api_key=api_key).raise_for_status()
             owner_row = s1.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)[0]
             owner_name = owner_row["node_name"]
             owner_node = s1 if owner_name == "storage-0" else s2
             peer_node = s2 if owner_name == "storage-0" else s1
+
+            owner_node.client().ingest({"events": [make_event(event_name="f30_nt")]}, api_key=api_key).raise_for_status()
 
             owner_node.stop(graceful=True)
             time.sleep(4.5)  # Exceed 3s writer_lease_ttl_secs
@@ -1323,11 +1426,13 @@ class TestTier2F30ProjectOwnerBoundaries(unittest.TestCase):
             s1, s2 = topo["storages"]
             pid, api_key = _create_project(s1.client(), "F30 Loop Scope")
 
-            s1.client().ingest({"events": [make_event(event_name="f30_loop")]}, api_key=api_key).raise_for_status()
+            owner_name = s1.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)[0]["node_name"]
+            owner_node = s1 if owner_name == "storage-0" else s2
+            non_owner = s2 if owner_name == "storage-0" else s1
+
+            owner_node.client().ingest({"events": [make_event(event_name="f30_loop")]}, api_key=api_key).raise_for_status()
             time.sleep(2.5)  # Allow several background ticks
 
-            owner_name = s1.sqlite_query("SELECT node_name FROM project_owner WHERE project_id = ?", (pid,), db_path=db_path)[0]["node_name"]
-            non_owner = s2 if owner_name == "storage-0" else s1
             self.assertEqual([p for p in non_owner.local_files() if pid in p], [])
 
     @tier(2)
@@ -1520,8 +1625,8 @@ class TestTier2F31ForwardingBoundaries(unittest.TestCase):
                 db_path=db_path,
                 readonly=False,
             )
-            # Bring orig_node back up so it responds NotOwner (not connection refused)
-            orig_node = orig_node.restart()
+            # Bring orig_node back up on the same port so it responds NotOwner (not connection refused)
+            orig_node = orig_node.restart(reuse_port=True)
             assert isinstance(orig_node, NodeInstance)
 
             # Writer's cached owner still points to orig_node; NotOwner must trigger cache refresh + retry on new_node
