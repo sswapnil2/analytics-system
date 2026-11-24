@@ -548,6 +548,26 @@ async fn run_project_forwarder_loop(
                     continue;
                 }
 
+                if status == StatusCode::SERVICE_UNAVAILABLE && code == Some("not_writer") {
+                    if let Ok(Some(refreshed)) = fwd.owners.refresh_owner(&project_id).await {
+                        if refreshed.node_name != owner.node_name
+                            || refreshed.address != owner.address
+                        {
+                            fwd.metrics
+                                .batches_not_owner
+                                .fetch_add(1, Ordering::Relaxed);
+                            fwd.metrics.retries_total.fetch_add(1, Ordering::Relaxed);
+                            consecutive_not_owner = consecutive_not_owner.saturating_add(1);
+                            let wait = Duration::from_millis(10);
+                            drop(fwd);
+                            if sleep_or_shutdown(wait, shutdown).await {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 fwd.metrics
                     .batches_retry_error
                     .fetch_add(1, Ordering::Relaxed);
@@ -727,7 +747,9 @@ impl OwnerSyncClient {
                 Err(e) => {
                     if attempt == 0 {
                         if let Ok(Some(refreshed)) = self.owners.refresh_owner(project_id).await {
-                            if refreshed.address != owner.address {
+                            if refreshed.node_name != owner.node_name
+                                || refreshed.address != owner.address
+                            {
                                 prefetched_owner = Some(refreshed);
                                 continue;
                             }
@@ -771,6 +793,22 @@ impl OwnerSyncClient {
                 && attempt < 2
             {
                 continue;
+            }
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && code == Some("not_writer")
+                && attempt < 2
+            {
+                if let Ok(Some(refreshed)) = self.owners.refresh_owner(project_id).await {
+                    if refreshed.node_name != owner.node_name || refreshed.address != owner.address
+                    {
+                        prefetched_owner = Some(refreshed);
+                        continue;
+                    } else if attempt == 0 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        prefetched_owner = Some(refreshed);
+                        continue;
+                    }
+                }
             }
             return Err(map_owner_http_error(
                 project_id,

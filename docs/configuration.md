@@ -59,12 +59,12 @@
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `PULSE_WRITER_FLUSH_MS` | `20` | Max delay (ms) before the W1 writer memory buffer (and `--role writer` `AgentWriterBuffer`) flushes queued batches to disk WAL / `writer_log/` |
-| `PULSE_WRITER_FLUSH_BYTES` | `1048576` (1 MiB) | Byte threshold at which the W1 writer memory buffer (and `--role writer` `AgentWriterBuffer`) flushes immediately |
+| `PULSE_WRITER_FLUSH_MS` | `20` | Max delay (ms) before the W1 writer memory buffer (and `--role writer` `AgentWriterBackend`) flushes queued batches to disk WAL / `writer_log/` |
+| `PULSE_WRITER_FLUSH_BYTES` | `1048576` (1 MiB) | Byte threshold at which the W1 writer memory buffer (and `--role writer` `AgentWriterBackend`) flushes immediately |
 | `PULSE_INGEST_BUFFER_PROJECT_MAX_MB` / `PULSE_INGEST_BUFFER_MAX_MB` | `64` / `256` | Per-project and node-wide bounds on queued W1 writer buffer bytes before `/v1/ingest` (or `--role writer` `/v1/agent/traces`) returns `429` (`ingest_buffer_backpressure`) |
-| `PULSE_WRITER_LOG_PROJECT_MAX_MB` / `PULSE_WRITER_LOG_MAX_MB` | `64` / `512` | Per-project and node-wide unforwarded `writer_log/` disk caps on `--role writer` nodes before `/v1/ingest` and `/v1/agent/traces` return `429` (`writer_log_backpressure`) |
-| `PULSE_WRITER_LOG_MAX_AGE_SECS` | `86400` | Age ceiling (seconds) after which unforwarded `writer_log/` segments on a stateless `writer` are expired and swept |
-| `PULSE_WRITER_FORWARD_BATCH_BYTES` / `PULSE_WRITER_FORWARD_CONCURRENCY` | `2097152` / `4` | Max `PWFB`/`PWFA` coalesced forward payload bytes and concurrent project forward tasks on `--role writer` nodes |
+| `PULSE_WRITER_LOG_PROJECT_MAX_MB` / `PULSE_WRITER_LOG_MAX_MB` | `512` / `4096` | Per-project and node-wide unforwarded `writer_log/` disk caps on `--role writer` nodes before `/v1/ingest` and `/v1/agent/traces` return `429` (`writer_log_backpressure`) |
+| `PULSE_WRITER_LOG_MAX_AGE_SECS` | `518400` | Age ceiling (seconds, 6 days `< T_expire = 7d`) after which unforwarded `writer_log/` segments on a stateless `writer` are expired and swept |
+| `PULSE_FORWARDER_MAX_BACKOFF_MS` | `5000` | Max backoff (ms) between `PWFE`/`PWFA` forwarder retries on `--role writer` nodes (1 in-flight batch per project in strict order) |
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
 | `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |
@@ -91,7 +91,7 @@
 |---|---|
 | `object_store/` | Flushed S3 event segments (`segments/`), `published/` manifests and snapshots, uploaded `replays/`, uploaded `agent_segments/`, and `agent_published/` manifests (unless `PULSE_OBJECT_STORE_URL` is set; with `PULSE_HOT_STORE=object`, also holds WALs, manifests, identity graph, and profiles) |
 | `wal/` | Write-ahead logs, dead-letter records, and corrupt-WAL quarantine for events (`wal/`, `wal_corrupt/`, `wal_dead/`) and agent traces (`agent_wal/`, `agent_wal_corrupt/`) with `PULSE_HOT_STORE=local` (the default). Must be on a persistent volume. Empty after a clean shutdown |
-| `writer_log/` | On `--role writer` nodes: persistent `writer_id` file and unforwarded `PWLF` v2 segments (`<project>/seg_*.pwlf`) for buffered events and agent traces awaiting owner acknowledgement |
+| `writer_log/` | On `--role writer` nodes: persistent `writer_id` file and unforwarded `PWLF` v2 segments (`<project>/seg_*.log`) for buffered events and agent traces awaiting owner acknowledgement |
 | `hot/` | Local SlateDB stores (`identity/` and `profiles/`), local-tier `hot/segments/`, `hot/agent_segments/`, `hot/replay/`, `hot/replay_cursors/`, authoritative `manifests/` and `agent_manifests/`, and `upload_intent.json` records when `PULSE_HOT_STORE=local` (the default). Must be on a persistent volume |
 | `query_hot/` | Ephemeral local Candidate B snapshot copies (`identity/` and `profiles/{project_id}/pub_{seq}`) restored by `--role query` nodes from S3 `published/` |
 | `hot_store_mode` | Persistent mode marker (`local` or `object`) written at initialization to prevent silent mode switches or volume-loss UID reuse |

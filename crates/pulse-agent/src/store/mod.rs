@@ -162,8 +162,8 @@ pub(crate) struct ProjectAgentState {
     pub last_published_erased_traces: parking_lot::Mutex<Option<BTreeMap<String, i64>>>,
     pub last_published_writer_offsets:
         parking_lot::Mutex<Option<BTreeMap<String, WriterOffsetEntry>>>,
-    pub writer_offsets: parking_lot::Mutex<BTreeMap<String, WriterOffsetEntry>>,
-    pub unflushed_writer_offsets: parking_lot::Mutex<Vec<UnflushedWriterOffsetRecord>>,
+    pub writer_offsets: Arc<parking_lot::Mutex<BTreeMap<String, WriterOffsetEntry>>>,
+    pub unflushed_writer_offsets: Arc<parking_lot::Mutex<Vec<UnflushedWriterOffsetRecord>>>,
     pub forward_locks: DashMap<String, Arc<AsyncMutex<()>>>,
     pub has_pending_upload_intent: AtomicBool,
     pub pending_local_deletes: parking_lot::Mutex<HashSet<String>>,
@@ -294,6 +294,17 @@ impl AgentTraceStore {
         Ok(store)
     }
 
+    async fn fence_and_evict_project(&self, project_id: &str) {
+        if let Some(st) = self.projects.get(project_id).map(|e| e.value().clone()) {
+            st.fenced.store(true, Ordering::Release);
+            self.projects
+                .remove_if(project_id, |_, cur| Arc::ptr_eq(cur, &st));
+            if let Some(ref writer) = st.wal_writer {
+                writer.shutdown().await;
+            }
+        }
+    }
+
     pub(crate) async fn ensure_writable_owner(&self, project_id: &str) -> StoreResult<()> {
         if self.config.read_only {
             return Ok(());
@@ -303,16 +314,22 @@ impl AgentTraceStore {
         };
         match checker.check_owner(project_id).await {
             Ok(OwnerCheck::Owned) => Ok(()),
-            Ok(OwnerCheck::Unassigned) => Err(StoreError::NotOwner {
-                project_id: project_id.to_string(),
-                owner_node: None,
-                owner_address: None,
-            }),
-            Ok(OwnerCheck::NotOwner(info)) => Err(StoreError::NotOwner {
-                project_id: project_id.to_string(),
-                owner_node: Some(info.node_name),
-                owner_address: Some(info.address),
-            }),
+            Ok(OwnerCheck::Unassigned) => {
+                self.fence_and_evict_project(project_id).await;
+                Err(StoreError::NotOwner {
+                    project_id: project_id.to_string(),
+                    owner_node: None,
+                    owner_address: None,
+                })
+            }
+            Ok(OwnerCheck::NotOwner(info)) => {
+                self.fence_and_evict_project(project_id).await;
+                Err(StoreError::NotOwner {
+                    project_id: project_id.to_string(),
+                    owner_node: Some(info.node_name),
+                    owner_address: Some(info.address),
+                })
+            }
             Err(e) => Err(StoreError::Storage(StorageError::Unavailable(format!(
                 "project owner check failed: {e}"
             )))),
@@ -616,30 +633,12 @@ impl AgentTraceStore {
         })?;
         // Write even if `batch` is empty (e.g. all spans dropped by trace limits) so the
         // offset marker is durable across crashes and promotes into AgentManifest.
-        let commit = writer
+        // `flush_wal_group` registers `(local_wid, wal_seq, swid, batch_offset, seen_ts_ms)` into
+        // `state.unflushed_writer_offsets` and `state.writer_offsets` BEFORE inserting into
+        // `memtable` / `record_accounted_wal_seq`, preventing a `flush_l0` WAL-purge race.
+        let _commit = writer
             .write_with_offset(batch, writer_id.to_string(), batch_offset, seen_ts_ms)
             .await?;
-
-        {
-            state.unflushed_writer_offsets.lock().push((
-                commit.writer_id,
-                commit.wal_seq,
-                writer_id.to_string(),
-                batch_offset,
-                seen_ts_ms,
-            ));
-            let mut offsets = state.writer_offsets.lock();
-            offsets
-                .entry(writer_id.to_string())
-                .and_modify(|cur| {
-                    cur.last_applied_offset = cur.last_applied_offset.max(batch_offset);
-                    cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(seen_ts_ms);
-                })
-                .or_insert(WriterOffsetEntry {
-                    last_applied_offset: batch_offset,
-                    last_seen_ts_ms: seen_ts_ms,
-                });
-        }
 
         if accepted_traces > 0 || accepted_spans > 0 {
             state
@@ -1232,12 +1231,26 @@ impl AgentTraceStore {
         project_id: &str,
     ) -> StoreResult<Arc<ProjectAgentState>> {
         validate_identifier("project_id", project_id)?;
+        let single_node_passthrough = self
+            .owner_checker
+            .as_ref()
+            .is_none_or(|c| c.is_single_node_passthrough());
         if let Some(existing) = self.projects.get(project_id) {
             let st = existing.value().clone();
-            if !self.config.read_only && st.fenced.load(Ordering::Acquire) {
-                return Err(StoreError::NotWriter {
-                    project_id: st.project_id.clone(),
-                });
+            if !self.config.read_only {
+                if st.fenced.load(Ordering::Acquire) {
+                    return Err(StoreError::NotWriter {
+                        project_id: st.project_id.clone(),
+                    });
+                }
+                if !single_node_passthrough {
+                    self.ensure_writable_owner(project_id).await?;
+                    if st.fenced.load(Ordering::Acquire) {
+                        return Err(StoreError::NotWriter {
+                            project_id: st.project_id.clone(),
+                        });
+                    }
+                }
             }
             return Ok(st);
         }
@@ -1245,10 +1258,20 @@ impl AgentTraceStore {
         let _init_guard = self.project_init_lock.lock().await;
         if let Some(existing) = self.projects.get(project_id) {
             let st = existing.value().clone();
-            if !self.config.read_only && st.fenced.load(Ordering::Acquire) {
-                return Err(StoreError::NotWriter {
-                    project_id: st.project_id.clone(),
-                });
+            if !self.config.read_only {
+                if st.fenced.load(Ordering::Acquire) {
+                    return Err(StoreError::NotWriter {
+                        project_id: st.project_id.clone(),
+                    });
+                }
+                if !single_node_passthrough {
+                    self.ensure_writable_owner(project_id).await?;
+                    if st.fenced.load(Ordering::Acquire) {
+                        return Err(StoreError::NotWriter {
+                            project_id: st.project_id.clone(),
+                        });
+                    }
+                }
             }
             return Ok(st);
         }
@@ -1285,8 +1308,8 @@ impl AgentTraceStore {
                 last_published_s3_segments: parking_lot::Mutex::new(None),
                 last_published_erased_traces: parking_lot::Mutex::new(None),
                 last_published_writer_offsets: parking_lot::Mutex::new(None),
-                writer_offsets: parking_lot::Mutex::new(BTreeMap::new()),
-                unflushed_writer_offsets: parking_lot::Mutex::new(Vec::new()),
+                writer_offsets: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+                unflushed_writer_offsets: Arc::new(parking_lot::Mutex::new(Vec::new())),
                 forward_locks: DashMap::new(),
                 has_pending_upload_intent: AtomicBool::new(false),
                 pending_local_deletes: parking_lot::Mutex::new(HashSet::new()),
@@ -1453,6 +1476,10 @@ impl AgentTraceStore {
             }
         }
 
+        let writer_offsets_arc = Arc::new(parking_lot::Mutex::new(writer_offsets));
+        let unflushed_writer_offsets_arc =
+            Arc::new(parking_lot::Mutex::new(unflushed_writer_offsets));
+
         let memtable_bytes = memtable.byte_stats().0;
         let fenced = Arc::new(AtomicBool::new(false));
         let wal_writer = if self.config.read_only {
@@ -1467,7 +1494,7 @@ impl AgentTraceStore {
                 .max_existing_seq_for_writer(&self.writer_id_str)
                 .await?;
             let initial_next_seq = committed_for_me.max(existing_max).saturating_add(1);
-            let writer = AgentWalWriter::spawn_with_fence(
+            let writer = AgentWalWriter::spawn_with_fence_and_offsets(
                 project_id,
                 &self.writer_id_str,
                 initial_next_seq,
@@ -1479,6 +1506,8 @@ impl AgentTraceStore {
                 self.object_store.clone(),
                 memtable.clone(),
                 fenced.clone(),
+                writer_offsets_arc.clone(),
+                unflushed_writer_offsets_arc.clone(),
             )?;
             Some(Arc::new(writer))
         };
@@ -1505,8 +1534,8 @@ impl AgentTraceStore {
             last_published_s3_segments: parking_lot::Mutex::new(initial_pub_s3),
             last_published_erased_traces: parking_lot::Mutex::new(initial_pub_erased),
             last_published_writer_offsets: parking_lot::Mutex::new(initial_pub_offsets),
-            writer_offsets: parking_lot::Mutex::new(writer_offsets),
-            unflushed_writer_offsets: parking_lot::Mutex::new(unflushed_writer_offsets),
+            writer_offsets: writer_offsets_arc,
+            unflushed_writer_offsets: unflushed_writer_offsets_arc,
             forward_locks: DashMap::new(),
             has_pending_upload_intent: AtomicBool::new(false),
             pending_local_deletes: parking_lot::Mutex::new(HashSet::new()),
@@ -4324,5 +4353,87 @@ mod tests {
             "expired writer_offsets entry must be pruned after T_expire"
         );
         store2.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingest_forwarded_batch_and_flush_l0_never_drops_writer_offsets_on_wal_purge(
+    ) {
+        let store_mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = Arc::new(
+            AgentTraceStore::open(
+                store_mem.clone(),
+                AgentTraceStoreConfig {
+                    wal_group_commit_ms: 5,
+                    ..AgentTraceStoreConfig::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let flusher_store = store.clone();
+        let flusher_stop = stop.clone();
+        let flusher = tokio::spawn(async move {
+            while !flusher_stop.load(Ordering::Acquire) {
+                let _ = flusher_store.flush_all_l0().await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        for offset in 0..30u64 {
+            let batch = if offset % 5 == 4 {
+                TraceIngestBatch::default()
+            } else {
+                sample_batch(&format!("tr_race_{offset}"), now_ms + offset as i64)
+            };
+            store
+                .ingest_forwarded_batch(
+                    "writer_race",
+                    "proj_race",
+                    offset,
+                    batch,
+                    now_ms + offset as i64,
+                )
+                .await
+                .unwrap();
+        }
+
+        stop.store(true, Ordering::Release);
+        flusher.await.unwrap();
+        store.flush_all_l0().await.unwrap();
+
+        let mf = store
+            .manifest_store("proj_race")
+            .await
+            .unwrap()
+            .load_latest()
+            .await
+            .unwrap();
+        assert_eq!(
+            mf.writer_offsets
+                .get("writer_race")
+                .map(|e| e.last_applied_offset),
+            Some(29),
+            "concurrent flush_l0 must never purge WAL before registering writer_offsets"
+        );
+        store.close().await.unwrap();
+
+        let reopened = AgentTraceStore::open(store_mem, AgentTraceStoreConfig::default())
+            .await
+            .unwrap();
+        let dup = reopened
+            .ingest_forwarded_batch(
+                "writer_race",
+                "proj_race",
+                29,
+                TraceIngestBatch::default(),
+                now_ms + 30,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup.accepted_traces, 0);
+        reopened.close().await.unwrap();
     }
 }

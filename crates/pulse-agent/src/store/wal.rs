@@ -12,12 +12,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use pulse_storage::WriterOffsetEntry;
+
 use crate::model::TraceIngestBatch;
 use crate::protocol::{
     decode_plst_batch, encode_plst_batch, MAX_PLST_SPANS, MAX_PLST_TRACES, MAX_PLST_UNCOMP_BYTES,
 };
 use crate::store::error::{validate_identifier, StoreError, StoreResult};
 use crate::store::memtable::{approx_header_bytes, approx_span_bytes, ShardedMemTable};
+use crate::store::UnflushedWriterOffsetRecord;
 
 pub const PTWL_MAGIC: [u8; 4] = *b"PTWL";
 pub const PTWL_VERSION: u8 = 1;
@@ -568,6 +571,31 @@ impl AgentWalWriter {
         memtable: Arc<ShardedMemTable>,
         fenced: Arc<AtomicBool>,
     ) -> StoreResult<Self> {
+        Self::spawn_with_fence_and_offsets(
+            project_id,
+            writer_id,
+            initial_next_seq,
+            config,
+            object_store,
+            memtable,
+            fenced,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_fence_and_offsets(
+        project_id: impl Into<String>,
+        writer_id: impl Into<String>,
+        initial_next_seq: u64,
+        config: WalConfig,
+        object_store: Arc<dyn ObjectStore>,
+        memtable: Arc<ShardedMemTable>,
+        fenced: Arc<AtomicBool>,
+        writer_offsets: Arc<Mutex<BTreeMap<String, WriterOffsetEntry>>>,
+        unflushed_writer_offsets: Arc<Mutex<Vec<UnflushedWriterOffsetRecord>>>,
+    ) -> StoreResult<Self> {
         let project_id = project_id.into();
         let writer_id = writer_id.into();
         validate_identifier("project_id", &project_id)?;
@@ -592,6 +620,8 @@ impl AgentWalWriter {
             max_bytes,
             object_store,
             memtable,
+            writer_offsets,
+            unflushed_writer_offsets,
         };
         let handle = tokio::spawn(run_group_commit_loop(ctx, rx));
 
@@ -696,6 +726,8 @@ struct GroupCommitCtx {
     max_bytes: usize,
     object_store: Arc<dyn ObjectStore>,
     memtable: Arc<ShardedMemTable>,
+    writer_offsets: Arc<Mutex<BTreeMap<String, WriterOffsetEntry>>>,
+    unflushed_writer_offsets: Arc<Mutex<Vec<UnflushedWriterOffsetRecord>>>,
 }
 
 async fn run_group_commit_loop(ctx: GroupCommitCtx, mut rx: mpsc::Receiver<WalWriteReq>) {
@@ -738,6 +770,8 @@ async fn run_group_commit_loop(ctx: GroupCommitCtx, mut rx: mpsc::Receiver<WalWr
             ctx.max_bytes,
             &ctx.object_store,
             &ctx.memtable,
+            &ctx.writer_offsets,
+            &ctx.unflushed_writer_offsets,
             group,
         )
         .await;
@@ -753,6 +787,8 @@ async fn flush_wal_group(
     max_bytes: usize,
     object_store: &Arc<dyn ObjectStore>,
     memtable: &Arc<ShardedMemTable>,
+    state_writer_offsets: &Arc<Mutex<BTreeMap<String, WriterOffsetEntry>>>,
+    unflushed_writer_offsets: &Arc<Mutex<Vec<UnflushedWriterOffsetRecord>>>,
     group: Vec<WalWriteReq>,
 ) {
     if fenced.load(Ordering::Acquire) {
@@ -848,7 +884,33 @@ async fn flush_wal_group(
             .await
         {
             Ok(_) => {
-                // Durability guarantee: WAL put_opts succeeded BEFORE L0 insert & BEFORE caller ack!
+                // Durability & exactly-once guarantee: WAL put_opts succeeded AND
+                // unflushed_writer_offsets / writer_offsets are registered BEFORE L0 insert /
+                // record_accounted_wal_seq so a concurrent flush_l0 cannot purge WAL seq without
+                // promoting its batch_offset into AgentManifest.writer_offsets.
+                if !writer_offsets.is_empty() {
+                    {
+                        let mut unflushed = unflushed_writer_offsets.lock();
+                        for (swid, off, ts) in &writer_offsets {
+                            unflushed.push((writer_id.to_string(), seq, swid.clone(), *off, *ts));
+                        }
+                    }
+                    {
+                        let mut offsets = state_writer_offsets.lock();
+                        for (swid, off, ts) in &writer_offsets {
+                            offsets
+                                .entry(swid.clone())
+                                .and_modify(|cur| {
+                                    cur.last_applied_offset = cur.last_applied_offset.max(*off);
+                                    cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(*ts);
+                                })
+                                .or_insert(WriterOffsetEntry {
+                                    last_applied_offset: *off,
+                                    last_seen_ts_ms: *ts,
+                                });
+                        }
+                    }
+                }
                 let ins_res = memtable.insert_batch(writer_id, seq, merged);
                 if ins_res.is_ok() && is_empty_batch {
                     memtable.record_accounted_wal_seq(writer_id, seq);
@@ -1148,6 +1210,8 @@ mod tests {
         }
         let next_seq = AtomicU64::new(1);
         let fenced = AtomicBool::new(false);
+        let state_writer_offsets = Arc::new(Mutex::new(BTreeMap::new()));
+        let unflushed_writer_offsets = Arc::new(Mutex::new(Vec::new()));
         flush_wal_group(
             "proj_wal",
             "w1",
@@ -1156,6 +1220,8 @@ mod tests {
             DEFAULT_WAL_MAX_GROUP_BYTES,
             &os,
             &memtable,
+            &state_writer_offsets,
+            &unflushed_writer_offsets,
             group,
         )
         .await;

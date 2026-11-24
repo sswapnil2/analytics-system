@@ -2620,14 +2620,19 @@ const SQL_LIST_NODE_LOADS: &str = "SELECT wn.node_name, wn.address, wn.role, wn.
      GROUP BY wn.node_name, wn.address, wn.role, wn.last_heartbeat_ms
      ORDER BY COUNT(po.project_id) ASC, wn.node_name ASC";
 const SQL_UPSERT_WRITER_LEASE: &str =
-    "INSERT INTO writer_leases (project_id, node_id, generation, expires_at_ms)
-     VALUES (?, ?, 1, ?)
+    "INSERT INTO writer_leases (project_id, node_id, generation, expires_at_ms, owner_node_name)
+     VALUES (?, ?, 1, ?, ?)
      ON CONFLICT(project_id) DO UPDATE SET
         generation = CASE WHEN writer_leases.node_id = excluded.node_id
             THEN writer_leases.generation ELSE writer_leases.generation + 1 END,
         node_id = excluded.node_id,
-        expires_at_ms = excluded.expires_at_ms
-     WHERE writer_leases.node_id = excluded.node_id OR writer_leases.expires_at_ms < ?";
+        expires_at_ms = excluded.expires_at_ms,
+        owner_node_name = excluded.owner_node_name
+     WHERE writer_leases.node_id = excluded.node_id
+        OR writer_leases.expires_at_ms < ?
+        OR (excluded.owner_node_name IS NOT NULL
+            AND writer_leases.owner_node_name IS NOT NULL
+            AND writer_leases.owner_node_name != excluded.owner_node_name)";
 const SQL_SELECT_WRITER_LEASE_GEN: &str =
     "SELECT generation FROM writer_leases WHERE project_id = ? AND node_id = ?";
 const SQL_INSERT_INTERNAL_TOKEN: &str =
@@ -2934,6 +2939,7 @@ impl MetaStore {
                     .bind(project_id)
                     .bind(node_id)
                     .bind(expires_at_ms)
+                    .bind(owner_node_name)
                     .bind(now_ms)
                     .execute(&mut *tx)
                     .await?;
@@ -2980,6 +2986,7 @@ impl MetaStore {
                     .bind(project_id)
                     .bind(node_id)
                     .bind(expires_at_ms)
+                    .bind(owner_node_name)
                     .bind(now_ms)
                     .execute(&mut *tx)
                     .await?;
@@ -3013,9 +3020,24 @@ impl MetaStore {
     pub async fn release_writer_leases(&self, node_id: &str) -> Result<u64, MetaError> {
         Ok(db_exec!(
             self,
-            "UPDATE writer_leases SET expires_at_ms = 0 WHERE node_id = ?",
+            "UPDATE writer_leases SET expires_at_ms = -1 WHERE node_id = ?",
             node_id,
         ))
+    }
+
+    /// Expires `node_id`'s lease on `project_id` only if `node_id` is currently the holder.
+    pub async fn release_writer_lease_for_project(
+        &self,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<bool, MetaError> {
+        let rows = db_exec!(
+            self,
+            "UPDATE writer_leases SET expires_at_ms = -1 WHERE project_id = ? AND node_id = ?",
+            project_id,
+            node_id,
+        );
+        Ok(rows > 0)
     }
 
     /// Resolves the shared internal node-to-node forwarding token (`PULSE_INTERNAL_TOKEN` env var
@@ -3198,6 +3220,10 @@ impl ProjectOwnerChecker for DbProjectOwnerChecker {
             (None, None) => OwnerCheck::Owned,
         })
     }
+
+    fn is_single_node_passthrough(&self) -> bool {
+        self.node_name.is_none()
+    }
 }
 
 /// Writer leases kept in the metadata database, shared by every node of a deployment.
@@ -3264,6 +3290,13 @@ impl pulse_storage::WriterLeases for DbWriterLeases {
                 now_ms,
                 now_ms + self.ttl.as_millis() as i64,
             )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn release(&self, project_id: &str) -> std::result::Result<bool, String> {
+        self.meta
+            .release_writer_lease_for_project(project_id, &self.node_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -3662,6 +3695,32 @@ mod writer_lease_tests {
             checker_anon.check_owner("p_owned").await.unwrap(),
             OwnerCheck::NotOwner(info) if info.node_name == "node-b"
         ));
+
+        // Ownership transfer to node-a allows immediate takeover even before node-b's TTL
+        // expires, while same-node split-brain (second process claiming node-a) is still
+        // fenced as HeldByOther, and node-b's release() never deletes node-a's lease.
+        meta.set_project_owner("p_owned", "node-a", "http://node-a:8080", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            leases_a.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::Acquired(2)
+        );
+        let leases_a_dup = DbWriterLeases::from_env_with_node(meta.clone(), Some("node-a".into()));
+        assert_eq!(
+            leases_a_dup.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::HeldByOther
+        );
+        assert!(!leases_b.release("p_owned").await.unwrap());
+        assert_eq!(
+            leases_a_dup.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::HeldByOther
+        );
+        assert!(leases_a.release("p_owned").await.unwrap());
+        assert_eq!(
+            leases_a_dup.acquire_checked("p_owned").await.unwrap(),
+            LeaseAcquireOutcome::Acquired(3)
+        );
     }
 
     #[tokio::test]

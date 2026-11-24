@@ -93,9 +93,29 @@ pub async fn handle_mcp_request_with_agent_store(
     qengine: &QueryEngine,
     agent_store: Option<&AgentTraceStore>,
 ) -> JsonRpcResponse {
+    let req_id = req.id.clone();
+    match handle_mcp_request_checked(req, bound_project_id, meta, qengine, agent_store).await {
+        Ok(resp) => resp,
+        Err(err) => JsonRpcResponse::ok(
+            req_id,
+            json!({
+                "content": [{ "type": "text", "text": err.to_string() }],
+                "isError": true
+            }),
+        ),
+    }
+}
+
+pub(crate) async fn handle_mcp_request_checked(
+    req: JsonRpcRequest,
+    bound_project_id: &str,
+    meta: &MetaStore,
+    qengine: &QueryEngine,
+    agent_store: Option<&AgentTraceStore>,
+) -> Result<JsonRpcResponse, McpToolError> {
     let _ = &req.jsonrpc;
     match req.method.as_str() {
-        "initialize" => JsonRpcResponse::ok(
+        "initialize" => Ok(JsonRpcResponse::ok(
             req.id,
             json!({
                 "protocolVersion": negotiate_protocol_version(&req.params),
@@ -105,8 +125,8 @@ pub async fn handle_mcp_request_with_agent_store(
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
-        ),
-        "ping" => JsonRpcResponse::ok(req.id, json!({})),
+        )),
+        "ping" => Ok(JsonRpcResponse::ok(req.id, json!({}))),
         "tools/list" => {
             let mut tools = vec![
                 json!({
@@ -305,11 +325,11 @@ pub async fn handle_mcp_request_with_agent_store(
                     }),
                 ]);
             }
-            JsonRpcResponse::ok(req.id, json!({ "tools": tools }))
+            Ok(JsonRpcResponse::ok(req.id, json!({ "tools": tools })))
         }
         "tools/call" => {
             let Some(tool_name) = req.params.get("name").and_then(|v| v.as_str()) else {
-                return JsonRpcResponse::err(req.id, -32602, "missing tool 'name'");
+                return Ok(JsonRpcResponse::err(req.id, -32602, "missing tool 'name'"));
             };
             let args = req
                 .params
@@ -323,11 +343,11 @@ pub async fn handle_mcp_request_with_agent_store(
                 .filter(|s| !s.is_empty())
             {
                 if arg_pid != bound_project_id {
-                    return JsonRpcResponse::err(
+                    return Ok(JsonRpcResponse::err(
                         req.id,
                         -32602,
                         "project_id argument cannot override authenticated principal scope",
-                    );
+                    ));
                 }
             }
 
@@ -341,7 +361,7 @@ pub async fn handle_mcp_request_with_agent_store(
             )
             .await
             {
-                Ok(payload) => JsonRpcResponse::ok(
+                Ok(payload) => Ok(JsonRpcResponse::ok(
                     req.id,
                     json!({
                         "content": [
@@ -352,27 +372,36 @@ pub async fn handle_mcp_request_with_agent_store(
                         ],
                         "structuredContent": payload
                     }),
-                ),
+                )),
+                Err(err @ McpToolError::NotOwner { .. } | err @ McpToolError::NotWriter { .. }) => {
+                    Err(err)
+                }
                 // Unknown tool and invalid parameter errors are protocol errors (-32602); other
                 // failures are tool execution errors the model should see (`isError: true`).
-                Err(msg) if msg.starts_with("unknown MCP tool") => {
-                    JsonRpcResponse::err(req.id, -32602, msg)
+                Err(McpToolError::Message(msg)) if msg.starts_with("unknown MCP tool") => {
+                    Ok(JsonRpcResponse::err(req.id, -32602, msg))
                 }
-                Err(msg) if msg.starts_with("invalid params: ") => JsonRpcResponse::err(
-                    req.id,
-                    -32602,
-                    msg.trim_start_matches("invalid params: ").to_string(),
-                ),
-                Err(msg) => JsonRpcResponse::ok(
+                Err(McpToolError::Message(msg)) if msg.starts_with("invalid params: ") => {
+                    Ok(JsonRpcResponse::err(
+                        req.id,
+                        -32602,
+                        msg.trim_start_matches("invalid params: ").to_string(),
+                    ))
+                }
+                Err(McpToolError::Message(msg)) => Ok(JsonRpcResponse::ok(
                     req.id,
                     json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
                     }),
-                ),
+                )),
             }
         }
-        other => JsonRpcResponse::err(req.id, -32601, format!("method not found: {other}")),
+        other => Ok(JsonRpcResponse::err(
+            req.id,
+            -32601,
+            format!("method not found: {other}"),
+        )),
     }
 }
 
@@ -424,12 +453,12 @@ async fn known_event_names(
     project_id: &str,
     meta: &MetaStore,
     qengine: &QueryEngine,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, McpToolError> {
     let mut names: std::collections::BTreeSet<String> = qengine
         .storage()
         .get_or_open_project(project_id)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(McpToolError::from)?
         .dictionary()
         .all_events()
         .into_iter()
@@ -438,7 +467,7 @@ async fn known_event_names(
     names.extend(
         meta.list_lexicon_events(project_id)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| McpToolError::Message(e.to_string()))?
             .into_iter()
             .map(|e| e.name),
     );
@@ -505,6 +534,96 @@ fn pick<T: Copy>(args: &Value, key: &str, default: T, options: &[(&str, T)]) -> 
     }
 }
 
+pub(crate) enum McpToolError {
+    Message(String),
+    NotOwner {
+        project_id: String,
+        owner_node: Option<String>,
+        owner_address: Option<String>,
+    },
+    NotWriter {
+        project_id: String,
+    },
+}
+
+impl std::fmt::Display for McpToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(msg) => write!(f, "{msg}"),
+            Self::NotOwner { project_id, .. } => {
+                write!(f, "this node is not the owner for project '{project_id}'")
+            }
+            Self::NotWriter { project_id } => {
+                write!(
+                    f,
+                    "this node does not hold the writer lease for project '{project_id}'"
+                )
+            }
+        }
+    }
+}
+
+impl From<String> for McpToolError {
+    fn from(msg: String) -> Self {
+        Self::Message(msg)
+    }
+}
+
+impl From<pulse_storage::StorageError> for McpToolError {
+    fn from(err: pulse_storage::StorageError) -> Self {
+        match err {
+            pulse_storage::StorageError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => Self::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            },
+            pulse_storage::StorageError::NotWriter { project_id } => Self::NotWriter { project_id },
+            other => Self::Message(other.to_string()),
+        }
+    }
+}
+
+impl From<pulse_exec::ExecError> for McpToolError {
+    fn from(err: pulse_exec::ExecError) -> Self {
+        match err {
+            pulse_exec::ExecError::Storage(se) => Self::from(se),
+            other => Self::Message(other.to_string()),
+        }
+    }
+}
+
+impl From<pulse_agent::StoreError> for McpToolError {
+    fn from(err: pulse_agent::StoreError) -> Self {
+        match err {
+            pulse_agent::StoreError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => Self::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            },
+            pulse_agent::StoreError::NotWriter { project_id } => Self::NotWriter { project_id },
+            pulse_agent::StoreError::Storage(se) => Self::from(se),
+            other => Self::Message(other.to_string()),
+        }
+    }
+}
+
+impl From<SyncErasedError> for McpToolError {
+    fn from(err: SyncErasedError) -> Self {
+        match err {
+            SyncErasedError::Meta(me) => Self::Message(me.to_string()),
+            SyncErasedError::Storage(se) => Self::from(se),
+        }
+    }
+}
+
 pub(crate) enum SyncErasedError {
     Meta(crate::db::MetaError),
     Storage(pulse_storage::StorageError),
@@ -533,6 +652,13 @@ pub(crate) async fn sync_erased_for_project_typed(
     ),
     SyncErasedError,
 > {
+    if !qengine.storage().is_published_reader() {
+        qengine
+            .storage()
+            .ensure_writable_owner(project_id)
+            .await
+            .map_err(SyncErasedError::Storage)?;
+    }
     let erased: pulse_storage::ErasedUids = meta
         .list_erased_uids(project_id)
         .await
@@ -604,7 +730,7 @@ async fn invoke_tool_with_agent_store(
     meta: &MetaStore,
     qengine: &QueryEngine,
     agent_store: Option<&AgentTraceStore>,
-) -> Result<Value, String> {
+) -> Result<Value, McpToolError> {
     let tz = qengine.catalogs().for_project(project_id).timezone();
     let range = default_range_days(args, tz);
     match tool_name {
@@ -612,11 +738,11 @@ async fn invoke_tool_with_agent_store(
             let events = meta
                 .list_lexicon_events(project_id)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let properties = meta
                 .list_lexicon_properties(project_id)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             Ok(json!({
                 "project_id": project_id,
                 "events": events,
@@ -625,13 +751,14 @@ async fn invoke_tool_with_agent_store(
         }
         "query_insights" => {
             let q: InsightsQuery = if args.get("series").is_some() {
-                serde_json::from_value(args.clone()).map_err(|e| e.to_string())?
+                serde_json::from_value(args.clone())
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             } else {
                 let ev = args
                     .get("event_name")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "missing required 'event_name'".to_string())?
+                    .ok_or_else(|| McpToolError::Message("missing required 'event_name'".into()))?
                     .to_string();
                 let metric = match args.get("metric").and_then(|v| v.as_str()) {
                     None | Some("uniques") => InsightsMetric::Uniques,
@@ -641,9 +768,9 @@ async fn invoke_tool_with_agent_store(
                     Some("wau") => InsightsMetric::Wau,
                     Some("mau") => InsightsMetric::Mau,
                     Some(other) => {
-                        return Err(format!(
+                        return Err(McpToolError::Message(format!(
                             "invalid metric '{other}': expected one of uniques, totals, sessions, dau, wau, mau"
-                        ))
+                        )))
                     }
                 };
                 let breakdown_by = args
@@ -673,7 +800,7 @@ async fn invoke_tool_with_agent_store(
             };
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.series.iter().map(|s| s.event_name.as_str()), &known)?;
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             if q.global_filter.cohort.is_some()
                 || q.breakdown_by.iter().any(|b| b.starts_with("$cohort:"))
             {
@@ -682,8 +809,8 @@ async fn invoke_tool_with_agent_store(
             let res = qengine
                 .query_insights(project_id, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "query_funnel" => {
             let q: FunnelQuery = if args
@@ -692,7 +819,8 @@ async fn invoke_tool_with_agent_store(
                 .and_then(|a| a.first())
                 .is_some_and(|x| x.is_object())
             {
-                serde_json::from_value(args.clone()).map_err(|e| e.to_string())?
+                serde_json::from_value(args.clone())
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             } else {
                 let step_names: Vec<String> = args
                     .get("steps")
@@ -704,7 +832,9 @@ async fn invoke_tool_with_agent_store(
                     })
                     .unwrap_or_default();
                 if step_names.len() < 2 {
-                    return Err("query_funnel requires at least 2 step event names".to_string());
+                    return Err(McpToolError::Message(
+                        "query_funnel requires at least 2 step event names".into(),
+                    ));
                 }
                 let order_mode = pick(
                     args,
@@ -741,7 +871,7 @@ async fn invoke_tool_with_agent_store(
             };
             let known = known_event_names(project_id, meta, qengine).await?;
             check_event_names(q.steps.iter().map(|s| s.event_name.as_str()), &known)?;
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             if q.global_filter.cohort.is_some()
                 || q.breakdown_by
                     .as_deref()
@@ -752,21 +882,21 @@ async fn invoke_tool_with_agent_store(
             let res = qengine
                 .query_funnel(project_id, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "query_retention" => {
             let start_event = args
                 .get("start_event")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "missing required 'start_event'".to_string())?
+                .ok_or_else(|| McpToolError::Message("missing required 'start_event'".into()))?
                 .to_string();
             let return_event = args
                 .get("return_event")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "missing required 'return_event'".to_string())?
+                .ok_or_else(|| McpToolError::Message("missing required 'return_event'".into()))?
                 .to_string();
             let mode = pick(
                 args,
@@ -794,12 +924,12 @@ async fn invoke_tool_with_agent_store(
                 global_filter: GlobalFilter::default(),
                 sampling: Default::default(),
             };
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let res = qengine
                 .query_retention(project_id, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "inspect_frustrated_sessions" => {
             let sq = SessionSearchQuery {
@@ -827,19 +957,19 @@ async fn invoke_tool_with_agent_store(
                     .unwrap_or(false),
                 limit: Some(args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize),
             };
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let res = qengine
                 .search_sessions(project_id, &sq)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "query_flows" => {
             let anchor_event = args
                 .get("anchor_event")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "missing required 'anchor_event'".to_string())?
+                .ok_or_else(|| McpToolError::Message("missing required 'anchor_event'".into()))?
                 .to_string();
             let direction = pick(
                 args,
@@ -870,12 +1000,12 @@ async fn invoke_tool_with_agent_store(
                 global_filter: GlobalFilter::default(),
                 sampling: Default::default(),
             };
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let res = qengine
                 .query_flows(project_id, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "get_user" => {
             let distinct_id = args
@@ -883,31 +1013,31 @@ async fn invoke_tool_with_agent_store(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "missing required 'distinct_id'".to_string())?;
+                .ok_or_else(|| McpToolError::Message("missing required 'distinct_id'".into()))?;
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 200) as usize;
             let (expanded, maybe_id_graph) =
-                sync_erased_for_project(project_id, meta, qengine).await?;
+                sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let id_graph = match maybe_id_graph {
                 Some(g) => g,
                 None => qengine
                     .storage()
                     .identity_graph(project_id, false)
                     .await
-                    .map_err(|e| e.to_string())?,
+                    .map_err(McpToolError::from)?,
             };
             let pstore = qengine
                 .storage()
                 .profile_store(project_id, false)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(McpToolError::from)?;
             let profile = pstore
                 .get_by_distinct_id(distinct_id)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(McpToolError::from)?
                 .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
                 .map(crate::ControlPlaneService::from_stored_profile);
             let canon = id_graph
@@ -919,19 +1049,19 @@ async fn invoke_tool_with_agent_store(
                 })
                 .or_else(|| profile.as_ref().map(|p| p.canonical_uid));
             let Some(canon) = canon else {
-                return Err(format!(
+                return Err(McpToolError::Message(format!(
                     "no user with distinct_id '{distinct_id}' in this project"
-                ));
+                )));
             };
             let events = qengine
                 .export_events(project_id, None, Some(canon), limit, true)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(McpToolError::from)?;
             // Every id merged into this user contributes; the newest value of each key wins.
             let rows: Vec<_> = pstore
                 .list_for_canonical(canon)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(McpToolError::from)?
                 .into_iter()
                 .filter(|p| !pulse_storage::is_profile_erased(p, &expanded, Some(&id_graph)))
                 .map(crate::ControlPlaneService::from_stored_profile)
@@ -951,7 +1081,7 @@ async fn invoke_tool_with_agent_store(
                 .get("property")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "missing required 'property'".to_string())?
+                .ok_or_else(|| McpToolError::Message("missing required 'property'".into()))?
                 .to_string();
             let event_name = args
                 .get("event_name")
@@ -981,11 +1111,11 @@ async fn invoke_tool_with_agent_store(
                 formula: None,
                 sampling: Default::default(),
             };
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let res = qengine
                 .query_insights(project_id, &q)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(McpToolError::from)?;
             let mut values: Vec<(String, f64)> = res
                 .series
                 .into_iter()
@@ -1002,7 +1132,7 @@ async fn invoke_tool_with_agent_store(
             }))
         }
         "list_cohorts" => {
-            sync_erased_for_project(project_id, meta, qengine).await?;
+            sync_erased_for_project_typed(project_id, meta, qengine).await?;
             let cohorts = sync_saved_cohorts(project_id, meta, qengine).await?;
             let mut out = Vec::with_capacity(cohorts.len());
             for c in cohorts {
@@ -1029,7 +1159,9 @@ async fn invoke_tool_with_agent_store(
         }
         "list_agent_traces" => {
             let Some(store) = agent_store else {
-                return Err(format!("unknown MCP tool: {tool_name}"));
+                return Err(McpToolError::Message(format!(
+                    "unknown MCP tool: {tool_name}"
+                )));
             };
             let now_ms = Utc::now().timestamp_millis();
             let start_ts_ms = args
@@ -1077,34 +1209,38 @@ async fn invoke_tool_with_agent_store(
             let tombstones = meta
                 .list_active_erasure_tombstones(project_id, now_ms)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let rollups = meta
                 .list_agent_eval_rollups(project_id, Some(EvalTargetType::Trace))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let res = store
                 .list_traces(project_id, &filter, &rollups, &tombstones)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                .map_err(McpToolError::from)?;
+            serde_json::to_value(res).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "get_agent_trace" => {
             let Some(store) = agent_store else {
-                return Err(format!("unknown MCP tool: {tool_name}"));
+                return Err(McpToolError::Message(format!(
+                    "unknown MCP tool: {tool_name}"
+                )));
             };
             let trace_id = args_str(args, "trace_id")
-                .ok_or_else(|| "missing required 'trace_id'".to_string())?;
+                .ok_or_else(|| McpToolError::Message("missing required 'trace_id'".into()))?;
             let now_ms = Utc::now().timestamp_millis();
             let tombstones = meta
                 .list_active_erasure_tombstones(project_id, now_ms)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let Some(mut detail) = store
                 .get_trace_detail(project_id, &trace_id, &tombstones)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(McpToolError::from)?
             else {
-                return Err(format!("trace '{trace_id}' not found"));
+                return Err(McpToolError::Message(format!(
+                    "trace '{trace_id}' not found"
+                )));
             };
             let rollups = meta
                 .get_eval_rollups_batch(
@@ -1113,7 +1249,7 @@ async fn invoke_tool_with_agent_store(
                     std::slice::from_ref(&trace_id),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             if let Some(rollup) = rollups.get(&(EvalTargetType::Trace, trace_id.clone())) {
                 detail.trace.avg_eval_score = Some(rollup.avg_score);
                 detail.trace.eval_pass_rate = rollup.pass_rate;
@@ -1121,12 +1257,14 @@ async fn invoke_tool_with_agent_store(
             detail.evaluations = meta
                 .list_trace_evaluations(project_id, &trace_id)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(detail).map_err(|e| e.to_string())?)
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
+            serde_json::to_value(detail).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "query_agent_analytics" => {
             let Some(store) = agent_store else {
-                return Err(format!("unknown MCP tool: {tool_name}"));
+                return Err(McpToolError::Message(format!(
+                    "unknown MCP tool: {tool_name}"
+                )));
             };
             let now_ms = Utc::now().timestamp_millis();
             let start_ts_ms = args
@@ -1162,15 +1300,15 @@ async fn invoke_tool_with_agent_store(
             let tombstones = meta
                 .list_active_erasure_tombstones(project_id, now_ms)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let mut overview = store
                 .query_analytics(project_id, &filter, &tombstones)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(McpToolError::from)?;
             let rollups = meta
                 .list_agent_eval_rollups(project_id, Some(EvalTargetType::Trace))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             if !rollups.is_empty() && filter.tool_name.is_none() {
                 enrich_overview_rollups(
                     store,
@@ -1182,11 +1320,13 @@ async fn invoke_tool_with_agent_store(
                 )
                 .await?;
             }
-            Ok(serde_json::to_value(overview).map_err(|e| e.to_string())?)
+            serde_json::to_value(overview).map_err(|e| McpToolError::Message(e.to_string()))
         }
         "list_agent_evaluations" => {
             if agent_store.is_none() {
-                return Err(format!("unknown MCP tool: {tool_name}"));
+                return Err(McpToolError::Message(format!(
+                    "unknown MCP tool: {tool_name}"
+                )));
             }
             let target_type = parse_eval_target_type_arg(args)?;
             let limit = args
@@ -1198,23 +1338,23 @@ async fn invoke_tool_with_agent_store(
             let tombstones = meta
                 .list_active_erasure_tombstones(project_id, now_ms)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| McpToolError::Message(e.to_string()))?;
             let mut evals = if let Some(tid) = args_str(args, "trace_id") {
                 meta.list_trace_evaluations(project_id, &tid)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             } else if let Some(sid) = args_str(args, "session_id") {
                 meta.list_session_evaluations(project_id, &sid)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             } else if let Some(spid) = args_str(args, "span_id") {
                 meta.list_span_evaluations(project_id, &spid)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             } else {
                 meta.list_project_evaluations_by_target(project_id, target_type, limit)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| McpToolError::Message(e.to_string()))?
             };
             if let Some(tt) = target_type {
                 evals.retain(|e| e.target_type == tt);
@@ -1242,7 +1382,7 @@ async fn invoke_tool_with_agent_store(
             let count = evals.len();
             Ok(json!({ "evaluations": evals, "count": count }))
         }
-        other => Err(format!("unknown MCP tool: {other}")),
+        other => Err(McpToolError::Message(format!("unknown MCP tool: {other}"))),
     }
 }
 
@@ -1282,7 +1422,7 @@ async fn enrich_overview_rollups(
     rollups: &HashMap<(EvalTargetType, String), AgentEvalRollup>,
     tombstones: &[AgentErasureTombstone],
     overview: &mut pulse_agent::AgentAnalyticsOverview,
-) -> Result<(), String> {
+) -> Result<(), McpToolError> {
     let mut trace_filter = filter.to_trace_list_filter();
     trace_filter.limit = Some(100);
     trace_filter.cursor = None;
@@ -1293,7 +1433,7 @@ async fn enrich_overview_rollups(
         let page = store
             .list_traces(project_id, &trace_filter, rollups, tombstones)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(McpToolError::from)?;
         for tr in &page.traces {
             if !seen.insert(tr.trace_id.clone()) {
                 continue;

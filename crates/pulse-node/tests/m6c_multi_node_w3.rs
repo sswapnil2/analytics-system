@@ -20,7 +20,6 @@
 //! 6. Alert evaluation webhook fires **once** per trigger when `Ingest`, `Writer`, and `Query`
 //!    coexist.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,7 +39,6 @@ use pulse_node::{
     restore_from_published_with_store_and_meta_for_test, start_pulse_node_with_store_and_identity,
     NodeConfig, NodeIdentity, NodeRole,
 };
-use pulse_storage::WriterOffsetEntry;
 use pulse_wire::{WireBatch, WireEvent};
 use serde_json::{json, Value};
 
@@ -331,7 +329,6 @@ fn w3_exit_1_and_2_writer_async_ingest_survives_writer_sigkill_and_owner_restart
         ("PULSE_HOT_STORE", Some("local")),
         ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
         ("PULSE_WRITER_FLUSH_MS", Some("15")),
-        ("PULSE_AGENT_WRITER_FLUSH_MS", Some("15")),
         ("PULSE_WRITER_LEASE_TTL_SECS", Some("2")),
     ]);
 
@@ -639,7 +636,6 @@ fn w3_exit_3_writer_log_per_project_429_isolation_outage_and_restore_from_publis
         ("PULSE_HOT_STORE", Some("local")),
         ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
         ("PULSE_WRITER_FLUSH_MS", Some("10")),
-        ("PULSE_AGENT_WRITER_FLUSH_MS", Some("10")),
         ("PULSE_WRITER_LOG_PROJECT_MAX_MB", Some("1")),
         ("PULSE_WRITER_LOG_MAX_MB", Some("8")),
         ("PULSE_WRITER_LEASE_TTL_SECS", Some("2")),
@@ -917,7 +913,6 @@ fn w3_exit_4_agent_forward_idempotency_erasure_wipe_and_7d_expiry() {
         ("PULSE_HOT_STORE", Some("local")),
         ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
         ("PULSE_WRITER_FLUSH_MS", Some("10")),
-        ("PULSE_AGENT_WRITER_FLUSH_MS", Some("10")),
         ("PULSE_WRITER_LEASE_TTL_SECS", Some("2")),
     ]);
 
@@ -1099,11 +1094,7 @@ fn w3_exit_4_agent_forward_idempotency_erasure_wipe_and_7d_expiry() {
         assert_eq!(analytics["total_executions"], 2, "{analytics}");
         assert_eq!(analytics["total_tokens"], 300, "{analytics}");
 
-        // 5. Verify 6d (< 7d) entry stays active across flush while stale 8d (> 7d) expires.
-        let _entry_check = WriterOffsetEntry {
-            last_applied_offset: 50,
-            last_seen_ts_ms: now_ms - 6 * 86_400_000,
-        };
+        // 5. Verify 6d (< 7d) entry stays active across flush + GC + publish while stale 8d (> 7d) expires.
         let trace_6d: TraceIngestBatch = serde_json::from_value(make_trace_batch(
             "tr_6d",
             "s_6d",
@@ -1119,7 +1110,56 @@ fn w3_exit_4_agent_forward_idempotency_erasure_wipe_and_7d_expiry() {
             .await
             .unwrap();
         assert_eq!(r_6d.accepted_traces, 1);
+
+        let trace_8d: TraceIngestBatch = serde_json::from_value(make_trace_batch(
+            "tr_8d",
+            "s_8d",
+            "u_8d",
+            now_ms - 8 * 86_400_000,
+            "bot",
+        ))
+        .unwrap();
+        let r_8d = owner2
+            .control
+            .agent_store()
+            .ingest_forwarded_batch("w_age_8d", &pid, 0, trace_8d, now_ms - 8 * 86_400_000)
+            .await
+            .unwrap();
+        assert_eq!(r_8d.accepted_traces, 1);
+
         owner2.control.agent_store().flush_all_l0().await.unwrap();
+        owner2
+            .control
+            .agent_store()
+            .compact_and_gc(Some(&pid), &[])
+            .await
+            .unwrap();
+        owner2
+            .control
+            .agent_store()
+            .publish_all_projects()
+            .await
+            .unwrap();
+
+        let pub_store =
+            PublishedAgentManifestStore::new(&pid, owner2.storage.encrypted_store().clone())
+                .unwrap();
+        let pub_man = pub_store
+            .load_latest()
+            .await
+            .unwrap()
+            .expect("published agent manifest after 6d/8d expiry check");
+        assert!(
+            pub_man.writer_offsets.contains_key("w_age_check"),
+            "6d (< 7d) writer_offsets entry must remain active: {:?}",
+            pub_man.writer_offsets
+        );
+        assert!(
+            !pub_man.writer_offsets.contains_key("w_age_8d"),
+            "8d (> 7d) writer_offsets entry must be pruned across compact_and_gc + publish: {:?}",
+            pub_man.writer_offsets
+        );
+
         let r_6d_dup = owner2
             .control
             .agent_store()
@@ -1127,6 +1167,23 @@ fn w3_exit_4_agent_forward_idempotency_erasure_wipe_and_7d_expiry() {
             .await
             .unwrap();
         assert_eq!(r_6d_dup.accepted_traces, 0);
+
+        // Because w_age_8d's >7d offset expired and was pruned, offset 0 is accepted again.
+        let trace_8d_recheck: TraceIngestBatch = serde_json::from_value(make_trace_batch(
+            "tr_8d_recheck",
+            "s_8d_r",
+            "u_8d_r",
+            now_ms,
+            "bot",
+        ))
+        .unwrap();
+        let r_8d_after_expire = owner2
+            .control
+            .agent_store()
+            .ingest_forwarded_batch("w_age_8d", &pid, 0, trace_8d_recheck, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(r_8d_after_expire.accepted_traces, 1);
 
         writer2.shutdown().await;
         owner2.shutdown().await;
@@ -1150,7 +1207,6 @@ fn w3_exit_5_and_6_routing_sync_profiles_queries_cache_invalidation_and_query_wr
         ("PULSE_HOT_STORE", Some("local")),
         ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
         ("PULSE_WRITER_FLUSH_MS", Some("10")),
-        ("PULSE_AGENT_WRITER_FLUSH_MS", Some("10")),
         ("PULSE_WRITER_LEASE_TTL_SECS", Some("2")),
     ]);
 
@@ -1647,7 +1703,6 @@ fn w3_exit_7_alerts_fire_once_on_owner_when_split_role_and_writer_present() {
         ("PULSE_HOT_STORE", Some("local")),
         ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
         ("PULSE_WRITER_FLUSH_MS", Some("10")),
-        ("PULSE_AGENT_WRITER_FLUSH_MS", Some("10")),
         ("PULSE_ALLOW_PRIVATE_ENDPOINTS", Some("1")),
     ]);
 
@@ -1791,11 +1846,305 @@ fn w3_exit_7_alerts_fire_once_on_owner_when_split_role_and_writer_present() {
         query.control.evaluate_alerts().await;
         assert_eq!(hits.load(Ordering::Acquire), 1);
 
-        let _unused_check: BTreeMap<String, WriterOffsetEntry> = BTreeMap::new();
-
         hook_task.abort();
         query.shutdown().await;
         writer.shutdown().await;
         ingest.shutdown().await;
+    });
+}
+
+#[test]
+fn w3_live_ownership_migration_prevents_split_brain_and_stale_lease_errors() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("owner_a");
+    let dir_b = tmp.path().join("node_b");
+    let dir_w = tmp.path().join("writer");
+    let meta_db = tmp.path().join("meta.db");
+    let meta_url = format!("sqlite://{}", meta_db.display());
+
+    let _env = EnvGuard::set(&[
+        ("DATABASE_URL", Some(&meta_url)),
+        ("PULSE_VAULT_KEK", Some(TEST_VAULT_KEK)),
+        ("PULSE_HOT_STORE", Some("local")),
+        ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
+        ("PULSE_WRITER_FLUSH_MS", Some("10")),
+        ("PULSE_WRITER_LEASE_TTL_SECS", Some("15")),
+        ("PULSE_OWNER_CACHE_TTL_MS", Some("60000")),
+    ]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let owner_a = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_a, "proj_default", NodeRole::All),
+            s3.clone(),
+            NodeIdentity::new("owner-a", None),
+        )
+        .await
+        .unwrap();
+        let node_b = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_b, "proj_default", NodeRole::All),
+            s3.clone(),
+            NodeIdentity::new("node-b", None),
+        )
+        .await
+        .unwrap();
+        let writer = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_w, "proj_default", NodeRole::Writer),
+            Arc::new(InMemory::new()),
+            NodeIdentity::new("writer-mig", None),
+        )
+        .await
+        .unwrap();
+
+        let url_a = format!("http://{}", owner_a.http_addr);
+        let url_b = format!("http://{}", node_b.http_addr);
+        let url_w = format!("http://{}", writer.http_addr);
+
+        let (pid, pk) = create_project_on(&http, &url_a, "proj-live-mig").await;
+        owner_a
+            .control
+            .meta()
+            .set_project_owner(&pid, "owner-a", &url_a, Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Warm ProjectStorage + AgentTraceStore + writer_leases on owner-a AND warm writer-1's
+        // and owner-a's 60s MetaOwnerDirectory caches.
+        assert_eq!(
+            http.post(format!("{url_w}/v1/identify"))
+                .header("x-pulse-key", &pk)
+                .json(&json!({ "anon_id": "anon_warm", "user_id": "u_warm" }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/ingest"))
+                .header("x-pulse-key", &pk)
+                .json(&json!({
+                    "events": [{
+                        "event": "Warm_Ev",
+                        "userId": "u_warm",
+                        "messageId": "m_warm_1",
+                        "timestamp": now_ms
+                    }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/agent/traces"))
+                .header("x-pulse-key", &pk)
+                .json(&make_trace_batch("tr_warm", "s_warm", "u_warm", now_ms, "bot"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        poll_until(Duration::from_secs(10), || async {
+            insights_total(&http, &url_a, &pid, "Warm_Ev", now_ms).await == 1
+                && list_agent_trace_ids(&http, &url_a, &pid)
+                    .await
+                    .contains(&"tr_warm".to_string())
+        })
+        .await;
+        assert!(owner_a.storage.get_project(&pid).is_some());
+
+        // Warm owner-a's MetaOwnerDirectory cache for /v1/mcp and /v1/query.
+        let r_mcp_warm = http
+            .post(format!("{url_a}/v1/mcp"))
+            .bearer_auth(ADMIN_TOKEN)
+            .header("x-pulse-project", &pid)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "query_insights",
+                    "arguments": { "event_name": "Warm_Ev", "metric": "totals" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mcp_warm.status(), 200);
+
+        // Migrate project_owner to node-b WITHOUT restarting owner-a and WITHOUT calling reconcile_ownership()!
+        node_b
+            .control
+            .meta()
+            .set_project_owner(&pid, "node-b", &url_b, Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+
+        // Immediately exercise /v1/identify, /v1/engage, /v1/replay/chunk, /v1/ingest,
+        // /v1/agent/traces, /v1/projects/:id/query/insights, and /v1/mcp!
+        let r_id = http
+            .post(format!("{url_w}/v1/identify"))
+            .header("x-pulse-key", &pk)
+            .json(&json!({ "anon_id": "anon_mig", "user_id": "u_mig" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_id.status(), 200, "{}", r_id.text().await.unwrap());
+
+        let r_eng = http
+            .post(format!("{url_w}/v1/engage"))
+            .header("x-pulse-key", &pk)
+            .json(&json!({ "distinct_id": "u_mig", "$set": { "migrated": true } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_eng.status(), 200, "{}", r_eng.text().await.unwrap());
+
+        let r_rep = http
+            .post(format!("{url_w}/v1/replay/chunk"))
+            .header("x-pulse-key", &pk)
+            .json(&json!({
+                "project_id": pid,
+                "session_id": "sess_mig",
+                "chunk_start_ts_ms": now_ms,
+                "ops": [
+                    { "op": "full_snapshot", "ts_offset_ms": 0, "width": 390, "height": 844, "nodes": [] }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_rep.status(), 200, "{}", r_rep.text().await.unwrap());
+
+        let r_ing = http
+            .post(format!("{url_w}/v1/ingest"))
+            .header("x-pulse-key", &pk)
+            .json(&json!({
+                "events": [{
+                    "event": "Migrated_Ev",
+                    "userId": "u_mig",
+                    "messageId": "m_mig_1",
+                    "timestamp": now_ms + 5
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_ing.status(), 200);
+
+        let r_ag = http
+            .post(format!("{url_w}/v1/agent/traces"))
+            .header("x-pulse-key", &pk)
+            .json(&make_trace_batch("tr_migrated", "s_mig", "u_mig", now_ms + 6, "bot"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_ag.status(), 200);
+
+        // Immediately query via writer (tests no 503 not_writer on new owner node-b).
+        let r_q_imm = http
+            .post(format!("{url_w}/v1/projects/{pid}/query/insights"))
+            .bearer_auth(ADMIN_TOKEN)
+            .json(&json!({
+                "time_range": { "start_ts_ms": now_ms - 60_000, "end_ts_ms": now_ms + 60_000 },
+                "interval": "day",
+                "series": [{ "label": "A", "event_name": "Migrated_Ev", "metric": "totals" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_q_imm.status(), 200, "{}", r_q_imm.text().await.unwrap());
+
+        // Wait until forwarded async events & agent traces land on node-b.
+        poll_until(Duration::from_secs(10), || async {
+            insights_total(&http, &url_b, &pid, "Migrated_Ev", now_ms).await == 1
+                && list_agent_trace_ids(&http, &url_b, &pid)
+                    .await
+                    .contains(&"tr_migrated".to_string())
+        })
+        .await;
+
+        // Stale-cache POST /v1/mcp on deposed owner-a must detect NotOwner and forward to node-b -> 200!
+        let r_mcp_mig = http
+            .post(format!("{url_a}/v1/mcp"))
+            .bearer_auth(ADMIN_TOKEN)
+            .header("x-pulse-project", &pid)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "query_insights",
+                    "arguments": { "event_name": "Migrated_Ev", "metric": "totals" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mcp_mig.status(), 200);
+        let mcp_body: Value = r_mcp_mig.json().await.unwrap();
+        assert_ne!(mcp_body["result"]["isError"], json!(true), "{mcp_body}");
+        assert_eq!(
+            mcp_body["result"]["structuredContent"]["series"][0]["overall_value"],
+            json!(1.0),
+            "{mcp_body}"
+        );
+
+        // Verify identify/engage/replay landed ONLY on node-b (zero split-brain writes on owner-a!).
+        let r_user_b = http
+            .get(format!("{url_b}/v1/projects/{pid}/users/u_mig"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_user_b.status(), 200);
+        let user_b: Value = r_user_b.json().await.unwrap();
+        assert_eq!(
+            user_b["profile"]["props"]["migrated"],
+            json!(true),
+            "{user_b}"
+        );
+
+        let r_rep_b = http
+            .get(format!("{url_b}/v1/projects/{pid}/replay/sess_mig"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_rep_b.status(), 200);
+
+        assert!(
+            owner_a.storage.get_project(&pid).is_none(),
+            "deposed owner-a must fence and evict cached ProjectStorage handle"
+        );
+        assert!(
+            !dir_a.join("hot/hot/replay").join(&pid).join("sess_mig").exists(),
+            "post-migration replay must not write to deposed owner-a"
+        );
+        assert!(
+            dir_b.join("hot/hot/replay").join(&pid).join("sess_mig").exists(),
+            "post-migration replay must land on new owner node-b"
+        );
+
+        writer.shutdown().await;
+        node_b.shutdown().await;
+        owner_a.shutdown().await;
     });
 }

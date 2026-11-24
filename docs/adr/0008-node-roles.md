@@ -8,7 +8,7 @@ Ingest and queries compete for CPU and memory, so a heavy query should not slow 
 ## Decision
 One binary can run as `--role all | ingest | writer | query | compactor` (`crates/pulse-node/src/lib.rs`).
 - `ingest` (and `all`) nodes own storage for projects assigned to them in `project_owner` and execute local WAL/L0/segment writes, S3 uploads, and `/internal/v1/forward/*` requests.
-- `writer` nodes are stateless ingest/routing frontends: they buffer async `/v1/ingest`, `/v1/agent/traces`, and `/v1/otel/v1/traces` into local `writer_log/` (`PWLF` v2) and forward idempotently (`PWFB`/`PWFA`) to each project's owner, and forward sync profile/replay calls and `/v1/projects/:id/*` queries/admin requests via `MetaOwnerDirectory` (`30 s` cache with immediate refresh on `503 not_owner`, `307`, or dead-owner transport failure).
+- `writer` nodes are stateless ingest/routing frontends: they buffer async `/v1/ingest`, `/v1/agent/traces`, and `/v1/otel/v1/traces` into local `writer_log/` (`PWLF` v2) and forward idempotently (`PWFE`/`PWFA`) to each project's owner, and forward sync profile/replay calls and `/v1/projects/:id/*` queries/admin requests via `MetaOwnerDirectory` (`30 s` cache with immediate refresh on `503 not_owner`, `307`, or dead-owner transport failure).
 - `query` nodes open storage and identity **read-only**, refresh from S3 `published/` + `agent_published/`, and forward storage-writing mutations to `project_owner`.
 - `compactor` nodes only compact.
 

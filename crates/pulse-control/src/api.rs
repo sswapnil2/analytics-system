@@ -2382,7 +2382,6 @@ fn should_skip_proxy_req_header(name: &axum::http::header::HeaderName) -> bool {
         || s.eq_ignore_ascii_case("connection")
         || s.eq_ignore_ascii_case("transfer-encoding")
         || s.eq_ignore_ascii_case("accept-encoding")
-        || s.eq_ignore_ascii_case("content-encoding")
         || s.eq_ignore_ascii_case("keep-alive")
         || s.eq_ignore_ascii_case("proxy-authenticate")
         || s.eq_ignore_ascii_case("proxy-authorization")
@@ -2596,18 +2595,38 @@ impl ControlPlaneService {
                 .await
                 .map_err(|e| CtrlError::service_unavailable(format!("proxy read failed: {e}")))?;
 
+            let err_code = if status == StatusCode::SERVICE_UNAVAILABLE {
+                serde_json::from_slice::<Value>(&resp_bytes)
+                    .ok()
+                    .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            } else {
+                None
+            };
+
             if attempt < 2
                 && (status == StatusCode::TEMPORARY_REDIRECT
-                    || (status == StatusCode::SERVICE_UNAVAILABLE
-                        && serde_json::from_slice::<Value>(&resp_bytes)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("code").and_then(|c| c.as_str()).map(str::to_string)
-                            })
-                            .as_deref()
-                            == Some("not_owner")))
+                    || err_code.as_deref() == Some("not_owner"))
             {
                 continue;
+            }
+            if attempt < 2 && err_code.as_deref() == Some("not_writer") {
+                if let Ok(Some(refreshed)) = dir.refresh_owner(project_id).await {
+                    if refreshed.node_name != owner.node_name || refreshed.address != owner.address
+                    {
+                        if !is_pub_reader
+                            && !is_writer
+                            && self.node_name.as_deref() == Some(refreshed.node_name.as_str())
+                        {
+                            return Ok(None);
+                        }
+                        prefetched_owner = Some(refreshed);
+                        continue;
+                    } else if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        prefetched_owner = Some(refreshed);
+                        continue;
+                    }
+                }
             }
 
             let mut out = Response::new(Body::from(resp_bytes));
@@ -2742,12 +2761,26 @@ async fn project_owner_forward_middleware(
         let r_bytes = axum::body::to_bytes(r_body, 1024 * 1024)
             .await
             .unwrap_or_default();
-        let is_not_owner = serde_json::from_slice::<Value>(&r_bytes)
+        let err_code = serde_json::from_slice::<Value>(&r_bytes)
             .ok()
-            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
-            .as_deref()
-            == Some("not_owner");
-        if is_not_owner {
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string));
+        let should_retry_forward = match err_code.as_deref() {
+            Some("not_owner") => true,
+            Some("not_writer") => {
+                let owner_dir = ctrl.owner_directory.read().clone();
+                if let Some(dir) = owner_dir {
+                    dir.refresh_owner(&project_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|o| ctrl.node_name.as_deref() != Some(o.node_name.as_str()))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if should_retry_forward {
             if let Some(fwd_resp) = ctrl
                 .forward_to_owner_if_remote(
                     &project_id,
@@ -3732,9 +3765,34 @@ async fn handle_unified_query(
         .unwrap_or("insights");
 
     let inner = payload.get("query").cloned().unwrap_or(payload.clone());
-    ctrl.load_erased_for_project(&pid)
-        .await
-        .map_err(CtrlError::internal)?;
+    if !is_pub_reader {
+        if let Err(err) = ctrl.load_erased_for_project_ingest(&pid).await {
+            if matches!(
+                err,
+                IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner { .. }
+                        | pulse_storage::StorageError::NotWriter { .. }
+                )
+            ) {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &pid,
+                        &Method::POST,
+                        &path_and_query,
+                        &headers,
+                        body,
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            return Err(CtrlError::ingest(err));
+        }
+    } else {
+        ctrl.load_erased_for_project_ctrl(&pid).await?;
+    }
     let exec_res: std::result::Result<Value, pulse_exec::ExecError> = match kind {
         "insights" => {
             let q: InsightsQuery = parse_query_value("insights", inner)?;
@@ -3798,9 +3856,7 @@ async fn handle_query_insights(
 ) -> ApiRes<pulse_exec::InsightsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: InsightsQuery = parse_json_body("insights query", &body)?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .query_insights(&id, &q)
@@ -3817,9 +3873,7 @@ async fn handle_query_funnel(
 ) -> ApiRes<pulse_exec::FunnelResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: FunnelQuery = parse_json_body("funnel query", &body)?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .query_funnel(&id, &q)
@@ -3843,9 +3897,7 @@ async fn handle_query_funnel_dropped(
         .get("step")
         .and_then(|s| s.parse::<usize>().ok())
         .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let users = ctrl
         .qengine
         .query_funnel_dropped_users(&id, &q, step)
@@ -3880,9 +3932,7 @@ async fn handle_query_retention(
 ) -> ApiRes<pulse_exec::RetentionResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: RetentionQuery = parse_json_body("retention query", &body)?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .query_retention(&id, &q)
@@ -3899,9 +3949,7 @@ async fn handle_query_flows(
 ) -> ApiRes<pulse_exec::FlowsResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let q: FlowsQuery = parse_json_body("flows query", &body)?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .query_flows(&id, &q)
@@ -3974,9 +4022,34 @@ async fn handle_get_sessions_default(
         }
     }
     let sq = session_query_from_params(&params);
-    ctrl.load_erased_for_project(&pid)
-        .await
-        .map_err(CtrlError::internal)?;
+    if !is_pub_reader {
+        if let Err(err) = ctrl.load_erased_for_project_ingest(&pid).await {
+            if matches!(
+                err,
+                IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner { .. }
+                        | pulse_storage::StorageError::NotWriter { .. }
+                )
+            ) {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &pid,
+                        &Method::GET,
+                        &path_and_query,
+                        &headers,
+                        Bytes::new(),
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            return Err(CtrlError::ingest(err));
+        }
+    } else {
+        ctrl.load_erased_for_project_ctrl(&pid).await?;
+    }
     match ctrl.qengine.search_sessions(&pid, &sq).await {
         Ok(res) => Ok(Json(res).into_response()),
         Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
@@ -4027,9 +4100,34 @@ async fn handle_post_sessions_default(
             return Ok(resp);
         }
     }
-    ctrl.load_erased_for_project(&pid)
-        .await
-        .map_err(CtrlError::internal)?;
+    if !is_pub_reader {
+        if let Err(err) = ctrl.load_erased_for_project_ingest(&pid).await {
+            if matches!(
+                err,
+                IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner { .. }
+                        | pulse_storage::StorageError::NotWriter { .. }
+                )
+            ) {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &pid,
+                        &Method::POST,
+                        &path_and_query,
+                        &headers,
+                        body,
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            return Err(CtrlError::ingest(err));
+        }
+    } else {
+        ctrl.load_erased_for_project_ctrl(&pid).await?;
+    }
     match ctrl.qengine.search_sessions(&pid, &sq).await {
         Ok(res) => Ok(Json(res).into_response()),
         Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
@@ -4062,9 +4160,7 @@ async fn handle_get_sessions(
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
     let sq = session_query_from_params(&params);
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .search_sessions(&id, &sq)
@@ -4080,9 +4176,7 @@ async fn handle_post_sessions(
     Json(sq): Json<SessionSearchQuery>,
 ) -> ApiRes<pulse_exec::SessionSearchResult> {
     ctrl.authorize_and_check(&principal, &id).await?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let res = ctrl
         .qengine
         .search_sessions(&id, &sq)
@@ -4592,9 +4686,7 @@ async fn handle_cohort_from_funnel_dropped(
         .get("step")
         .and_then(|s| s.parse::<usize>().ok())
         .ok_or_else(|| CtrlError::bad("?step=N is required: the step users didn't reach"))?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let uids = ctrl
         .qengine
         .query_funnel_dropped_uids(&id, &req.query, step)
@@ -4636,9 +4728,7 @@ async fn handle_preview_cohort(
     let cat = ctrl.qengine.catalogs().for_project(&id);
     validate_cohort_acyclic(None, &req.definition, &cat)
         .map_err(|e| CtrlError::bad(e.to_string()))?;
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let (user_count, exec_time_us) = ctrl
         .qengine
         .preview_cohort_count(&id, &req.definition, req.time_range)
@@ -5430,9 +5520,34 @@ async fn handle_edge_flag_bundle(
         .list_feature_flags(&project_id)
         .await
         .map_err(CtrlError::meta)?;
-    ctrl.load_erased_for_project(&project_id)
-        .await
-        .map_err(CtrlError::internal)?;
+    if !is_pub_reader {
+        if let Err(err) = ctrl.load_erased_for_project_ingest(&project_id).await {
+            if matches!(
+                err,
+                IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner { .. }
+                        | pulse_storage::StorageError::NotWriter { .. }
+                )
+            ) {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &project_id,
+                        &Method::GET,
+                        &path_and_query,
+                        &headers,
+                        Bytes::new(),
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            return Err(CtrlError::ingest(err));
+        }
+    } else {
+        ctrl.load_erased_for_project_ctrl(&project_id).await?;
+    }
     let bundle = match build_edge_flag_bundle_with_cohorts(
         &project_id,
         &flags,
@@ -5609,12 +5724,10 @@ async fn handle_experiment_results_scoped(
     let flag = flags
         .iter()
         .find(|f| f.id == exp.flag_id || f.key == exp.flag_key);
-    ctrl.load_erased_for_project(&project_id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&project_id).await?;
     let results = evaluate_experiment_results(&exp, flag, &ctrl.qengine)
         .await
-        .map_err(CtrlError::internal)?;
+        .map_err(CtrlError::exec)?;
     Ok(Json(results))
 }
 
@@ -5639,7 +5752,7 @@ async fn handle_mcp(
                 &Method::POST,
                 &path_and_query,
                 &headers,
-                body,
+                body.clone(),
                 false,
             )
             .await?
@@ -5652,18 +5765,88 @@ async fn handle_mcp(
     if req.id.is_null() {
         return Ok(StatusCode::ACCEPTED.into_response());
     }
-    ctrl.load_erased_for_project(&bound_pid)
-        .await
-        .map_err(CtrlError::internal)?;
-    let resp = crate::mcp::handle_mcp_request_with_agent_store(
+    if !is_pub_reader {
+        if let Err(err) = ctrl.load_erased_for_project_ingest(&bound_pid).await {
+            if matches!(
+                err,
+                IngestError::Storage(
+                    pulse_storage::StorageError::NotOwner { .. }
+                        | pulse_storage::StorageError::NotWriter { .. }
+                )
+            ) {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &bound_pid,
+                        &Method::POST,
+                        &path_and_query,
+                        &headers,
+                        body,
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            return Err(CtrlError::ingest(err));
+        }
+    } else {
+        ctrl.load_erased_for_project_ctrl(&bound_pid).await?;
+    }
+    match crate::mcp::handle_mcp_request_checked(
         req,
         &bound_pid,
         &ctrl.meta,
         &ctrl.qengine,
         Some(ctrl.agent_store().as_ref()),
     )
-    .await;
-    Ok(Json(resp).into_response())
+    .await
+    {
+        Ok(resp) => Ok(Json(resp).into_response()),
+        Err(crate::mcp::McpToolError::NotOwner {
+            project_id,
+            owner_node,
+            owner_address,
+        }) => {
+            if !is_pub_reader {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &bound_pid,
+                        &Method::POST,
+                        &path_and_query,
+                        &headers,
+                        body,
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            Err(CtrlError::not_owner(project_id, owner_node, owner_address))
+        }
+        Err(crate::mcp::McpToolError::NotWriter { project_id }) => {
+            if !is_pub_reader {
+                if let Some(resp) = ctrl
+                    .forward_to_owner_if_remote(
+                        &bound_pid,
+                        &Method::POST,
+                        &path_and_query,
+                        &headers,
+                        body,
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(resp);
+                }
+            }
+            Err(CtrlError::storage(pulse_storage::StorageError::NotWriter {
+                project_id,
+            }))
+        }
+        Err(crate::mcp::McpToolError::Message(msg)) => Err(CtrlError::internal(msg)),
+    }
 }
 
 // ------------------- User Profiles, DPDP Erasure, Import/Export, Revenue & Alerts -------------------
@@ -6091,9 +6274,7 @@ async fn handle_export_events(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "ndjson".to_string());
 
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let rows = ctrl
         .qengine
         .export_events(&id, time_range, None, limit, true)
@@ -7115,9 +7296,7 @@ async fn handle_warehouse_export(
         _ => None,
     };
     let limit = req.limit.unwrap_or(10_000).clamp(1, 50_000);
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let rows = ctrl
         .qengine
         .export_events(&id, time_range, None, limit, true)
@@ -7188,9 +7367,7 @@ async fn handle_byok_copilot(
     let llm_api_key =
         unseal_secret(&ctrl.vault_kek, &llm_cred.sealed_secret_hex).map_err(CtrlError::internal)?;
 
-    ctrl.load_erased_for_project(&id)
-        .await
-        .map_err(CtrlError::internal)?;
+    ctrl.load_erased_for_project_ctrl(&id).await?;
     let resp = run_byok_copilot(
         &ctrl.qengine,
         &ctrl.meta,

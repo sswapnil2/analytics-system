@@ -1498,7 +1498,7 @@ impl IngestService {
         ps.check_hot_segment_backpressure()?;
 
         let processor = self.processor_for(project_id, &ps).await?;
-        let bucket_outcomes = futures::future::try_join_all(by_bucket.into_iter().map(
+        let bucket_outcomes = match futures::future::try_join_all(by_bucket.into_iter().map(
             |(bucket_id, (candidates, slice_bytes))| {
                 let ps = ps.clone();
                 let dedup = self.dedup.clone();
@@ -1563,7 +1563,17 @@ impl IngestService {
                 }
             },
         ))
-        .await?;
+        .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(err @ IngestError::Storage(StorageError::NotWriter { .. })) => {
+                self.local_storage()?
+                    .ensure_writable_owner(project_id)
+                    .await?;
+                return Err(err);
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut total_accepted = 0usize;
         let mut total_deduped = 0usize;
@@ -2050,16 +2060,25 @@ impl IngestService {
                 .await;
         }
         if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
-            return sync_client
-                .forward_identify_with_headers(project_id, req, incoming)
-                .await;
+            match sync_client
+                .forward_identify_with_headers(project_id, req.clone(), incoming)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(IngestError::Storage(StorageError::NotOwner {
+                    owner_node: Some(ref node),
+                    ..
+                })) if sync_client.self_node_name() == Some(node.as_str()) => {}
+                Err(e) => return Err(e),
+            }
         }
         match self
             .identify_for_project_local(project_id, req.clone())
             .await
         {
             Ok(resp) => Ok(resp),
-            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. }))
+            | Err(err @ IngestError::Storage(StorageError::NotWriter { .. })) => {
                 if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
                     sync_client
                         .forward_identify_with_headers(project_id, req, incoming)
@@ -2169,16 +2188,25 @@ impl IngestService {
                 .await;
         }
         if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
-            return sync_client
-                .forward_engage_with_headers(project_id, payload, incoming)
-                .await;
+            match sync_client
+                .forward_engage_with_headers(project_id, payload.clone(), incoming)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(IngestError::Storage(StorageError::NotOwner {
+                    owner_node: Some(ref node),
+                    ..
+                })) if sync_client.self_node_name() == Some(node.as_str()) => {}
+                Err(e) => return Err(e),
+            }
         }
         match self
             .engage_for_project_local(project_id, payload.clone())
             .await
         {
             Ok(resp) => Ok(resp),
-            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. }))
+            | Err(err @ IngestError::Storage(StorageError::NotWriter { .. })) => {
                 if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
                     sync_client
                         .forward_engage_with_headers(project_id, payload, incoming)
@@ -2330,16 +2358,25 @@ impl IngestService {
                 .await;
         }
         if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
-            return sync_client
-                .forward_group_engage_with_headers(project_id, payload, incoming)
-                .await;
+            match sync_client
+                .forward_group_engage_with_headers(project_id, payload.clone(), incoming)
+                .await
+            {
+                Ok(updated) => return Ok(updated),
+                Err(IngestError::Storage(StorageError::NotOwner {
+                    owner_node: Some(ref node),
+                    ..
+                })) if sync_client.self_node_name() == Some(node.as_str()) => {}
+                Err(e) => return Err(e),
+            }
         }
         match self
             .group_engage_for_project_local(project_id, payload.clone())
             .await
         {
             Ok(updated) => Ok(updated),
-            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. }))
+            | Err(err @ IngestError::Storage(StorageError::NotWriter { .. })) => {
                 if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
                     sync_client
                         .forward_group_engage_with_headers(project_id, payload, incoming)
@@ -2442,16 +2479,25 @@ impl IngestService {
                 .await;
         }
         if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
-            return sync_client
+            match sync_client
                 .forward_replay_with_headers(project_id, content_type, body, incoming)
-                .await;
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(IngestError::Storage(StorageError::NotOwner {
+                    owner_node: Some(ref node),
+                    ..
+                })) if sync_client.self_node_name() == Some(node.as_str()) => {}
+                Err(e) => return Err(e),
+            }
         }
         match self
             .ingest_replay_for_project_local(project_id, content_type, body)
             .await
         {
             Ok(resp) => Ok(resp),
-            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. }))
+            | Err(err @ IngestError::Storage(StorageError::NotWriter { .. })) => {
                 if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
                     sync_client
                         .forward_replay_with_headers(project_id, content_type, body, incoming)

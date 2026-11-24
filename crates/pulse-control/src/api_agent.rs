@@ -282,6 +282,17 @@ impl AgentWriterBackend {
         batch: TraceIngestBatch,
         enqueued_at_ms: i64,
     ) -> Result<(), IngestError> {
+        // Validate single-batch PLST encodability synchronously before queueing so an
+        // unencodable / oversized batch returns 400/413 immediately without poisoning the
+        // background flusher or locking out subsequent valid batches for this project.
+        if let Err(err) = encode_plst_batch(&batch, true) {
+            return Err(match err {
+                ProtocolError::ResourceLimitExceeded(msg) => {
+                    IngestError::PayloadTooLarge(msg.to_string())
+                }
+                other => IngestError::BadRequest(format!("unencodable trace batch: {other}")),
+            });
+        }
         let est_bytes = approx_trace_batch_bytes(&batch);
         let proj_buf = self
             .projects
@@ -618,23 +629,37 @@ async fn drain_agent_project_buffer_once(
                             continue;
                         }
                         Err(err2) => {
+                            tracing::error!(
+                                project_id = %proj_buf.project_id,
+                                error = %err2,
+                                "dropping unencodable single agent trace batch without poisoning project"
+                            );
                             let mut st = proj_buf.state.lock();
-                            st.sticky_error = Some(err2.to_string());
                             st.buffered_bytes = st.buffered_bytes.saturating_sub(single_bytes);
+                            if st.queue.is_empty() {
+                                st.oldest_queued_at = None;
+                            }
                             backend.node_bytes.fetch_sub(single_bytes, Ordering::AcqRel);
                             st.flush_seq += 1;
                             proj_buf.flush_done.notify_waiters();
-                            return;
+                            continue;
                         }
                     }
                 }
+                tracing::error!(
+                    project_id = %proj_buf.project_id,
+                    error = %e,
+                    "dropping unencodable single agent trace batch without poisoning project"
+                );
                 let mut st = proj_buf.state.lock();
-                st.sticky_error = Some(e.to_string());
                 st.buffered_bytes = st.buffered_bytes.saturating_sub(slice_bytes);
+                if st.queue.is_empty() {
+                    st.oldest_queued_at = None;
+                }
                 backend.node_bytes.fetch_sub(slice_bytes, Ordering::AcqRel);
                 st.flush_seq += 1;
                 proj_buf.flush_done.notify_waiters();
-                return;
+                continue;
             }
         };
 
@@ -907,6 +932,7 @@ pub(crate) fn agent_admin_routes() -> Router<Arc<ControlPlaneService>> {
 // Public Ingest Pipeline (Zero SQL Writes)
 // ===========================================================================
 
+#[derive(Debug)]
 enum IngestError {
     Unauthorized(&'static str),
     BadRequest(String),
@@ -5437,5 +5463,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_trace.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn agent_writer_backend_unencodable_batch_does_not_poison_project() {
+        use crate::MetaOwnerDirectory;
+        use pulse_ingest::ForwardLoopGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = crate::db::MetaStore::connect_auto(tmp.path())
+            .await
+            .unwrap();
+        let writer_log = WriterLogManager::open(tmp.path()).unwrap();
+        let owners = Arc::new(MetaOwnerDirectory::new(meta));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let forwarder = WriterForwarder::start(
+            writer_log.clone(),
+            owners,
+            Arc::new(ForwardLoopGuard::new(Some("writer-test".into()))),
+            None,
+            shutdown_rx,
+        );
+        let backend = AgentWriterBackend::new(writer_log.clone(), forwarder.clone());
+        let now_ms = Utc::now().timestamp_millis();
+
+        let make_trace = |tid: &str| -> AgentTrace {
+            serde_json::from_value(json!({
+                "trace_id": tid,
+                "project_id": "proj_unenc",
+                "agent_name": "agent",
+                "agent_version": "1.0",
+                "status": "ok",
+                "start_ts_ms": now_ms,
+                "duration_ms": 10
+            }))
+            .unwrap()
+        };
+
+        // 1. Oversized / unencodable batch (> MAX_PLST_TRACES) is rejected synchronously in enqueue()
+        //    with 413 PayloadTooLarge and does NOT poison subsequent valid batches.
+        let oversized = TraceIngestBatch {
+            traces: (0..=MAX_PLST_TRACES)
+                .map(|i| make_trace(&format!("tr_over_{i}")))
+                .collect(),
+            spans: Vec::new(),
+        };
+        let err = backend
+            .enqueue("proj_unenc", oversized.clone(), now_ms)
+            .expect_err("oversized batch must fail synchronously");
+        assert!(
+            matches!(err, IngestError::PayloadTooLarge(_)),
+            "expected PayloadTooLarge, got {}",
+            err.into_response().status()
+        );
+
+        let valid = TraceIngestBatch {
+            traces: vec![make_trace("tr_valid_1")],
+            spans: Vec::new(),
+        };
+        backend
+            .enqueue("proj_unenc", valid.clone(), now_ms + 1)
+            .expect("valid batch after oversized rejection must succeed");
+        backend.flush_project("proj_unenc").await.unwrap();
+
+        // 2. Defense-in-depth: even if an unencodable batch enters the internal queue directly,
+        //    drain_agent_project_buffer_once drops it without setting sticky_error, so a
+        //    subsequent valid batch still enqueues and flushes cleanly.
+        let proj_buf = backend
+            .projects
+            .get("proj_unenc")
+            .expect("project buffer exists")
+            .clone();
+        let bad_bytes = approx_trace_batch_bytes(&oversized);
+        backend.node_bytes.fetch_add(bad_bytes, Ordering::AcqRel);
+        {
+            let mut st = proj_buf.state.lock();
+            st.queue.push_back(BufferedAgentBatch {
+                batch: oversized,
+                bytes: bad_bytes,
+                enqueued_at_ms: now_ms + 2,
+            });
+            st.buffered_bytes += bad_bytes;
+        }
+        drain_agent_project_buffer_once(&backend, &proj_buf).await;
+        assert!(
+            proj_buf.state.lock().sticky_error.is_none(),
+            "encode error must not set sticky_error"
+        );
+        backend
+            .enqueue("proj_unenc", valid, now_ms + 3)
+            .expect("valid batch after dropped queue item must not hit 503");
+        backend.flush_project("proj_unenc").await.unwrap();
+
+        backend.shutdown().await;
+        let _ = shutdown_tx.send(true);
     }
 }

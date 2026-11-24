@@ -40,7 +40,7 @@ then a raw or Zstd body with five columnar sections: string table, content-addre
 (0x04 / 0x08) for streamed runs. The SDKs in `sdks/ts-agent` and `sdks/py-agent` send PLST by default and
 fall back to JSON.
 
-Ingest does privacy redaction and pricing, appends to the WAL (or, on `--role writer` nodes, buffers up to `20 ms` / `1 MiB` into `AgentWriterBuffer` → `writer_log/` `PWLF` v2 and forwards asynchronously via `PWFA` `/internal/v1/forward/agent-traces` with idempotent `writer_offsets` in `PTWL` + `AgentManifest` + `PublishedAgentManifest` across `T_expire = 7d`), and returns. It makes no SQL writes. Non-owner `--role all` / `--role ingest` nodes reject unforwarded `/v1/agent/traces` and `/v1/otel/v1/traces` with `503 not_owner`.
+Ingest does privacy redaction and pricing, appends to the WAL (or, on `--role writer` nodes, buffers up to `20 ms` / `1 MiB` into `AgentWriterBackend` → `writer_log/` `PWLF` v2 and forwards asynchronously via `PWFA` `/internal/v1/forward/agent-traces` with idempotent `writer_offsets` in `PTWL` + `AgentManifest` + `PublishedAgentManifest` across `T_expire = 7d`), and returns. It makes no SQL writes. Non-owner `--role all` / `--role ingest` nodes reject unforwarded `/v1/agent/traces` and `/v1/otel/v1/traces` with `503 not_owner`.
 
 ## Storage
 
