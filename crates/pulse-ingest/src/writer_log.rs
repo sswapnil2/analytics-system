@@ -18,6 +18,25 @@ use uuid::Uuid;
 pub const WRITER_LOG_MAGIC: [u8; 4] = *b"PWLF";
 pub const WRITER_LOG_VERSION: u8 = 1;
 pub const WRITER_LOG_HEADER_LEN: usize = 29;
+pub const WRITER_LOG_VERSION_2: u8 = 2;
+pub const WRITER_LOG_HEADER_LEN_V2: usize = 34;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WriterRecordKind {
+    Events = 0,
+    AgentTraces = 1,
+}
+
+impl WriterRecordKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Events),
+            1 => Some(Self::AgentTraces),
+            _ => None,
+        }
+    }
+}
 
 pub const DEFAULT_WRITER_LOG_SEGMENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_WRITER_LOG_IDLE_CLOSE_MS: u64 = 5_000;
@@ -43,8 +62,9 @@ pub struct WriterLogStats {
 pub struct WriterLogBatch {
     pub batch_offset: u64,
     pub enqueued_at_ms: i64,
+    pub kind: WriterRecordKind,
     pub event_count: usize,
-    pub plsb_bytes: Vec<u8>,
+    pub payload_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +79,7 @@ struct FrameIndex {
     file_offset: u64,
     payload_len: u32,
     enqueued_at_ms: i64,
+    kind: WriterRecordKind,
     event_count: usize,
 }
 
@@ -207,20 +228,25 @@ fn compute_frame_crc(header_without_magic_or_crc: &[u8], payload: &[u8]) -> u32 
     hasher.finalize()
 }
 
-fn encode_frame(
+fn encode_frame_v2(
+    kind: WriterRecordKind,
+    item_count: usize,
     batch_offset: u64,
     enqueued_at_ms: i64,
     payload: &[u8],
 ) -> Result<Vec<u8>, StorageError> {
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| StorageError::Corrupted("writer_log frame exceeds 4 GiB".into()))?;
-    let mut out = Vec::with_capacity(WRITER_LOG_HEADER_LEN + payload.len());
+    let count_u32 = u32::try_from(item_count).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(WRITER_LOG_HEADER_LEN_V2 + payload.len());
     out.extend_from_slice(&WRITER_LOG_MAGIC);
-    out.push(WRITER_LOG_VERSION);
+    out.push(WRITER_LOG_VERSION_2);
+    out.push(kind as u8);
+    out.extend_from_slice(&count_u32.to_le_bytes());
     out.extend_from_slice(&batch_offset.to_le_bytes());
     out.extend_from_slice(&enqueued_at_ms.to_le_bytes());
     out.extend_from_slice(&payload_len.to_le_bytes());
-    let crc = compute_frame_crc(&out[4..25], payload);
+    let crc = compute_frame_crc(&out[4..30], payload);
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(payload);
     Ok(out)
@@ -286,18 +312,79 @@ fn recover_project_state(proj_dir: &Path) -> Result<ProjectLogState, StorageErro
         let mut last_offset = 0u64;
 
         while pos + (WRITER_LOG_HEADER_LEN as u64) <= file_len {
-            let mut hdr = [0u8; WRITER_LOG_HEADER_LEN];
-            if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut hdr).is_err() {
+            let mut magic_ver = [0u8; 5];
+            if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut magic_ver).is_err() {
                 break;
             }
-            if hdr[0..4] != WRITER_LOG_MAGIC || hdr[4] != WRITER_LOG_VERSION {
+            if magic_ver[0..4] != WRITER_LOG_MAGIC {
                 break;
             }
-            let offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
-            let enqueued_at_ms = i64::from_le_bytes(hdr[13..21].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(hdr[21..25].try_into().unwrap());
-            let expected_crc = u32::from_le_bytes(hdr[25..29].try_into().unwrap());
-            let frame_end = pos + (WRITER_LOG_HEADER_LEN as u64) + u64::from(payload_len);
+            let version = magic_ver[4];
+            let (
+                hdr_len,
+                kind,
+                offset,
+                enqueued_at_ms,
+                payload_len,
+                expected_crc,
+                crc_hdr_tail,
+                item_count_opt,
+            ) = if version == WRITER_LOG_VERSION {
+                let mut rest = [0u8; WRITER_LOG_HEADER_LEN - 5];
+                if f.read_exact(&mut rest).is_err() {
+                    break;
+                }
+                let offset = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let enqueued_at_ms = i64::from_le_bytes(rest[8..16].try_into().unwrap());
+                let payload_len = u32::from_le_bytes(rest[16..20].try_into().unwrap());
+                let expected_crc = u32::from_le_bytes(rest[20..24].try_into().unwrap());
+                let mut crc_hdr = Vec::with_capacity(21);
+                crc_hdr.push(version);
+                crc_hdr.extend_from_slice(&rest[0..20]);
+                (
+                    WRITER_LOG_HEADER_LEN,
+                    WriterRecordKind::Events,
+                    offset,
+                    enqueued_at_ms,
+                    payload_len,
+                    expected_crc,
+                    crc_hdr,
+                    None,
+                )
+            } else if version == WRITER_LOG_VERSION_2 {
+                if pos + (WRITER_LOG_HEADER_LEN_V2 as u64) > file_len {
+                    break;
+                }
+                let mut rest = [0u8; WRITER_LOG_HEADER_LEN_V2 - 5];
+                if f.read_exact(&mut rest).is_err() {
+                    break;
+                }
+                let Some(kind) = WriterRecordKind::from_u8(rest[0]) else {
+                    break;
+                };
+                let item_count = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
+                let offset = u64::from_le_bytes(rest[5..13].try_into().unwrap());
+                let enqueued_at_ms = i64::from_le_bytes(rest[13..21].try_into().unwrap());
+                let payload_len = u32::from_le_bytes(rest[21..25].try_into().unwrap());
+                let expected_crc = u32::from_le_bytes(rest[25..29].try_into().unwrap());
+                let mut crc_hdr = Vec::with_capacity(26);
+                crc_hdr.push(version);
+                crc_hdr.extend_from_slice(&rest[0..25]);
+                (
+                    WRITER_LOG_HEADER_LEN_V2,
+                    kind,
+                    offset,
+                    enqueued_at_ms,
+                    payload_len,
+                    expected_crc,
+                    crc_hdr,
+                    Some(item_count),
+                )
+            } else {
+                break;
+            };
+
+            let frame_end = pos + (hdr_len as u64) + u64::from(payload_len);
             if frame_end > file_len {
                 break;
             }
@@ -305,14 +392,24 @@ fn recover_project_state(proj_dir: &Path) -> Result<ProjectLogState, StorageErro
             if f.read_exact(&mut payload).is_err() {
                 break;
             }
-            let actual_crc = compute_frame_crc(&hdr[4..25], &payload);
+            let actual_crc = compute_frame_crc(&crc_hdr_tail, &payload);
             if actual_crc != expected_crc {
                 break;
             }
-            let Ok(batch) = WireBatch::decode_binary(&payload) else {
-                break;
+            let event_count = match kind {
+                WriterRecordKind::Events => {
+                    let Ok(batch) = WireBatch::decode_binary(&payload) else {
+                        break;
+                    };
+                    item_count_opt.unwrap_or(batch.events.len())
+                }
+                WriterRecordKind::AgentTraces => {
+                    if payload.len() < 4 || payload[0..4] != *b"PLST" {
+                        break;
+                    }
+                    item_count_opt.unwrap_or(0)
+                }
             };
-            let event_count = batch.events.len();
             max_offset_seen = Some(max_offset_seen.map_or(offset, |m| m.max(offset)));
             last_offset = offset;
             if acked_offset.is_none_or(|a| offset > a) {
@@ -326,6 +423,7 @@ fn recover_project_state(proj_dir: &Path) -> Result<ProjectLogState, StorageErro
                     file_offset: pos,
                     payload_len,
                     enqueued_at_ms,
+                    kind,
                     event_count,
                 });
             }
@@ -584,14 +682,54 @@ impl WriterLogManager {
             return Err(StorageError::Io(std::io::Error::other(err.clone())));
         }
         let payload = batch.encode_binary(1)?;
-        let event_count = batch.events.len();
+        self.append_raw_frame(
+            project_id,
+            WriterRecordKind::Events,
+            &payload,
+            batch.events.len(),
+            enqueued_at_ms,
+        )
+    }
+
+    pub fn append_agent_batch(
+        &self,
+        project_id: &str,
+        plst_bytes: &[u8],
+        item_count: usize,
+        enqueued_at_ms: i64,
+    ) -> Result<u64, StorageError> {
+        if let Some(ref err) = *self.sticky_io_error.lock() {
+            return Err(StorageError::Io(std::io::Error::other(err.clone())));
+        }
+        if plst_bytes.len() < 4 || plst_bytes[0..4] != *b"PLST" {
+            return Err(StorageError::Corrupted(
+                "writer_log agent batch payload missing PLST magic".into(),
+            ));
+        }
+        self.append_raw_frame(
+            project_id,
+            WriterRecordKind::AgentTraces,
+            plst_bytes,
+            item_count,
+            enqueued_at_ms,
+        )
+    }
+
+    fn append_raw_frame(
+        &self,
+        project_id: &str,
+        kind: WriterRecordKind,
+        payload: &[u8],
+        item_count: usize,
+        enqueued_at_ms: i64,
+    ) -> Result<u64, StorageError> {
         let handle = self.get_or_create_project(project_id)?;
         let seg_max = self.segment_max_bytes.load(Ordering::Relaxed);
 
         let offset = {
             let mut st = handle.state.lock();
             let offset = st.next_offset;
-            let frame_bytes = encode_frame(offset, enqueued_at_ms, &payload)?;
+            let frame_bytes = encode_frame_v2(kind, item_count, offset, enqueued_at_ms, payload)?;
 
             let need_new_segment = match st.segments.back() {
                 Some(seg) => seg.file_bytes >= seg_max,
@@ -645,12 +783,13 @@ impl WriterLogManager {
                 file_offset,
                 payload_len: payload.len() as u32,
                 enqueued_at_ms,
-                event_count,
+                kind,
+                event_count: item_count,
             });
             st.next_offset = offset.saturating_add(1);
             st.disk_bytes += frame_bytes.len();
             st.unforwarded_batches += 1;
-            st.unforwarded_events += event_count;
+            st.unforwarded_events += item_count;
             st.oldest_unforwarded_ts_ms = Some(
                 st.oldest_unforwarded_ts_ms
                     .map_or(enqueued_at_ms, |m| m.min(enqueued_at_ms)),
@@ -660,7 +799,7 @@ impl WriterLogManager {
                 .fetch_add(frame_bytes.len(), Ordering::AcqRel);
             self.node_unforwarded_batches.fetch_add(1, Ordering::AcqRel);
             self.node_unforwarded_events
-                .fetch_add(event_count, Ordering::AcqRel);
+                .fetch_add(item_count, Ordering::AcqRel);
             offset
         };
 
@@ -794,10 +933,10 @@ impl WriterLogManager {
         let Some(handle) = self.projects.get(project_id).map(|e| e.clone()) else {
             return Ok(None);
         };
-        let (seg_path, frame) = {
-            let mut st = handle.state.lock();
-            self.expire_head_frames_locked(project_id, &mut st, now_ms)?;
-            let (seg_path, fr) = {
+        loop {
+            let (seg_path, frame) = {
+                let mut st = handle.state.lock();
+                self.expire_head_frames_locked(project_id, &mut st, now_ms)?;
                 let Some(seg) = st.segments.front() else {
                     return Ok(None);
                 };
@@ -806,38 +945,74 @@ impl WriterLogManager {
                 };
                 (seg.path.clone(), fr)
             };
-            (seg_path, fr)
-        };
 
-        let mut f =
-            File::open(&seg_path).map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
-        f.seek(SeekFrom::Start(frame.file_offset))
-            .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
-        let mut hdr = [0u8; WRITER_LOG_HEADER_LEN];
-        f.read_exact(&mut hdr)
-            .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
-        if hdr[0..4] != WRITER_LOG_MAGIC || hdr[4] != WRITER_LOG_VERSION {
-            return Err(StorageError::Corrupted(
-                "invalid writer_log frame header".into(),
-            ));
-        }
-        let expected_crc = u32::from_le_bytes(hdr[25..29].try_into().unwrap());
-        let mut payload = vec![0u8; frame.payload_len as usize];
-        f.read_exact(&mut payload)
-            .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
-        let actual_crc = compute_frame_crc(&hdr[4..25], &payload);
-        if actual_crc != expected_crc {
-            return Err(StorageError::Corrupted(format!(
-                "writer_log crc mismatch: expected {expected_crc:#x}, got {actual_crc:#x}"
-            )));
-        }
+            let mut f = match File::open(&seg_path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let st = handle.state.lock();
+                    let concurrently_consumed = st.acked_offset.is_some_and(|a| frame.offset <= a)
+                        || !st.segments.iter().any(|s| s.path == seg_path);
+                    if concurrently_consumed {
+                        continue;
+                    }
+                    return Err(self.record_io_error(&StorageError::Io(e)));
+                }
+                Err(e) => return Err(self.record_io_error(&StorageError::Io(e))),
+            };
 
-        Ok(Some(WriterLogBatch {
-            batch_offset: frame.offset,
-            enqueued_at_ms: frame.enqueued_at_ms,
-            event_count: frame.event_count,
-            plsb_bytes: payload,
-        }))
+            f.seek(SeekFrom::Start(frame.file_offset))
+                .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
+            let mut magic_ver = [0u8; 5];
+            f.read_exact(&mut magic_ver)
+                .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
+            if magic_ver[0..4] != WRITER_LOG_MAGIC {
+                return Err(StorageError::Corrupted(
+                    "invalid writer_log frame header".into(),
+                ));
+            }
+            let version = magic_ver[4];
+            let (expected_crc, crc_hdr_tail) = if version == WRITER_LOG_VERSION {
+                let mut rest = [0u8; WRITER_LOG_HEADER_LEN - 5];
+                f.read_exact(&mut rest)
+                    .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
+                let expected_crc = u32::from_le_bytes(rest[20..24].try_into().unwrap());
+                let mut crc_hdr = Vec::with_capacity(21);
+                crc_hdr.push(version);
+                crc_hdr.extend_from_slice(&rest[0..20]);
+                (expected_crc, crc_hdr)
+            } else if version == WRITER_LOG_VERSION_2 {
+                let mut rest = [0u8; WRITER_LOG_HEADER_LEN_V2 - 5];
+                f.read_exact(&mut rest)
+                    .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
+                let expected_crc = u32::from_le_bytes(rest[25..29].try_into().unwrap());
+                let mut crc_hdr = Vec::with_capacity(26);
+                crc_hdr.push(version);
+                crc_hdr.extend_from_slice(&rest[0..25]);
+                (expected_crc, crc_hdr)
+            } else {
+                return Err(StorageError::Corrupted(format!(
+                    "unsupported writer_log frame version {version}"
+                )));
+            };
+
+            let mut payload = vec![0u8; frame.payload_len as usize];
+            f.read_exact(&mut payload)
+                .map_err(|e| self.record_io_error(&StorageError::Io(e)))?;
+            let actual_crc = compute_frame_crc(&crc_hdr_tail, &payload);
+            if actual_crc != expected_crc {
+                return Err(StorageError::Corrupted(format!(
+                    "writer_log crc mismatch: expected {expected_crc:#x}, got {actual_crc:#x}"
+                )));
+            }
+
+            return Ok(Some(WriterLogBatch {
+                batch_offset: frame.offset,
+                enqueued_at_ms: frame.enqueued_at_ms,
+                kind: frame.kind,
+                event_count: frame.event_count,
+                payload_bytes: payload,
+            }));
+        }
     }
 
     pub fn ack_batch(&self, project_id: &str, batch_offset: u64) -> Result<(), StorageError> {
@@ -1101,5 +1276,120 @@ mod tests {
             wl.check_admission("proj_unwritable", 0, 0, 64),
             Err(StorageError::Io(_))
         ));
+    }
+
+    fn encode_v1_frame_for_test(batch_offset: u64, enqueued_at_ms: i64, payload: &[u8]) -> Vec<u8> {
+        let payload_len = payload.len() as u32;
+        let mut out = Vec::with_capacity(WRITER_LOG_HEADER_LEN + payload.len());
+        out.extend_from_slice(&WRITER_LOG_MAGIC);
+        out.push(WRITER_LOG_VERSION);
+        out.extend_from_slice(&batch_offset.to_le_bytes());
+        out.extend_from_slice(&enqueued_at_ms.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        let crc = compute_frame_crc(&out[4..25], payload);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn pwlf_v2_roundtrip_events_and_agent_traces_with_v1_compat_and_crash_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let now = Utc::now().timestamp_millis();
+
+        // Seed an older PWLF v1 frame on disk before reopening WriterLogManager.
+        let proj_dir = data_dir.join("writer_log").join("proj_v2");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let v1_payload = WireBatch::new(vec![make_ev(1)]).encode_binary(1).unwrap();
+        let v1_bytes = encode_v1_frame_for_test(0, now, &v1_payload);
+        std::fs::write(proj_dir.join("seg_0000000000000000.log"), v1_bytes).unwrap();
+
+        let wl = WriterLogManager::open(data_dir).unwrap();
+        let ev_off = wl
+            .append_batch("proj_v2", &WireBatch::new(vec![make_ev(2)]), now + 1)
+            .unwrap();
+        assert_eq!(ev_off, 1);
+
+        let fake_plst = b"PLST\x01agent_payload_bytes".to_vec();
+        let ag_off = wl
+            .append_agent_batch("proj_v2", &fake_plst, 7, now + 2)
+            .unwrap();
+        assert_eq!(ag_off, 2);
+        drop(wl);
+
+        // Append torn trailing v2 frame to verify crash tail truncation.
+        let seg_path = proj_dir.join("seg_0000000000000000.log");
+        let valid_len = std::fs::metadata(&seg_path).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&seg_path).unwrap();
+            f.write_all(b"PWLF\x02\x01torn_tail").unwrap();
+        }
+
+        let wl2 = WriterLogManager::open(data_dir).unwrap();
+        assert_eq!(std::fs::metadata(&seg_path).unwrap().len(), valid_len);
+
+        let b0 = wl2.peek_next_batch("proj_v2", now + 10).unwrap().unwrap();
+        assert_eq!(b0.batch_offset, 0);
+        assert_eq!(b0.kind, WriterRecordKind::Events);
+        assert_eq!(b0.event_count, 1);
+        wl2.ack_batch("proj_v2", 0).unwrap();
+
+        let b1 = wl2.peek_next_batch("proj_v2", now + 10).unwrap().unwrap();
+        assert_eq!(b1.batch_offset, 1);
+        assert_eq!(b1.kind, WriterRecordKind::Events);
+        assert_eq!(b1.event_count, 1);
+        wl2.ack_batch("proj_v2", 1).unwrap();
+
+        let b2 = wl2.peek_next_batch("proj_v2", now + 10).unwrap().unwrap();
+        assert_eq!(b2.batch_offset, 2);
+        assert_eq!(b2.kind, WriterRecordKind::AgentTraces);
+        assert_eq!(b2.event_count, 7);
+        assert_eq!(b2.payload_bytes, fake_plst);
+        wl2.ack_batch("proj_v2", 2).unwrap();
+        assert!(wl2.peek_next_batch("proj_v2", now + 10).unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_next_batch_concurrent_sweep_not_found_does_not_trip_sticky_io_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wl = WriterLogManager::open(tmp.path()).unwrap();
+        wl.set_max_batch_age_for_test(Duration::from_millis(25));
+        wl.set_segment_max_bytes_for_test(1024);
+
+        let base_ms = Utc::now().timestamp_millis();
+        for i in 0..80u64 {
+            wl.append_batch(
+                "proj_race",
+                &WireBatch::new(vec![make_ev(i)]),
+                base_ms + (i as i64),
+            )
+            .unwrap();
+        }
+
+        let wl_peek = wl.clone();
+        let wl_sweep = wl.clone();
+        let t_peek = std::thread::spawn(move || {
+            for step in 0..400i64 {
+                let res = wl_peek.peek_next_batch("proj_race", base_ms + (step / 4));
+                assert!(
+                    res.is_ok(),
+                    "peek_next_batch must not fail on concurrent expiry/ack: {res:?}"
+                );
+            }
+        });
+        let t_sweep = std::thread::spawn(move || {
+            for step in 0..200i64 {
+                wl_sweep.sweep_expired_batches(base_ms + 30 + step);
+                std::thread::yield_now();
+            }
+        });
+        t_peek.join().unwrap();
+        t_sweep.join().unwrap();
+
+        assert!(
+            wl.health_check().is_ok(),
+            "concurrent sweep/peek NotFound must never trip sticky_io_error"
+        );
     }
 }

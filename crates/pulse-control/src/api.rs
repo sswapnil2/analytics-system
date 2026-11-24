@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{MatchedPath, Path as AxumPath, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
@@ -21,12 +21,15 @@ use pulse_exec::{
     TimeRange,
 };
 use pulse_ingest::{
-    forward_loop_middleware, rate_limit::RateLimiter, DiscoveredEventSchema, ForwardLoopGuard,
+    apply_outgoing_forward_headers, check_incoming_forward, forward_loop_middleware,
+    internal_token_middleware, rate_limit::RateLimiter, DiscoveredEventSchema, ForwardLoopGuard,
     GovernanceProvider, IngestError, IngestService, OwnerDirectory, ProjectLexiconRules,
+    WriterForwarder, WriterLogManager, HEADER_INTERNAL_TOKEN,
 };
 use pulse_storage::{
     build_customer_object_store, make_key_id, parse_or_derive_master_key,
-    validate_object_store_connection, validate_outbound_url_ssrf, ProjectOwnerChecker,
+    validate_object_store_connection, validate_outbound_url_ssrf, OwnerCheck, ProjectOwnerChecker,
+    ProjectOwnerInfo,
 };
 use pulse_wire::{mask_user_identifier, PropValue, WireBatch, WireEvent, WireframeOp};
 use ring::hmac;
@@ -170,6 +173,8 @@ pub struct ControlPlaneService {
     bootstrap_creds: Mutex<BootstrapCredentials>,
     /// Keyed by lowercase SHA-256 hex digest.
     api_key_cache: DashMap<String, CachedApiKey>,
+    api_key_miss_until_ms: DashMap<String, i64>,
+    api_key_reload_lock: tokio::sync::Mutex<()>,
     /// Project id → owning org id.
     known_projects: DashMap<String, String>,
     lexicon_cache: DashMap<String, Arc<ProjectLexiconRules>>,
@@ -192,6 +197,9 @@ pub struct ControlPlaneService {
     forward_guard: Arc<ForwardLoopGuard>,
     stateless_writer: std::sync::atomic::AtomicBool,
     owner_directory: parking_lot::RwLock<Option<Arc<MetaOwnerDirectory>>>,
+    internal_token: parking_lot::RwLock<Option<String>>,
+    forward_http_client: reqwest::Client,
+    agent_writer: parking_lot::RwLock<Option<Arc<crate::api_agent::AgentWriterBackend>>>,
 }
 
 fn writer_node_stale_after_ms() -> i64 {
@@ -403,6 +411,8 @@ impl ControlPlaneService {
                 generated_ingest_key: None,
             }),
             api_key_cache: DashMap::new(),
+            api_key_miss_until_ms: DashMap::new(),
+            api_key_reload_lock: tokio::sync::Mutex::new(()),
             known_projects: DashMap::new(),
             lexicon_cache: DashMap::new(),
             profiles_synced_ms: DashMap::new(),
@@ -420,6 +430,14 @@ impl ControlPlaneService {
             forward_guard,
             stateless_writer: std::sync::atomic::AtomicBool::new(stateless_writer),
             owner_directory: parking_lot::RwLock::new(None),
+            internal_token: parking_lot::RwLock::new(None),
+            forward_http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            agent_writer: parking_lot::RwLock::new(None),
         });
 
         let generated_ingest = svc
@@ -695,8 +713,46 @@ impl ControlPlaneService {
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
+    pub fn is_stateless_writer(&self) -> bool {
+        self.stateless_writer
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_owner_directory(&self, dir: Arc<MetaOwnerDirectory>) {
         *self.owner_directory.write() = Some(dir);
+    }
+
+    pub fn set_internal_token(&self, token: String) {
+        let trimmed = token.trim().to_string();
+        *self.internal_token.write() = (!trimmed.is_empty()).then_some(trimmed);
+    }
+
+    pub fn attach_agent_writer(
+        &self,
+        writer_log: Arc<WriterLogManager>,
+        forwarder: Arc<WriterForwarder>,
+    ) {
+        let backend = crate::api_agent::AgentWriterBackend::new(writer_log, forwarder);
+        *self.agent_writer.write() = Some(backend);
+    }
+
+    pub(crate) fn agent_writer_backend(&self) -> Option<Arc<crate::api_agent::AgentWriterBackend>> {
+        self.agent_writer.read().clone()
+    }
+
+    pub async fn flush_agent_writer(&self) -> Result<(), String> {
+        let backend = self.agent_writer.read().clone();
+        if let Some(b) = backend {
+            b.flush_all().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_agent_writer(&self) {
+        let backend = self.agent_writer.read().clone();
+        if let Some(b) = backend {
+            b.shutdown().await;
+        }
     }
 
     pub async fn reload_caches_from_db(&self) -> Result<(), String> {
@@ -930,7 +986,40 @@ impl ControlPlaneService {
         let _ = self.meta.insert_enterprise_audit(&rec).await;
     }
 
-    fn verify_admin_token(&self, token: &str) -> Result<AuthPrincipal, CtrlError> {
+    async fn lookup_or_refresh_api_key(&self, key_hash: &str) -> Option<CachedApiKey> {
+        if let Some(entry) = self.api_key_cache.get(key_hash) {
+            return Some(entry.clone());
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        if self
+            .api_key_miss_until_ms
+            .get(key_hash)
+            .is_some_and(|until| *until > now_ms)
+        {
+            return None;
+        }
+        let _guard = self.api_key_reload_lock.lock().await;
+        if let Some(entry) = self.api_key_cache.get(key_hash) {
+            return Some(entry.clone());
+        }
+        if self.refresh_api_key_cache().await.is_ok() {
+            if let Some(entry) = self.api_key_cache.get(key_hash) {
+                return Some(entry.clone());
+            }
+        }
+        if self.api_key_miss_until_ms.len() >= 4096 {
+            self.api_key_miss_until_ms
+                .retain(|_, until| *until > now_ms);
+            if self.api_key_miss_until_ms.len() >= 4096 {
+                self.api_key_miss_until_ms.clear();
+            }
+        }
+        self.api_key_miss_until_ms
+            .insert(key_hash.to_string(), now_ms + 2_000);
+        None
+    }
+
+    async fn verify_admin_token(&self, token: &str) -> Result<AuthPrincipal, CtrlError> {
         let trimmed = token.trim();
         if trimmed.is_empty() {
             return Err(CtrlError::unauthorized("missing admin bearer token"));
@@ -941,10 +1030,10 @@ impl ControlPlaneService {
         }
 
         let hash_hex = hex::encode(digest_bytes);
-        if let Some(entry) = self.api_key_cache.get(&hash_hex) {
+        if let Some(entry) = self.lookup_or_refresh_api_key(&hash_hex).await {
             if entry.role == KEY_ROLE_ADMIN {
                 return Ok(AuthPrincipal::ProjectAdmin {
-                    project_id: entry.project_id.clone(),
+                    project_id: entry.project_id,
                 });
             }
             return Err(CtrlError::forbidden(
@@ -1536,6 +1625,12 @@ impl ControlPlaneService {
         if let Err(e) = self.refresh_api_key_cache().await {
             control_err.get_or_insert(e);
         }
+        let owner_dir = self.owner_directory.read().clone();
+        if let Some(dir) = owner_dir {
+            if let Err(e) = dir.refresh_all().await {
+                control_err.get_or_insert(format!("owner directory refresh failed: {e}"));
+            }
+        }
 
         let mut refreshed = 0usize;
         let mut manifest_err: Option<String> = None;
@@ -1870,13 +1965,15 @@ fn storage_err_to_ingest(err: pulse_storage::StorageError) -> IngestError {
 impl GovernanceProvider for ControlPlaneService {
     async fn authenticate_api_key(&self, api_key: &str) -> Option<String> {
         let key_hash = sha256_hex(api_key.trim());
-        self.api_key_cache.get(&key_hash).and_then(|entry| {
-            if entry.role == KEY_ROLE_INGEST_AND_FLAGS {
-                Some(entry.project_id.clone())
-            } else {
-                None
-            }
-        })
+        self.lookup_or_refresh_api_key(&key_hash)
+            .await
+            .and_then(|entry| {
+                if entry.role == KEY_ROLE_INGEST_AND_FLAGS {
+                    Some(entry.project_id)
+                } else {
+                    None
+                }
+            })
     }
 
     fn lexicon_rules(&self, project_id: &str) -> Arc<ProjectLexiconRules> {
@@ -2246,18 +2343,21 @@ async fn require_admin_auth(
         (AuthSource::Cookie, None) => {
             return Err(CtrlError::unauthorized("invalid or expired session cookie"));
         }
-        (AuthSource::Header, None) => ctrl.verify_admin_token(token)?,
+        (AuthSource::Header, None) => ctrl.verify_admin_token(token).await?,
     };
     if auth_source == AuthSource::Cookie && is_state_changing_method(req.method()) {
         let public_url = ctrl.auth_cfg.read().public_url.clone();
         verify_cookie_csrf(req.headers(), req.uri(), &public_url)?;
     }
-    let path = req
+    let raw_path = req
         .extensions()
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
-    let needed = accounts::required_role(req.method(), &path);
+    let path = raw_path
+        .strip_prefix("/internal/v1/forward/admin")
+        .unwrap_or(&raw_path);
+    let needed = accounts::required_role(req.method(), path);
     if principal.role() < needed {
         return Err(CtrlError::forbidden(format!(
             "your role can't do this; it needs {} or above",
@@ -2268,28 +2368,407 @@ async fn require_admin_auth(
     Ok(next.run(req).await)
 }
 
-/// Builds the public SDK Flag Bundle router (`GET /v1/flags/:project_api_key`), safe for permissive CORS.
-pub fn build_public_flag_router(ctrl: Arc<ControlPlaneService>) -> Router {
-    let forward_guard = ctrl.forward_guard();
-    Router::new()
-        .route("/v1/flags/:project_api_key", get(handle_edge_flag_bundle))
-        .layer(middleware::from_fn_with_state(
-            forward_guard,
-            forward_loop_middleware,
-        ))
-        .with_state(ctrl)
+fn is_query_storage_write_route(method: &Method, matched_path: &str) -> bool {
+    (*method == Method::DELETE && matched_path == "/v1/projects/:id/users/:distinct_id")
+        || (*method == Method::POST && matched_path == "/v1/projects/:id/import")
+        || (*method == Method::DELETE && matched_path == "/v1/projects/:id/agent/traces/:trace_id")
+        || (*method == Method::POST && matched_path == "/v1/projects/:id/agent/erasure")
 }
 
-/// Builds the authenticated Control Plane + Query + Replay + MCP router.
-pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
-    let forward_guard = ctrl.forward_guard();
-    Router::new()
-        .route("/v1/status", get(handle_status))
-        .route("/v1/admin/flush", post(handle_admin_flush))
-        .route(
-            "/v1/projects",
-            get(handle_list_projects).post(handle_create_project),
+fn should_skip_proxy_req_header(name: &axum::http::header::HeaderName) -> bool {
+    let s = name.as_str();
+    s.eq_ignore_ascii_case("host")
+        || s.eq_ignore_ascii_case("content-length")
+        || s.eq_ignore_ascii_case("connection")
+        || s.eq_ignore_ascii_case("transfer-encoding")
+        || s.eq_ignore_ascii_case("accept-encoding")
+        || s.eq_ignore_ascii_case("content-encoding")
+        || s.eq_ignore_ascii_case("keep-alive")
+        || s.eq_ignore_ascii_case("proxy-authenticate")
+        || s.eq_ignore_ascii_case("proxy-authorization")
+        || s.eq_ignore_ascii_case("te")
+        || s.eq_ignore_ascii_case("trailers")
+        || s.eq_ignore_ascii_case("upgrade")
+        || s.eq_ignore_ascii_case("x-pulse-forwarded")
+        || s.eq_ignore_ascii_case("x-pulse-forwarded-hop")
+        || s.eq_ignore_ascii_case("x-pulse-forwarded-by")
+        || s.eq_ignore_ascii_case(HEADER_INTERNAL_TOKEN)
+}
+
+fn should_skip_proxy_resp_header(name: &reqwest::header::HeaderName) -> bool {
+    let s = name.as_str();
+    s.eq_ignore_ascii_case("connection")
+        || s.eq_ignore_ascii_case("transfer-encoding")
+        || s.eq_ignore_ascii_case("keep-alive")
+        || s.eq_ignore_ascii_case("proxy-authenticate")
+        || s.eq_ignore_ascii_case("proxy-authorization")
+        || s.eq_ignore_ascii_case("te")
+        || s.eq_ignore_ascii_case("trailers")
+        || s.eq_ignore_ascii_case("upgrade")
+        || s.eq_ignore_ascii_case("content-encoding")
+        || s.eq_ignore_ascii_case("content-length")
+}
+
+impl ControlPlaneService {
+    pub(crate) async fn forward_to_owner_if_remote(
+        &self,
+        project_id: &str,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+        force_refresh: bool,
+    ) -> Result<Option<Response>, CtrlError> {
+        let is_pub_reader = self.qengine.storage().is_published_reader();
+        let is_writer = self.is_stateless_writer();
+        let hop = check_incoming_forward(
+            headers,
+            self.forward_guard.self_node_name.as_deref(),
+            self.forward_guard.max_hops,
         )
+        .map_err(|e| CtrlError::forward_loop(e.to_string()))?;
+
+        if hop > 0 {
+            if is_writer {
+                return Err(CtrlError::not_owner(project_id.to_string(), None, None));
+            }
+            if !is_pub_reader {
+                match self.owner_checker.check_owner(project_id).await {
+                    Ok(OwnerCheck::Owned) => return Ok(None),
+                    Ok(OwnerCheck::NotOwner(info)) => {
+                        return Err(CtrlError::not_owner(
+                            project_id.to_string(),
+                            Some(info.node_name),
+                            Some(info.address),
+                        ));
+                    }
+                    Ok(OwnerCheck::Unassigned) => {
+                        return Err(CtrlError::not_owner(project_id.to_string(), None, None));
+                    }
+                    Err(e) => return Err(CtrlError::service_unavailable(e)),
+                }
+            }
+            return Ok(None);
+        }
+
+        let owner_dir = self.owner_directory.read().clone();
+        let Some(dir) = owner_dir else {
+            if is_writer {
+                return Err(CtrlError::service_unavailable(
+                    "owner directory not configured on stateless writer",
+                ));
+            }
+            return Ok(None);
+        };
+
+        let mut fwd_headers = HeaderMap::new();
+        let sender = self
+            .forward_guard
+            .self_node_name
+            .as_deref()
+            .or(self.node_name.as_deref())
+            .or(Some("pulse-router"));
+        apply_outgoing_forward_headers(
+            &mut fwd_headers,
+            Some(headers),
+            sender,
+            self.forward_guard.max_hops,
+        )
+        .map_err(|e| CtrlError::forward_loop(e.to_string()))?;
+
+        let mut req_headers = reqwest::header::HeaderMap::new();
+        for (k, v) in headers {
+            if should_skip_proxy_req_header(k) {
+                continue;
+            }
+            if let (Ok(rk), Ok(rv)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                req_headers.append(rk, rv);
+            }
+        }
+        if !headers.contains_key("x-forwarded-host") {
+            if let Some(host) = headers.get(header::HOST) {
+                if let Ok(rv) = reqwest::header::HeaderValue::from_bytes(host.as_bytes()) {
+                    req_headers.insert(
+                        reqwest::header::HeaderName::from_static("x-forwarded-host"),
+                        rv,
+                    );
+                }
+            }
+        }
+        for (k, v) in &fwd_headers {
+            if let (Ok(rk), Ok(rv)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                req_headers.insert(rk, rv);
+            }
+        }
+        if let Some(tok) = self.internal_token.read().as_deref() {
+            if let Ok(rv) = reqwest::header::HeaderValue::from_str(tok) {
+                req_headers.insert(
+                    reqwest::header::HeaderName::from_static(HEADER_INTERNAL_TOKEN),
+                    rv,
+                );
+            }
+        }
+
+        let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+            .map_err(|e| CtrlError::bad(format!("invalid HTTP method: {e}")))?;
+
+        let mut prefetched_owner: Option<ProjectOwnerInfo> = None;
+
+        for attempt in 0..3u8 {
+            let owner = if let Some(cached) = prefetched_owner.take() {
+                Some(cached)
+            } else if attempt == 0 && !force_refresh {
+                dir.resolve_owner(project_id)
+                    .await
+                    .map_err(CtrlError::service_unavailable)?
+            } else {
+                dir.refresh_owner(project_id)
+                    .await
+                    .map_err(CtrlError::service_unavailable)?
+            };
+
+            let Some(owner) = owner else {
+                if is_writer || (!is_pub_reader && self.node_name.is_some()) {
+                    return Err(CtrlError::not_owner(project_id.to_string(), None, None));
+                }
+                return Ok(None);
+            };
+
+            if !is_pub_reader
+                && !is_writer
+                && self.node_name.as_deref() == Some(owner.node_name.as_str())
+            {
+                return Ok(None);
+            }
+            if is_writer && self.node_name.as_deref() == Some(owner.node_name.as_str()) {
+                return Err(CtrlError::service_unavailable(
+                    "stateless writer resolved self as project_owner",
+                ));
+            }
+
+            let target_url = format!(
+                "{}/internal/v1/forward/admin{}",
+                owner.address.trim_end_matches('/'),
+                path_and_query
+            );
+            let resp = match self
+                .forward_http_client
+                .request(req_method.clone(), &target_url)
+                .headers(req_headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt == 0 {
+                        if let Ok(Some(refreshed)) = dir.refresh_owner(project_id).await {
+                            if refreshed.address != owner.address {
+                                if !is_pub_reader
+                                    && !is_writer
+                                    && self.node_name.as_deref()
+                                        == Some(refreshed.node_name.as_str())
+                                {
+                                    return Ok(None);
+                                }
+                                prefetched_owner = Some(refreshed);
+                                continue;
+                            }
+                        }
+                    }
+                    return Err(CtrlError::service_unavailable(format!(
+                        "owning storage node unreachable: {e}"
+                    )));
+                }
+            };
+
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let resp_headers = resp.headers().clone();
+            let resp_bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| CtrlError::service_unavailable(format!("proxy read failed: {e}")))?;
+
+            if attempt < 2
+                && (status == StatusCode::TEMPORARY_REDIRECT
+                    || (status == StatusCode::SERVICE_UNAVAILABLE
+                        && serde_json::from_slice::<Value>(&resp_bytes)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("code").and_then(|c| c.as_str()).map(str::to_string)
+                            })
+                            .as_deref()
+                            == Some("not_owner")))
+            {
+                continue;
+            }
+
+            let mut out = Response::new(Body::from(resp_bytes));
+            *out.status_mut() = status;
+            for (k, v) in &resp_headers {
+                if should_skip_proxy_resp_header(k) {
+                    continue;
+                }
+                if let (Ok(ak), Ok(av)) = (
+                    axum::http::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+                    axum::http::HeaderValue::from_bytes(v.as_bytes()),
+                ) {
+                    out.headers_mut().append(ak, av);
+                }
+            }
+            return Ok(Some(out));
+        }
+
+        Err(CtrlError::not_owner(project_id.to_string(), None, None))
+    }
+}
+
+async fn project_owner_forward_middleware(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    req: Request,
+    next: Next,
+) -> std::result::Result<Response, CtrlError> {
+    let raw_matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    let matched = raw_matched
+        .strip_prefix("/internal/v1/forward/admin")
+        .unwrap_or(&raw_matched);
+    if matched != "/v1/projects/:id" && !matched.starts_with("/v1/projects/:id/") {
+        return Ok(next.run(req).await);
+    }
+
+    let raw_uri_path = req.uri().path().to_string();
+    let uri_path = raw_uri_path
+        .strip_prefix("/internal/v1/forward/admin")
+        .unwrap_or(&raw_uri_path);
+    let Some(rest) = uri_path.strip_prefix("/v1/projects/") else {
+        return Ok(next.run(req).await);
+    };
+    let project_id = rest.split('/').next().unwrap_or("").to_string();
+    if project_id.is_empty() {
+        return Ok(next.run(req).await);
+    }
+
+    let principal = req
+        .extensions()
+        .get::<AuthPrincipal>()
+        .cloned()
+        .ok_or_else(|| CtrlError::unauthorized("missing authentication principal"))?;
+    ctrl.authorize_and_check(&principal, &project_id).await?;
+
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    let is_writer = ctrl.is_stateless_writer();
+    if is_pub_reader && !is_query_storage_write_route(req.method(), matched) {
+        return Ok(next.run(req).await);
+    }
+
+    let hop = check_incoming_forward(
+        req.headers(),
+        ctrl.forward_guard.self_node_name.as_deref(),
+        ctrl.forward_guard.max_hops,
+    )
+    .map_err(|e| CtrlError::forward_loop(e.to_string()))?;
+
+    if hop > 0 {
+        if is_writer || is_pub_reader {
+            return Err(CtrlError::not_owner(project_id, None, None));
+        }
+        match ctrl.owner_checker.check_owner(&project_id).await {
+            Ok(OwnerCheck::Owned) => return Ok(next.run(req).await),
+            Ok(OwnerCheck::NotOwner(info)) => {
+                return Err(CtrlError::not_owner(
+                    project_id,
+                    Some(info.node_name),
+                    Some(info.address),
+                ));
+            }
+            Ok(OwnerCheck::Unassigned) => {
+                return Err(CtrlError::not_owner(project_id, None, None));
+            }
+            Err(e) => return Err(CtrlError::service_unavailable(e)),
+        }
+    }
+
+    if !is_writer && !is_pub_reader && ctrl.owner_directory.read().is_none() {
+        return Ok(next.run(req).await);
+    }
+
+    let path_and_query = match req.uri().query() {
+        Some(q) if !q.is_empty() => format!("{uri_path}?{q}"),
+        _ => uri_path.to_string(),
+    };
+    let (parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            CtrlError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds 16 MiB limit: {e}"),
+            )
+        })?;
+
+    if let Some(resp) = ctrl
+        .forward_to_owner_if_remote(
+            &project_id,
+            &parts.method,
+            &path_and_query,
+            &parts.headers,
+            body_bytes.clone(),
+            false,
+        )
+        .await?
+    {
+        return Ok(resp);
+    }
+
+    if is_writer {
+        return Err(CtrlError::not_owner(project_id, None, None));
+    }
+
+    let local_req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+    let resp = next.run(local_req).await;
+    if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let (r_parts, r_body) = resp.into_parts();
+        let r_bytes = axum::body::to_bytes(r_body, 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let is_not_owner = serde_json::from_slice::<Value>(&r_bytes)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("not_owner");
+        if is_not_owner {
+            if let Some(fwd_resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &project_id,
+                    &parts.method,
+                    &path_and_query,
+                    &parts.headers,
+                    body_bytes,
+                    true,
+                )
+                .await?
+            {
+                return Ok(fwd_resp);
+            }
+        }
+        return Ok(Response::from_parts(r_parts, Body::from(r_bytes)));
+    }
+    Ok(resp)
+}
+
+fn project_scoped_routes() -> Router<Arc<ControlPlaneService>> {
+    Router::new()
         .route("/v1/projects/:id", patch(handle_patch_project))
         .route(
             "/v1/projects/:id/api-keys",
@@ -2299,8 +2778,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/api-keys/:key_id",
             delete(handle_revoke_key),
         )
-        // Unified & per-project Query endpoints
-        .route("/v1/query", post(handle_unified_query))
         .route(
             "/v1/projects/:id/query/insights",
             post(handle_query_insights),
@@ -2315,21 +2792,14 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_query_retention),
         )
         .route("/v1/projects/:id/query/flows", post(handle_query_flows))
-        // Sessions & Byte-Range Wireframe Replay
-        .route(
-            "/v1/sessions",
-            get(handle_get_sessions_default).post(handle_post_sessions_default),
-        )
         .route(
             "/v1/projects/:id/sessions",
             get(handle_get_sessions).post(handle_post_sessions),
         )
-        .route("/v1/replay/:session_id", get(handle_get_replay_default))
         .route(
             "/v1/projects/:id/replay/:session_id",
             get(handle_get_replay),
         )
-        // Lexicon Governance
         .route("/v1/projects/:id/lexicon", get(handle_get_lexicon))
         .route(
             "/v1/projects/:id/lexicon/events/:name",
@@ -2339,7 +2809,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/lexicon/properties/:name",
             put(handle_put_lexicon_prop),
         )
-        // Cohorts & Schema Extensions
         .route(
             "/v1/projects/:id/cohorts",
             get(handle_list_cohorts).post(handle_create_cohort),
@@ -2360,7 +2829,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/cohorts/:cohort_id/export",
             get(handle_export_cohort),
         )
-        // User Profiles, DPDP Erasure, Batch Import/Export, Revenue & Alerts (`Gaps 1, 4, 5, 7, 14, 15, 16`)
         .route("/v1/projects/:id/users", get(handle_list_user_profiles))
         .route(
             "/v1/projects/:id/users/:distinct_id",
@@ -2402,7 +2870,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/annotations/:ann_id",
             axum::routing::delete(handle_delete_annotation),
         )
-        // Saved Reports & Dashboards
         .route(
             "/v1/projects/:id/saved-reports",
             get(handle_list_reports).post(handle_save_report),
@@ -2423,7 +2890,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
                 .put(handle_replace_dashboard)
                 .delete(handle_delete_dashboard),
         )
-        // Feature Flags & Experimentation
         .route(
             "/v1/projects/:id/flags",
             get(handle_list_flags).post(handle_upsert_flag),
@@ -2441,15 +2907,6 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             "/v1/projects/:id/experiments/:exp_id/results",
             get(handle_experiment_results_scoped),
         )
-        // Model Context Protocol (MCP) JSON-RPC 2.0
-        .route("/v1/mcp", post(handle_mcp))
-        // Encryption at rest, audit log, provider credentials, warehouse export & copilot
-        .route("/v1/system/encryption", get(handle_get_encryption))
-        .route(
-            "/v1/system/encryption/rotate",
-            post(handle_rotate_encryption),
-        )
-        .route("/v1/audit-logs", get(handle_list_audit_logs))
         .route(
             "/v1/projects/:id/byok",
             get(handle_list_byok).put(handle_upsert_byok),
@@ -2464,13 +2921,55 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             post(handle_warehouse_export),
         )
         .route("/v1/projects/:id/ai/copilot", post(handle_byok_copilot))
+        .merge(crate::api_agent::agent_admin_routes())
+}
+
+/// Builds the public SDK Flag Bundle router (`GET /v1/flags/:project_api_key`), safe for permissive CORS.
+pub fn build_public_flag_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
+    Router::new()
+        .route("/v1/flags/:project_api_key", get(handle_edge_flag_bundle))
+        .layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
+        .with_state(ctrl)
+}
+
+/// Builds the authenticated Control Plane + Query + Replay + MCP router.
+pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
+    Router::new()
+        .route("/v1/status", get(handle_status))
+        .route("/v1/admin/flush", post(handle_admin_flush))
+        .route(
+            "/v1/projects",
+            get(handle_list_projects).post(handle_create_project),
+        )
+        .route("/v1/query", post(handle_unified_query))
+        .route(
+            "/v1/sessions",
+            get(handle_get_sessions_default).post(handle_post_sessions_default),
+        )
+        .route("/v1/replay/:session_id", get(handle_get_replay_default))
+        .route("/v1/mcp", post(handle_mcp))
+        .route("/v1/system/encryption", get(handle_get_encryption))
+        .route(
+            "/v1/system/encryption/rotate",
+            post(handle_rotate_encryption),
+        )
+        .route("/v1/audit-logs", get(handle_list_audit_logs))
         .route(
             "/v1/auth/me",
             get(auth::handle_me).patch(accounts::handle_update_me),
         )
         .route("/v1/auth/logout", post(auth::handle_logout))
-        .merge(crate::api_agent::agent_admin_routes())
+        .merge(project_scoped_routes())
         .merge(accounts::account_router())
+        .route_layer(middleware::from_fn_with_state(
+            ctrl.clone(),
+            project_owner_forward_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             ctrl.clone(),
             require_admin_auth,
@@ -2484,6 +2983,50 @@ pub fn build_admin_control_router(ctrl: Arc<ControlPlaneService>) -> Router {
             forward_loop_middleware,
         ))
         .with_state(ctrl)
+}
+
+/// Builds the `/v1/projects/:id/*` forwarding router mounted on stateless `NodeRole::Writer` nodes.
+/// Enforces `require_admin_auth`, `authorize_and_check`, `forward_loop_middleware`, and forwards
+/// unconditionally to the owning storage node without touching local storage or SlateDB.
+pub fn build_writer_project_forward_router(ctrl: Arc<ControlPlaneService>) -> Router {
+    let forward_guard = ctrl.forward_guard();
+    project_scoped_routes()
+        .route_layer(middleware::from_fn_with_state(
+            ctrl.clone(),
+            project_owner_forward_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            ctrl.clone(),
+            require_admin_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
+        .with_state(ctrl)
+}
+
+/// Builds the internal admin/query forwarding router mounted on `owns_storage()` (`All | Ingest`) nodes.
+pub fn build_internal_admin_forward_router(
+    ctrl: Arc<ControlPlaneService>,
+    internal_token: Option<String>,
+) -> Router {
+    let expected_token: Option<Arc<String>> = internal_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    let forward_guard = ctrl.forward_guard();
+    let inner = build_admin_control_router(ctrl.clone()).merge(build_public_flag_router(ctrl));
+    Router::new()
+        .nest("/internal/v1/forward/admin", inner)
+        .route_layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            expected_token,
+            internal_token_middleware,
+        ))
 }
 
 /// Combined Control Plane router (public edge flag bundle + public agent ingest + bearer-protected admin/query routes).
@@ -2530,6 +3073,17 @@ impl CtrlError {
     }
     pub(crate) fn bad_gateway(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, msg)
+    }
+    pub(crate) fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, msg)
+    }
+    pub(crate) fn forward_loop(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+            code: Some("forward_loop_detected"),
+            not_owner: None,
+        }
     }
     pub(crate) fn not_writer(msg: impl Into<String>) -> Self {
         Self {
@@ -2606,6 +3160,7 @@ impl CtrlError {
                 Self::conflict(err.to_string())
             }
             IngestError::Unavailable(msg) => Self::new(StatusCode::SERVICE_UNAVAILABLE, msg),
+            IngestError::ForwardLoop(msg) => Self::forward_loop(msg),
             IngestError::Identity(ref e) if e.is_store_unavailable() => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
             }
@@ -2676,40 +3231,79 @@ impl IntoResponse for CtrlError {
     }
 }
 
+fn canonical_path_and_query(uri: &axum::http::Uri) -> String {
+    let raw_path = uri.path();
+    let stripped = raw_path
+        .strip_prefix("/internal/v1/forward/admin")
+        .unwrap_or(raw_path);
+    let path = if stripped.is_empty() { "/" } else { stripped };
+    match uri.query() {
+        Some(q) if !q.is_empty() => format!("{path}?{q}"),
+        _ => path.to_string(),
+    }
+}
+
 async fn handle_status(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(q): Query<HashMap<String, String>>,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let pid = ctrl
         .resolve_and_check(&principal, q.get("project_id").map(|s| s.as_str()))
         .await?;
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &pid,
+                &Method::GET,
+                &path_and_query,
+                &headers,
+                Bytes::new(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
 
-    let (snap, l0_rows, interned_users) = {
-        let refresh_cat = ctrl
-            .qengine
-            .storage()
-            .is_published_reader()
-            .then(|| ctrl.qengine.catalogs().for_project(&pid));
+    let load_status_res = async {
+        let refresh_cat = is_pub_reader.then(|| ctrl.qengine.catalogs().for_project(&pid));
         let _refresh_guard = match refresh_cat.as_ref() {
             Some(cat) => Some(cat.acquire_query_read().await),
             None => None,
         };
-        let ps = ctrl
-            .qengine
-            .storage()
-            .open_for_read(&pid)
-            .await
-            .map_err(CtrlError::storage)?;
+        let ps = ctrl.qengine.storage().open_for_read(&pid).await?;
         let snap = ps.snapshot();
         let l0_rows = ps.total_l0_rows();
-        let id_graph = ctrl
-            .qengine
-            .storage()
-            .identity_graph(&pid, false)
-            .await
-            .map_err(CtrlError::storage)?;
-        (snap, l0_rows, id_graph.user_count())
+        let id_graph = ctrl.qengine.storage().identity_graph(&pid, false).await?;
+        Ok::<_, pulse_storage::StorageError>((snap, l0_rows, id_graph.user_count()))
+    }
+    .await;
+
+    let (snap, l0_rows, interned_users) = match load_status_res {
+        Ok(vals) => vals,
+        Err(pulse_storage::StorageError::NotOwner { .. }) if !is_pub_reader => {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &pid,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    Bytes::new(),
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            return Err(CtrlError::not_owner(pid, None, None));
+        }
+        Err(e) => return Err(CtrlError::storage(e)),
     };
 
     let (live_eps, accepted_total, deduped_total, dropped_total) =
@@ -2743,7 +3337,8 @@ async fn handle_status(
         "segment_count": snap.manifest.total_segments(),
         "interned_users": interned_users,
         "projects": projects,
-    })))
+    }))
+    .into_response())
 }
 
 async fn handle_admin_flush(
@@ -3105,11 +3700,30 @@ fn parse_query_value<T: serde::de::DeserializeOwned>(
 async fn handle_unified_query(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Bytes,
-) -> ApiRes<Value> {
+) -> std::result::Result<Response, CtrlError> {
     let payload: Value = parse_json_body("query", &body)?;
     let req_pid = payload.get("project_id").and_then(|v| v.as_str());
     let pid = ctrl.resolve_and_check(&principal, req_pid).await?;
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &pid,
+                &Method::POST,
+                &path_and_query,
+                &headers,
+                body.clone(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
 
     let kind = payload
         .get("kind")
@@ -3121,44 +3735,58 @@ async fn handle_unified_query(
     ctrl.load_erased_for_project(&pid)
         .await
         .map_err(CtrlError::internal)?;
-    match kind {
+    let exec_res: std::result::Result<Value, pulse_exec::ExecError> = match kind {
         "insights" => {
             let q: InsightsQuery = parse_query_value("insights", inner)?;
-            let res = ctrl
-                .qengine
+            ctrl.qengine
                 .query_insights(&pid, &q)
                 .await
-                .map_err(CtrlError::exec)?;
-            Ok(Json(serde_json::to_value(res).unwrap()))
+                .map(|res| serde_json::to_value(res).unwrap())
         }
         "funnel" | "funnels" => {
             let q: FunnelQuery = parse_query_value("funnel", inner)?;
-            let res = ctrl
-                .qengine
+            ctrl.qengine
                 .query_funnel(&pid, &q)
                 .await
-                .map_err(CtrlError::exec)?;
-            Ok(Json(serde_json::to_value(res).unwrap()))
+                .map(|res| serde_json::to_value(res).unwrap())
         }
         "retention" => {
             let q: RetentionQuery = parse_query_value("retention", inner)?;
-            let res = ctrl
-                .qengine
+            ctrl.qengine
                 .query_retention(&pid, &q)
                 .await
-                .map_err(CtrlError::exec)?;
-            Ok(Json(serde_json::to_value(res).unwrap()))
+                .map(|res| serde_json::to_value(res).unwrap())
         }
         "flows" | "flow" => {
             let q: FlowsQuery = parse_query_value("flows", inner)?;
-            let res = ctrl
-                .qengine
+            ctrl.qengine
                 .query_flows(&pid, &q)
                 .await
-                .map_err(CtrlError::exec)?;
-            Ok(Json(serde_json::to_value(res).unwrap()))
+                .map(|res| serde_json::to_value(res).unwrap())
         }
-        other => Err(CtrlError::bad(format!("unknown query kind: {other}"))),
+        other => return Err(CtrlError::bad(format!("unknown query kind: {other}"))),
+    };
+    match exec_res {
+        Ok(val) => Ok(Json(val).into_response()),
+        Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
+            if !is_pub_reader =>
+        {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &pid,
+                    &Method::POST,
+                    &path_and_query,
+                    &headers,
+                    body,
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            Err(CtrlError::not_owner(pid, None, None))
+        }
+        Err(e) => Err(CtrlError::exec(e)),
     }
 }
 
@@ -3321,38 +3949,109 @@ fn session_query_from_params(params: &HashMap<String, String>) -> SessionSearchQ
 async fn handle_get_sessions_default(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(params): Query<HashMap<String, String>>,
-) -> ApiRes<pulse_exec::SessionSearchResult> {
+) -> std::result::Result<Response, CtrlError> {
     let pid = ctrl
         .resolve_and_check(&principal, params.get("project_id").map(|s| s.as_str()))
         .await?;
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &pid,
+                &Method::GET,
+                &path_and_query,
+                &headers,
+                Bytes::new(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
     let sq = session_query_from_params(&params);
     ctrl.load_erased_for_project(&pid)
         .await
         .map_err(CtrlError::internal)?;
-    let res = ctrl
-        .qengine
-        .search_sessions(&pid, &sq)
-        .await
-        .map_err(CtrlError::exec)?;
-    Ok(Json(res))
+    match ctrl.qengine.search_sessions(&pid, &sq).await {
+        Ok(res) => Ok(Json(res).into_response()),
+        Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
+            if !is_pub_reader =>
+        {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &pid,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    Bytes::new(),
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            Err(CtrlError::not_owner(pid, None, None))
+        }
+        Err(e) => Err(CtrlError::exec(e)),
+    }
 }
 
 async fn handle_post_sessions_default(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
-    Json(sq): Json<SessionSearchQuery>,
-) -> ApiRes<pulse_exec::SessionSearchResult> {
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> std::result::Result<Response, CtrlError> {
     let pid = ctrl.resolve_and_check(&principal, None).await?;
+    let sq: SessionSearchQuery = parse_json_body("session search", &body)?;
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &pid,
+                &Method::POST,
+                &path_and_query,
+                &headers,
+                body.clone(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
     ctrl.load_erased_for_project(&pid)
         .await
         .map_err(CtrlError::internal)?;
-    let res = ctrl
-        .qengine
-        .search_sessions(&pid, &sq)
-        .await
-        .map_err(CtrlError::exec)?;
-    Ok(Json(res))
+    match ctrl.qengine.search_sessions(&pid, &sq).await {
+        Ok(res) => Ok(Json(res).into_response()),
+        Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
+            if !is_pub_reader =>
+        {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &pid,
+                    &Method::POST,
+                    &path_and_query,
+                    &headers,
+                    body,
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            Err(CtrlError::not_owner(pid, None, None))
+        }
+        Err(e) => Err(CtrlError::exec(e)),
+    }
 }
 
 async fn handle_get_sessions(
@@ -3397,12 +4096,49 @@ async fn handle_get_replay_default(
     Extension(principal): Extension<AuthPrincipal>,
     AxumPath(session_id): AxumPath<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(params): Query<HashMap<String, String>>,
 ) -> std::result::Result<Response, CtrlError> {
     let pid = ctrl
         .resolve_and_check(&principal, params.get("project_id").map(|s| s.as_str()))
         .await?;
-    serve_replay(&ctrl, &pid, &session_id, &headers, &params).await
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &pid,
+                &Method::GET,
+                &path_and_query,
+                &headers,
+                Bytes::new(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
+    match serve_replay(&ctrl, &pid, &session_id, &headers, &params).await {
+        Ok(resp) => Ok(resp),
+        Err(ref e) if e.code == Some("not_owner") && !is_pub_reader => {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &pid,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    Bytes::new(),
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            Err(CtrlError::not_owner(pid, None, None))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn handle_get_replay(
@@ -4667,10 +5403,28 @@ async fn handle_edge_flag_bundle(
     State(ctrl): State<Arc<ControlPlaneService>>,
     AxumPath(api_key): AxumPath<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> std::result::Result<Response, CtrlError> {
     let Some(project_id) = ctrl.authenticate_api_key(&api_key).await else {
         return Err(CtrlError::unauthorized("invalid project api key"));
     };
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &project_id,
+                &Method::GET,
+                &path_and_query,
+                &headers,
+                Bytes::new(),
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
     let flags = ctrl
         .meta
         .list_feature_flags(&project_id)
@@ -4679,14 +5433,35 @@ async fn handle_edge_flag_bundle(
     ctrl.load_erased_for_project(&project_id)
         .await
         .map_err(CtrlError::internal)?;
-    let bundle = build_edge_flag_bundle_with_cohorts(
+    let bundle = match build_edge_flag_bundle_with_cohorts(
         &project_id,
         &flags,
         &ctrl.qengine,
         Utc::now().timestamp_millis(),
     )
     .await
-    .map_err(CtrlError::internal)?;
+    {
+        Ok(b) => b,
+        Err(pulse_exec::ExecError::Storage(pulse_storage::StorageError::NotOwner { .. }))
+            if !is_pub_reader =>
+        {
+            if let Some(resp) = ctrl
+                .forward_to_owner_if_remote(
+                    &project_id,
+                    &Method::GET,
+                    &path_and_query,
+                    &headers,
+                    Bytes::new(),
+                    true,
+                )
+                .await?
+            {
+                return Ok(resp);
+            }
+            return Err(CtrlError::not_owner(project_id, None, None));
+        }
+        Err(e) => return Err(CtrlError::internal(e)),
+    };
 
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
@@ -4849,10 +5624,29 @@ async fn handle_mcp(
     State(ctrl): State<Arc<ControlPlaneService>>,
     Extension(principal): Extension<AuthPrincipal>,
     headers: HeaderMap,
-    Json(req): Json<JsonRpcRequest>,
+    uri: axum::http::Uri,
+    body: Bytes,
 ) -> std::result::Result<Response, CtrlError> {
     let header_pid = headers.get("x-pulse-project").and_then(|v| v.to_str().ok());
     let bound_pid = ctrl.resolve_and_check(&principal, header_pid).await?;
+    let req: JsonRpcRequest = parse_json_body("mcp", &body)?;
+    let path_and_query = canonical_path_and_query(&uri);
+    let is_pub_reader = ctrl.qengine.storage().is_published_reader();
+    if !is_pub_reader {
+        if let Some(resp) = ctrl
+            .forward_to_owner_if_remote(
+                &bound_pid,
+                &Method::POST,
+                &path_and_query,
+                &headers,
+                body,
+                false,
+            )
+            .await?
+        {
+            return Ok(resp);
+        }
+    }
     // JSON-RPC notifications (no `id`, e.g. `notifications/initialized`) get no response body;
     // MCP Streamable HTTP requires `202 Accepted`.
     if req.id.is_null() {

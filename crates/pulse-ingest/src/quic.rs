@@ -199,6 +199,7 @@ fn quic_error_json(e: &IngestError) -> Vec<u8> {
         IngestError::Storage(pulse_storage::StorageError::NotWriter { .. }) => {
             Some("not_writer".into())
         }
+        IngestError::ForwardLoop(_) => Some("forward_loop_detected".into()),
         IngestError::Storage(pulse_storage::StorageError::StaleWriter { .. }) => {
             Some("stale_writer".into())
         }

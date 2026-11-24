@@ -23,6 +23,7 @@ pub const PTWL_MAGIC: [u8; 4] = *b"PTWL";
 pub const PTWL_VERSION: u8 = 1;
 pub const PTWL_HEADER_LEN: usize = 32;
 pub const PTWL_FLAG_PLST: u8 = 0x01;
+pub const PTWL_FLAG_WRITER_OFFSETS: u8 = 0x02;
 pub const MAX_PTWL_PAYLOAD_BYTES: usize = MAX_PLST_UNCOMP_BYTES;
 
 pub const DEFAULT_WAL_GROUP_COMMIT_MS: u64 = 10;
@@ -60,6 +61,7 @@ pub struct DecodedWalFrame {
     pub seq: u64,
     pub timestamp_ms: i64,
     pub batch: TraceIngestBatch,
+    pub writer_offsets: Vec<(String, u64, i64)>,
 }
 
 pub fn wal_object_path(project_id: &str, writer_id: &str, seq: u64) -> StoreResult<ObjectPath> {
@@ -91,7 +93,41 @@ pub fn encode_ptwl_frame(
     timestamp_ms: i64,
     batch: &TraceIngestBatch,
 ) -> StoreResult<Vec<u8>> {
-    let payload = encode_plst_batch(batch, true)?;
+    encode_ptwl_frame_with_offsets(seq, timestamp_ms, batch, &[])
+}
+
+/// Encodes a `PTWL` frame optionally carrying `(stateless_writer_id, batch_offset, seen_ts_ms)`
+/// offsets (`PTWL_FLAG_WRITER_OFFSETS`). When `writer_offsets` is empty, emits a pure v1 `PTWL_FLAG_PLST` frame.
+pub fn encode_ptwl_frame_with_offsets(
+    seq: u64,
+    timestamp_ms: i64,
+    batch: &TraceIngestBatch,
+    writer_offsets: &[(String, u64, i64)],
+) -> StoreResult<Vec<u8>> {
+    let plst = encode_plst_batch(batch, true)?;
+    let (flags, payload) = if writer_offsets.is_empty() {
+        (PTWL_FLAG_PLST, plst)
+    } else {
+        let plst_len = u32::try_from(plst.len())
+            .map_err(|_| StoreError::ResourceLimitExceeded("PTWL PLST length overflow"))?;
+        let count = u32::try_from(writer_offsets.len())
+            .map_err(|_| StoreError::ResourceLimitExceeded("PTWL writer_offsets overflow"))?;
+        let mut buf = Vec::with_capacity(8 + plst.len() + writer_offsets.len() * 24);
+        buf.extend_from_slice(&plst_len.to_le_bytes());
+        buf.extend_from_slice(&plst);
+        buf.extend_from_slice(&count.to_le_bytes());
+        for (wid, offset, seen_ts_ms) in writer_offsets {
+            let wid_bytes = wid.as_bytes();
+            let wid_len = u16::try_from(wid_bytes.len()).map_err(|_| {
+                StoreError::InvalidIdentifier("writer_id exceeds 65535 bytes".into())
+            })?;
+            buf.extend_from_slice(&wid_len.to_le_bytes());
+            buf.extend_from_slice(wid_bytes);
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&seen_ts_ms.to_le_bytes());
+        }
+        (PTWL_FLAG_PLST | PTWL_FLAG_WRITER_OFFSETS, buf)
+    };
     if payload.len() > MAX_PTWL_PAYLOAD_BYTES {
         return Err(StoreError::ResourceLimitExceeded(
             "PTWL payload exceeds 64 MiB limit",
@@ -103,7 +139,7 @@ pub fn encode_ptwl_frame(
     let mut frame = Vec::with_capacity(PTWL_HEADER_LEN + payload.len());
     frame.extend_from_slice(&PTWL_MAGIC);
     frame.push(PTWL_VERSION);
-    frame.push(PTWL_FLAG_PLST);
+    frame.push(flags);
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&seq.to_le_bytes());
     frame.extend_from_slice(&timestamp_ms.to_le_bytes());
@@ -117,6 +153,50 @@ pub fn encode_ptwl_frame(
     frame.extend_from_slice(&crc.to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+pub type WalWriterOffset = (String, u64, i64);
+
+fn decode_writer_offsets_payload(payload: &[u8]) -> Result<(&[u8], Vec<WalWriterOffset>), String> {
+    if payload.len() < 8 {
+        return Err("truncated PTWL writer_offsets header".to_string());
+    }
+    let plst_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut pos = 4usize;
+    let Some(plst_end) = pos.checked_add(plst_len) else {
+        return Err("PTWL plst_len overflow".to_string());
+    };
+    if plst_end + 4 > payload.len() {
+        return Err("truncated PTWL writer_offsets PLST slice".to_string());
+    }
+    let plst_slice = &payload[pos..plst_end];
+    pos = plst_end;
+    let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut offsets = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        if pos + 2 > payload.len() {
+            return Err("truncated PTWL writer_offset entry".to_string());
+        }
+        let wid_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if wid_len == 0 || pos + wid_len + 16 > payload.len() {
+            return Err("invalid PTWL writer_id length".to_string());
+        }
+        let wid = std::str::from_utf8(&payload[pos..pos + wid_len])
+            .map_err(|e| format!("invalid writer_id utf8 in PTWL: {e}"))?
+            .to_string();
+        pos += wid_len;
+        let offset = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let seen_ts_ms = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        offsets.push((wid, offset, seen_ts_ms));
+    }
+    if pos != payload.len() {
+        return Err("trailing bytes in PTWL writer_offsets payload".to_string());
+    }
+    Ok((plst_slice, offsets))
 }
 
 /// Decodes one or more `PTWL` v1 frames from `bytes`, tolerating truncated/corrupt tail entries
@@ -149,7 +229,9 @@ pub fn decode_ptwl_frames_tolerant(bytes: &[u8]) -> (Vec<DecodedWalFrame>, Optio
             );
         }
         let flags = hdr[5];
-        if (flags & !PTWL_FLAG_PLST) != 0 || (flags & PTWL_FLAG_PLST) == 0 {
+        if (flags & !(PTWL_FLAG_PLST | PTWL_FLAG_WRITER_OFFSETS)) != 0
+            || (flags & PTWL_FLAG_PLST) == 0
+        {
             return (
                 frames,
                 Some(format!("invalid PTWL flags 0x{flags:02x} at offset {pos}")),
@@ -199,12 +281,29 @@ pub fn decode_ptwl_frames_tolerant(bytes: &[u8]) -> (Vec<DecodedWalFrame>, Optio
             );
         }
 
-        match decode_plst_batch(payload) {
+        let (plst_slice, writer_offsets) = if (flags & PTWL_FLAG_WRITER_OFFSETS) != 0 {
+            match decode_writer_offsets_payload(payload) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    return (
+                        frames,
+                        Some(format!(
+                            "invalid writer_offsets in PTWL at offset {pos}: {reason}"
+                        )),
+                    );
+                }
+            }
+        } else {
+            (payload, Vec::new())
+        };
+
+        match decode_plst_batch(plst_slice) {
             Ok(batch) => {
                 frames.push(DecodedWalFrame {
                     seq,
                     timestamp_ms,
                     batch,
+                    writer_offsets,
                 });
                 pos = payload_end;
             }
@@ -275,6 +374,22 @@ impl AgentWalStore {
         applied_seq: &mut HashMap<String, u64>,
         quarantine_corrupt: bool,
     ) -> StoreResult<Vec<(String, u64, TraceIngestBatch)>> {
+        let frames = self
+            .replay_uncommitted_with_offsets(committed_wal_seq, applied_seq, quarantine_corrupt)
+            .await?;
+        Ok(frames
+            .into_iter()
+            .map(|(wid, seq, batch, _)| (wid, seq, batch))
+            .collect())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub async fn replay_uncommitted_with_offsets(
+        &self,
+        committed_wal_seq: &BTreeMap<String, u64>,
+        applied_seq: &mut HashMap<String, u64>,
+        quarantine_corrupt: bool,
+    ) -> StoreResult<Vec<(String, u64, TraceIngestBatch, Vec<(String, u64, i64)>)>> {
         let prefix = ObjectPath::from(format!("agent_wal/{}/", self.project_id));
         let metas: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
 
@@ -304,7 +419,7 @@ impl AgentWalStore {
             for frame in frames {
                 max_frame_seq = max_frame_seq.max(frame.seq);
                 let frame_seq = if frame.seq == 0 { path_seq } else { frame.seq };
-                out.push((wid.clone(), frame_seq, frame.batch));
+                out.push((wid.clone(), frame_seq, frame.batch, frame.writer_offsets));
             }
 
             if let Some(err_reason) = corrupt_err {
@@ -408,6 +523,7 @@ impl AgentWalStore {
 struct WalWriteReq {
     batch: TraceIngestBatch,
     est_bytes: usize,
+    writer_offset: Option<(String, u64, i64)>,
     ack: oneshot::Sender<StoreResult<WalCommitResult>>,
 }
 
@@ -498,6 +614,25 @@ impl AgentWalWriter {
     }
 
     pub async fn write(&self, batch: TraceIngestBatch) -> StoreResult<WalCommitResult> {
+        self.write_inner(batch, None).await
+    }
+
+    pub async fn write_with_offset(
+        &self,
+        batch: TraceIngestBatch,
+        stateless_writer_id: String,
+        batch_offset: u64,
+        seen_ts_ms: i64,
+    ) -> StoreResult<WalCommitResult> {
+        self.write_inner(batch, Some((stateless_writer_id, batch_offset, seen_ts_ms)))
+            .await
+    }
+
+    async fn write_inner(
+        &self,
+        batch: TraceIngestBatch,
+        writer_offset: Option<(String, u64, i64)>,
+    ) -> StoreResult<WalCommitResult> {
         if self.fenced.load(Ordering::Acquire) {
             return Err(StoreError::NotWriter {
                 project_id: self.project_id.clone(),
@@ -508,6 +643,7 @@ impl AgentWalWriter {
         let req = WalWriteReq {
             batch,
             est_bytes,
+            writer_offset,
             ack: ack_tx,
         };
         let sender = {
@@ -660,15 +796,29 @@ async fn flush_wal_group(
     for chunk in chunks {
         let mut merged = TraceIngestBatch::default();
         let mut acks = Vec::with_capacity(chunk.len());
+        let mut coalesced_offsets: BTreeMap<String, (u64, i64)> = BTreeMap::new();
         for req in chunk {
             merged.traces.extend(req.batch.traces);
             merged.spans.extend(req.batch.spans);
+            if let Some((swid, off, ts)) = req.writer_offset {
+                coalesced_offsets
+                    .entry(swid)
+                    .and_modify(|(cur_off, cur_ts)| {
+                        *cur_off = (*cur_off).max(off);
+                        *cur_ts = (*cur_ts).max(ts);
+                    })
+                    .or_insert((off, ts));
+            }
             acks.push(req.ack);
         }
+        let writer_offsets: Vec<(String, u64, i64)> = coalesced_offsets
+            .into_iter()
+            .map(|(swid, (off, ts))| (swid, off, ts))
+            .collect();
 
         let seq = next_seq.fetch_add(1, Ordering::AcqRel);
         let ts_ms = chrono::Utc::now().timestamp_millis();
-        let frame_res = encode_ptwl_frame(seq, ts_ms, &merged);
+        let frame_res = encode_ptwl_frame_with_offsets(seq, ts_ms, &merged, &writer_offsets);
         let frame = match frame_res {
             Ok(f) => f,
             Err(e) => {
@@ -692,6 +842,7 @@ async fn flush_wal_group(
         };
 
         let opts = PutOptions::from(PutMode::Create);
+        let is_empty_batch = merged.traces.is_empty() && merged.spans.is_empty();
         match object_store
             .put_opts(&path, PutPayload::from_bytes(Bytes::from(frame)), opts)
             .await
@@ -699,6 +850,9 @@ async fn flush_wal_group(
             Ok(_) => {
                 // Durability guarantee: WAL put_opts succeeded BEFORE L0 insert & BEFORE caller ack!
                 let ins_res = memtable.insert_batch(writer_id, seq, merged);
+                if ins_res.is_ok() && is_empty_batch {
+                    memtable.record_accounted_wal_seq(writer_id, seq);
+                }
                 match ins_res {
                     Ok(_) => {
                         for ack in acks {
@@ -987,6 +1141,7 @@ mod tests {
             group.push(WalWriteReq {
                 est_bytes: estimate_batch_bytes(&batch),
                 batch,
+                writer_offset: None,
                 ack,
             });
             acks.push(rx);
@@ -1181,5 +1336,55 @@ mod tests {
                 .is_file(),
             "quarantined agent WAL must reside on local disk under <data_dir>/wal"
         );
+    }
+
+    #[tokio::test]
+    async fn ptwl_writer_offsets_roundtrip_and_multi_writer_group_commit() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mem = Arc::new(ShardedMemTable::new("proj_wal", 2));
+        let writer = AgentWalWriter::spawn(
+            "proj_wal",
+            "local_wal_wid",
+            1,
+            WalConfig {
+                group_commit_ms: 25,
+                max_group_items: 16,
+                max_group_bytes: 1024 * 1024,
+            },
+            os.clone(),
+            mem.clone(),
+        )
+        .unwrap();
+
+        let (r1, r2, r3) = tokio::join!(
+            writer.write_with_offset(sample_batch("tr_1"), "sw_a".to_string(), 0, 10_000),
+            writer.write_with_offset(sample_batch("tr_2"), "sw_a".to_string(), 2, 10_200),
+            writer.write_with_offset(TraceIngestBatch::default(), "sw_b".to_string(), 5, 10_500),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+        writer.shutdown().await;
+
+        let wal = AgentWalStore::new("proj_wal", os).unwrap();
+        let mut applied = HashMap::new();
+        let replayed = wal
+            .replay_uncommitted_with_offsets(&BTreeMap::new(), &mut applied, false)
+            .await
+            .unwrap();
+        let mut max_seen: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+        for (_wid, _seq, _batch, offsets) in replayed {
+            for (swid, off, ts) in offsets {
+                max_seen
+                    .entry(swid)
+                    .and_modify(|(co, ct)| {
+                        *co = (*co).max(off);
+                        *ct = (*ct).max(ts);
+                    })
+                    .or_insert((off, ts));
+            }
+        }
+        assert_eq!(max_seen.get("sw_a"), Some(&(2, 10_200)));
+        assert_eq!(max_seen.get("sw_b"), Some(&(5, 10_500)));
     }
 }

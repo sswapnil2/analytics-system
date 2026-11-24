@@ -12,9 +12,10 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use pulse_control::{
-    build_admin_control_router, build_agent_ingest_router, build_public_flag_router,
-    AgentTraceStoreConfig, BootstrapCredentials, ControlPlaneService, MetaOwnerDirectory,
-    MetaStore, WriterNode,
+    build_admin_control_router, build_agent_ingest_router, build_internal_admin_forward_router,
+    build_internal_agent_forward_router, build_public_flag_router,
+    build_writer_project_forward_router, AgentTraceStoreConfig, BootstrapCredentials,
+    ControlPlaneService, MetaOwnerDirectory, MetaStore, WriterNode,
 };
 use pulse_exec::{CatalogRegistry, QueryEngine};
 use pulse_identity::IdentityRouter;
@@ -292,6 +293,8 @@ impl RunningNode {
             self.http_task.abort();
         }
         self.qengine.cache().close().await;
+        // Drain W3 agent writer buffer into writer_log/ before stopping forwarder & ingest.
+        self.control.shutdown_agent_writer().await;
         // Drains the agent WAL group commit and flushes agent L0 (no-op flush when read-only).
         if let Err(e) = self.control.agent_store().close().await {
             tracing::error!(error = %e, "closing agent trace store on shutdown failed");
@@ -705,16 +708,31 @@ pub async fn start_pulse_node_with_store_and_identity(
         );
     }
 
-    let internal_token = if config.role.owns_storage() || config.role.is_stateless_writer() {
-        Some(meta.resolve_or_create_internal_token().await?)
+    let internal_token = if config.role.owns_storage()
+        || config.role.is_stateless_writer()
+        || config.role.serves_query_and_admin()
+    {
+        let tok = meta.resolve_or_create_internal_token().await?;
+        control.set_internal_token(tok.clone());
+        Some(tok)
+    } else {
+        None
+    };
+
+    let owner_dir = if config.role.owns_storage()
+        || config.role.is_stateless_writer()
+        || config.role.serves_query_and_admin()
+    {
+        let dir = Arc::new(MetaOwnerDirectory::new(meta.clone()));
+        control.set_owner_directory(dir.clone());
+        Some(dir)
     } else {
         None
     };
 
     let ingest = if config.role.is_stateless_writer() {
         let writer_log = WriterLogManager::open(&config.data_dir)?;
-        let owner_dir = Arc::new(MetaOwnerDirectory::new(meta.clone()));
-        control.set_owner_directory(owner_dir.clone());
+        let dir = owner_dir.expect("owner_dir initialized for writer");
         let fwd_guard = Arc::new(ForwardLoopGuard::new(
             node_name
                 .clone()
@@ -722,17 +740,27 @@ pub async fn start_pulse_node_with_store_and_identity(
         ));
         let forwarder = WriterForwarder::start(
             writer_log.clone(),
-            owner_dir.clone(),
+            dir.clone(),
             fwd_guard.clone(),
             internal_token.clone(),
             shutdown_bg_rx.clone(),
         );
+        control.attach_agent_writer(writer_log.clone(), forwarder.clone());
         IngestService::new_stateless_writer(
             writer_log,
-            owner_dir,
+            dir,
             forwarder,
             control.clone(),
             fwd_guard,
+            internal_token.clone(),
+        )
+    } else if config.role.owns_storage() {
+        let dir = owner_dir.expect("owner_dir initialized for storage owner");
+        IngestService::new_with_owner_forwarding(
+            storage.clone(),
+            control.clone(),
+            dir,
+            control.forward_guard(),
             internal_token.clone(),
         )
     } else {
@@ -1158,10 +1186,8 @@ pub async fn start_pulse_node_with_store_and_identity(
         }));
     if config.role.serves_ingest() {
         let mut ingest_routes =
-            build_ingest_router_with_guard(ingest.clone(), control.forward_guard());
-        if config.role.owns_storage() {
-            ingest_routes = ingest_routes.merge(build_agent_ingest_router(control.clone()));
-        }
+            build_ingest_router_with_guard(ingest.clone(), control.forward_guard())
+                .merge(build_agent_ingest_router(control.clone()));
         if let Some(cap) = ingest_inflight_cap() {
             ingest_routes = ingest_routes.layer(axum::middleware::from_fn_with_state(
                 Arc::new(tokio::sync::Semaphore::new(cap)),
@@ -1181,17 +1207,31 @@ pub async fn start_pulse_node_with_store_and_identity(
         api_router = api_router.merge(flag_public);
     }
     if config.role.owns_storage() {
-        api_router = api_router.merge(build_internal_forward_router(
-            ingest.clone(),
-            control.forward_guard(),
-            internal_token,
-        ));
+        api_router = api_router
+            .merge(build_internal_forward_router(
+                ingest.clone(),
+                control.forward_guard(),
+                internal_token.clone(),
+            ))
+            .merge(build_internal_agent_forward_router(
+                control.clone(),
+                internal_token.clone(),
+            ))
+            .merge(build_internal_admin_forward_router(
+                control.clone(),
+                internal_token,
+            ));
     }
     if config.role.serves_query_and_admin() {
         let admin_router = build_admin_control_router(control.clone())
             .layer(axum::middleware::from_fn(security_headers_middleware))
             .layer(build_admin_cors_layer(&config.allowed_origins));
         api_router = api_router.merge(admin_router);
+    } else if config.role.is_stateless_writer() {
+        let writer_project_router = build_writer_project_forward_router(control.clone())
+            .layer(axum::middleware::from_fn(security_headers_middleware))
+            .layer(build_admin_cors_layer(&config.allowed_origins));
+        api_router = api_router.merge(writer_project_router);
     }
 
     let index_file = config.web_dist_dir.join("index.html");

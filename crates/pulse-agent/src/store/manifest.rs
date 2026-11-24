@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as OsError, ObjectMeta, ObjectStore, PutMode, PutOptions, PutPayload};
+use pulse_storage::WriterOffsetEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::store::bloom::SegmentZoneMap;
@@ -101,6 +102,22 @@ pub struct AgentManifest {
     pub s3_partition_last_upload_ms: BTreeMap<String, i64>,
     #[serde(default)]
     pub erased_traces: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub writer_offsets: BTreeMap<String, WriterOffsetEntry>,
+}
+
+/// Removes writer offset entries unseen for longer than `expire_ms` (`now_ms - last_seen_ts_ms > expire_ms`).
+pub fn prune_expired_agent_writer_offsets(
+    offsets: &mut BTreeMap<String, WriterOffsetEntry>,
+    now_ms: i64,
+    expire_ms: i64,
+) -> usize {
+    if offsets.is_empty() || expire_ms <= 0 {
+        return 0;
+    }
+    let before = offsets.len();
+    offsets.retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ts_ms) <= expire_ms);
+    before.saturating_sub(offsets.len())
 }
 
 /// Pin tracker ensuring superseded/compacted `.plss` segments are never deleted while
@@ -384,6 +401,8 @@ pub struct PublishedAgentManifest {
     pub committed_wal_seq: BTreeMap<String, u64>,
     #[serde(default)]
     pub erased_traces: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub writer_offsets: BTreeMap<String, WriterOffsetEntry>,
 }
 
 impl PublishedAgentManifest {
@@ -405,6 +424,7 @@ impl PublishedAgentManifest {
             pending_s3_deletes: Vec::new(),
             s3_partition_last_upload_ms: BTreeMap::new(),
             erased_traces: self.erased_traces.clone(),
+            writer_offsets: self.writer_offsets.clone(),
         }
     }
 }

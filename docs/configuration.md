@@ -12,9 +12,12 @@
 | `--web-dir <path>` | `PULSE_WEB_DIST_DIR` | `./web/dist` | Built Studio files. Without them the API still works | `pulse-node/src/lib.rs` |
 | `--project-id <id>` | `PULSE_DEFAULT_PROJECT` | `proj_default` (`proj_fintech_in` with `--seed`) | Project used when a request names none | `pulse-node/src/lib.rs` |
 | `--seed` / `--no-seed` | `PULSE_SEED=1` | off | Load the synthetic demo dataset into an empty default project | `pulse-node/src/main.rs` |
-| `--role <role>` | `PULSE_NODE_ROLE` | `all` | `all`, `ingest`, `query` or `compactor`. See [node roles](architecture.md#node-roles-and-deployment) | `pulse-node/src/lib.rs` |
+| `--role <role>` | `PULSE_NODE_ROLE` | `all` | `all`, `ingest`, `writer`, `query` or `compactor`. See [node roles](architecture.md#node-roles-and-deployment) | `pulse-node/src/lib.rs` |
+| `--node-name <name>` | `PULSE_NODE_NAME` | unset | Stable logical node name used for `writer_nodes` registration and `project_owner` routing | `pulse-node/src/lib.rs` |
+| `--advertise-addr <url>` | `PULSE_ADVERTISE_ADDR` | derived from bind host/port | Internal URL other nodes use to forward `/internal/v1/forward/*` requests to this node | `pulse-node/src/lib.rs` |
 | `--quic-addr <ip:port>` / `--no-quic` | `PULSE_QUIC_ADDR` | off | Optional QUIC/UDP ingest listener, with a self-signed certificate | `pulse-ingest/src/quic.rs` |
-| | `PULSE_WRITER_LEASE_TTL_SECS` | `15` (min `3`) | How long a project's writer lease lasts without renewal: how long another ingest node, or this node restarted after a crash, must wait before it can write the projects a dead holder had. Running a standby is not supported yet ([limitations](limitations.md#operational-limitations)). Renewed every third of it; node clocks must agree to within a third of it. See [limitations](limitations.md#operational-limitations) | `pulse-control/src/db.rs` |
+| | `PULSE_WRITER_LEASE_TTL_SECS` | `15` (min `3`) | How long a project's writer lease lasts without renewal: how long another ingest node, or this node restarted after a crash, must wait before it can write the projects a dead holder had. Renewed every third of it; node clocks must agree to within a third of it. See [limitations](limitations.md#operational-limitations) | `pulse-control/src/db.rs` |
+| | `PULSE_WRITER_NODE_STALE_MS` | `30000` | Heartbeat staleness threshold (`ms`) after which a `writer_nodes` entry is considered unhealthy during project placement | `pulse-control/src/api.rs` |
 | | `PULSE_SHUTDOWN_DRAIN_MS` | `0` | Wait this long after `/readyz` turns `503` before closing the listener | `pulse-node/src/lib.rs` |
 | | `RUST_LOG` | `info,slatedb=warn` | Log filter | `pulse-node/src/main.rs` |
 
@@ -56,9 +59,12 @@
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `PULSE_WRITER_FLUSH_MS` | `20` | Max delay (ms) before the W1 writer memory buffer flushes queued `/v1/ingest` events to the WAL |
-| `PULSE_WRITER_FLUSH_BYTES` | `1048576` (1 MiB) | Byte threshold at which the W1 writer memory buffer flushes immediately to the WAL |
-| `PULSE_INGEST_BUFFER_PROJECT_MAX_MB` / `PULSE_INGEST_BUFFER_MAX_MB` | `64` / `256` | Per-project and node-wide bounds on queued W1 writer buffer bytes before `/v1/ingest` returns `429` (`ingest_buffer_backpressure`) |
+| `PULSE_WRITER_FLUSH_MS` | `20` | Max delay (ms) before the W1 writer memory buffer (and `--role writer` `AgentWriterBuffer`) flushes queued batches to disk WAL / `writer_log/` |
+| `PULSE_WRITER_FLUSH_BYTES` | `1048576` (1 MiB) | Byte threshold at which the W1 writer memory buffer (and `--role writer` `AgentWriterBuffer`) flushes immediately |
+| `PULSE_INGEST_BUFFER_PROJECT_MAX_MB` / `PULSE_INGEST_BUFFER_MAX_MB` | `64` / `256` | Per-project and node-wide bounds on queued W1 writer buffer bytes before `/v1/ingest` (or `--role writer` `/v1/agent/traces`) returns `429` (`ingest_buffer_backpressure`) |
+| `PULSE_WRITER_LOG_PROJECT_MAX_MB` / `PULSE_WRITER_LOG_MAX_MB` | `64` / `512` | Per-project and node-wide unforwarded `writer_log/` disk caps on `--role writer` nodes before `/v1/ingest` and `/v1/agent/traces` return `429` (`writer_log_backpressure`) |
+| `PULSE_WRITER_LOG_MAX_AGE_SECS` | `86400` | Age ceiling (seconds) after which unforwarded `writer_log/` segments on a stateless `writer` are expired and swept |
+| `PULSE_WRITER_FORWARD_BATCH_BYTES` / `PULSE_WRITER_FORWARD_CONCURRENCY` | `2097152` / `4` | Max `PWFB`/`PWFA` coalesced forward payload bytes and concurrent project forward tasks on `--role writer` nodes |
 | `PULSE_INGEST_EVENTS_PER_SEC` | `20000` | Per-project token-bucket rate, per node. `<= 0` disables it |
 | `PULSE_INGEST_MAX_INFLIGHT` | `256` | Concurrent ingest requests per node (events, replay and agent traces). Beyond it the node answers `503` with `Retry-After: 1`, which the SDKs retry. `0` removes the cap |
 | `PULSE_INGEST_BURST_SECS` | `5` | Burst size, in seconds of rate |
@@ -85,6 +91,7 @@
 |---|---|
 | `object_store/` | Flushed S3 event segments (`segments/`), `published/` manifests and snapshots, uploaded `replays/`, uploaded `agent_segments/`, and `agent_published/` manifests (unless `PULSE_OBJECT_STORE_URL` is set; with `PULSE_HOT_STORE=object`, also holds WALs, manifests, identity graph, and profiles) |
 | `wal/` | Write-ahead logs, dead-letter records, and corrupt-WAL quarantine for events (`wal/`, `wal_corrupt/`, `wal_dead/`) and agent traces (`agent_wal/`, `agent_wal_corrupt/`) with `PULSE_HOT_STORE=local` (the default). Must be on a persistent volume. Empty after a clean shutdown |
+| `writer_log/` | On `--role writer` nodes: persistent `writer_id` file and unforwarded `PWLF` v2 segments (`<project>/seg_*.pwlf`) for buffered events and agent traces awaiting owner acknowledgement |
 | `hot/` | Local SlateDB stores (`identity/` and `profiles/`), local-tier `hot/segments/`, `hot/agent_segments/`, `hot/replay/`, `hot/replay_cursors/`, authoritative `manifests/` and `agent_manifests/`, and `upload_intent.json` records when `PULSE_HOT_STORE=local` (the default). Must be on a persistent volume |
 | `query_hot/` | Ephemeral local Candidate B snapshot copies (`identity/` and `profiles/{project_id}/pub_{seq}`) restored by `--role query` nodes from S3 `published/` |
 | `hot_store_mode` | Persistent mode marker (`local` or `object`) written at initialization to prevent silent mode switches or volume-loss UID reuse |

@@ -2,7 +2,7 @@
 
 This page records how these docs were checked, what is still unverified, and what to write next. Update it whenever you verify or change a page.
 
-*Last verification: 2026-11-24, against `fix/scalability-review-quick-wins` (`af317f3` + M5b2 workspace suite, `scripts/check_docs_links.py`, and `scripts/verify_e2e.sh`).*
+*Last verification: 2026-11-24, against `fix/scalability-review-quick-wins` (M6c W3 multi-node routing + async writer agent path, `scripts/check_docs_links.py`, and `scripts/verify_e2e.sh`).*
 
 ## How the docs were built
 
@@ -24,6 +24,7 @@ Every architecture page was written from the source on `main`, not from older do
 | `/v1/identify` merging two identified users | `409` with the documented message |
 | `/v1/engage`, `/v1/identify`, `/v1/groups`, `/v1/replay/chunk` (W2 sync durability) | `/v1/identify` and `/v1/engage` flush identity before writing profiles, return `canonical_uid` (`canonical_uids` on batches), read back immediately on the next request, survive `SIGKILL`, and return `503` on `ProfileStore` / `hot/profiles/` unavailability |
 | Agent local hot tier, cycle upload (`agent_segments/`, `agent_published/`), `NodeRole::Query` reads, and physical erasure before `expires_at` (#27b, #27c) | Verified in `store_calls` (0 S3 calls on `/v1/agent/traces` and idle ticks) and `t4_agent_local_tier` (`SIGKILL` recovery, BYOK `PLSEAGM2` + key rotation, `503` on local WAL write failure, `restore --from-published`, and 3-level pre-expiry physical erasure) |
+| Multi-node W3 stateless `writer`, `project_owner` routing, and async agent traces (`m6a_ownership`, `m6b_writer_log_and_forwarder`, `m6c_multi_node_w3`) | Verified across `all`, `ingest`, `writer`, and `query` roles: `SIGKILL` recovery of `PWLF` v2 events + agent traces, per-project `429 writer_log_backpressure` isolation, `restore --from-published` preserving `writer_offsets`, idempotency across flush/publish/restart/erasure/`7d` expiry, sync + `/v1/projects/:id/*` + non-`:id` + `query` write forwarding, stale-cache invalidation, hop-loop `503`, and single-fire `alert_claims` |
 | `DELETE /v1/projects/:id/users/:distinct_id`, then `GET …/deletions` | Erasure recorded with `events_purged` |
 | `/metrics` | `pulse_ingest_events_*`, `pulse_writer_*`, `pulse_wal_bytes`, `pulse_ingest_apply_*`, `pulse_l0_rows`, `pulse_ready` present |
 | MCP `tools/list` | The 9 tools listed in [MCP](mcp.md) |
@@ -48,8 +49,7 @@ Every architecture page was written from the source on `main`, not from older do
 
 These statements come from reading code; they were not exercised:
 
-- **Multi-node.** Running several ingest nodes against one project. The docs deliberately make no safety claim.
-- **S3 and Postgres.** The `PULSE_OBJECT_STORE_URL=s3://…` and `DATABASE_URL=postgres://…` paths were not run.
+- **External Postgres and live S3.** Multi-node topologies were exercised end-to-end against shared SQLite and local/in-memory object stores; live external `PULSE_OBJECT_STORE_URL=s3://…` and `DATABASE_URL=postgres://…` servers were not run here (Postgres SQL rewrites are unit-tested in `pulse-control`).
 - **Encryption.** `PULSE_BYOK_MASTER_KEY` encryption, key rotation, and whether rotated keys survive a restart.
 - **Google sign-in, Copilot, webhooks, warehouse export.** None of these was exercised (they need external credentials).
 - **Session replay.** The end-to-end replay path and the Studio player.

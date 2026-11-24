@@ -15,14 +15,17 @@ pub use forward_guard::{
     HEADER_FORWARDED_BY, HEADER_FORWARDED_HOP,
 };
 pub use forwarder::{
-    decode_forward_events_envelope, encode_forward_events_envelope, ForwarderStats, OwnerDirectory,
-    OwnerSyncClient, WriterForwarder, FORWARD_EVENTS_MAGIC, HEADER_INTERNAL_TOKEN,
+    decode_forward_agent_traces_envelope, decode_forward_events_envelope,
+    encode_forward_agent_traces_envelope, encode_forward_events_envelope, ForwarderStats,
+    OwnerDirectory, OwnerSyncClient, WriterForwarder, FORWARD_AGENT_TRACES_MAGIC,
+    FORWARD_EVENTS_MAGIC, HEADER_INTERNAL_TOKEN,
 };
 pub use governance::{
     DiscoveredEventSchema, GovernanceProvider, InMemoryGovernance, ProjectLexiconRules,
 };
 pub use http::{
     build_ingest_router, build_ingest_router_with_guard, build_internal_forward_router,
+    internal_token_middleware,
 };
 pub use quic::{
     send_quic_ingest_batch, spawn_quic_listener, QuicIngestHandle, QUIC_OP_IDENTIFY,
@@ -33,9 +36,10 @@ pub use service::{
     IngestResponse, IngestService, ReplayIngestResponse, Result,
 };
 pub use writer_log::{
-    WriterLogBatch, WriterLogManager, WriterLogStats, DEFAULT_WRITER_LOG_IDLE_CLOSE_MS,
-    DEFAULT_WRITER_LOG_MAX_AGE_SECS, DEFAULT_WRITER_LOG_NODE_MAX_MB,
-    DEFAULT_WRITER_LOG_PROJECT_MAX_MB, WRITER_LOG_HEADER_LEN, WRITER_LOG_MAGIC, WRITER_LOG_VERSION,
+    WriterLogBatch, WriterLogManager, WriterLogStats, WriterRecordKind,
+    DEFAULT_WRITER_LOG_IDLE_CLOSE_MS, DEFAULT_WRITER_LOG_MAX_AGE_SECS,
+    DEFAULT_WRITER_LOG_NODE_MAX_MB, DEFAULT_WRITER_LOG_PROJECT_MAX_MB, WRITER_LOG_HEADER_LEN,
+    WRITER_LOG_HEADER_LEN_V2, WRITER_LOG_MAGIC, WRITER_LOG_VERSION, WRITER_LOG_VERSION_2,
 };
 
 #[cfg(test)]

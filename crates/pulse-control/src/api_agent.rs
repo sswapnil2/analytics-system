@@ -4,30 +4,39 @@
 //! `POST /v1/otel/v1/traces`); traces and spans flow directly into `AgentTraceStore`
 //! (`PTWL` WAL + L0 + `PLSS` segments) after read-only privacy/pricing governance.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use pulse_agent::{
-    compare_continuous_metric, cost_nanos_to_usd, decode_plst_batch, estimate_cost_nanos,
-    normalize_otlp_protobuf, normalize_otlp_traces, run_deterministic_evaluator, sanitize_batch,
-    sync_span_cost, sync_trace_cost, AgentAlertEvent, AgentAlertRule, AgentAnalyticsOverview,
-    AgentDataset, AgentDatasetItem, AgentErasureTombstone, AgentEvalRollup, AgentEvaluation,
-    AgentExperiment, AgentExperimentRun, AgentPrivacyPolicy, AgentSpan, AgentTrace,
-    AnalyticsFilter, CompareFilter, CompareResponse, ErasureLevel, EvalContext, EvalTargetType,
-    EvaluatorConfig, EvaluatorType, ModelPricingRule, OtlpExportTraceRequest, ProtocolError,
-    ScoreType, SessionDetail, SessionListFilter, SessionListResponse, SpanPhase, SpanType,
-    StoreError, TraceDetail, TraceIngestBatch, TraceIngestResponse, TraceListFilter,
-    TraceListResponse, TraceStatus, MIN_SIGNIFICANCE_SAMPLES, PLST_MAGIC,
+    compare_continuous_metric, cost_nanos_to_usd, decode_plst_batch, encode_plst_batch,
+    estimate_cost_nanos, normalize_otlp_protobuf, normalize_otlp_traces,
+    run_deterministic_evaluator, sanitize_batch, sync_span_cost, sync_trace_cost, AgentAlertEvent,
+    AgentAlertRule, AgentAnalyticsOverview, AgentDataset, AgentDatasetItem, AgentErasureTombstone,
+    AgentEvalRollup, AgentEvaluation, AgentExperiment, AgentExperimentRun, AgentPrivacyPolicy,
+    AgentSpan, AgentTrace, AnalyticsFilter, CompareFilter, CompareResponse, ErasureLevel,
+    EvalContext, EvalTargetType, EvaluatorConfig, EvaluatorType, ModelPricingRule,
+    OtlpExportTraceRequest, ProtocolError, ScoreType, SessionDetail, SessionListFilter,
+    SessionListResponse, SpanPhase, SpanType, StoreError, TraceDetail, TraceIngestBatch,
+    TraceIngestResponse, TraceListFilter, TraceListResponse, TraceStatus, MAX_PLST_SPANS,
+    MAX_PLST_TRACES, MIN_SIGNIFICANCE_SAMPLES, PLST_MAGIC,
 };
-use pulse_storage::validate_outbound_url_ssrf;
+use pulse_ingest::{
+    decode_forward_agent_traces_envelope, forward_loop_middleware, internal_token_middleware,
+    WriterForwarder, WriterLogManager,
+};
+use pulse_storage::{validate_outbound_url_ssrf, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
@@ -76,6 +85,711 @@ pub fn build_agent_ingest_router(ctrl: Arc<ControlPlaneService>) -> Router {
             pulse_ingest::forward_loop_middleware,
         ))
         .with_state(ctrl)
+}
+
+/// Builds the internal node-to-node agent trace forwarding router mounted on storage-owning nodes (`All | Ingest`).
+pub fn build_internal_agent_forward_router(
+    ctrl: Arc<ControlPlaneService>,
+    internal_token: Option<String>,
+) -> Router {
+    let expected_token: Option<Arc<String>> = internal_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    let forward_guard = ctrl.forward_guard();
+    Router::new()
+        .route(
+            "/internal/v1/forward/agent-traces",
+            post(handle_forward_agent_traces),
+        )
+        .route_layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(
+            forward_guard,
+            forward_loop_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            expected_token,
+            internal_token_middleware,
+        ))
+        .with_state(ctrl)
+}
+
+const DEFAULT_AGENT_WRITER_FLUSH_MS: u64 = 20;
+const DEFAULT_AGENT_WRITER_FLUSH_BYTES: usize = 1_048_576;
+const DEFAULT_AGENT_BUFFER_PROJECT_MAX_MB: usize = 64;
+const DEFAULT_AGENT_BUFFER_NODE_MAX_MB: usize = 256;
+const MAX_AGENT_SLICE_EST_BYTES: usize = 8 * 1024 * 1024;
+
+struct BufferedAgentBatch {
+    batch: TraceIngestBatch,
+    bytes: usize,
+    enqueued_at_ms: i64,
+}
+
+struct AgentProjectBufferState {
+    queue: VecDeque<BufferedAgentBatch>,
+    buffered_bytes: usize,
+    oldest_queued_at: Option<tokio::time::Instant>,
+    explicit_flush: bool,
+    flush_seq: u64,
+    sticky_error: Option<String>,
+    retry_backoff_ms: u64,
+    next_retry_at: tokio::time::Instant,
+    shutting_down: bool,
+}
+
+struct AgentProjectBuffer {
+    project_id: String,
+    state: Mutex<AgentProjectBufferState>,
+    wake_flusher: tokio::sync::Notify,
+    flush_done: tokio::sync::Notify,
+    flusher_started: AtomicBool,
+    flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AgentProjectBuffer {
+    fn new(project_id: String) -> Arc<Self> {
+        let now = tokio::time::Instant::now();
+        Arc::new(Self {
+            project_id,
+            state: Mutex::new(AgentProjectBufferState {
+                queue: VecDeque::new(),
+                buffered_bytes: 0,
+                oldest_queued_at: None,
+                explicit_flush: false,
+                flush_seq: 0,
+                sticky_error: None,
+                retry_backoff_ms: 0,
+                next_retry_at: now,
+                shutting_down: false,
+            }),
+            wake_flusher: tokio::sync::Notify::new(),
+            flush_done: tokio::sync::Notify::new(),
+            flusher_started: AtomicBool::new(false),
+            flusher_handle: Mutex::new(None),
+        })
+    }
+}
+
+pub struct AgentWriterBackend {
+    writer_log: Arc<WriterLogManager>,
+    forwarder: Arc<WriterForwarder>,
+    projects: DashMap<String, Arc<AgentProjectBuffer>>,
+    flush_ms: AtomicU64,
+    flush_bytes: AtomicUsize,
+    project_max_bytes: AtomicUsize,
+    node_max_bytes: AtomicUsize,
+    node_bytes: Arc<AtomicUsize>,
+    self_weak: std::sync::OnceLock<std::sync::Weak<AgentWriterBackend>>,
+}
+
+fn approx_value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 4,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => a.iter().map(|x| 2 + approx_value_bytes(x)).sum(),
+        Value::Object(m) => m
+            .iter()
+            .map(|(k, val)| k.len() + 4 + approx_value_bytes(val))
+            .sum(),
+    }
+}
+
+fn approx_trace_batch_bytes(batch: &TraceIngestBatch) -> usize {
+    let mut bytes = 64usize;
+    for tr in &batch.traces {
+        bytes = bytes.saturating_add(
+            256 + tr.trace_id.len()
+                + tr.agent_name.len()
+                + approx_value_bytes(&tr.input)
+                + approx_value_bytes(&tr.output)
+                + approx_value_bytes(&tr.metadata),
+        );
+    }
+    for sp in &batch.spans {
+        bytes = bytes.saturating_add(
+            256 + sp.trace_id.len()
+                + sp.span_id.len()
+                + sp.name.len()
+                + approx_value_bytes(&sp.input)
+                + approx_value_bytes(&sp.output)
+                + approx_value_bytes(&sp.attributes)
+                + approx_value_bytes(&sp.metadata),
+        );
+    }
+    bytes
+}
+
+impl AgentWriterBackend {
+    pub fn new(writer_log: Arc<WriterLogManager>, forwarder: Arc<WriterForwarder>) -> Arc<Self> {
+        let flush_ms = std::env::var("PULSE_WRITER_FLUSH_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_AGENT_WRITER_FLUSH_MS);
+        let flush_bytes = std::env::var("PULSE_WRITER_FLUSH_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(DEFAULT_AGENT_WRITER_FLUSH_BYTES);
+        let project_max_bytes = std::env::var("PULSE_INGEST_BUFFER_PROJECT_MAX_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(DEFAULT_AGENT_BUFFER_PROJECT_MAX_MB)
+            .saturating_mul(1024 * 1024);
+        let node_max_bytes = std::env::var("PULSE_INGEST_BUFFER_MAX_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(DEFAULT_AGENT_BUFFER_NODE_MAX_MB)
+            .saturating_mul(1024 * 1024);
+        let backend = Arc::new(Self {
+            writer_log,
+            forwarder,
+            projects: DashMap::new(),
+            flush_ms: AtomicU64::new(flush_ms),
+            flush_bytes: AtomicUsize::new(flush_bytes),
+            project_max_bytes: AtomicUsize::new(project_max_bytes),
+            node_max_bytes: AtomicUsize::new(node_max_bytes),
+            node_bytes: Arc::new(AtomicUsize::new(0)),
+            self_weak: std::sync::OnceLock::new(),
+        });
+        let _ = backend.self_weak.set(Arc::downgrade(&backend));
+        backend
+    }
+
+    fn ensure_flusher_started(&self, proj_buf: &Arc<AgentProjectBuffer>) {
+        if proj_buf
+            .flusher_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Some(weak) = self.self_weak.get().cloned() {
+                let pb = proj_buf.clone();
+                let handle = tokio::spawn(agent_project_flusher_loop(weak, pb));
+                *proj_buf.flusher_handle.lock() = Some(handle);
+            } else {
+                proj_buf.flusher_started.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    fn enqueue(
+        &self,
+        project_id: &str,
+        batch: TraceIngestBatch,
+        enqueued_at_ms: i64,
+    ) -> Result<(), IngestError> {
+        let est_bytes = approx_trace_batch_bytes(&batch);
+        let proj_buf = self
+            .projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| AgentProjectBuffer::new(project_id.to_string()))
+            .clone();
+        self.ensure_flusher_started(&proj_buf);
+
+        let should_wake;
+        {
+            let mut st = proj_buf.state.lock();
+            if st.shutting_down {
+                return Err(IngestError::ServiceUnavailable(
+                    "agent writer shutting down".to_string(),
+                ));
+            }
+            if let Some(ref err) = st.sticky_error {
+                return Err(IngestError::ServiceUnavailable(err.clone()));
+            }
+            let proj_used = st.buffered_bytes;
+            let node_used = self.node_bytes.load(Ordering::Acquire);
+            if let Err(err) = self
+                .writer_log
+                .check_admission(project_id, proj_used, node_used, est_bytes)
+            {
+                return Err(match err {
+                    StorageError::Backpressure { .. } => {
+                        IngestError::RateLimited(1, "writer_log_backpressure")
+                    }
+                    other => IngestError::ServiceUnavailable(other.to_string()),
+                });
+            }
+            let proj_max = self.project_max_bytes.load(Ordering::Relaxed);
+            if proj_used + est_bytes > proj_max {
+                return Err(IngestError::RateLimited(1, "ingest_buffer_backpressure"));
+            }
+            let node_max = self.node_max_bytes.load(Ordering::Relaxed);
+            let mut cur = self.node_bytes.load(Ordering::Acquire);
+            loop {
+                if cur + est_bytes > node_max {
+                    return Err(IngestError::RateLimited(1, "ingest_buffer_backpressure"));
+                }
+                match self.node_bytes.compare_exchange_weak(
+                    cur,
+                    cur + est_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+
+            st.queue.push_back(BufferedAgentBatch {
+                batch,
+                bytes: est_bytes,
+                enqueued_at_ms,
+            });
+            st.buffered_bytes += est_bytes;
+            let flush_bytes = self.flush_bytes.load(Ordering::Relaxed);
+            let flush_ms = self.flush_ms.load(Ordering::Relaxed);
+            let first = st.oldest_queued_at.is_none();
+            if first {
+                st.oldest_queued_at = Some(tokio::time::Instant::now());
+            }
+            should_wake = first || st.buffered_bytes >= flush_bytes || flush_ms == 0;
+        }
+        if should_wake {
+            proj_buf.wake_flusher.notify_one();
+        }
+        Ok(())
+    }
+
+    pub async fn flush_project(&self, project_id: &str) -> Result<(), String> {
+        let Some(proj_buf) = self.projects.get(project_id).map(|e| e.clone()) else {
+            return Ok(());
+        };
+        let mut target_seq = {
+            let mut st = proj_buf.state.lock();
+            if st.queue.is_empty() {
+                if let Some(ref err) = st.sticky_error {
+                    return Err(err.clone());
+                }
+                return Ok(());
+            }
+            st.explicit_flush = true;
+            st.flush_seq + 1
+        };
+        self.ensure_flusher_started(&proj_buf);
+        loop {
+            let notified = proj_buf.flush_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut st = proj_buf.state.lock();
+                if st.flush_seq >= target_seq {
+                    if let Some(ref err) = st.sticky_error {
+                        return Err(err.clone());
+                    }
+                    if st.queue.is_empty() {
+                        return Ok(());
+                    }
+                    st.explicit_flush = true;
+                    target_seq = st.flush_seq + 1;
+                } else if st.queue.is_empty() {
+                    if let Some(ref err) = st.sticky_error {
+                        return Err(err.clone());
+                    }
+                    return Ok(());
+                } else {
+                    st.explicit_flush = true;
+                }
+            }
+            proj_buf.wake_flusher.notify_one();
+            notified.await;
+        }
+    }
+
+    pub async fn flush_all(&self) -> Result<(), String> {
+        let pids: Vec<String> = self.projects.iter().map(|e| e.key().clone()).collect();
+        for pid in pids {
+            self.flush_project(&pid).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let proj_bufs: Vec<Arc<AgentProjectBuffer>> =
+            self.projects.iter().map(|e| e.value().clone()).collect();
+        for pb in &proj_bufs {
+            if let Err(e) = self.flush_project(&pb.project_id).await {
+                tracing::error!(
+                    project_id = %pb.project_id,
+                    error = %e,
+                    "draining agent writer buffer on shutdown failed"
+                );
+            }
+            {
+                pb.state.lock().shutting_down = true;
+            }
+            pb.wake_flusher.notify_one();
+            let handle = pb.flusher_handle.lock().take();
+            if let Some(h) = handle {
+                let _ = h.await;
+            }
+        }
+    }
+}
+
+async fn agent_project_flusher_loop(
+    weak_backend: std::sync::Weak<AgentWriterBackend>,
+    proj_buf: Arc<AgentProjectBuffer>,
+) {
+    loop {
+        let Some(backend) = weak_backend.upgrade() else {
+            return;
+        };
+        let flush_ms = backend.flush_ms.load(Ordering::Relaxed);
+        let flush_bytes = backend.flush_bytes.load(Ordering::Relaxed);
+
+        enum Action {
+            WaitIndefinite,
+            WaitUntil(tokio::time::Instant),
+            Flush,
+            Exit,
+        }
+
+        let action = {
+            let mut st = proj_buf.state.lock();
+            if st.shutting_down && (st.queue.is_empty() || st.sticky_error.is_some()) {
+                if !st.queue.is_empty() {
+                    let dropped_bytes = st.buffered_bytes;
+                    st.queue.clear();
+                    st.buffered_bytes = 0;
+                    st.oldest_queued_at = None;
+                    st.explicit_flush = false;
+                    backend
+                        .node_bytes
+                        .fetch_sub(dropped_bytes, Ordering::AcqRel);
+                }
+                Action::Exit
+            } else if st.queue.is_empty() {
+                st.explicit_flush = false;
+                Action::WaitIndefinite
+            } else if st.sticky_error.is_some()
+                && !st.explicit_flush
+                && !st.shutting_down
+                && st.next_retry_at > tokio::time::Instant::now()
+            {
+                Action::WaitUntil(st.next_retry_at)
+            } else if st.explicit_flush
+                || st.shutting_down
+                || st.buffered_bytes >= flush_bytes
+                || flush_ms == 0
+            {
+                st.explicit_flush = false;
+                Action::Flush
+            } else if let Some(oldest) = st.oldest_queued_at {
+                let deadline = oldest + Duration::from_millis(flush_ms);
+                if tokio::time::Instant::now() >= deadline {
+                    Action::Flush
+                } else {
+                    Action::WaitUntil(deadline)
+                }
+            } else {
+                Action::Flush
+            }
+        };
+
+        match action {
+            Action::Exit => {
+                proj_buf.flush_done.notify_waiters();
+                return;
+            }
+            Action::WaitIndefinite => {
+                drop(backend);
+                proj_buf.wake_flusher.notified().await;
+            }
+            Action::WaitUntil(deadline) => {
+                drop(backend);
+                let notified = proj_buf.wake_flusher.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+            Action::Flush => {
+                drain_agent_project_buffer_once(&backend, &proj_buf).await;
+            }
+        }
+    }
+}
+
+async fn drain_agent_project_buffer_once(
+    backend: &AgentWriterBackend,
+    proj_buf: &Arc<AgentProjectBuffer>,
+) {
+    loop {
+        let slice: Vec<BufferedAgentBatch> = {
+            let mut st = proj_buf.state.lock();
+            if st.queue.is_empty() {
+                break;
+            }
+            let mut out = Vec::new();
+            let mut slice_bytes = 0usize;
+            let mut slice_traces = 0usize;
+            let mut slice_spans = 0usize;
+            while let Some(front) = st.queue.front() {
+                let ft = front.batch.traces.len();
+                let fs = front.batch.spans.len();
+                if !out.is_empty()
+                    && (slice_bytes + front.bytes > MAX_AGENT_SLICE_EST_BYTES
+                        || slice_traces + ft > MAX_PLST_TRACES
+                        || slice_spans + fs > MAX_PLST_SPANS)
+                {
+                    break;
+                }
+                slice_bytes += front.bytes;
+                slice_traces += ft;
+                slice_spans += fs;
+                if let Some(item) = st.queue.pop_front() {
+                    out.push(item);
+                }
+            }
+            out
+        };
+
+        if slice.is_empty() {
+            break;
+        }
+
+        let mut merged = TraceIngestBatch::default();
+        let mut slice_bytes = 0usize;
+        let mut max_now_ms = i64::MIN;
+        for b in &slice {
+            slice_bytes += b.bytes;
+            max_now_ms = max_now_ms.max(b.enqueued_at_ms);
+            merged.traces.extend(b.batch.traces.iter().cloned());
+            merged.spans.extend(b.batch.spans.iter().cloned());
+        }
+        let item_count = merged.traces.len() + merged.spans.len();
+        let plst_bytes = match encode_plst_batch(&merged, true) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // If coalescing multiple items hit PLST limits, re-queue and flush 1 item at a time.
+                if slice.len() > 1 {
+                    let first = {
+                        let mut st = proj_buf.state.lock();
+                        for item in slice.into_iter().rev() {
+                            st.queue.push_front(item);
+                        }
+                        st.queue.pop_front().unwrap()
+                    };
+                    let single_bytes = first.bytes;
+                    let single_now = first.enqueued_at_ms;
+                    let single_count = first.batch.traces.len() + first.batch.spans.len();
+                    match encode_plst_batch(&first.batch, true) {
+                        Ok(b) => {
+                            let wl = backend.writer_log.clone();
+                            let pid = proj_buf.project_id.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                wl.append_agent_batch(&pid, &b, single_count, single_now)
+                            })
+                            .await
+                            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))
+                            .and_then(|r| r);
+                            if let Err(err) = res {
+                                let mut st = proj_buf.state.lock();
+                                st.queue.push_front(first);
+                                st.sticky_error = Some(err.to_string());
+                                let next_ms = if st.retry_backoff_ms == 0 {
+                                    20
+                                } else {
+                                    (st.retry_backoff_ms * 2).min(1_000)
+                                };
+                                st.retry_backoff_ms = next_ms;
+                                st.next_retry_at =
+                                    tokio::time::Instant::now() + Duration::from_millis(next_ms);
+                                st.flush_seq += 1;
+                                proj_buf.flush_done.notify_waiters();
+                                return;
+                            }
+                            backend.forwarder.notify_project(&proj_buf.project_id);
+                            {
+                                let mut st = proj_buf.state.lock();
+                                st.buffered_bytes = st.buffered_bytes.saturating_sub(single_bytes);
+                                st.retry_backoff_ms = 0;
+                                st.sticky_error = None;
+                                st.flush_seq += 1;
+                                proj_buf.flush_done.notify_waiters();
+                            }
+                            backend.node_bytes.fetch_sub(single_bytes, Ordering::AcqRel);
+                            continue;
+                        }
+                        Err(err2) => {
+                            let mut st = proj_buf.state.lock();
+                            st.sticky_error = Some(err2.to_string());
+                            st.buffered_bytes = st.buffered_bytes.saturating_sub(single_bytes);
+                            backend.node_bytes.fetch_sub(single_bytes, Ordering::AcqRel);
+                            st.flush_seq += 1;
+                            proj_buf.flush_done.notify_waiters();
+                            return;
+                        }
+                    }
+                }
+                let mut st = proj_buf.state.lock();
+                st.sticky_error = Some(e.to_string());
+                st.buffered_bytes = st.buffered_bytes.saturating_sub(slice_bytes);
+                backend.node_bytes.fetch_sub(slice_bytes, Ordering::AcqRel);
+                st.flush_seq += 1;
+                proj_buf.flush_done.notify_waiters();
+                return;
+            }
+        };
+
+        let wl = backend.writer_log.clone();
+        let pid = proj_buf.project_id.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            wl.append_agent_batch(&pid, &plst_bytes, item_count, max_now_ms)
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))
+        .and_then(|r| r);
+
+        if let Err(err) = res {
+            let mut st = proj_buf.state.lock();
+            for item in slice.into_iter().rev() {
+                st.queue.push_front(item);
+            }
+            st.sticky_error = Some(err.to_string());
+            let next_ms = if st.retry_backoff_ms == 0 {
+                20
+            } else {
+                (st.retry_backoff_ms * 2).min(1_000)
+            };
+            st.retry_backoff_ms = next_ms;
+            st.next_retry_at = tokio::time::Instant::now() + Duration::from_millis(next_ms);
+            st.flush_seq += 1;
+            proj_buf.flush_done.notify_waiters();
+            return;
+        }
+
+        backend.forwarder.notify_project(&proj_buf.project_id);
+        {
+            let mut st = proj_buf.state.lock();
+            st.buffered_bytes = st.buffered_bytes.saturating_sub(slice_bytes);
+        }
+        backend.node_bytes.fetch_sub(slice_bytes, Ordering::AcqRel);
+    }
+
+    let mut st = proj_buf.state.lock();
+    st.sticky_error = None;
+    st.retry_backoff_ms = 0;
+    if st.queue.is_empty() {
+        st.oldest_queued_at = None;
+    }
+    st.flush_seq += 1;
+    proj_buf.flush_done.notify_waiters();
+}
+
+async fn handle_forward_agent_traces(
+    State(ctrl): State<Arc<ControlPlaneService>>,
+    body: Bytes,
+) -> Result<Json<Value>, IngestError> {
+    let (writer_id, project_id, batch_offset, plst_bytes) =
+        decode_forward_agent_traces_envelope(&body).map_err(IngestError::BadRequest)?;
+    let batch = decode_plst_batch(plst_bytes).map_err(|e| match e {
+        ProtocolError::ResourceLimitExceeded(msg) => IngestError::PayloadTooLarge(msg.to_string()),
+        other => IngestError::BadRequest(format!("invalid forwarded PLST payload: {other}")),
+    })?;
+
+    let eval_candidates = collect_eval_candidates(&batch);
+    let batch_match_keys = collect_batch_match_keys(&batch);
+    let ingest_started_ms = Utc::now().timestamp_millis();
+
+    let resp = ctrl
+        .agent_store()
+        .ingest_forwarded_batch(
+            &writer_id,
+            &project_id,
+            batch_offset,
+            batch,
+            ingest_started_ms,
+        )
+        .await
+        .map_err(|e| match e {
+            StoreError::InvalidIdentifier(msg) => IngestError::BadRequest(msg),
+            StoreError::WalBackpressure { .. } | StoreError::L0Backpressure { .. } => {
+                IngestError::RateLimited(1, "l0_backpressure")
+            }
+            StoreError::NotOwner {
+                project_id,
+                owner_node,
+                owner_address,
+            } => IngestError::NotOwner {
+                message: format!("this node is not the owner for project '{project_id}'"),
+                project_id,
+                owner_node,
+                owner_address,
+            },
+            StoreError::Shutdown
+            | StoreError::NotWriter { .. }
+            | StoreError::StaleWriter { .. } => IngestError::ServiceUnavailable(e.to_string()),
+            e @ (StoreError::Io(_) | StoreError::ObjectStore(_)) => {
+                IngestError::ServiceUnavailable(e.to_string())
+            }
+            other => IngestError::Internal(other.to_string()),
+        })?;
+
+    if resp.accepted_traces > 0 || resp.accepted_spans > 0 {
+        if let Ok(purged_finite) = ctrl
+            .meta()
+            .list_purged_finite_erasure_tombstones(&project_id, ingest_started_ms)
+            .await
+        {
+            if !purged_finite.is_empty() {
+                let matching_ids: Vec<String> = purged_finite
+                    .into_iter()
+                    .filter(|tb| batch_match_keys.may_match(tb))
+                    .map(|tb| tb.id)
+                    .collect();
+                if !matching_ids.is_empty() {
+                    match ctrl
+                        .meta()
+                        .reset_erasure_tombstones_purged(&matching_ids)
+                        .await
+                    {
+                        Ok(n) if n > 0 => ctrl.notify_agent_erasure(),
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!(
+                            project_id = %project_id,
+                            error = %err,
+                            "failed to reopen matching purged finite erasure tombstones on forwarded ingest"
+                        ),
+                    }
+                }
+            }
+        }
+
+        if resp.dropped_spans > 0 {
+            ctrl.agent_metrics()
+                .spans_dropped_trace_limit
+                .fetch_add(resp.dropped_spans as u64, Ordering::Relaxed);
+        }
+        ctrl.agent_metrics()
+            .traces_ingested
+            .fetch_add(resp.accepted_traces as u64, Ordering::Relaxed);
+        ctrl.agent_metrics()
+            .spans_ingested
+            .fetch_add(resp.accepted_spans as u64, Ordering::Relaxed);
+
+        for (trace_id, session_id) in eval_candidates {
+            ctrl.try_enqueue_eval(EvalJob {
+                project_id: project_id.clone(),
+                session_id,
+                trace_id: Some(trace_id),
+                span_id: None,
+                evaluator_ids: None,
+            });
+        }
+    }
+
+    Ok(Json(json!({
+        "status": "ok",
+        "accepted_traces": resp.accepted_traces,
+        "accepted_spans": resp.accepted_spans,
+    })))
 }
 
 /// Protected project-scoped `/v1/projects/:id/agent/...` routes mounted inside
@@ -485,6 +1199,46 @@ async fn ingest_canonical_batch(
     let eval_candidates = collect_eval_candidates(&batch);
     let batch_match_keys = collect_batch_match_keys(&batch);
     let ingest_started_ms = Utc::now().timestamp_millis();
+
+    if let Some(agent_writer) = ctrl.agent_writer_backend() {
+        let accepted_traces = batch.traces.len();
+        let accepted_spans = batch.spans.len();
+        agent_writer.enqueue(project_id, batch, ingest_started_ms)?;
+
+        let mut warnings = Vec::new();
+        if sanitize_stats.dropped_spans > 0 {
+            warnings.push(format!(
+                "{} span(s) dropped for exceeding MAX_SPANS_PER_TRACE",
+                sanitize_stats.dropped_spans
+            ));
+        }
+        ctrl.agent_metrics()
+            .traces_ingested
+            .fetch_add(accepted_traces as u64, Ordering::Relaxed);
+        ctrl.agent_metrics()
+            .spans_ingested
+            .fetch_add(accepted_spans as u64, Ordering::Relaxed);
+        if blobs_deduped > 0 {
+            ctrl.agent_metrics()
+                .blobs_deduped
+                .fetch_add(blobs_deduped, Ordering::Relaxed);
+        }
+
+        return Ok(Json(TraceIngestResponse {
+            accepted_traces,
+            accepted_spans,
+            truncated_payloads: sanitize_stats.truncated_payloads,
+            redacted_fields: sanitize_stats.redacted_fields,
+            dropped_spans: sanitize_stats.dropped_spans,
+            warnings,
+        }));
+    }
+
+    if ctrl.is_stateless_writer() {
+        return Err(IngestError::ServiceUnavailable(
+            "stateless agent writer backend is not attached".to_string(),
+        ));
+    }
 
     let mut resp = ctrl
         .agent_store()

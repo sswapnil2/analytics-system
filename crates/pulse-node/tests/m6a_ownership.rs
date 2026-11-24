@@ -150,13 +150,19 @@ fn multi_node_ownership_enforces_not_owner_scopes_loops_places_projects_and_relo
         );
         node_a.ingest.flush_all().await.unwrap();
 
-        // 4. Non-owner node-b MUST reject all writable & query requests for `proj_multi` with 503 not_owner.
+        // 4. Non-owner node-b MUST still reject unforwarded async ingest (/v1/ingest, /v1/agent/traces,
+        // /v1/otel/v1/traces) with 503 not_owner, while W3 owner-routing forwards sync profile/replay
+        // and query/status endpoints transparently to node-a (returning 503 not_owner when hop=1).
         let assert_not_owner = |status: reqwest::StatusCode, body: Value| {
             assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
             assert_eq!(body["code"], "not_owner", "{body}");
             assert_eq!(body["project_id"], pid, "{body}");
             assert_eq!(body["owner_node"], "node-a", "{body}");
             assert_eq!(body["owner_address"], format!("http://{}", node_a.http_addr), "{body}");
+        };
+        let assert_forward_loop = |status: reqwest::StatusCode, body: Value| {
+            assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["code"], "forward_loop_detected", "{body}");
         };
 
         let r_ingest = http
@@ -168,27 +174,67 @@ fn multi_node_ownership_enforces_not_owner_scopes_loops_places_projects_and_relo
             .unwrap();
         assert_not_owner(r_ingest.status(), r_ingest.json().await.unwrap());
 
-        let r_identify = http
+        let r_identify_fwd = http
             .post(format!("{url_b}/v1/identify"))
             .header("x-pulse-key", &ingest_key)
+            .json(&json!({ "anon_id": "a_fwd_x", "user_id": "u_fwd_x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_identify_fwd.status(), reqwest::StatusCode::OK);
+        let identify_body: Value = r_identify_fwd.json().await.unwrap();
+        assert!(identify_body["canonical_uid"].as_u64().is_some(), "{identify_body}");
+
+        let r_identify_hop = http
+            .post(format!("{url_b}/v1/identify"))
+            .header("x-pulse-key", &ingest_key)
+            .header("x-pulse-forwarded-hop", "1")
             .json(&json!({ "anon_id": "a_x", "user_id": "u_x" }))
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_identify.status(), r_identify.json().await.unwrap());
+        assert_forward_loop(r_identify_hop.status(), r_identify_hop.json().await.unwrap());
 
-        let r_engage = http
+        let r_engage_fwd = http
             .post(format!("{url_b}/v1/engage"))
             .header("x-pulse-key", &ingest_key)
+            .json(&json!({ "distinct_id": "u_fwd_x", "$set": { "plan": "pro" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_engage_fwd.status(), reqwest::StatusCode::OK);
+        let engage_body: Value = r_engage_fwd.json().await.unwrap();
+        assert_eq!(engage_body["updated"], 1, "{engage_body}");
+
+        let r_engage_hop = http
+            .post(format!("{url_b}/v1/engage"))
+            .header("x-pulse-key", &ingest_key)
+            .header("x-pulse-forwarded-hop", "1")
             .json(&json!({ "distinct_id": "u_x", "$set": { "plan": "pro" } }))
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_engage.status(), r_engage.json().await.unwrap());
+        assert_forward_loop(r_engage_hop.status(), r_engage_hop.json().await.unwrap());
 
-        let r_groups = http
+        let r_groups_fwd = http
             .post(format!("{url_b}/v1/groups"))
             .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "group_type": "company",
+                "group_id": "acme_fwd",
+                "$set": { "plan": "pro" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_groups_fwd.status(), reqwest::StatusCode::OK);
+        let groups_body: Value = r_groups_fwd.json().await.unwrap();
+        assert_eq!(groups_body["updated"], 1, "{groups_body}");
+
+        let r_groups_hop = http
+            .post(format!("{url_b}/v1/groups"))
+            .header("x-pulse-key", &ingest_key)
+            .header("x-pulse-forwarded-hop", "1")
             .json(&json!({
                 "group_type": "company",
                 "group_id": "acme",
@@ -197,11 +243,26 @@ fn multi_node_ownership_enforces_not_owner_scopes_loops_places_projects_and_relo
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_groups.status(), r_groups.json().await.unwrap());
+        assert_forward_loop(r_groups_hop.status(), r_groups_hop.json().await.unwrap());
 
-        let r_replay = http
+        let r_replay_fwd = http
             .post(format!("{url_b}/v1/replay/chunk"))
             .header("x-pulse-key", &ingest_key)
+            .json(&json!({
+                "project_id": pid,
+                "session_id": "sess_fwd_1",
+                "chunk_start_ts_ms": now_ms,
+                "ops": []
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_replay_fwd.status(), reqwest::StatusCode::OK);
+
+        let r_replay_hop = http
+            .post(format!("{url_b}/v1/replay/chunk"))
+            .header("x-pulse-key", &ingest_key)
+            .header("x-pulse-forwarded-hop", "1")
             .json(&json!({
                 "project_id": pid,
                 "session_id": "sess_1",
@@ -211,9 +272,9 @@ fn multi_node_ownership_enforces_not_owner_scopes_loops_places_projects_and_relo
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_replay.status(), r_replay.json().await.unwrap());
+        assert_forward_loop(r_replay_hop.status(), r_replay_hop.json().await.unwrap());
 
-        let r_query = http
+        let r_query_fwd = http
             .post(format!("{url_b}/v1/projects/{pid}/query/insights"))
             .bearer_auth(admin_token)
             .json(&json!({
@@ -224,15 +285,40 @@ fn multi_node_ownership_enforces_not_owner_scopes_loops_places_projects_and_relo
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_query.status(), r_query.json().await.unwrap());
+        assert_eq!(r_query_fwd.status(), reqwest::StatusCode::OK);
 
-        let r_status = http
+        let r_query_hop = http
+            .post(format!("{url_b}/v1/projects/{pid}/query/insights"))
+            .bearer_auth(admin_token)
+            .header("x-pulse-forwarded-hop", "1")
+            .json(&json!({
+                "time_range": { "start_ts_ms": now_ms - 60_000, "end_ts_ms": now_ms + 60_000 },
+                "interval": "day",
+                "series": [{ "label": "A", "event_name": "App_Open", "metric": "totals" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_not_owner(r_query_hop.status(), r_query_hop.json().await.unwrap());
+
+        let r_status_fwd = http
             .get(format!("{url_b}/v1/status?project_id={pid}"))
             .bearer_auth(admin_token)
             .send()
             .await
             .unwrap();
-        assert_not_owner(r_status.status(), r_status.json().await.unwrap());
+        assert_eq!(r_status_fwd.status(), reqwest::StatusCode::OK);
+        let status_body: Value = r_status_fwd.json().await.unwrap();
+        assert_eq!(status_body["active_project_id"], pid, "{status_body}");
+
+        let r_status_hop = http
+            .get(format!("{url_b}/v1/status?project_id={pid}"))
+            .bearer_auth(admin_token)
+            .header("x-pulse-forwarded-hop", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_not_owner(r_status_hop.status(), r_status_hop.json().await.unwrap());
 
         let r_agent = http
             .post(format!("{url_b}/v1/agent/traces"))

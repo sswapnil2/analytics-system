@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use chrono::Utc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -60,6 +61,9 @@ pub enum IngestError {
 
     #[error("governance error: {0}")]
     Governance(String),
+
+    #[error("forwarding loop detected: {0}")]
+    ForwardLoop(String),
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -764,7 +768,11 @@ pub struct StatelessWriterBackend {
 }
 
 enum IngestBackend {
-    LocalDirect(Arc<StorageEngine>),
+    LocalDirect {
+        storage: Arc<StorageEngine>,
+        owners: Option<Arc<dyn OwnerDirectory>>,
+        sync_client: Option<Arc<OwnerSyncClient>>,
+    },
     StatelessWriter(Arc<StatelessWriterBackend>),
 }
 
@@ -798,7 +806,11 @@ impl IngestService {
         rate_limit: crate::rate_limit::RateLimiter,
     ) -> Arc<Self> {
         let svc = Arc::new(Self {
-            backend: IngestBackend::LocalDirect(storage),
+            backend: IngestBackend::LocalDirect {
+                storage,
+                owners: None,
+                sync_client: None,
+            },
             governance,
             dedup: Arc::new(DedupRegistry::new()),
             processors: DashMap::new(),
@@ -806,6 +818,39 @@ impl IngestService {
             dict_registry: Arc::new(DictionaryRegistry::default()),
             metrics: IngestMetrics::default(),
             rate_limit,
+            wal_groups: DashMap::new(),
+            self_weak: std::sync::OnceLock::new(),
+        });
+        let _ = svc.self_weak.set(Arc::downgrade(&svc));
+        svc
+    }
+
+    pub fn new_with_owner_forwarding(
+        storage: Arc<StorageEngine>,
+        governance: Arc<dyn GovernanceProvider>,
+        owners: Arc<dyn OwnerDirectory>,
+        forward_guard: Arc<ForwardLoopGuard>,
+        internal_token: Option<String>,
+    ) -> Arc<Self> {
+        let writer_id = forward_guard
+            .self_node_name
+            .clone()
+            .unwrap_or_else(|| "local-node".to_string());
+        let sync_client =
+            OwnerSyncClient::new(writer_id, owners.clone(), forward_guard, internal_token);
+        let svc = Arc::new(Self {
+            backend: IngestBackend::LocalDirect {
+                storage,
+                owners: Some(owners),
+                sync_client: Some(sync_client),
+            },
+            governance,
+            dedup: Arc::new(DedupRegistry::new()),
+            processors: DashMap::new(),
+            buffer: IngestBuffer::from_env(),
+            dict_registry: Arc::new(DictionaryRegistry::default()),
+            metrics: IngestMetrics::default(),
+            rate_limit: crate::rate_limit::RateLimiter::from_env(),
             wal_groups: DashMap::new(),
             self_weak: std::sync::OnceLock::new(),
         });
@@ -855,20 +900,20 @@ impl IngestService {
     pub fn writer_log(&self) -> Option<&Arc<WriterLogManager>> {
         match &self.backend {
             IngestBackend::StatelessWriter(w) => Some(&w.log),
-            IngestBackend::LocalDirect(_) => None,
+            IngestBackend::LocalDirect { .. } => None,
         }
     }
 
     pub fn forwarder(&self) -> Option<&Arc<WriterForwarder>> {
         match &self.backend {
             IngestBackend::StatelessWriter(w) => Some(&w.forwarder),
-            IngestBackend::LocalDirect(_) => None,
+            IngestBackend::LocalDirect { .. } => None,
         }
     }
 
     fn local_storage(&self) -> Result<&Arc<StorageEngine>> {
         match &self.backend {
-            IngestBackend::LocalDirect(s) => Ok(s),
+            IngestBackend::LocalDirect { storage, .. } => Ok(storage),
             IngestBackend::StatelessWriter(_) => Err(IngestError::Storage(
                 StorageError::Unavailable("stateless writer has no local storage".to_string()),
             )),
@@ -1154,7 +1199,7 @@ impl IngestService {
     /// Flushes buffered W1 events for `project_id` to WAL and waits for the processor to apply them.
     pub async fn flush_project(&self, project_id: &str) -> Result<()> {
         self.flush_project_buffer(project_id).await?;
-        if let IngestBackend::LocalDirect(ref storage) = self.backend {
+        if let IngestBackend::LocalDirect { ref storage, .. } = self.backend {
             if let Some(ps) = storage.get_project(project_id) {
                 ps.wait_applied(Duration::from_secs(10)).await;
             }
@@ -1173,7 +1218,7 @@ impl IngestService {
         for pid in pids {
             self.flush_project_buffer(&pid).await?;
         }
-        if let IngestBackend::LocalDirect(ref storage) = self.backend {
+        if let IngestBackend::LocalDirect { ref storage, .. } = self.backend {
             for ps in storage.open_projects() {
                 ps.wait_applied(Duration::from_secs(10)).await;
             }
@@ -1266,7 +1311,7 @@ impl IngestService {
     ) -> Result<IngestResponse> {
         let w = match &self.backend {
             IngestBackend::StatelessWriter(w) => w,
-            IngestBackend::LocalDirect(_) => {
+            IngestBackend::LocalDirect { .. } => {
                 let ps = self.ensure_project_ready(project_id, server_now_ms).await?;
                 let rules = self.governance.lexicon_rules(project_id);
                 let num_buckets = ps.config().num_buckets;
@@ -1901,7 +1946,7 @@ impl IngestService {
             };
             match (user, other) {
                 (Some(user_id), Some(anon_id)) if user_id != anon_id => {
-                    self.identify_for_project(
+                    self.identify_for_project_local(
                         project_id,
                         IdentifyRequest {
                             anon_id,
@@ -1914,7 +1959,7 @@ impl IngestService {
                 }
                 (Some(id), _) | (None, Some(id)) => {
                     let Some(t) = traits else { continue };
-                    self.engage_for_project(
+                    self.engage_for_project_local(
                         project_id,
                         serde_json::json!({ "distinct_id": id, "$set": t }),
                     )
@@ -1927,14 +1972,60 @@ impl IngestService {
         Ok(applied)
     }
 
+    async fn resolve_remote_sync_client(&self, project_id: &str) -> Option<&Arc<OwnerSyncClient>> {
+        let IngestBackend::LocalDirect {
+            owners: Some(owners),
+            sync_client: Some(sync_client),
+            ..
+        } = &self.backend
+        else {
+            return None;
+        };
+        let me = sync_client.self_node_name()?;
+        if let Ok(Some(owner)) = owners.resolve_owner(project_id).await {
+            if owner.node_name != me {
+                return Some(sync_client);
+            }
+        }
+        None
+    }
+
+    async fn refresh_remote_sync_client(&self, project_id: &str) -> Option<&Arc<OwnerSyncClient>> {
+        let IngestBackend::LocalDirect {
+            owners: Some(owners),
+            sync_client: Some(sync_client),
+            ..
+        } = &self.backend
+        else {
+            return None;
+        };
+        let me = sync_client.self_node_name()?;
+        if let Ok(Some(owner)) = owners.refresh_owner(project_id).await {
+            if owner.node_name != me {
+                return Some(sync_client);
+            }
+        }
+        None
+    }
+
     pub async fn identify(&self, api_key: &str, req: IdentifyRequest) -> Result<IdentifyResponse> {
+        self.identify_with_headers(api_key, req, None).await
+    }
+
+    pub async fn identify_with_headers(
+        &self,
+        api_key: &str,
+        req: IdentifyRequest,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<IdentifyResponse> {
         let project_id = self
             .governance
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
         self.charge(&project_id, 1)?;
-        self.identify_for_project(&project_id, req).await
+        self.identify_for_project_with_headers(&project_id, req, incoming)
+            .await
     }
 
     pub async fn identify_for_project(
@@ -1942,9 +2033,50 @@ impl IngestService {
         project_id: &str,
         req: IdentifyRequest,
     ) -> Result<IdentifyResponse> {
+        self.identify_for_project_with_headers(project_id, req, None)
+            .await
+    }
+
+    pub async fn identify_for_project_with_headers(
+        &self,
+        project_id: &str,
+        req: IdentifyRequest,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<IdentifyResponse> {
         if let IngestBackend::StatelessWriter(ref w) = self.backend {
-            return w.sync_client.forward_identify(project_id, req).await;
+            return w
+                .sync_client
+                .forward_identify_with_headers(project_id, req, incoming)
+                .await;
         }
+        if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
+            return sync_client
+                .forward_identify_with_headers(project_id, req, incoming)
+                .await;
+        }
+        match self
+            .identify_for_project_local(project_id, req.clone())
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+                if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
+                    sync_client
+                        .forward_identify_with_headers(project_id, req, incoming)
+                        .await
+                } else {
+                    Err(err)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn identify_for_project_local(
+        &self,
+        project_id: &str,
+        req: IdentifyRequest,
+    ) -> Result<IdentifyResponse> {
         self.flush_project_buffer(project_id).await?;
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
@@ -1995,6 +2127,15 @@ impl IngestService {
 
     /// Processes `/engage` or Identify user profile mutations (`Gap 1`).
     pub async fn engage(&self, api_key: &str, body: &[u8]) -> Result<EngageResponse> {
+        self.engage_with_headers(api_key, body, None).await
+    }
+
+    pub async fn engage_with_headers(
+        &self,
+        api_key: &str,
+        body: &[u8],
+        incoming: Option<&HeaderMap>,
+    ) -> Result<EngageResponse> {
         let project_id = self
             .governance
             .authenticate_api_key(api_key)
@@ -2002,7 +2143,8 @@ impl IngestService {
             .ok_or(IngestError::Unauthorized)?;
         self.charge(&project_id, 1)?;
         let val: serde_json::Value = serde_json::from_slice(body)?;
-        self.engage_for_project(&project_id, val).await
+        self.engage_for_project_with_headers(&project_id, val, incoming)
+            .await
     }
 
     pub async fn engage_for_project(
@@ -2010,9 +2152,50 @@ impl IngestService {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<EngageResponse> {
+        self.engage_for_project_with_headers(project_id, payload, None)
+            .await
+    }
+
+    pub async fn engage_for_project_with_headers(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<EngageResponse> {
         if let IngestBackend::StatelessWriter(ref w) = self.backend {
-            return w.sync_client.forward_engage(project_id, payload).await;
+            return w
+                .sync_client
+                .forward_engage_with_headers(project_id, payload, incoming)
+                .await;
         }
+        if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
+            return sync_client
+                .forward_engage_with_headers(project_id, payload, incoming)
+                .await;
+        }
+        match self
+            .engage_for_project_local(project_id, payload.clone())
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+                if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
+                    sync_client
+                        .forward_engage_with_headers(project_id, payload, incoming)
+                        .await
+                } else {
+                    Err(err)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn engage_for_project_local(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<EngageResponse> {
         let ps = self
             .ensure_project_ready(project_id, Utc::now().timestamp_millis())
             .await?;
@@ -2100,6 +2283,15 @@ impl IngestService {
 
     /// Processes Group Analytics `/groups` property updates (`Gap 8`).
     pub async fn group_engage(&self, api_key: &str, body: &[u8]) -> Result<serde_json::Value> {
+        self.group_engage_with_headers(api_key, body, None).await
+    }
+
+    pub async fn group_engage_with_headers(
+        &self,
+        api_key: &str,
+        body: &[u8],
+        incoming: Option<&HeaderMap>,
+    ) -> Result<serde_json::Value> {
         let project_id = self
             .governance
             .authenticate_api_key(api_key)
@@ -2107,7 +2299,9 @@ impl IngestService {
             .ok_or(IngestError::Unauthorized)?;
         self.charge(&project_id, 1)?;
         let val: serde_json::Value = serde_json::from_slice(body)?;
-        let updated = self.group_engage_for_project(&project_id, val).await?;
+        let updated = self
+            .group_engage_for_project_with_headers(&project_id, val, incoming)
+            .await?;
         Ok(serde_json::json!({
             "status": "ok",
             "updated": updated,
@@ -2119,12 +2313,53 @@ impl IngestService {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<usize> {
+        self.group_engage_for_project_with_headers(project_id, payload, None)
+            .await
+    }
+
+    pub async fn group_engage_for_project_with_headers(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<usize> {
         if let IngestBackend::StatelessWriter(ref w) = self.backend {
             return w
                 .sync_client
-                .forward_group_engage(project_id, payload)
+                .forward_group_engage_with_headers(project_id, payload, incoming)
                 .await;
         }
+        if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
+            return sync_client
+                .forward_group_engage_with_headers(project_id, payload, incoming)
+                .await;
+        }
+        match self
+            .group_engage_for_project_local(project_id, payload.clone())
+            .await
+        {
+            Ok(updated) => Ok(updated),
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+                if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
+                    sync_client
+                        .forward_group_engage_with_headers(project_id, payload, incoming)
+                        .await
+                } else {
+                    Err(err)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn group_engage_for_project_local(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<usize> {
+        self.local_storage()?
+            .ensure_writable_owner(project_id)
+            .await?;
         let items: Vec<serde_json::Value> = match payload {
             serde_json::Value::Array(arr) => arr,
             serde_json::Value::Object(_) => vec![payload],
@@ -2162,13 +2397,24 @@ impl IngestService {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<ReplayIngestResponse> {
+        self.ingest_replay_with_headers(api_key, content_type, body, None)
+            .await
+    }
+
+    pub async fn ingest_replay_with_headers(
+        &self,
+        api_key: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        incoming: Option<&HeaderMap>,
+    ) -> Result<ReplayIngestResponse> {
         let project_id = self
             .governance
             .authenticate_api_key(api_key)
             .await
             .ok_or(IngestError::Unauthorized)?;
         self.charge(&project_id, 1)?;
-        self.ingest_replay_for_project(&project_id, content_type, body)
+        self.ingest_replay_for_project_with_headers(&project_id, content_type, body, incoming)
             .await
     }
 
@@ -2178,12 +2424,52 @@ impl IngestService {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<ReplayIngestResponse> {
+        self.ingest_replay_for_project_with_headers(project_id, content_type, body, None)
+            .await
+    }
+
+    pub async fn ingest_replay_for_project_with_headers(
+        &self,
+        project_id: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        incoming: Option<&HeaderMap>,
+    ) -> Result<ReplayIngestResponse> {
         if let IngestBackend::StatelessWriter(ref w) = self.backend {
             return w
                 .sync_client
-                .forward_replay(project_id, content_type, body)
+                .forward_replay_with_headers(project_id, content_type, body, incoming)
                 .await;
         }
+        if let Some(sync_client) = self.resolve_remote_sync_client(project_id).await {
+            return sync_client
+                .forward_replay_with_headers(project_id, content_type, body, incoming)
+                .await;
+        }
+        match self
+            .ingest_replay_for_project_local(project_id, content_type, body)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err @ IngestError::Storage(StorageError::NotOwner { .. })) => {
+                if let Some(sync_client) = self.refresh_remote_sync_client(project_id).await {
+                    sync_client
+                        .forward_replay_with_headers(project_id, content_type, body, incoming)
+                        .await
+                } else {
+                    Err(err)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn ingest_replay_for_project_local(
+        &self,
+        project_id: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<ReplayIngestResponse> {
         let mut chunk = ReplayChunk::decode_auto(body, content_type)?;
         chunk.project_id = project_id.to_string();
         let rules = self.governance.lexicon_rules(project_id);

@@ -13,11 +13,14 @@ pub use agent_eval_worker::{
     MAX_CONCURRENT_LLM_JUDGES,
 };
 pub use api::{
-    build_admin_control_router, build_control_router, build_public_flag_router,
+    build_admin_control_router, build_control_router, build_internal_admin_forward_router,
+    build_public_flag_router, build_writer_project_forward_router,
     restore_encryption_keyring_to_store, AuthConfig, AuthPrincipal, BootstrapCredentials,
     ControlPlaneService,
 };
-pub use api_agent::{build_agent_ingest_router, AgentRetentionStats};
+pub use api_agent::{
+    build_agent_ingest_router, build_internal_agent_forward_router, AgentRetentionStats,
+};
 pub use copilot::{copilot_revenue_summary, CopilotRequest, CopilotResponse};
 pub use db::{
     DbProjectOwnerChecker, DbWriterLeases, MetaError, MetaOwnerDirectory, MetaStore, OrgInvite,

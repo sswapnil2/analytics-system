@@ -11,14 +11,15 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
 
-use crate::forward_guard::{apply_outgoing_forward_headers, ForwardLoopGuard};
+use crate::forward_guard::{apply_outgoing_forward_headers, ForwardCheckError, ForwardLoopGuard};
 use crate::service::{
     EngageResponse, IdentifyRequest, IdentifyResponse, IngestError, ReplayIngestResponse, Result,
 };
-use crate::writer_log::WriterLogManager;
+use crate::writer_log::{WriterLogManager, WriterRecordKind};
 
 pub const HEADER_INTERNAL_TOKEN: &str = "x-pulse-internal-token";
 pub const FORWARD_EVENTS_MAGIC: [u8; 4] = *b"PWFE";
+pub const FORWARD_AGENT_TRACES_MAGIC: [u8; 4] = *b"PWFA";
 const DEFAULT_FORWARDER_MAX_BACKOFF_MS: u64 = 5_000;
 
 #[async_trait]
@@ -61,36 +62,38 @@ impl ForwarderMetrics {
     }
 }
 
-pub fn encode_forward_events_envelope(
+pub fn encode_forward_envelope(
+    magic: [u8; 4],
     writer_id: &str,
     project_id: &str,
     batch_offset: u64,
-    plsb_bytes: &[u8],
+    payload_bytes: &[u8],
 ) -> Vec<u8> {
     let wid = writer_id.as_bytes();
     let pid = project_id.as_bytes();
-    let mut out = Vec::with_capacity(4 + 4 + wid.len() + 4 + pid.len() + 8 + plsb_bytes.len());
-    out.extend_from_slice(&FORWARD_EVENTS_MAGIC);
+    let mut out = Vec::with_capacity(4 + 4 + wid.len() + 4 + pid.len() + 8 + payload_bytes.len());
+    out.extend_from_slice(&magic);
     out.extend_from_slice(&(wid.len() as u32).to_le_bytes());
     out.extend_from_slice(wid);
     out.extend_from_slice(&(pid.len() as u32).to_le_bytes());
     out.extend_from_slice(pid);
     out.extend_from_slice(&batch_offset.to_le_bytes());
-    out.extend_from_slice(plsb_bytes);
+    out.extend_from_slice(payload_bytes);
     out
 }
 
-pub fn decode_forward_events_envelope(
+pub fn decode_forward_envelope(
+    expected_magic: [u8; 4],
     bytes: &[u8],
 ) -> std::result::Result<(String, String, u64, &[u8]), String> {
-    if bytes.len() < 20 || bytes[0..4] != FORWARD_EVENTS_MAGIC {
-        return Err("invalid forward events envelope magic or header".to_string());
+    if bytes.len() < 20 || bytes[0..4] != expected_magic {
+        return Err("invalid forward envelope magic or header".to_string());
     }
     let mut pos = 4usize;
     let wid_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if wid_len == 0 || wid_len > 4096 || pos + wid_len + 12 > bytes.len() {
-        return Err("invalid writer_id length in forward events envelope".to_string());
+        return Err("invalid writer_id length in forward envelope".to_string());
     }
     let writer_id = std::str::from_utf8(&bytes[pos..pos + wid_len])
         .map_err(|e| format!("invalid writer_id utf8: {e}"))?
@@ -99,7 +102,7 @@ pub fn decode_forward_events_envelope(
     let pid_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if pid_len == 0 || pid_len > 4096 || pos + pid_len + 8 > bytes.len() {
-        return Err("invalid project_id length in forward events envelope".to_string());
+        return Err("invalid project_id length in forward envelope".to_string());
     }
     let project_id = std::str::from_utf8(&bytes[pos..pos + pid_len])
         .map_err(|e| format!("invalid project_id utf8: {e}"))?
@@ -108,6 +111,48 @@ pub fn decode_forward_events_envelope(
     let batch_offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
     pos += 8;
     Ok((writer_id, project_id, batch_offset, &bytes[pos..]))
+}
+
+pub fn encode_forward_events_envelope(
+    writer_id: &str,
+    project_id: &str,
+    batch_offset: u64,
+    plsb_bytes: &[u8],
+) -> Vec<u8> {
+    encode_forward_envelope(
+        FORWARD_EVENTS_MAGIC,
+        writer_id,
+        project_id,
+        batch_offset,
+        plsb_bytes,
+    )
+}
+
+pub fn decode_forward_events_envelope(
+    bytes: &[u8],
+) -> std::result::Result<(String, String, u64, &[u8]), String> {
+    decode_forward_envelope(FORWARD_EVENTS_MAGIC, bytes)
+}
+
+pub fn encode_forward_agent_traces_envelope(
+    writer_id: &str,
+    project_id: &str,
+    batch_offset: u64,
+    plst_bytes: &[u8],
+) -> Vec<u8> {
+    encode_forward_envelope(
+        FORWARD_AGENT_TRACES_MAGIC,
+        writer_id,
+        project_id,
+        batch_offset,
+        plst_bytes,
+    )
+}
+
+pub fn decode_forward_agent_traces_envelope(
+    bytes: &[u8],
+) -> std::result::Result<(String, String, u64, &[u8]), String> {
+    decode_forward_envelope(FORWARD_AGENT_TRACES_MAGIC, bytes)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +212,7 @@ fn max_backoff_ms_from_env() -> u64 {
 
 fn build_forward_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .build()
@@ -175,15 +221,16 @@ fn build_forward_client() -> reqwest::Client {
 
 fn build_outgoing_headers(
     forward_guard: &ForwardLoopGuard,
+    incoming: Option<&HeaderMap>,
     internal_token: Option<&str>,
     fallback_sender: &str,
-) -> reqwest::header::HeaderMap {
+) -> std::result::Result<reqwest::header::HeaderMap, ForwardCheckError> {
     let mut axum_headers = HeaderMap::new();
     let sender = forward_guard
         .self_node_name
         .as_deref()
         .or(Some(fallback_sender));
-    let _ = apply_outgoing_forward_headers(&mut axum_headers, None, sender, forward_guard.max_hops);
+    apply_outgoing_forward_headers(&mut axum_headers, incoming, sender, forward_guard.max_hops)?;
     let mut req_headers = reqwest::header::HeaderMap::new();
     for (k, v) in &axum_headers {
         if let (Ok(rk), Ok(rv)) = (
@@ -201,7 +248,7 @@ fn build_outgoing_headers(
             );
         }
     }
-    req_headers
+    Ok(req_headers)
 }
 
 impl WriterForwarder {
@@ -387,21 +434,49 @@ async fn run_project_forwarder_loop(
             continue;
         }
 
-        let url = format!(
-            "{}/internal/v1/forward/events",
-            owner.address.trim_end_matches('/')
-        );
-        let body = encode_forward_events_envelope(
-            fwd.writer_log.writer_id(),
-            &project_id,
-            next.batch_offset,
-            &next.plsb_bytes,
-        );
-        let headers = build_outgoing_headers(
+        let (url, body) = match next.kind {
+            WriterRecordKind::Events => (
+                format!(
+                    "{}/internal/v1/forward/events",
+                    owner.address.trim_end_matches('/')
+                ),
+                encode_forward_events_envelope(
+                    fwd.writer_log.writer_id(),
+                    &project_id,
+                    next.batch_offset,
+                    &next.payload_bytes,
+                ),
+            ),
+            WriterRecordKind::AgentTraces => (
+                format!(
+                    "{}/internal/v1/forward/agent-traces",
+                    owner.address.trim_end_matches('/')
+                ),
+                encode_forward_agent_traces_envelope(
+                    fwd.writer_log.writer_id(),
+                    &project_id,
+                    next.batch_offset,
+                    &next.payload_bytes,
+                ),
+            ),
+        };
+        let headers = match build_outgoing_headers(
             &fwd.forward_guard,
+            None,
             fwd.internal_token.as_deref(),
             fwd.writer_log.writer_id(),
-        );
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(project_id = %project_id, error = %e, "forwarder outgoing header build failed");
+                let wait = Duration::from_millis(500);
+                drop(fwd);
+                if sleep_or_shutdown(wait, shutdown).await {
+                    return;
+                }
+                continue;
+            }
+        };
 
         let resp_res = fwd
             .http_client
@@ -564,34 +639,63 @@ impl OwnerSyncClient {
         })
     }
 
+    pub fn self_node_name(&self) -> Option<&str> {
+        self.forward_guard.self_node_name.as_deref()
+    }
+
     async fn post_json_to_owner<Req: Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         project_id: &str,
         path: &str,
         body: &Req,
+        incoming: Option<&HeaderMap>,
     ) -> Result<Resp> {
         let bytes = serde_json::to_vec(body)?;
         let resp_bytes = self
-            .post_bytes_to_owner(project_id, path, "application/json", &bytes)
+            .post_bytes_to_owner_with_headers(
+                project_id,
+                path,
+                "application/json",
+                &bytes,
+                incoming,
+            )
             .await?;
         let parsed: Resp = serde_json::from_slice(&resp_bytes)?;
         Ok(parsed)
     }
 
-    async fn post_bytes_to_owner(
+    async fn post_bytes_to_owner_with_headers(
         &self,
         project_id: &str,
         path: &str,
         content_type: &str,
         body: &[u8],
+        incoming: Option<&HeaderMap>,
     ) -> Result<Vec<u8>> {
+        let headers = build_outgoing_headers(
+            &self.forward_guard,
+            incoming,
+            self.internal_token.as_deref(),
+            &self.writer_id,
+        )
+        .map_err(|e| IngestError::ForwardLoop(e.to_string()))?;
+
+        let mut prefetched_owner: Option<ProjectOwnerInfo> = None;
+
         for attempt in 0..3u8 {
-            let owner = if attempt == 0 {
-                self.owners.resolve_owner(project_id).await
+            let owner = if let Some(cached) = prefetched_owner.take() {
+                Some(cached)
+            } else if attempt == 0 {
+                self.owners
+                    .resolve_owner(project_id)
+                    .await
+                    .map_err(|e| IngestError::Storage(StorageError::Unavailable(e)))?
             } else {
-                self.owners.refresh_owner(project_id).await
-            }
-            .map_err(|e| IngestError::Storage(StorageError::Unavailable(e)))?;
+                self.owners
+                    .refresh_owner(project_id)
+                    .await
+                    .map_err(|e| IngestError::Storage(StorageError::Unavailable(e)))?
+            };
 
             let Some(owner) = owner else {
                 return Err(IngestError::Storage(StorageError::NotOwner {
@@ -602,30 +706,38 @@ impl OwnerSyncClient {
             };
 
             if self.forward_guard.self_node_name.as_deref() == Some(owner.node_name.as_str()) {
-                return Err(IngestError::Storage(StorageError::Unavailable(
-                    "stateless writer resolved self as project_owner".to_string(),
-                )));
+                return Err(IngestError::Storage(StorageError::NotOwner {
+                    project_id: project_id.to_string(),
+                    owner_node: Some(owner.node_name),
+                    owner_address: Some(owner.address),
+                }));
             }
 
             let url = format!("{}{}", owner.address.trim_end_matches('/'), path);
-            let headers = build_outgoing_headers(
-                &self.forward_guard,
-                self.internal_token.as_deref(),
-                &self.writer_id,
-            );
-            let resp = self
+            let resp = match self
                 .http_client
                 .post(&url)
-                .headers(headers)
+                .headers(headers.clone())
                 .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(body.to_vec())
                 .send()
                 .await
-                .map_err(|e| {
-                    IngestError::Storage(StorageError::Unavailable(format!(
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt == 0 {
+                        if let Ok(Some(refreshed)) = self.owners.refresh_owner(project_id).await {
+                            if refreshed.address != owner.address {
+                                prefetched_owner = Some(refreshed);
+                                continue;
+                            }
+                        }
+                    }
+                    return Err(IngestError::Storage(StorageError::Unavailable(format!(
                         "owner sync request failed: {e}"
-                    )))
-                })?;
+                    ))));
+                }
+            };
 
             let status = resp.status();
             let resp_bytes = resp
@@ -654,7 +766,9 @@ impl OwnerSyncClient {
                 .unwrap_or("owner sync request failed")
                 .to_string();
 
-            if status == StatusCode::SERVICE_UNAVAILABLE && code == Some("not_owner") && attempt < 2
+            if ((status == StatusCode::SERVICE_UNAVAILABLE && code == Some("not_owner"))
+                || status == StatusCode::TEMPORARY_REDIRECT)
+                && attempt < 2
             {
                 continue;
             }
@@ -679,6 +793,16 @@ impl OwnerSyncClient {
         project_id: &str,
         calls: Vec<serde_json::Value>,
     ) -> Result<usize> {
+        self.forward_profile_calls_with_headers(project_id, calls, None)
+            .await
+    }
+
+    pub async fn forward_profile_calls_with_headers(
+        &self,
+        project_id: &str,
+        calls: Vec<serde_json::Value>,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<usize> {
         let resp: ForwardProfileCallsResponse = self
             .post_json_to_owner(
                 project_id,
@@ -687,6 +811,7 @@ impl OwnerSyncClient {
                     project_id: project_id.to_string(),
                     calls,
                 },
+                incoming,
             )
             .await?;
         Ok(resp.profiles_updated)
@@ -697,6 +822,16 @@ impl OwnerSyncClient {
         project_id: &str,
         req: IdentifyRequest,
     ) -> Result<IdentifyResponse> {
+        self.forward_identify_with_headers(project_id, req, None)
+            .await
+    }
+
+    pub async fn forward_identify_with_headers(
+        &self,
+        project_id: &str,
+        req: IdentifyRequest,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<IdentifyResponse> {
         self.post_json_to_owner(
             project_id,
             "/internal/v1/forward/identify",
@@ -704,6 +839,7 @@ impl OwnerSyncClient {
                 project_id: project_id.to_string(),
                 req,
             },
+            incoming,
         )
         .await
     }
@@ -713,6 +849,16 @@ impl OwnerSyncClient {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<EngageResponse> {
+        self.forward_engage_with_headers(project_id, payload, None)
+            .await
+    }
+
+    pub async fn forward_engage_with_headers(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<EngageResponse> {
         self.post_json_to_owner(
             project_id,
             "/internal/v1/forward/engage",
@@ -720,6 +866,7 @@ impl OwnerSyncClient {
                 project_id: project_id.to_string(),
                 payload,
             },
+            incoming,
         )
         .await
     }
@@ -729,6 +876,16 @@ impl OwnerSyncClient {
         project_id: &str,
         payload: serde_json::Value,
     ) -> Result<usize> {
+        self.forward_group_engage_with_headers(project_id, payload, None)
+            .await
+    }
+
+    pub async fn forward_group_engage_with_headers(
+        &self,
+        project_id: &str,
+        payload: serde_json::Value,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<usize> {
         let resp: ForwardGroupEngageResponse = self
             .post_json_to_owner(
                 project_id,
@@ -737,6 +894,7 @@ impl OwnerSyncClient {
                     project_id: project_id.to_string(),
                     payload,
                 },
+                incoming,
             )
             .await?;
         Ok(resp.updated)
@@ -748,10 +906,21 @@ impl OwnerSyncClient {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<ReplayIngestResponse> {
+        self.forward_replay_with_headers(project_id, content_type, body, None)
+            .await
+    }
+
+    pub async fn forward_replay_with_headers(
+        &self,
+        project_id: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        incoming: Option<&HeaderMap>,
+    ) -> Result<ReplayIngestResponse> {
         let path = format!("/internal/v1/forward/replay-chunk?project_id={project_id}");
         let ct = content_type.unwrap_or("application/octet-stream");
         let resp_bytes = self
-            .post_bytes_to_owner(project_id, &path, ct, body)
+            .post_bytes_to_owner_with_headers(project_id, &path, ct, body, incoming)
             .await?;
         let resp: ReplayIngestResponse = serde_json::from_slice(&resp_bytes)?;
         Ok(resp)
@@ -811,6 +980,7 @@ fn map_owner_http_error(
             Some("not_writer") => IngestError::Storage(StorageError::NotWriter {
                 project_id: project_id.to_string(),
             }),
+            Some("forward_loop_detected") => IngestError::ForwardLoop(msg),
             _ => IngestError::Storage(StorageError::Unavailable(msg)),
         },
         _ => IngestError::Storage(StorageError::Unavailable(msg)),

@@ -40,7 +40,7 @@ then a raw or Zstd body with five columnar sections: string table, content-addre
 (0x04 / 0x08) for streamed runs. The SDKs in `sdks/ts-agent` and `sdks/py-agent` send PLST by default and
 fall back to JSON.
 
-Ingest does privacy redaction and pricing, appends to the WAL, and returns. It makes no SQL writes.
+Ingest does privacy redaction and pricing, appends to the WAL (or, on `--role writer` nodes, buffers up to `20 ms` / `1 MiB` into `AgentWriterBuffer` → `writer_log/` `PWLF` v2 and forwards asynchronously via `PWFA` `/internal/v1/forward/agent-traces` with idempotent `writer_offsets` in `PTWL` + `AgentManifest` + `PublishedAgentManifest` across `T_expire = 7d`), and returns. It makes no SQL writes. Non-owner `--role all` / `--role ingest` nodes reject unforwarded `/v1/agent/traces` and `/v1/otel/v1/traces` with `503 not_owner`.
 
 ## Storage
 
@@ -63,8 +63,7 @@ Queries merge unflushed L0 with pruned PLSS segments, so a run is readable as so
 Background compaction merges small segments (disabled on local `hot/agent_segments/` when `PULSE_UPLOAD_INTERVAL_SECS > 0`, except for physical erasure and closed-date S3 cold merge). Run summaries leave out large fields (`input`, `output`,
 `metadata`, `error_message`) to stay small; trace detail reads them from the payload packs.
 
-Node roles: `all` and `ingest` write the store (WAL, L0 flush every 5 s, upload/publish on `PULSE_UPLOAD_INTERVAL_SECS`, compaction/cold-merge/GC every minute, physical erasure sweep on notify / 5 s poll / urgent deadline);
-`query` and `compactor` open it read-only (in `local` mode, `query` reads S3 `agent_published/` and `agent_segments/` on demand and never prunes tombstones). The eval worker runs on every role except `compactor`.
+Node roles: `all` and `ingest` own storage and write the store (WAL, L0 flush every 5 s, upload/publish on `PULSE_UPLOAD_INTERVAL_SECS`, compaction/cold-merge/GC every minute, physical erasure sweep on notify / 5 s poll / urgent deadline); `writer` nodes accept `/v1/agent/traces` and `/v1/otel/v1/traces` asynchronously into `writer_log/` (`PWLF` v2) and forward to the project's owning `ingest`/`all` node (and forward `/v1/projects/:id/agent/*` queries); `query` and `compactor` open it read-only (in `local` mode, `query` reads S3 `agent_published/` and `agent_segments/` on demand, forwards `DELETE .../agent/traces/:trace_id` and `POST .../agent/erasure` to `project_owner`, and never prunes tombstones). The eval worker runs on `all` and `ingest` owners (plus `query` when no owner exists).
 
 ### SQL (`MetaStore`, migrations `0011_agent_observability.sql`, `0101_agent_erasure_physical_purge.sql`)
 

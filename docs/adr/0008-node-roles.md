@@ -6,17 +6,18 @@
 Ingest and queries compete for CPU and memory, so a heavy query should not slow down ingest.
 
 ## Decision
-One binary can run as `--role all | ingest | query | compactor` (`crates/pulse-node/src/lib.rs`).
-- Ingest nodes write.
-- Query nodes open storage and identity **read-only** and refresh them.
-- The compactor only compacts.
+One binary can run as `--role all | ingest | writer | query | compactor` (`crates/pulse-node/src/lib.rs`).
+- `ingest` (and `all`) nodes own storage for projects assigned to them in `project_owner` and execute local WAL/L0/segment writes, S3 uploads, and `/internal/v1/forward/*` requests.
+- `writer` nodes are stateless ingest/routing frontends: they buffer async `/v1/ingest`, `/v1/agent/traces`, and `/v1/otel/v1/traces` into local `writer_log/` (`PWLF` v2) and forward idempotently (`PWFB`/`PWFA`) to each project's owner, and forward sync profile/replay calls and `/v1/projects/:id/*` queries/admin requests via `MetaOwnerDirectory` (`30 s` cache with immediate refresh on `503 not_owner`, `307`, or dead-owner transport failure).
+- `query` nodes open storage and identity **read-only**, refresh from S3 `published/` + `agent_published/`, and forward storage-writing mutations to `project_owner`.
+- `compactor` nodes only compact.
 
-All roles share an object store and a Postgres metadata DB.
+All roles share Postgres (`DATABASE_URL`, with `PULSE_VAULT_KEK` across nodes); storage-owning, `query`, and `compactor` nodes share the object store (`PULSE_OBJECT_STORE_URL`).
 
 ## Trade-offs
-- **+** Ingest and query scale and fail independently; no separate service codebases.
-- **−** Some state is in memory per node: rate limits, dedup windows, login lockout, OAuth state.
-- **−** This documentation has not verified that running several ingest nodes against one project is safe.
+- **+** Stateless `writer`, storage-owning `ingest`, and `query` tiers scale and fail independently without separate service codebases, while `project_owner` routing keeps SlateDB/L0 single-writer per project.
+- **−** Some state remains in memory per node: rate limits, event dedup windows, login lockout, and OAuth state (agent forwarded batches deduplicate idempotently on `(writer_id, offset)` via `writer_offsets` across `T_expire = 7d`).
+- **−** Under `PULSE_HOT_STORE=local`, cross-machine ownership failover for an existing project requires `PULSE_HOT_STORE=object`, a shared volume, or explicit `pulse-node restore --from-published`.
 
 ## Future considerations
-Write down the supported multi-node topology and its guarantees.
+Keep multi-node integration coverage (`crates/pulse-node/tests/m6a_ownership.rs`, `m6b_writer_log_and_forwarder.rs`, `m6c_multi_node_w3.rs`) updated as placement and rebalancing evolve.

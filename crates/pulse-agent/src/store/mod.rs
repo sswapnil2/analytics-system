@@ -21,7 +21,10 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode};
-use pulse_storage::{EncryptedObjectStore, OwnerCheck, ProjectOwnerChecker, StorageError};
+use pulse_storage::{
+    writer_offset_expire_ms_from_env, EncryptedObjectStore, OwnerCheck, ProjectOwnerChecker,
+    StorageError, WriterOffsetEntry,
+};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
@@ -35,9 +38,10 @@ use crate::pricing::{sync_span_cost, sync_trace_cost};
 use crate::store::cache::AgentSegmentCache;
 use crate::store::error::validate_identifier;
 use crate::store::manifest::{
-    compute_urgent_grace_ms, partition_upload_key, AgentManifest, AgentUploadIntent,
-    AgentUploadIntentBatch, AgentUploadIntentStore, ManifestStore, PendingAgentS3Delete,
-    PublishedAgentManifest, PublishedAgentManifestStore, ReaderPinTracker, SegmentDescriptor,
+    compute_urgent_grace_ms, partition_upload_key, prune_expired_agent_writer_offsets,
+    AgentManifest, AgentUploadIntent, AgentUploadIntentBatch, AgentUploadIntentStore,
+    ManifestStore, PendingAgentS3Delete, PublishedAgentManifest, PublishedAgentManifestStore,
+    ReaderPinTracker, SegmentDescriptor,
 };
 use crate::store::memtable::{
     merge_spans_crdt_with_ranks, merge_trace_headers_with_meta,
@@ -141,6 +145,8 @@ pub struct ProjectErasureOutcome {
 }
 
 #[allow(dead_code)]
+pub(crate) type UnflushedWriterOffsetRecord = (String, u64, String, u64, i64);
+
 pub(crate) struct ProjectAgentState {
     pub project_id: String,
     pub manifest_store: Arc<ManifestStore>,
@@ -154,6 +160,11 @@ pub(crate) struct ProjectAgentState {
     pub last_published_seq: parking_lot::Mutex<Option<u64>>,
     pub last_published_s3_segments: parking_lot::Mutex<Option<Vec<String>>>,
     pub last_published_erased_traces: parking_lot::Mutex<Option<BTreeMap<String, i64>>>,
+    pub last_published_writer_offsets:
+        parking_lot::Mutex<Option<BTreeMap<String, WriterOffsetEntry>>>,
+    pub writer_offsets: parking_lot::Mutex<BTreeMap<String, WriterOffsetEntry>>,
+    pub unflushed_writer_offsets: parking_lot::Mutex<Vec<UnflushedWriterOffsetRecord>>,
+    pub forward_locks: DashMap<String, Arc<AsyncMutex<()>>>,
     pub has_pending_upload_intent: AtomicBool,
     pub pending_local_deletes: parking_lot::Mutex<HashSet<String>>,
     pub closed_date_pending_since_ms: parking_lot::Mutex<HashMap<String, i64>>,
@@ -183,6 +194,7 @@ pub struct AgentTraceStore {
     closed_date_max_bytes: AtomicU64,
     upload_merge_max_input_bytes: AtomicU64,
     cold_merge_idle_ms: AtomicU64,
+    pub(crate) writer_offset_expire_ms: AtomicU64,
     projects: DashMap<String, Arc<ProjectAgentState>>,
     project_init_lock: AsyncMutex<()>,
     owner_checker: Option<Arc<dyn ProjectOwnerChecker>>,
@@ -240,6 +252,7 @@ impl AgentTraceStore {
         let closed_date_max_bytes = pulse_storage::closed_date_max_bytes_from_env();
         let upload_merge_max_input_bytes = pulse_storage::upload_merge_max_input_bytes_from_env();
         let cold_merge_idle_ms = pulse_storage::cold_merge_idle_from_env().as_millis() as u64;
+        let writer_offset_expire_ms = writer_offset_expire_ms_from_env();
 
         let store = Self {
             object_store,
@@ -253,6 +266,7 @@ impl AgentTraceStore {
             closed_date_max_bytes: AtomicU64::new(closed_date_max_bytes),
             upload_merge_max_input_bytes: AtomicU64::new(upload_merge_max_input_bytes),
             cold_merge_idle_ms: AtomicU64::new(cold_merge_idle_ms),
+            writer_offset_expire_ms: AtomicU64::new(writer_offset_expire_ms),
             projects: DashMap::new(),
             project_init_lock: AsyncMutex::new(()),
             owner_checker,
@@ -389,6 +403,18 @@ impl AgentTraceStore {
             .store(idle.as_millis() as u64, Ordering::Release);
     }
 
+    #[doc(hidden)]
+    pub fn set_writer_offset_expire_for_test(&self, d: Duration) {
+        self.writer_offset_expire_ms
+            .store((d.as_millis() as u64).max(1), Ordering::Release);
+    }
+
+    pub(crate) fn writer_offset_expire_ms(&self) -> i64 {
+        self.writer_offset_expire_ms
+            .load(Ordering::Acquire)
+            .min(i64::MAX as u64) as i64
+    }
+
     pub fn last_ingest_ms(&self, project_id: &str) -> Option<i64> {
         self.projects
             .get(project_id)
@@ -513,6 +539,200 @@ impl AgentTraceStore {
             dropped_spans,
             warnings: Vec::new(),
         })
+    }
+
+    /// Receives a forwarded batch from a stateless writer (`writer_id, batch_offset, batch`),
+    /// enforcing per-`(project_id, writer_id)` idempotency via `(PTWL + AgentManifest + PublishedAgentManifest)`
+    /// `writer_offsets` (`T_expire = 7d`).
+    pub async fn ingest_forwarded_batch(
+        &self,
+        writer_id: &str,
+        project_id: &str,
+        batch_offset: u64,
+        mut batch: TraceIngestBatch,
+        seen_ts_ms: i64,
+    ) -> Result<TraceIngestResponse, StoreError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(StoreError::Shutdown);
+        }
+        if self.config.read_only {
+            return Err(StoreError::InvalidIdentifier(
+                "cannot ingest into read-only AgentTraceStore".to_string(),
+            ));
+        }
+        validate_identifier("project_id", project_id)?;
+        validate_identifier("writer_id", writer_id)?;
+
+        for tr in &mut batch.traces {
+            if tr.project_id.is_empty() {
+                tr.project_id = project_id.to_string();
+            }
+            sync_trace_cost(tr);
+        }
+        for sp in &mut batch.spans {
+            if sp.project_id.is_empty() {
+                sp.project_id = project_id.to_string();
+            }
+            sync_span_cost(sp);
+        }
+
+        let state = self.get_or_open_project(project_id).await?;
+        if state.fenced.load(Ordering::Acquire) {
+            return Err(StoreError::NotWriter {
+                project_id: state.project_id.clone(),
+            });
+        }
+
+        let fwd_lock = state
+            .forward_locks
+            .entry(writer_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        let _fwd_guard = fwd_lock.lock().await;
+
+        if state
+            .writer_offsets
+            .lock()
+            .get(writer_id)
+            .is_some_and(|e| batch_offset <= e.last_applied_offset)
+        {
+            return Ok(TraceIngestResponse {
+                accepted_traces: 0,
+                accepted_spans: 0,
+                truncated_payloads: 0,
+                redacted_fields: 0,
+                dropped_spans: 0,
+                warnings: Vec::new(),
+            });
+        }
+
+        self.check_l0_backpressure(&state)?;
+        let dropped_spans = self.enforce_trace_limits(&state, &mut batch);
+        let accepted_traces = batch.traces.len();
+        let accepted_spans = batch.spans.len();
+
+        let writer = state.wal_writer.as_ref().ok_or_else(|| {
+            StoreError::Corrupted("missing WAL writer on writable project state".to_string())
+        })?;
+        // Write even if `batch` is empty (e.g. all spans dropped by trace limits) so the
+        // offset marker is durable across crashes and promotes into AgentManifest.
+        let commit = writer
+            .write_with_offset(batch, writer_id.to_string(), batch_offset, seen_ts_ms)
+            .await?;
+
+        {
+            state.unflushed_writer_offsets.lock().push((
+                commit.writer_id,
+                commit.wal_seq,
+                writer_id.to_string(),
+                batch_offset,
+                seen_ts_ms,
+            ));
+            let mut offsets = state.writer_offsets.lock();
+            offsets
+                .entry(writer_id.to_string())
+                .and_modify(|cur| {
+                    cur.last_applied_offset = cur.last_applied_offset.max(batch_offset);
+                    cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(seen_ts_ms);
+                })
+                .or_insert(WriterOffsetEntry {
+                    last_applied_offset: batch_offset,
+                    last_seen_ts_ms: seen_ts_ms,
+                });
+        }
+
+        if accepted_traces > 0 || accepted_spans > 0 {
+            state
+                .last_ingest_ms
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
+            state.dirty_since_compact.store(true, Ordering::Release);
+
+            let (total, largest_shard) = state.memtable.byte_stats();
+            state.l0_bytes.store(total, Ordering::Release);
+            if largest_shard >= self.config.l0_flush_max_bytes {
+                self.flush_notify.notify_one();
+            }
+        } else if state.memtable.has_purged_wal() {
+            state.dirty_since_compact.store(true, Ordering::Release);
+        }
+
+        Ok(TraceIngestResponse {
+            accepted_traces,
+            accepted_spans,
+            truncated_payloads: 0,
+            redacted_fields: 0,
+            dropped_spans,
+            warnings: Vec::new(),
+        })
+    }
+
+    pub(crate) fn promote_writer_offsets_into_manifest(
+        state: &ProjectAgentState,
+        m: &mut AgentManifest,
+        now_ms: i64,
+        expire_ms: i64,
+    ) -> bool {
+        let pending = state.unflushed_writer_offsets.lock().clone();
+        let mut changed = false;
+        for (local_wid, wal_seq, swid, batch_offset, seen_ts_ms) in pending {
+            let committed = m.committed_wal_seq.get(&local_wid).copied().unwrap_or(0);
+            if wal_seq <= committed {
+                match m.writer_offsets.get_mut(&swid) {
+                    Some(cur) => {
+                        if batch_offset > cur.last_applied_offset
+                            || seen_ts_ms > cur.last_seen_ts_ms
+                        {
+                            cur.last_applied_offset = cur.last_applied_offset.max(batch_offset);
+                            cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(seen_ts_ms);
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        m.writer_offsets.insert(
+                            swid,
+                            WriterOffsetEntry {
+                                last_applied_offset: batch_offset,
+                                last_seen_ts_ms: seen_ts_ms,
+                            },
+                        );
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if prune_expired_agent_writer_offsets(&mut m.writer_offsets, now_ms, expire_ms) > 0 {
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn finish_writer_offsets_after_commit(
+        state: &ProjectAgentState,
+        committed_manifest: &AgentManifest,
+    ) {
+        let mut unflushed = state.unflushed_writer_offsets.lock();
+        unflushed.retain(|(local_wid, wal_seq, ..)| {
+            *wal_seq
+                > committed_manifest
+                    .committed_wal_seq
+                    .get(local_wid)
+                    .copied()
+                    .unwrap_or(0)
+        });
+        let mut rebuilt = committed_manifest.writer_offsets.clone();
+        for (_local_wid, _wal_seq, swid, batch_offset, seen_ts_ms) in unflushed.iter() {
+            rebuilt
+                .entry(swid.clone())
+                .and_modify(|cur| {
+                    cur.last_applied_offset = cur.last_applied_offset.max(*batch_offset);
+                    cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(*seen_ts_ms);
+                })
+                .or_insert(WriterOffsetEntry {
+                    last_applied_offset: *batch_offset,
+                    last_seen_ts_ms: *seen_ts_ms,
+                });
+        }
+        *state.writer_offsets.lock() = rebuilt;
     }
 
     /// Drops a trace's spans from `batch` once that trace has reached its span or byte cap.
@@ -804,7 +1024,16 @@ impl AgentTraceStore {
             }
             if staged_list.is_empty() {
                 let mut any_wal_purged = false;
-                if force_all || state.memtable.has_purged_wal() {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let expire_ms = self.writer_offset_expire_ms();
+                let has_expired_offsets = {
+                    let guard = state.writer_offsets.lock();
+                    !guard.is_empty()
+                        && guard
+                            .values()
+                            .any(|e| now_ms.saturating_sub(e.last_seen_ts_ms) > expire_ms)
+                };
+                if force_all || state.memtable.has_purged_wal() || has_expired_offsets {
                     let mut advanced_wids: Vec<(String, u64)> = Vec::new();
                     let committed_manifest = state
                         .manifest_store
@@ -824,12 +1053,18 @@ impl AgentTraceStore {
                                     changed = true;
                                 }
                             }
+                            if Self::promote_writer_offsets_into_manifest(
+                                state, m, now_ms, expire_ms,
+                            ) {
+                                changed = true;
+                            }
                             if changed {
-                                m.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                                m.updated_at_ms = now_ms;
                             }
                             Ok(changed)
                         })
                         .await?;
+                    Self::finish_writer_offsets_after_commit(state, &committed_manifest);
                     for (wid, seq) in &advanced_wids {
                         if *seq > 0 {
                             let _ = state.wal_store.purge_up_to(wid, *seq).await?;
@@ -854,6 +1089,8 @@ impl AgentTraceStore {
 
             let mut retry_needed = false;
             let mut advanced_wids: Vec<(String, u64)> = Vec::new();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let expire_ms = self.writer_offset_expire_ms();
             let commit_res = state
                 .manifest_store
                 .commit_with_cas(|m| {
@@ -899,7 +1136,8 @@ impl AgentTraceStore {
                             advanced_wids.push((wid, seq));
                         }
                     }
-                    m.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                    let _ = Self::promote_writer_offsets_into_manifest(state, m, now_ms, expire_ms);
+                    m.updated_at_ms = now_ms;
                     Ok(true)
                 })
                 .await;
@@ -917,6 +1155,7 @@ impl AgentTraceStore {
             }
 
             let committed_manifest = commit_res?;
+            Self::finish_writer_offsets_after_commit(state, &committed_manifest);
             for sf in &staged_list {
                 state.memtable.complete_shard_flush(sf);
             }
@@ -1045,6 +1284,10 @@ impl AgentTraceStore {
                 last_published_seq: parking_lot::Mutex::new(None),
                 last_published_s3_segments: parking_lot::Mutex::new(None),
                 last_published_erased_traces: parking_lot::Mutex::new(None),
+                last_published_writer_offsets: parking_lot::Mutex::new(None),
+                writer_offsets: parking_lot::Mutex::new(BTreeMap::new()),
+                unflushed_writer_offsets: parking_lot::Mutex::new(Vec::new()),
+                forward_locks: DashMap::new(),
                 has_pending_upload_intent: AtomicBool::new(false),
                 pending_local_deletes: parking_lot::Mutex::new(HashSet::new()),
                 closed_date_pending_since_ms: parking_lot::Mutex::new(HashMap::new()),
@@ -1164,19 +1407,39 @@ impl AgentTraceStore {
 
         let mut applied = HashMap::new();
         let replayed = wal_store
-            .replay_uncommitted(
+            .replay_uncommitted_with_offsets(
                 &manifest.committed_wal_seq,
                 &mut applied,
                 !self.config.read_only,
             )
             .await?;
         let mut replayed_any = false;
-        for (wid, seq, mut batch) in replayed {
+        let mut writer_offsets = manifest.writer_offsets.clone();
+        let mut unflushed_writer_offsets = Vec::new();
+        for (wid, seq, mut batch, frame_offsets) in replayed {
             replayed_any = true;
+            let has_frame_offsets = !frame_offsets.is_empty();
+            for (swid, off, ts) in frame_offsets {
+                writer_offsets
+                    .entry(swid.clone())
+                    .and_modify(|cur| {
+                        cur.last_applied_offset = cur.last_applied_offset.max(off);
+                        cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(ts);
+                    })
+                    .or_insert(WriterOffsetEntry {
+                        last_applied_offset: off,
+                        last_seen_ts_ms: ts,
+                    });
+                unflushed_writer_offsets.push((wid.clone(), seq, swid, off, ts));
+            }
             let had_erased = filter_batch_erased(&mut batch, &manifest.erased_traces);
             if wid != self.writer_id_str {
                 if is_local_hot && !self.config.read_only {
-                    memtable.record_recovered_foreign_wal_seq(&wid, seq, had_erased);
+                    memtable.record_recovered_foreign_wal_seq(
+                        &wid,
+                        seq,
+                        had_erased || has_frame_offsets,
+                    );
                 } else if had_erased {
                     memtable.record_blocked_foreign_wal_seq(&wid, seq);
                 }
@@ -1225,6 +1488,7 @@ impl AgentTraceStore {
             .as_ref()
             .map(|p| sorted_s3_segment_paths(&p.segments));
         let initial_pub_erased = latest_published.as_ref().map(|p| p.erased_traces.clone());
+        let initial_pub_offsets = latest_published.as_ref().map(|p| p.writer_offsets.clone());
         let dirty_init = replayed_any || memtable.total_traces() > 0 || memtable.has_purged_wal();
 
         let state = Arc::new(ProjectAgentState {
@@ -1240,6 +1504,10 @@ impl AgentTraceStore {
             last_published_seq: parking_lot::Mutex::new(initial_pub_seq),
             last_published_s3_segments: parking_lot::Mutex::new(initial_pub_s3),
             last_published_erased_traces: parking_lot::Mutex::new(initial_pub_erased),
+            last_published_writer_offsets: parking_lot::Mutex::new(initial_pub_offsets),
+            writer_offsets: parking_lot::Mutex::new(writer_offsets),
+            unflushed_writer_offsets: parking_lot::Mutex::new(unflushed_writer_offsets),
+            forward_locks: DashMap::new(),
             has_pending_upload_intent: AtomicBool::new(false),
             pending_local_deletes: parking_lot::Mutex::new(HashSet::new()),
             closed_date_pending_since_ms: parking_lot::Mutex::new(HashMap::new()),
@@ -1583,12 +1851,20 @@ impl AgentTraceStore {
             Some(prev) => *prev != cur_mf.erased_traces,
             None => !cur_mf.erased_traces.is_empty() && !cur_s3_segs.is_empty(),
         };
+        let writer_offsets_dirty = match &*state.last_published_writer_offsets.lock() {
+            Some(prev) => *prev != cur_mf.writer_offsets,
+            None => !cur_mf.writer_offsets.is_empty(),
+        };
         let has_unstamped_s3_deletes = cur_mf
             .pending_s3_deletes
             .iter()
             .any(|d| d.eligible_after_ms.is_none());
 
-        if frozen_groups.is_empty() && !s3_state_dirty && !erased_dirty && !has_unstamped_s3_deletes
+        if frozen_groups.is_empty()
+            && !s3_state_dirty
+            && !erased_dirty
+            && !writer_offsets_dirty
+            && !has_unstamped_s3_deletes
         {
             let has_ready_s3_deletes = cur_mf.pending_s3_deletes.iter().any(|d| {
                 d.eligible_after_ms.is_some_and(|t| now_ms >= t)
@@ -1891,6 +2167,12 @@ impl AgentTraceStore {
             .cloned()
             .collect();
         let pub_ts_ms = chrono::Utc::now().timestamp_millis();
+        let mut pub_writer_offsets = committed_mf.writer_offsets.clone();
+        prune_expired_agent_writer_offsets(
+            &mut pub_writer_offsets,
+            pub_ts_ms,
+            self.writer_offset_expire_ms(),
+        );
         let pub_manifest = PublishedAgentManifest {
             publish_seq,
             writer_generation: committed_mf.writer_generation,
@@ -1900,6 +2182,7 @@ impl AgentTraceStore {
             segments: s3_segments.clone(),
             committed_wal_seq: committed_mf.committed_wal_seq.clone(),
             erased_traces: committed_mf.erased_traces.clone(),
+            writer_offsets: pub_writer_offsets,
         };
 
         let pub_store =
@@ -1980,6 +2263,7 @@ impl AgentTraceStore {
         *state.last_published_seq.lock() = Some(publish_seq);
         *state.last_published_s3_segments.lock() = Some(sorted_s3_segment_paths(&s3_segments));
         *state.last_published_erased_traces.lock() = Some(post_step6.erased_traces.clone());
+        *state.last_published_writer_offsets.lock() = Some(published.writer_offsets.clone());
 
         {
             let active_hot_dates: HashSet<String> = post_step6
@@ -3653,6 +3937,7 @@ mod tests {
                 segments: Vec::new(),
                 committed_wal_seq: BTreeMap::new(),
                 erased_traces: BTreeMap::new(),
+                writer_offsets: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -3879,5 +4164,165 @@ mod tests {
 
         store_a.close().await.unwrap();
         store_b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarded_agent_batch_idempotency_across_flush_publish_restore_and_7d_expiry() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let s3_raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let routed1 = pulse_storage::with_hot_store_for_role(s3_raw.clone(), dir1.path(), false)
+            .await
+            .unwrap();
+        let store1 = AgentTraceStore::open(routed1.clone(), AgentTraceStoreConfig::default())
+            .await
+            .unwrap();
+        store1.set_upload_interval(Duration::from_secs(300));
+
+        let now_ms = chrono::Utc::now().timestamp_millis() - 5_000;
+        let r1 = store1
+            .ingest_forwarded_batch(
+                "writer_1",
+                "proj_fwd_ag",
+                0,
+                sample_batch("tr_fwd_1", now_ms),
+                now_ms,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.accepted_traces, 1);
+        assert_eq!(r1.accepted_spans, 1);
+
+        // 2. Immediate duplicate retry -> 0 accepted.
+        let r_dup = store1
+            .ingest_forwarded_batch(
+                "writer_1",
+                "proj_fwd_ag",
+                0,
+                sample_batch("tr_fwd_1", now_ms),
+                now_ms + 100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_dup.accepted_traces, 0);
+        assert_eq!(r_dup.accepted_spans, 0);
+
+        // 3. Erase tr_fwd_1, flush L0 (purges WAL), publish to S3.
+        store1
+            .compact_and_gc(
+                Some("proj_fwd_ag"),
+                &[AgentErasureTombstone {
+                    id: "tb_fwd_1".into(),
+                    project_id: "proj_fwd_ag".into(),
+                    level: ErasureLevel::Trace,
+                    target_id: "tr_fwd_1".into(),
+                    created_at: now_ms + 200,
+                    expires_at: None,
+                }],
+            )
+            .await
+            .unwrap();
+        store1.flush_all_l0().await.unwrap();
+        let pub_m = store1
+            .upload_project_at("proj_fwd_ag", now_ms + 300, true)
+            .await
+            .unwrap()
+            .expect("published manifest expected");
+        assert_eq!(
+            pub_m
+                .writer_offsets
+                .get("writer_1")
+                .map(|e| e.last_applied_offset),
+            Some(0)
+        );
+
+        // 4. Empty forwarded batch (e.g. offset 1) writes empty offset-marker PTWL frame & promotes.
+        let r_empty = store1
+            .ingest_forwarded_batch(
+                "writer_1",
+                "proj_fwd_ag",
+                1,
+                TraceIngestBatch::default(),
+                now_ms + 400,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_empty.accepted_traces, 0);
+        store1.flush_all_l0().await.unwrap();
+        let pub_m2 = store1
+            .upload_project_at("proj_fwd_ag", now_ms + 500, true)
+            .await
+            .unwrap()
+            .expect("published manifest expected for empty offset marker");
+        assert_eq!(
+            pub_m2
+                .writer_offsets
+                .get("writer_1")
+                .map(|e| e.last_applied_offset),
+            Some(1)
+        );
+        store1.close().await.unwrap();
+
+        // 5. Restore onto empty dir2 -> resend offset 0 (previously erased trace!) and offset 1 -> 0 accepted, no resurrection.
+        let routed2_restore =
+            pulse_storage::open_hot_store_for_restore(s3_raw.clone(), dir2.path())
+                .await
+                .unwrap();
+        let pub_latest = PublishedAgentManifestStore::new("proj_fwd_ag", routed2_restore.clone())
+            .unwrap()
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        manifest::install_restored_agent_manifest("proj_fwd_ag", &pub_latest, routed2_restore)
+            .await
+            .unwrap();
+        pulse_storage::finalize_local_hot_store_marker(dir2.path())
+            .await
+            .unwrap();
+
+        let routed2 = pulse_storage::with_hot_store_for_role(s3_raw, dir2.path(), false)
+            .await
+            .unwrap();
+        let store2 = AgentTraceStore::open(routed2, AgentTraceStoreConfig::default())
+            .await
+            .unwrap();
+        let r_resurrect = store2
+            .ingest_forwarded_batch(
+                "writer_1",
+                "proj_fwd_ag",
+                0,
+                sample_batch("tr_fwd_1", now_ms),
+                now_ms + 600,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_resurrect.accepted_traces, 0);
+        assert!(store2
+            .get_trace_detail("proj_fwd_ag", "tr_fwd_1", &[])
+            .await
+            .unwrap()
+            .is_none());
+
+        // 6. Expiry (> T_expire) prunes writer_offsets on GC/flush.
+        store2.set_writer_offset_expire_for_test(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store2
+            .compact_and_gc(Some("proj_fwd_ag"), &[])
+            .await
+            .unwrap();
+        let mf_after_gc = store2
+            .manifest_store("proj_fwd_ag")
+            .await
+            .unwrap()
+            .load_latest()
+            .await
+            .unwrap();
+        assert!(
+            !mf_after_gc.writer_offsets.contains_key("writer_1"),
+            "expired writer_offsets entry must be pruned after T_expire"
+        );
+        store2.close().await.unwrap();
     }
 }

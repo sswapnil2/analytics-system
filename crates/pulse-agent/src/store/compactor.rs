@@ -210,6 +210,11 @@ pub(crate) async fn compact_project_locked(
     }
 
     let grace_ms = store.gc_grace_ms();
+    let offset_expire_ms = store.writer_offset_expire_ms();
+    let has_expired_writer_offsets = manifest
+        .writer_offsets
+        .values()
+        .any(|e| now_ms.saturating_sub(e.last_seen_ts_ms) > offset_expire_ms);
     let has_ready_erased_gc = manifest
         .erased_traces
         .values()
@@ -226,6 +231,7 @@ pub(crate) async fn compact_project_locked(
     // Zero-S3-call idle fast-path when nothing in this project requires compaction, erasure, or GC.
     if active_tombstones.is_empty()
         && newly_erased_ids.is_empty()
+        && !has_expired_writer_offsets
         && !has_ready_erased_gc
         && !has_ready_pending_gc
         && !has_ready_pending_s3
@@ -284,7 +290,7 @@ pub(crate) async fn compact_project_locked(
             let wal_advances = safe_wal
                 .iter()
                 .any(|(wid, &seq)| seq > manifest.committed_wal_seq.get(wid).copied().unwrap_or(0));
-            if !wal_advances {
+            if !wal_advances && !has_expired_writer_offsets {
                 state.dirty_since_compact.store(false, Ordering::Release);
                 return Ok(());
             }
@@ -927,6 +933,14 @@ pub(crate) async fn compact_project_locked(
                     changed = true;
                 }
             }
+            if AgentTraceStore::promote_writer_offsets_into_manifest(
+                state,
+                m,
+                commit_ts_ms,
+                offset_expire_ms,
+            ) {
+                changed = true;
+            }
 
             if changed {
                 m.updated_at_ms = commit_ts_ms;
@@ -940,6 +954,7 @@ pub(crate) async fn compact_project_locked(
         cleanup_orphan_segments(store, &new_segments).await;
     }
     let committed_manifest = commit_res?;
+    AgentTraceStore::finish_writer_offsets_after_commit(state, &committed_manifest);
 
     for seg_id in superseded_map.keys() {
         store.cache().invalidate_segment(seg_id);

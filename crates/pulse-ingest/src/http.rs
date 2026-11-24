@@ -82,7 +82,7 @@ pub fn build_internal_forward_router(
         .with_state(service)
 }
 
-async fn internal_token_middleware(
+pub async fn internal_token_middleware(
     State(expected): State<Option<Arc<String>>>,
     req: Request,
     next: Next,
@@ -156,7 +156,7 @@ async fn handle_forward_identify(
     Json(req): Json<ForwardIdentifyRequest>,
 ) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
     let resp = service
-        .identify_for_project(&req.project_id, req.req)
+        .identify_for_project_local(&req.project_id, req.req)
         .await?;
     Ok(Json(resp))
 }
@@ -166,7 +166,7 @@ async fn handle_forward_engage(
     Json(req): Json<ForwardJsonPayloadRequest>,
 ) -> std::result::Result<Json<crate::service::EngageResponse>, ApiError> {
     let resp = service
-        .engage_for_project(&req.project_id, req.payload)
+        .engage_for_project_local(&req.project_id, req.payload)
         .await?;
     Ok(Json(resp))
 }
@@ -176,7 +176,7 @@ async fn handle_forward_groups(
     Json(req): Json<ForwardJsonPayloadRequest>,
 ) -> std::result::Result<Json<ForwardGroupEngageResponse>, ApiError> {
     let updated = service
-        .group_engage_for_project(&req.project_id, req.payload)
+        .group_engage_for_project_local(&req.project_id, req.payload)
         .await?;
     Ok(Json(ForwardGroupEngageResponse {
         status: "ok".to_string(),
@@ -192,7 +192,7 @@ async fn handle_forward_replay_chunk(
 ) -> std::result::Result<Json<crate::service::ReplayIngestResponse>, ApiError> {
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let resp = service
-        .ingest_replay_for_project(&q.project_id, content_type, &body)
+        .ingest_replay_for_project_local(&q.project_id, content_type, &body)
         .await?;
     Ok(Json(resp))
 }
@@ -235,7 +235,9 @@ async fn handle_identify(
 ) -> std::result::Result<Json<crate::service::IdentifyResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let req: IdentifyRequest = serde_json::from_slice(&body).map_err(IngestError::Json)?;
-    let resp = service.identify(api_key, req).await?;
+    let resp = service
+        .identify_with_headers(api_key, req, Some(&headers))
+        .await?;
     Ok(Json(resp))
 }
 
@@ -245,7 +247,9 @@ async fn handle_engage(
     body: Bytes,
 ) -> std::result::Result<Json<crate::service::EngageResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
-    let resp = service.engage(api_key, &body).await?;
+    let resp = service
+        .engage_with_headers(api_key, &body, Some(&headers))
+        .await?;
     Ok(Json(resp))
 }
 
@@ -255,7 +259,9 @@ async fn handle_groups(
     body: Bytes,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
-    let resp = service.group_engage(api_key, &body).await?;
+    let resp = service
+        .group_engage_with_headers(api_key, &body, Some(&headers))
+        .await?;
     Ok(Json(resp))
 }
 
@@ -266,7 +272,9 @@ async fn handle_replay_chunk(
 ) -> std::result::Result<Json<crate::service::ReplayIngestResponse>, ApiError> {
     let api_key = extract_api_key(&headers).ok_or(IngestError::Unauthorized)?;
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
-    let resp = service.ingest_replay(api_key, content_type, &body).await?;
+    let resp = service
+        .ingest_replay_with_headers(api_key, content_type, &body, Some(&headers))
+        .await?;
     Ok(Json(resp))
 }
 
@@ -377,6 +385,14 @@ impl IntoResponse for ApiError {
                 Json(body),
             )
                 .into_response();
+        }
+        if let IngestError::ForwardLoop(_) = &self.0 {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "forward_loop_detected",
+                "message": self.0.to_string(),
+            });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
         }
         if let IngestError::Storage(pulse_storage::StorageError::StaleWriter { .. }) = &self.0 {
             let body = serde_json::json!({

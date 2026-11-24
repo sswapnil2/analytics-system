@@ -4763,7 +4763,7 @@ impl StorageEngine {
         &self.replay_store
     }
 
-    async fn ensure_writable_owner(&self, project_id: &str) -> Result<()> {
+    pub async fn ensure_writable_owner(&self, project_id: &str) -> Result<()> {
         if self.is_published_reader() {
             return Ok(());
         }
