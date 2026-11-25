@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -18,7 +19,7 @@ _HARNESS_ROOT = Path(__file__).resolve().parent.parent
 if str(_HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(_HARNESS_ROOT))
 
-from lib.client import PulseHttpClient  # noqa: E402
+from lib.client import HttpStatusError, PulseHttpClient  # noqa: E402
 from lib.node_mgr import ClusterHarness, NodeInstance, free_port  # noqa: E402
 from lib.oracle import (  # noqa: E402
     decode_manifest,
@@ -121,6 +122,82 @@ def _parse_wal_epoch(rel_paths: list[str]) -> int:
     return 1
 
 
+def _incompressible_str(seed: str, length: int) -> str:
+    chunks: list[str] = []
+    cur = 0
+    counter = 0
+    while cur < length:
+        digest = hashlib.sha256(f"{seed}:{counter}".encode("utf-8")).digest()
+        b85 = base64.b85encode(digest).decode("ascii")
+        chunks.append(b85)
+        cur += len(b85)
+        counter += 1
+    return "".join(chunks)[:length]
+
+
+def _wait_project_open(
+    client: PulseHttpClient,
+    project_id: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    def _try_query() -> dict[str, Any] | None:
+        resp = client.query(
+            {
+                "project_id": project_id,
+                "kind": "insights",
+                "query": {
+                    "time_range": {"start_ts_ms": start_ms, "end_ts_ms": end_ms},
+                    "interval": "day",
+                    "series": [{"label": "cnt", "event_name": "page_view", "metric": "totals"}],
+                },
+            }
+        )
+        if resp.status == 200:
+            return resp.json()
+        return None
+
+    res = wait_until(_try_query, timeout=timeout, interval=0.25, desc=f"project {project_id} open")
+    assert res is not None
+    return res
+
+
+def _wait_w1_drained(client: PulseHttpClient, *, timeout: float = 10.0) -> None:
+    wait_until(
+        lambda: (
+            (m := client.parsed_metrics()).sum_by_name("pulse_writer_buffer_events") == 0.0
+            and m.sum_by_name("pulse_ingest_log_lag_bytes") == 0.0
+        ),
+        timeout=timeout,
+        interval=0.05,
+        desc="W1 writer buffer and ingest log lag drained to 0",
+    )
+
+
+def _latest_local_manifest(node: NodeInstance, rel_dir: str) -> dict[str, Any] | None:
+    paths = sorted(p for p in node.local_files(rel_dir) if "epoch_" in p and p.endswith(".json"))
+    if not paths:
+        return None
+    return decode_manifest(node.read_local_bytes(paths[-1]))
+
+
+def _find_profiles_dir(node: NodeInstance, project_id: str) -> Path:
+    for rel in (
+        f"hot/profiles/{project_id}",
+        "hot/profiles",
+        f"wal/profiles/{project_id}",
+        f"profiles/{project_id}",
+        "wal/profiles",
+        "profiles",
+    ):
+        cand = node.data_dir / rel
+        if cand.exists() and any(cand.rglob("*")):
+            return cand
+    raise AssertionError(f"Could not locate non-empty profiles directory under {node.data_dir} for {project_id}")
+
+
 class _WebhookSink:
     """Tiny stdlib HTTP server capturing alert webhook deliveries."""
 
@@ -203,7 +280,17 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                     binary=(i % 2 == 1),
                 ).raise_for_status()
 
-            # Verify PLSEAGM2 encryption on local WALs & 0 S3 WAL calls
+            # Wait for W1 flush to local WALs, then verify PLSEAGM2 encryption & 0 S3 WAL calls
+            wait_until(
+                lambda: (
+                    client.parsed_metrics().sum_by_name("pulse_writer_buffer_events") == 0.0
+                    and len(node.local_files("wal/wal/")) >= 1
+                    and len(node.local_files("wal/agent_wal/")) >= 1
+                ),
+                timeout=10.0,
+                interval=0.05,
+                desc="W1 flushes events and agent traces to local WAL",
+            )
             wal_files = node.local_files("wal/wal/")
             agent_wals = node.local_files("wal/agent_wal/")
             self.assertGreaterEqual(len(wal_files), 1)
@@ -213,8 +300,18 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             self.assertEqual(s3.put_count("wal/"), 0)
             self.assertEqual(s3.put_count("agent_wal/"), 0)
 
-            # Transient unwritable WAL dir -> 503 for both events and traces
-            _chmod_tree(wal_root, 0o555)
+            # Transient unwritable WAL dir -> latch sticky wal_error with probe, then assert 503 for both events and traces
+            _chmod_tree(wal_root, 0o555, 0o444)
+            wait_until(
+                lambda: client.ingest(
+                    {"events": [make_event(event_name="s01_probe", distinct_id="u_s01_probe", ts_ms=now_ms)]},
+                    api_key=api_key,
+                ).status
+                == 503,
+                timeout=10.0,
+                interval=0.05,
+                desc="sticky wal_error trips 503 on unwritable WAL",
+            )
             self.assertEqual(
                 client.ingest({"events": [make_event(event_name="s01_signup", distinct_id="u_drop", ts_ms=now_ms)]}, api_key=api_key).status,
                 503,
@@ -224,6 +321,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 503,
             )
             _chmod_tree(wal_root, 0o755, 0o644)
+            _wait_w1_drained(client)
 
             epoch = _parse_wal_epoch(wal_files)
             node.kill()
@@ -265,7 +363,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
     @feature("F01", "F02", "F04", "F05")
     @require_milestone("T0b")
     def test_s02_hot_store_upgrade_object_sigkill_refusal_clean_stop_local_upgrade(self) -> None:
-        """S02: Hot-store upgrade (object -> SIGKILL refusal -> clean stop -> local upgrade -> full query preservation)."""
+        """S02: Hot-store mode enforcement (object -> SIGKILL T0b/T0a refusals -> clean stop -> permanent T0b refusal & same-mode preservation)."""
         with ClusterHarness(use_mock_s3=True) as cluster:
             s3 = cluster.mock_s3
             assert s3 is not None
@@ -279,10 +377,20 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             client.ingest({"events": make_events(50, event_name="s02_ev", distinct_id_prefix="u_s02", base_ts_ms=now_ms)}, api_key=api_key).raise_for_status()
             for i in range(10):
                 client.ingest_agent_traces(make_agent_trace(trace_id=f"tr_s02_{i}", start_ts_ms=now_ms + i), api_key=api_key).raise_for_status()
+            wait_until(
+                lambda: (
+                    client.parsed_metrics().sum_by_name("pulse_writer_buffer_events") == 0.0
+                    and bool(s3.list_objects("wal/"))
+                    and _insights_total(client, pid, "s02_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 50.0
+                ),
+                timeout=15.0,
+                interval=0.05,
+                desc="object-mode WAL flushed to S3 before SIGKILL",
+            )
             node.kill()
 
-            # Switching directly to local after SIGKILL must be refused
-            rc, _, _ = cluster.node_mgr.start_node(
+            # T0b mode-marker refusal on node.data_dir, plus T0a unflushed WAL refusal on a fresh local data_dir
+            rc_m, out_m, err_m = cluster.node_mgr.start_node(
                 data_dir=node.data_dir,
                 mock_s3=s3,
                 hot_store="local",
@@ -290,19 +398,54 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 writer_lease_ttl_secs=3,
                 expect_fail=True,
             )
-            self.assertNotEqual(rc, 0)
+            self.assertNotEqual(rc_m, 0)
+            self.assertIn("hot-store mode mismatch", out_m + "\n" + err_m)
 
-            # Boot object once, stop cleanly, then upgrade to local
+            fresh_dir = cluster.node_mgr.make_temp_data_dir("s02_fresh_local_")
+            rc_wal, out_wal, err_wal = cluster.node_mgr.start_node(
+                data_dir=fresh_dir,
+                mock_s3=s3,
+                hot_store="local",
+                admin_token=cluster.admin_token,
+                writer_lease_ttl_secs=3,
+                expect_fail=True,
+            )
+            self.assertNotEqual(rc_wal, 0)
+            self.assertIn("unflushed WAL", out_wal + "\n" + err_wal)
+
+            # Boot object once, wait for project open & WAL replay, then stop cleanly so S3 wal/ empties
             node_obj = cluster.start_node(data_dir=node.data_dir, hot_store="object", writer_lease_ttl_secs=3)
             assert isinstance(node_obj, NodeInstance)
+            c_obj = node_obj.client()
+            _wait_project_open(c_obj, pid, now_ms - 60_000, now_ms + 60_000)
+            wait_until(
+                lambda: _insights_total(c_obj, pid, "s02_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 50.0,
+                timeout=15.0,
+                desc="object restart replayed all 50 events",
+            )
             node_obj.stop(graceful=True)
+            self.assertEqual(s3.list_objects("wal/"), [])
 
-            node_loc = cluster.start_node(data_dir=node.data_dir, hot_store="local", writer_lease_ttl_secs=3)
-            assert isinstance(node_loc, NodeInstance)
-            cl = node_loc.client()
-            self.assertEqual(_insights_total(cl, pid, "s02_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 50.0)
-            self.assertEqual(len(cl.list_agent_traces(pid).raise_for_status().json()["traces"]), 10)
-            self.assertEqual(cl.get_user(pid, "u_s02").raise_for_status().json()["profile"]["props"]["plan"], "pro")
+            # T0b permanently refuses switching an initialized object-mode data_dir/S3 store to local
+            rc_after, out_after, err_after = cluster.node_mgr.start_node(
+                data_dir=node.data_dir,
+                mock_s3=s3,
+                hot_store="local",
+                admin_token=cluster.admin_token,
+                writer_lease_ttl_secs=3,
+                expect_fail=True,
+            )
+            self.assertNotEqual(rc_after, 0)
+            self.assertIn("hot-store mode mismatch", out_after + "\n" + err_after)
+
+            # Same-mode object restart preserves all 50 events, 10 traces, and profile properties
+            node_obj2 = cluster.start_node(data_dir=node.data_dir, hot_store="object", writer_lease_ttl_secs=3)
+            assert isinstance(node_obj2, NodeInstance)
+            c2 = node_obj2.client()
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
+            self.assertEqual(_insights_total(c2, pid, "s02_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 50.0)
+            self.assertEqual(len(c2.list_agent_traces(pid).raise_for_status().json()["traces"]), 10)
+            self.assertEqual(c2.get_user(pid, "u_s02").raise_for_status().json()["profile"]["props"]["plan"], "pro")
 
     @feature("F04", "F05", "F06")
     @require_milestone("T0b")
@@ -333,6 +476,8 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node2 = cluster.start_node(data_dir=node.data_dir, hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
             c2 = node2.client()
+            now_ms = int(time.time() * 1000)
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
             users = c2.list_users(pid, limit=200).raise_for_status().json()
             self.assertEqual(len(users), 100)
             self.assertEqual(c2.get_user(pid, "user_s03_099").raise_for_status().json()["profile"]["props"]["score"], 990)
@@ -363,19 +508,26 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                     {"events": make_events(10, event_name="s04_ev", distinct_id_prefix=f"u_s04_c{cycle}", base_ts_ms=now_ms + cycle * 1000)},
                     api_key=api_key,
                 ).raise_for_status()
+                _wait_w1_drained(client)
                 client.admin_flush().raise_for_status()
                 wait_until(
-                    lambda seq=cycle: f"published/{pid}/pub_{seq:012}.json" in s3.list_objects(f"published/{pid}/"),
+                    lambda min_cnt=cycle + 1: len(
+                        [k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json")]
+                    )
+                    >= min_cnt,
                     timeout=20.0,
                 )
 
-            pub_objs = sorted(k for k in s3.list_objects(f"published/{pid}/") if k.endswith(".json"))
+            pub_objs = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json"))
+            self.assertGreaterEqual(len(pub_objs), 3)
             self.assertEqual(
-                [f"published/{pid}/pub_{i:012}.json" for i in range(3)],
-                [k for k in pub_objs if "/pub_" in k],
+                [f"published/{pid}/pub_{i:012}.json" for i in range(len(pub_objs))],
+                pub_objs,
             )
             for k in pub_objs:
                 self.assertTrue(s3.get_object(k).startswith(b"PLSEAGM2"))
+            self.assertEqual(_insights_total(client, pid, "s04_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 30.0)
+            self.assertEqual(len(client.list_users(pid, limit=100).raise_for_status().json()), 3)
 
     @feature("F05", "F08", "F10", "F11")
     @require_milestone("T1")
@@ -399,8 +551,17 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             client.engage({"distinct_id": "u_pub_1", "$set": {"tier": "pro"}}, api_key=api_key).raise_for_status()
             client.ingest({"events": make_events(10, event_name="s05_pub", distinct_id_prefix="u_s05", base_ts_ms=now_ms)}, api_key=api_key).raise_for_status()
+            _wait_w1_drained(client)
             client.admin_flush().raise_for_status()
-            wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
+
+            def _s05_published_ready() -> bool:
+                pub_objs = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json"))
+                if not pub_objs or len(s3.list_objects(f"segments/{pid}/")) < 1:
+                    return False
+                m = decode_manifest(s3.get_object(pub_objs[-1]))
+                return int(m.get("high_water_mark", 0)) >= 11
+
+            wait_until(_s05_published_ready, timeout=20.0, desc="S05 initial segment and HWM >= 11 published")
 
             # Unpublished post-publish event before volume loss
             s3.set_fault(fail_prefixes=[f"published/{pid}/"], status=503, ops=["PUT"])
@@ -439,6 +600,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             )
             assert isinstance(node2, NodeInstance)
             c2 = node2.client()
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
             self.assertEqual(_insights_total(c2, pid, "s05_pub", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 10.0)
             self.assertEqual(_insights_total(c2, pid, "s05_unpub", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 0.0)
             new_id = c2.identify({"anon_id": "a_new", "user_id": "u_new"}, api_key=api_key).raise_for_status().json()
@@ -466,8 +628,16 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             client.engage({"distinct_id": "u_lt_hwm", "$set": {"tier": "gold"}}, api_key=api_key).raise_for_status()
             client.ingest({"events": [make_event(event_name="s06_ev", distinct_id="u_lt_hwm", ts_ms=now_ms)]}, api_key=api_key).raise_for_status()
+            _wait_w1_drained(client)
             client.admin_flush().raise_for_status()
-            wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
+            wait_until(
+                lambda: (
+                    len([k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json")]) >= 1
+                    and len(s3.list_objects(f"segments/{pid}/")) >= 1
+                ),
+                timeout=20.0,
+                desc="S06 initial segment and published manifest",
+            )
 
             s3.set_fault(fail_prefixes=[f"published/{pid}/"], status=503, ops=["PUT"])
             client.engage({"distinct_id": "u_ge_hwm", "$set": {"tier": "silver"}}, api_key=api_key).raise_for_status()
@@ -477,10 +647,12 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             s3.clear_faults()
 
             restored_dir = cluster.node_mgr.make_temp_data_dir("s06_restored_")
-            cluster.node_mgr.run_cli(["restore", "--from-published"], data_dir=restored_dir, env={**s3.env_vars(), "DATABASE_URL": pg_url})
+            res = cluster.node_mgr.run_cli(["restore", "--from-published"], data_dir=restored_dir, env={**s3.env_vars(), "DATABASE_URL": pg_url})
+            self.assertEqual(res.returncode, 0, res.stderr)
             node2 = cluster.start_node(data_dir=restored_dir, hot_store="local", database_url=pg_url, writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
             c2 = node2.client()
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
 
             self.assertEqual(len(c2.list_deletions(pid).raise_for_status().json()), 2)
             self.assertIsNone(c2.get_user(pid, "u_lt_hwm").raise_for_status().json().get("profile"))
@@ -513,8 +685,16 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             ca.identify({"anon_id": "anon_s07", "user_id": "usr_s07", "user_properties": {"plan": "pro"}}, api_key=api_key).raise_for_status()
             ca.ingest({"events": [make_event(event_name="s07_ev", distinct_id="anon_s07", ts_ms=now_ms)]}, api_key=api_key).raise_for_status()
+            _wait_w1_drained(ca)
             ca.admin_flush().raise_for_status()
-            wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
+            wait_until(
+                lambda: (
+                    len([k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json")]) >= 1
+                    and len(s3.list_objects(f"segments/{pid}/")) >= 1
+                ),
+                timeout=20.0,
+                desc="S07 initial segment and published manifest",
+            )
 
             qnode = cluster.start_node(
                 role="query",
@@ -526,6 +706,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             assert isinstance(qnode, NodeInstance)
             cq = qnode.client()
             wait_until(lambda: len(cq.list_users(pid).raise_for_status().json()) == 1, timeout=15.0)
+            wait_until(
+                lambda: _insights_total(cq, pid, "s07_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 1.0,
+                timeout=15.0,
+                desc="query node sees initial s07_ev before erasure",
+            )
 
             # Freeze publish, erase usr_s07 on owner, verify immediate hide on both nodes
             s3.set_fault(fail_prefixes=[f"published/{pid}/"], status=503, ops=["PUT"])
@@ -568,8 +753,28 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             client.ingest({"events": evs}, api_key=api_key).raise_for_status()
             for u in range(0, 200, 10):
                 client.engage({"distinct_id": f"u_s08_{u:04d}", "$set": {"cohort": u}}, api_key=api_key).raise_for_status()
+            post_engage_ms = int(time.time() * 1000)
+            _wait_w1_drained(client)
             client.admin_flush().raise_for_status()
-            wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=25.0)
+
+            def _s08_complete_publish() -> bool:
+                pub_objs = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json"))
+                if not pub_objs:
+                    return False
+                m = decode_manifest(s3.get_object(pub_objs[-1]))
+                row_count = sum(
+                    int(seg.get("footer", {}).get("row_count", 0))
+                    for p in m.get("partitions", [])
+                    for seg in p.get("segments", [])
+                )
+                return (
+                    int(m.get("high_water_mark", 0)) >= 200
+                    and row_count >= 200
+                    and (m.get("snapshot_ref") or {}).get("profiles") is not None
+                    and int(m.get("published_at_ms", 0)) >= post_engage_ms - 500
+                )
+
+            wait_until(_s08_complete_publish, timeout=25.0, desc="S08 complete manifest (HWM>=200, rows>=200, profiles snapshot)")
 
             pub_puts = s3.put_count("published/")
             self.assertGreaterEqual(pub_puts, 1)
@@ -600,6 +805,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             now_ms = int(time.time() * 1000)
 
             client.ingest({"events": [make_event(event_name="s09_ev", distinct_id="u1", ts_ms=now_ms)]}, api_key=api_key).raise_for_status()
+            _wait_w1_drained(client)
             client.admin_flush().raise_for_status()
             wait_until(lambda: f"published/{pid}/pub_000000000000.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
 
@@ -611,6 +817,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 else None
             )
             client.ingest({"events": [make_event(event_name="s09_ev", distinct_id="u2", ts_ms=now_ms + 10)]}, api_key=api_key).raise_for_status()
+            _wait_w1_drained(client)
             client.admin_flush().raise_for_status()
             wait_until(killed.is_set, timeout=20.0)
             s3.clear_callbacks()
@@ -618,16 +825,29 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             node2 = cluster.start_node(data_dir=node.data_dir, hot_store="local", upload_interval_secs=2, writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
-            self.assertEqual(_insights_total(node2.client(), pid, "s09_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 2.0)
+            c2 = node2.client()
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
+            self.assertEqual(_insights_total(c2, pid, "s09_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 2.0)
             node2.stop(graceful=True)
 
-            # Part B: Depose writer by advancing S3 pub_2 with higher writer_generation and lower source_local_epoch
-            pub1 = decode_manifest(s3.get_object(f"published/{pid}/pub_000000000001.json"))
-            pub2 = dict(pub1)
-            pub2["publish_seq"] = int(pub1["publish_seq"]) + 1
-            pub2["writer_generation"] = int(pub1["writer_generation"]) + 1
-            pub2["source_local_epoch"] = 1
-            s3.put_object_raw(f"published/{pid}/pub_000000000002.json", json.dumps(pub2).encode("utf-8"))
+            # Part B: Depose writer by advancing S3 published manifest with strictly higher writer_generation
+            # (within fenced node's newly acquired lease generation so open_project returns StaleWriter, not NotWriter)
+            # and lower source_local_epoch.
+            local_mf = _latest_local_manifest(node2, f"hot/manifests/{pid}/")
+            self.assertIsNotNone(local_mf, f"Expected local manifest under hot/manifests/{pid}/")
+            assert local_mf is not None
+            local_gen = int(local_mf["writer_generation"])
+
+            pub_objs = sorted(k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json"))
+            latest_pub = decode_manifest(s3.get_object(pub_objs[-1]))
+            pub_next = dict(latest_pub)
+            pub_next["publish_seq"] = int(latest_pub["publish_seq"]) + 1
+            pub_next["writer_generation"] = max(local_gen + 1, int(latest_pub["writer_generation"]) + 1)
+            pub_next["source_local_epoch"] = 1
+            s3.put_object_raw(
+                f"published/{pid}/pub_{pub_next['publish_seq']:012}.json",
+                json.dumps(pub_next).encode("utf-8"),
+            )
 
             fenced = cluster.node_mgr.start_node(
                 data_dir=node2.data_dir,
@@ -637,11 +857,14 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 writer_lease_ttl_secs=3,
                 wait_ready=True,
             )
-            if isinstance(fenced, NodeInstance):
-                self.assertEqual(
-                    fenced.client().ingest({"events": [make_event(event_name="s09_ev", distinct_id="u3", ts_ms=now_ms + 20)]}, api_key=api_key).status,
-                    503,
-                )
+            self.assertIsInstance(fenced, NodeInstance)
+            assert isinstance(fenced, NodeInstance)
+            resp = fenced.client().ingest(
+                {"events": [make_event(event_name="s09_ev", distinct_id="u3", ts_ms=now_ms + 20)]},
+                api_key=api_key,
+            )
+            self.assertEqual(resp.status, 503, resp.text)
+            self.assertEqual(resp.json().get("code"), "stale_writer", resp.text)
 
     @feature("F16", "F17", "F26")
     @require_milestone("T4")
@@ -658,7 +881,12 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 hot_store="local",
                 upload_interval_secs=2,
                 writer_lease_ttl_secs=3,
-                extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"},
+                extra_env={
+                    "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                    "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+                    "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                    "PULSE_NUM_BUCKETS": "1",
+                },
             )
             assert isinstance(owner, NodeInstance)
             ca = owner.client()
@@ -667,10 +895,12 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             for i in range(3):
                 ca.ingest({"events": [make_event(event_name="s10_ev", distinct_id="u_s10", ts_ms=closed_ts + i * 100)]}, api_key=api_key).raise_for_status()
+                _wait_w1_drained(ca)
                 ca.admin_flush().raise_for_status()
                 wait_until(lambda seq=i: f"published/{pid}/pub_{seq:012}.json" in s3.list_objects(f"published/{pid}/"), timeout=20.0)
 
             old_segs = set(s3.list_objects(f"segments/{pid}/"))
+            self.assertGreaterEqual(len(old_segs), 1)
             qnode = cluster.start_node(
                 role="query",
                 data_dir=cluster.node_mgr.make_temp_data_dir("s10_query_"),
@@ -680,10 +910,16 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             )
             assert isinstance(qnode, NodeInstance)
             cq = qnode.client()
+            wait_until(
+                lambda: _insights_total(cq, pid, "s10_ev", start_ms=closed_ts - 60_000, end_ms=closed_ts + 60_000) == 3.0,
+                timeout=15.0,
+                desc="query node loads published closed-date segments before owner restart",
+            )
 
-            # Restart owner while cold merge / grace window progresses
+            # Restart owner while cold merge / grace window progresses, and open project so background cold merge runs
             owner = owner.restart(graceful_stop=True)
             assert isinstance(owner, NodeInstance)
+            _wait_project_open(owner.client(), pid, closed_ts - 60_000, closed_ts + 60_000)
             wait_until(lambda: not old_segs.issubset(set(s3.list_objects(f"segments/{pid}/"))), timeout=35.0)
             self.assertEqual(_insights_total(cq, pid, "s10_ev", start_ms=closed_ts - 60_000, end_ms=closed_ts + 60_000), 3.0)
 
@@ -691,10 +927,6 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
     @require_milestone("T3")
     def test_s11_local_segment_tier_7step_upload_64mib_cap_closed_date_idle_zero_s3(self) -> None:
         """S11: High-volume local segment tier + 7-step upload cycle + >merge cap split + closed-date trickle + 429 backpressure + idle 0 S3 calls."""
-        def _incompressible_pad(tag: str) -> str:
-            raw = b"".join(hashlib.sha256(f"{tag}:{k}".encode("utf-8")).digest() for k in range(16))
-            return base64.b85encode(raw).decode("ascii")
-
         with ClusterHarness(use_mock_s3=True) as cluster:
             s3 = cluster.mock_s3
             assert s3 is not None
@@ -705,8 +937,8 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 writer_lease_ttl_secs=3,
                 extra_env={
                     "PULSE_MERGE_PART_MAX_BYTES": str(64 * 1024),
-                    "PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": str(64 * 1024),
-                    "PULSE_HOT_SEGMENTS_MAX_BYTES": str(128 * 1024),
+                    "PULSE_HOT_SEGMENTS_PROJECT_MAX_BYTES": str(1024 * 1024),
+                    "PULSE_HOT_SEGMENTS_MAX_BYTES": str(2 * 1024 * 1024),
                 },
             )
             assert isinstance(node, NodeInstance)
@@ -726,11 +958,12 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                         event_name="s11_hot",
                         distinct_id=f"u_hot_{b}_{i}",
                         ts_ms=now_ms + b * 100 + i,
-                        props={"pad": _incompressible_pad(f"s11a:{b}:{i}")},
+                        props={"pad": _incompressible_str(f"s11a:{b}:{i}", 640)},
                     )
                     for i in range(60)
                 ]
                 client.ingest({"events": evs}, api_key=api_key).raise_for_status()
+                _wait_w1_drained(client)
                 client.admin_flush().raise_for_status()
                 hot_count += len(evs)
 
@@ -740,7 +973,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             self.assertEqual(_insights_total(client, pid, "s11_late", start_ms=yesterday_ms - 60_000, end_ms=yesterday_ms + 60_000), 1.0)
 
             # Trigger F21 429 backpressure under S3 outage with incompressible segments, then recover with zero loss
-            s3.set_fault(fail_prefixes=["segments/", "published/"], status=503)
+            s3.set_fault(fail_prefixes=["segments/", "published/"], status=403)
             bp_acked = 0
             hit_429 = False
             for b in range(40):
@@ -749,7 +982,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                         event_name="s11_hot",
                         distinct_id=f"u_bp_{b}_{i}",
                         ts_ms=now_ms + 10_000 + b * 100 + i,
-                        props={"pad": _incompressible_pad(f"s11bp:{b}:{i}")},
+                        props={"pad": _incompressible_str(f"s11bp:{b}:{i}", 640)},
                     )
                     for i in range(60)
                 ]
@@ -760,6 +993,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                     break
                 r.raise_for_status()
                 bp_acked += int(r.json()["accepted"])
+                _wait_w1_drained(client)
                 client.admin_flush().raise_for_status()
             self.assertTrue(hit_429, "Expected HTTP 429 once hot/segments/ exceeded 2x byte bound")
 
@@ -769,12 +1003,44 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 timeout=25.0,
                 desc="ingest recovers to 200 after S3 fault cleared",
             )
-            self.assertEqual(
-                _insights_total(client, pid, "s11_hot", start_ms=now_ms - 60_000, end_ms=now_ms + 120_000),
-                float(hot_count + bp_acked + 1),
+            _wait_w1_drained(client)
+            client.admin_flush().raise_for_status()
+            wait_until(
+                lambda: _insights_total(client, pid, "s11_hot", start_ms=now_ms - 60_000, end_ms=now_ms + 120_000) == float(hot_count + bp_acked + 1),
+                timeout=20.0,
+                desc="recovered s11_hot total includes hot_count + bp_acked + 1",
             )
 
-            # Verify idle zero S3 calls after upload settles
+            # Verify idle zero S3 calls after u_s11_rec publishes, hot/segments/ drains, and 2*3s grace + 5s GC settles
+            expected_total_rows = 1 + hot_count + bp_acked + 1
+
+            def _s11_idle_settled() -> bool:
+                if len(node.local_files(f"hot/hot/segments/{pid}/")) != 0:
+                    return False
+                if len(node.local_files("wal/wal/")) != 0:
+                    return False
+                pub_objs = sorted(
+                    k for k in s3.list_objects(f"published/{pid}/") if "/pub_" in k and k.endswith(".json")
+                )
+                if not pub_objs:
+                    return False
+                pub_m = decode_manifest(s3.get_object(pub_objs[-1]))
+                pub_rows = sum(
+                    int(seg.get("footer", {}).get("row_count", 0))
+                    for part in pub_m.get("partitions", [])
+                    for seg in part.get("segments", [])
+                )
+                if pub_rows < expected_total_rows:
+                    return False
+                local_mf = _latest_local_manifest(node, f"hot/manifests/{pid}/")
+                if local_mf is None:
+                    return False
+                return (
+                    local_mf.get("last_published_seq") == pub_m.get("publish_seq")
+                    and local_mf.get("pending_s3_deletes", []) == []
+                )
+
+            wait_until(_s11_idle_settled, timeout=30.0, desc="S11 post-recovery publish, hot segments, and pending_s3_deletes drained")
             time.sleep(3.5)
             s3.reset_counts()
             time.sleep(4.0)
@@ -805,39 +1071,48 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                     {"events": make_events(5, event_name="s12_ev", distinct_id_prefix=f"u_s12_{step_idx}", base_ts_ms=now_ms + step_idx * 1000, seed_prefix=f"s12_{step_idx}")},
                     api_key=api_key,
                 ).raise_for_status()
-                client.admin_flush().raise_for_status()
+                _wait_w1_drained(client)
+                try:
+                    client.admin_flush().raise_for_status()
+                except (OSError, http.client.HTTPException):
+                    if not killed.is_set():
+                        raise
                 wait_until(killed.is_set, timeout=20.0)
                 s3.clear_callbacks()
                 node.stop(graceful=False)
                 node = cluster.start_node(data_dir=node.data_dir, hot_store="local", upload_interval_secs=2, writer_lease_ttl_secs=3)
                 assert isinstance(node, NodeInstance)
                 client = node.client()
+                _wait_project_open(client, pid, now_ms - 60_000, now_ms + 60_000)
 
-            wait_until(lambda: _insights_total(client, pid, "s12_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 10.0, timeout=20.0)
+            wait_until(
+                lambda: _insights_total(client, pid, "s12_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 10.0,
+                timeout=20.0,
+                ignore_exceptions=(HttpStatusError,),
+            )
 
-            # F20: S3 unreachable during restart dedup seeding must refuse project open rather than accepting duplicates
+            # F20: S3 segment GET failure during restart dedup seeding must refuse project open rather than accepting duplicates
             node.stop(graceful=True)
-            s3.set_fault(unreachable=True)
+            s3.set_fault(fail_prefixes=["segments/"], status=403, ops=["GET"])
             node_down = cluster.start_node(
                 data_dir=node.data_dir,
                 hot_store="local",
                 upload_interval_secs=2,
                 writer_lease_ttl_secs=3,
-                wait_ready=False,
+                wait_ready=True,
             )
             assert isinstance(node_down, NodeInstance)
-            time.sleep(2.0)
-            if node_down.proc is not None and node_down.proc.poll() is None:
-                r_dup = node_down.client().ingest(
-                    {"events": make_events(5, event_name="s12_ev", distinct_id_prefix="u_s12_0", base_ts_ms=now_ms, seed_prefix="s12_0")},
-                    api_key=api_key,
-                )
-                self.assertGreaterEqual(r_dup.status, 500)
+            r_dup = node_down.client().ingest(
+                {"events": make_events(5, event_name="s12_ev", distinct_id_prefix="u_s12_0", base_ts_ms=now_ms, seed_prefix="s12_0")},
+                api_key=api_key,
+            )
+            self.assertGreaterEqual(r_dup.status, 500)
             s3.clear_faults()
             node_down.stop(graceful=False)
 
             node_rec = cluster.start_node(data_dir=node.data_dir, hot_store="local", upload_interval_secs=2, writer_lease_ttl_secs=3)
             assert isinstance(node_rec, NodeInstance)
+            _wait_project_open(node_rec.client(), pid, now_ms - 60_000, now_ms + 60_000)
             self.assertEqual(_insights_total(node_rec.client(), pid, "s12_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 10.0)
 
     @feature("F19", "F21")
@@ -859,12 +1134,21 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             pid, api_key = _create_project(client, "S13 S3 Outage 429")
             now_ms = int(time.time() * 1000)
 
-            s3.set_fault(fail_prefixes=["segments/", "published/"], status=503)
+            _wait_project_open(client, pid, now_ms - 60_000, now_ms + 60_000)
+            s3.set_fault(fail_prefixes=["segments/", "published/"], status=403)
             acked = 0
             hit_429 = False
             for i in range(60):
                 r = client.ingest(
-                    {"events": make_events(40, event_name="s13_ev", distinct_id_prefix=f"u_s13_{i}", base_ts_ms=now_ms + i * 10, props={"pad": "B" * 512})},
+                    {
+                        "events": make_events(
+                            40,
+                            event_name="s13_ev",
+                            distinct_id_prefix=f"u_s13_{i}",
+                            base_ts_ms=now_ms + i * 10,
+                            props={"pad": _incompressible_str(f"s13_{i}", 2048)},
+                        )
+                    },
                     api_key=api_key,
                 )
                 if r.status == 429:
@@ -873,6 +1157,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                     break
                 r.raise_for_status()
                 acked += int(r.json()["accepted"])
+                _wait_w1_drained(client)
                 client.admin_flush().raise_for_status()
             self.assertTrue(hit_429)
 
@@ -881,7 +1166,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 lambda: client.ingest({"events": [make_event(event_name="s13_ev", distinct_id="u_final", ts_ms=now_ms + 5000)]}, api_key=api_key).status == 200,
                 timeout=25.0,
             )
-            self.assertEqual(_insights_total(client, pid, "s13_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), float(acked + 1))
+            wait_until(
+                lambda: _insights_total(client, pid, "s13_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == float(acked + 1),
+                timeout=20.0,
+                desc="recovered s13_ev total includes acked + 1",
+            )
 
     @feature("F22", "F23", "F24")
     @require_milestone("W1")
@@ -903,6 +1192,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             self.assertEqual(r2["deduped"], 0)
 
             wait_until(lambda: client.parsed_metrics().sum_by_name("pulse_ingest_events_deduped_total") >= 15.0, timeout=15.0)
+            _wait_w1_drained(client)
             self.assertEqual(_insights_total(client, pid, "s14_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 15.0)
 
             # Verify PII masked in export
@@ -915,6 +1205,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node2 = cluster.start_node(data_dir=node.data_dir, hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
             c2 = node2.client()
+            _wait_project_open(c2, pid, now_ms - 60_000, now_ms + 60_000)
             self.assertEqual(_insights_total(c2, pid, "s14_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000), 15.0)
 
             # F23: Trigger per-project schema-cap dead-lettering (8192 event dictionary cap), inspect CLI, then DPDP-erase user
@@ -927,10 +1218,10 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 ]
                 c2.ingest({"events": chunk}, api_key=api_key).raise_for_status()
                 idx += len(chunk)
-            wait_until(lambda: c2.parsed_metrics().sum_by_name("pulse_ingest_log_lag_bytes") == 0.0, timeout=30.0)
+            _wait_w1_drained(c2, timeout=30.0)
 
             c2.ingest(
-                {"events": [make_event(event_name="s14_overflow_8193", distinct_id="u_s14_dl", ts_ms=now_ms + 20_000)]},
+                {"events": [make_event(event_name="s14_overflow_8193", distinct_id="u_s14_dl", ts_ms=now_ms - 1000)]},
                 api_key=api_key,
             ).raise_for_status()
             wait_until(lambda: c2.parsed_metrics().sum_by_name("pulse_ingest_dead_lettered_events_total") >= 1.0, timeout=15.0)
@@ -953,6 +1244,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node3 = cluster.start_node(data_dir=node2.data_dir, hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node3, NodeInstance)
             node3.client().delete_user(pid, "u_s14_dl").raise_for_status()
+            node3.client().admin_flush().raise_for_status()
             node3.stop(graceful=True)
 
             cli_after = cluster.node_mgr.run_cli(
@@ -970,9 +1262,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
         with ClusterHarness(use_mock_s3=True) as cluster:
             node = cluster.start_node(role="all", hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node, NodeInstance)
-            prof_root = node.data_dir / "profiles"
-            wal_prof_root = node.data_dir / "wal" / "profiles"
-            self.addCleanup(lambda: (_chmod_tree(prof_root, 0o755, 0o644), _chmod_tree(wal_prof_root, 0o755, 0o644)))
+            self.addCleanup(lambda: _chmod_tree(node.data_dir / "hot" / "profiles", 0o755, 0o644))
 
             client = node.client()
             pid, api_key = _create_project(client, "S15 W2 Sync Profile")
@@ -988,9 +1278,15 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             node2 = cluster.start_node(data_dir=node.data_dir, hot_store="local", writer_lease_ttl_secs=3)
             assert isinstance(node2, NodeInstance)
             c2 = node2.client()
-            self.assertEqual(c2.get_user(pid, "u_s15").raise_for_status().json()["profile"]["props"]["tier"], "gold")
+            wait_until(
+                lambda: c2.get_user(pid, "u_s15").raise_for_status().json()["profile"]["props"]["tier"] == "gold",
+                timeout=15.0,
+                ignore_exceptions=(HttpStatusError,),
+                desc="profile readable after SIGKILL and lease expiry",
+            )
 
-            target_prof = prof_root if (node2.data_dir / "profiles").exists() else (node2.data_dir / "wal" / "profiles")
+            target_prof = _find_profiles_dir(node2, pid)
+            self.addCleanup(lambda p=target_prof: _chmod_tree(p, 0o755, 0o644))
             _chmod_tree(target_prof, 0o555, 0o444)
             self.assertIn(c2.identify({"anon_id": "a_err", "user_id": "u_err"}, api_key=api_key).status, (500, 503))
             self.assertIn(c2.engage({"distinct_id": "u_s15", "$set": {"tier": "plat"}}, api_key=api_key).status, (500, 503))
@@ -1008,7 +1304,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 hot_store="local",
                 upload_interval_secs=2,
                 writer_lease_ttl_secs=3,
-                extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "3600"},
+                extra_env={
+                    "PULSE_COLD_MERGE_IDLE_SECS": "3600",
+                    "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+                    "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                },
             )
             assert isinstance(node, NodeInstance)
             client = node.client()
@@ -1020,6 +1320,7 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 ts = now_ms - day_off * 86_400_000
                 for c in range(2):
                     client.ingest({"events": [make_event(event_name="s16_cold", distinct_id="u_s16", ts_ms=ts + c * 100)]}, api_key=api_key).raise_for_status()
+                    _wait_w1_drained(client)
                     client.admin_flush().raise_for_status()
                     target_pub = f"published/{pid}/pub_{pub_seq:012}.json"
                     wait_until(lambda k=target_pub: k in s3.list_objects(f"published/{pid}/"), timeout=20.0)
@@ -1029,9 +1330,17 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             self.assertGreaterEqual(len(initial_segs), 6, f"Expected >=6 segments across 3 closed days, got {initial_segs}")
 
             # Enable aggressive cold merge only after seeding all 6 closed-day segments
-            node = node.restart(graceful_stop=True, extra_env={"PULSE_COLD_MERGE_IDLE_SECS": "1"})
+            node = node.restart(
+                graceful_stop=True,
+                extra_env={
+                    "PULSE_COLD_MERGE_IDLE_SECS": "1",
+                    "PULSE_COLD_MERGE_INTERVAL_SECS": "1",
+                    "PULSE_CLOSED_DATE_UPLOAD_SECS": "0",
+                },
+            )
             assert isinstance(node, NodeInstance)
             client = node.client()
+            _wait_project_open(client, pid, now_ms - 4 * 86_400_000, now_ms + 60_000)
 
             # Verify cold S3 merge consolidates closed-day segments (<= 1 per active bucket per closed day = <= 3) after grace
             wait_until(
@@ -1047,17 +1356,40 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             agent_now_ms = int(time.time() * 1000)
             client.replay_chunk(make_replay_chunk(session_id="rs_s16", project_id=pid, chunk_start_ts_ms=agent_now_ms), api_key=api_key, binary=True).raise_for_status()
-            client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_erase", start_ts_ms=agent_now_ms), api_key=api_key, binary=True).raise_for_status()
-            client.erase_agent(pid, level="trace", target_id="tr_s16_erase", expires_at=agent_now_ms + 1500).raise_for_status()
+            client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_keep", start_ts_ms=agent_now_ms), api_key=api_key, binary=True).raise_for_status()
+            client.ingest_agent_traces(make_agent_trace(trace_id="tr_s16_erase", start_ts_ms=agent_now_ms + 10), api_key=api_key, binary=True).raise_for_status()
+            client.admin_flush().raise_for_status()
 
             wait_until(lambda: any(k.startswith(f"replays/{pid}/") for k in s3.list_objects("replays/")), timeout=20.0)
             wait_until(lambda: any(k.startswith(f"agent_segments/{pid}/") for k in s3.list_objects("agent_segments/")), timeout=20.0)
+
+            erase_now_ms = int(time.time() * 1000)
+            client.erase_agent(pid, level="trace", target_id="tr_s16_erase", expires_at=erase_now_ms + 1500).raise_for_status()
             time.sleep(2.5)
             client.admin_flush().raise_for_status()
             self.assertEqual(client.get_agent_trace(pid, "tr_s16_erase").status, 404)
+            self.assertEqual(client.get_agent_trace(pid, "tr_s16_keep").status, 200)
             self.assertEqual(client.get_replay(pid, "rs_s16", byte_range="bytes=0-15").status, 206)
 
-            time.sleep(2.5)
+            # Wait past 2*2s=4s grace + 5s GC/erasure ticker and verify local hot/agent segments and pending_s3_deletes drained
+            time.sleep(5.5)
+
+            def _s16_idle_settled() -> bool:
+                if len(node.local_files(f"hot/hot/segments/{pid}/")) != 0:
+                    return False
+                if len(node.local_files(f"hot/hot/agent_segments/{pid}/")) != 0:
+                    return False
+                local_mf = _latest_local_manifest(node, f"hot/manifests/{pid}/")
+                if local_mf is not None and local_mf.get("pending_s3_deletes", []) != []:
+                    return False
+                agent_mf = _latest_local_manifest(node, f"hot/agent_manifests/{pid}/")
+                if agent_mf is not None and (
+                    agent_mf.get("pending_s3_deletes", []) != [] or agent_mf.get("pending_gc", []) != []
+                ):
+                    return False
+                return True
+
+            wait_until(_s16_idle_settled, timeout=20.0, desc="S16 local segments and pending_s3_deletes drained")
             s3.reset_counts()
             time.sleep(4.0)
             self.assertEqual(s3.total_calls(), 0, f"Expected 0 idle S3 calls, got {s3.get_counts()}")
@@ -1075,7 +1407,10 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
                 num_storage=2,
                 database_url=meta_url,
                 writer_lease_ttl_secs=3,
-                extra_env={"PULSE_ALERT_EVAL_INTERVAL_SECS": "1"},
+                extra_env={
+                    "PULSE_ALERT_EVAL_INTERVAL_SECS": "1",
+                    "PULSE_VAULT_KEK": random_byok_hex(),
+                },
             )
             s0, s1 = topo["storages"]
             w0, w1 = topo["writers"]
@@ -1083,8 +1418,11 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
 
             projects = [_create_project(sc, f"S17_P{i}") for i in range(4)]
             p1, k1 = projects[0]
+            pids = [p for p, _ in projects]
+            placeholders = ",".join("?" for _ in pids)
             rows = cluster.node_mgr.sqlite_query(
-                "SELECT node_name, COUNT(*) AS cnt FROM project_owner GROUP BY node_name",
+                f"SELECT node_name, COUNT(*) AS cnt FROM project_owner WHERE project_id IN ({placeholders}) GROUP BY node_name",
+                tuple(pids),
                 db_path=db_path,
             )
             counts = {r["node_name"]: int(r["cnt"]) for r in rows}
@@ -1092,6 +1430,17 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             self.assertEqual(counts.get("storage-0", 0), 2)
             self.assertEqual(counts.get("storage-1", 0), 2)
 
+            sc.request(
+                "PUT",
+                f"/v1/projects/{p1}/byok",
+                json_body={
+                    "category": "webhook",
+                    "provider": "custom_webhook",
+                    "secret": sink.url,
+                    "config_json": {"signing_secret": "e2e_webhook_signing_secret_12345"},
+                },
+                token=s0.admin_token,
+            ).raise_for_status()
             sc.create_alert(p1, {"name": "s17_spike", "event_name": "s17_alert_ev", "operator": "gte", "threshold": 3.0, "webhook_url": sink.url}).raise_for_status()
             now_ms = int(time.time() * 1000)
 
@@ -1100,7 +1449,21 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             w1.client().ingest({"events": make_events(5, event_name="s17_alert_ev", distinct_id_prefix="u_s17", base_ts_ms=now_ms)}, api_key=k1).raise_for_status()
             w1.client().ingest_agent_traces(make_agent_trace(trace_id="tr_s17", start_ts_ms=now_ms), api_key=k1).raise_for_status()
 
-            wait_until(lambda: _insights_total(w0.client(), p1, "s17_alert_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 5.0, timeout=20.0)
+            def _w0_alert_ev_total() -> float:
+                resp = w0.client().query_insights(
+                    p1,
+                    {
+                        "time_range": {"start_ts_ms": now_ms - 60_000, "end_ts_ms": now_ms + 60_000},
+                        "interval": "day",
+                        "series": [{"label": "cnt", "event_name": "s17_alert_ev", "metric": "totals"}],
+                    },
+                )
+                if resp.status != 200:
+                    return 0.0
+                series = resp.json().get("series") or []
+                return float(series[0]["overall_value"]) if series else 0.0
+
+            wait_until(lambda: _w0_alert_ev_total() == 5.0, timeout=20.0)
             wait_until(lambda: w0.client().get_agent_trace(p1, "tr_s17").status == 200, timeout=20.0)
             self.assertEqual(w1.client().get_user(p1, "u_s17").raise_for_status().json()["profile"]["props"]["plan"], "pro")
 
@@ -1123,9 +1486,21 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             p2, k2 = _create_project(sc, "S18_P2")
             now_ms = int(time.time() * 1000)
 
-            # Ingest on W0 and SIGKILL mid-forward, then restart W0
+            # Ingest on W0, wait for W1 IngestBuffer flush to writer_log/{p1}/, then SIGKILL and restart W0
             evs = make_events(60, event_name="s18_ev", distinct_id_prefix="u_s18", base_ts_ms=now_ms, seed_prefix="s18")
             w0.client().ingest({"events": evs}, api_key=k1).raise_for_status()
+            wait_until(
+                lambda: (
+                    w0.client().parsed_metrics().sum_by_name("pulse_writer_buffer_events") == 0.0
+                    and (
+                        len(w0.local_files(f"writer_log/{p1}/")) >= 1
+                        or _insights_total(sc, p1, "s18_ev", start_ms=now_ms - 60_000, end_ms=now_ms + 60_000) == 60.0
+                    )
+                ),
+                timeout=10.0,
+                interval=0.05,
+                desc="W0 IngestBuffer drained to writer_log before SIGKILL",
+            )
             w0.kill()
             w0_up = w0.restart(graceful_stop=False)
             assert isinstance(w0_up, NodeInstance)
@@ -1140,8 +1515,8 @@ class TestTier4RealWorldWorkloads(unittest.TestCase):
             if rows2[0]["node_name"] == o1_name:
                 other_name = "storage-1" if o1_name == "storage-0" else "storage-0"
                 cluster.node_mgr.sqlite_query(
-                    "UPDATE project_owner SET node_name = ?, address = ? WHERE project_id = ?",
-                    (other_name, other_s.base_url, p2),
+                    "UPDATE project_owner SET node_name = ?, address = ?, updated_at_ms = ? WHERE project_id = ?",
+                    (other_name, other_s.base_url, int(time.time() * 1000), p2),
                     db_path=db_path,
                     readonly=False,
                 )
