@@ -1194,6 +1194,7 @@ impl AgentTraceStore {
                 writer.shutdown().await;
             }
         }
+        let mut first_err: Option<StoreError> = None;
         if !self.config.read_only {
             let now_ms = chrono::Utc::now().timestamp_millis();
             for state in &states {
@@ -1208,18 +1209,65 @@ impl AgentTraceStore {
                         StoreError::NotWriter { .. }
                         | StoreError::NotOwner { .. }
                         | StoreError::StaleWriter { .. },
-                    ) => continue,
-                    Err(e) => return Err(e),
+                    ) => {
+                        tracing::info!(
+                            project_id = %state.project_id,
+                            "skipping agent store close flush for fenced/non-owned project"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %state.project_id,
+                            error = %e,
+                            "agent store close flush_project_l0 failed"
+                        );
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                        continue;
+                    }
                 }
                 if self.is_local_hot_tier() && !state.fenced.load(Ordering::Acquire) {
-                    self.upload_project_state(state, now_ms, true, &[], None)
-                        .await?;
+                    match self
+                        .upload_project_state(state, now_ms, true, &[], None)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(
+                            StoreError::NotWriter { .. }
+                            | StoreError::NotOwner { .. }
+                            | StoreError::StaleWriter { .. },
+                        ) => {
+                            tracing::info!(
+                                project_id = %state.project_id,
+                                "skipping agent store close upload for fenced/non-owned project"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                project_id = %state.project_id,
+                                error = %e,
+                                "agent store close upload_project_state failed"
+                            );
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        self.cache.close().await?;
-        Ok(())
+        if let Err(e) = self.cache.close().await {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     // -----------------------------------------------------------------------

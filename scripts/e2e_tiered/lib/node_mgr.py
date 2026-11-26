@@ -277,10 +277,13 @@ class NodeManager:
                 return candidate
             raise FileNotFoundError(f"Specified pulse-node binary not found: {candidate}")
 
-        for rel in ("target/release/pulse-node", "target/debug/pulse-node"):
-            p = self.repo_root / rel
-            if p.is_file():
-                return p
+        candidates = [
+            self.repo_root / rel
+            for rel in ("target/release/pulse-node", "target/debug/pulse-node")
+            if (self.repo_root / rel).is_file()
+        ]
+        if candidates:
+            return max(candidates, key=lambda p: p.stat().st_mtime_ns)
         raise FileNotFoundError(
             f"Could not find pulse-node binary under {self.repo_root / 'target'}"
         )

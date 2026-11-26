@@ -419,6 +419,8 @@ async fn first_object_under(
                 "segments" => "segments",
                 "published" => "published",
                 "agent_published" => "agent_published",
+                "agent_segments" => "agent_segments",
+                "replays" => "replays",
                 _ => "other",
             };
             return Ok(Some((matched, meta.location)));
@@ -567,7 +569,25 @@ pub async fn with_hot_store_for_role(
                         first_object_under(&hot_store, &["profiles", "manifests", "hot/segments"])
                             .await?
                             .is_some();
-                    if has_segments || has_wal || has_local_hot {
+                    let has_unbacked_agent =
+                        first_object_under(&segments, &["agent_published", "agent_segments"])
+                            .await?
+                            .is_some()
+                            && first_object_under(&hot_store, &["agent_manifests"])
+                                .await?
+                                .is_none();
+                    let has_unbacked_replay = first_object_under(&segments, &["replays"])
+                        .await?
+                        .is_some()
+                        && first_object_under(&hot_store, &["hot/replay", "hot/replay_cursors"])
+                            .await?
+                            .is_none();
+                    if has_segments
+                        || has_wal
+                        || has_local_hot
+                        || has_unbacked_agent
+                        || has_unbacked_replay
+                    {
                         return Err(config_error(format!(
                             "hot-store mode is `local` and local identity store `{}` is empty \
                              while existing project state was found; refusing to start to prevent \

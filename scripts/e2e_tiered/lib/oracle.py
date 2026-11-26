@@ -16,7 +16,7 @@ T = TypeVar("T")
 
 MILESTONES: tuple[str, ...] = ("T0a", "T0b", "T1", "T2", "T3", "W1", "W2", "T4", "W3")
 VALID_FEATURES: tuple[str, ...] = tuple(f"F{i:02d}" for i in range(1, 32))
-VALID_TIERS: tuple[str | int, ...] = ("self", 1, 2, 3, 4)
+VALID_TIERS: tuple[str | int, ...] = ("self", 1, 2, 3, 4, 5)
 
 _UNSET = object()
 _ACTIVE_MODE: str | None = None
@@ -91,7 +91,7 @@ def _check_milestone_or_skip(milestone: str) -> None:
 
 
 def tier(value: int | str) -> Callable[[Any], Any]:
-    """Tag a TestCase class or test method with tier `1|2|3|4|'self'`."""
+    """Tag a TestCase class or test method with tier `1|2|3|4|5|'self'`."""
     if isinstance(value, str) and value.isdigit():
         value = int(value)
     if isinstance(value, bool) or value not in VALID_TIERS:

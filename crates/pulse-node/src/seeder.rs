@@ -25,6 +25,17 @@ pub struct SeedSummary {
 }
 
 #[inline]
+fn fit_seed_ts(ts_ms: i64, start_day_ms: i64, max_gen_ms: i64, target_end_ms: i64) -> i64 {
+    if max_gen_ms <= target_end_ms || target_end_ms <= start_day_ms {
+        return ts_ms;
+    }
+    let gen_span = (max_gen_ms - start_day_ms).max(1) as i128;
+    let avail_span = (target_end_ms - start_day_ms).max(1) as i128;
+    let off = (ts_ms - start_day_ms).max(0) as i128;
+    start_day_ms + ((off * avail_span) / gen_span) as i64
+}
+
+#[inline]
 fn seed_hash(salt: &str, u: usize) -> u64 {
     let mut buf = [0u8; 32];
     let sb = salt.as_bytes();
@@ -227,11 +238,19 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     let mut kyc_timeout_sessions: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    let replay_gen_max_ms = start_day_ms + 14 * 86_400_000;
+    let replay_target_end_ms = now_ms - 10_000;
     for r_idx in 0..replay_session_count {
         let u = 200 + r_idx * 17;
         let sess_id = format!("sess_kyc_timeout_{u:05}");
         kyc_timeout_sessions.insert(sess_id.clone());
-        let base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
+        let raw_base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
+        let base_t = fit_seed_ts(
+            raw_base_t,
+            start_day_ms,
+            replay_gen_max_ms,
+            replay_target_end_ms,
+        );
 
         let chunk1 = ReplayChunk {
             project_id: project_id.to_string(),
@@ -466,7 +485,13 @@ m_croma,Electronics_EMI,9.5,Prime\n";
     ];
     for &(u, screen_title, err_msg, api_path) in extra_step_replays {
         let sess_id = format!("sess_onboard_{u:05}");
-        let base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
+        let raw_base_t = start_day_ms + pick_cohort_day(u) * 86_400_000 + 38_000_000;
+        let base_t = fit_seed_ts(
+            raw_base_t,
+            start_day_ms,
+            replay_gen_max_ms,
+            replay_target_end_ms,
+        );
         let chunk = ReplayChunk {
             project_id: project_id.to_string(),
             session_id: sess_id.clone(),
@@ -967,17 +992,19 @@ m_croma,Electronics_EMI,9.5,Prime\n";
 
     id_graph.flush().await?;
 
-    // The synthetic timeline can run past "now" for the newest cohort (a few hours). Real clients never
-    // send future events, so slide the whole timeline back; gaps between a user's events stay the same.
-    let overrun = all_events
+    // The synthetic timeline spans [start_day_ms + 5h, today_floor + ~24h] and can run past `now_ms`
+    // for the newest cohort depending on the current UTC hour. Fit `[start_day_ms, max_ts]` into
+    // `[start_day_ms, now_ms]` so no event is in the future AND all 14 cohorts remain inside
+    // `[exp.start_ts_ms, exp.end_ts_ms]` and the 14-day `[start_day_ms, today_floor + 1d)` window
+    // regardless of UTC time of day, while preserving per-user event ordering.
+    let max_ts = all_events
         .iter()
         .map(|e| e.client_event_ts_ms)
         .max()
-        .unwrap_or(now_ms)
-        - now_ms;
-    if overrun > 0 {
+        .unwrap_or(now_ms);
+    if max_ts > now_ms {
         for e in &mut all_events {
-            e.client_event_ts_ms -= overrun;
+            e.client_event_ts_ms = fit_seed_ts(e.client_event_ts_ms, start_day_ms, max_ts, now_ms);
         }
     }
     let unique_events = all_events.len();
@@ -1420,4 +1447,42 @@ pub async fn seed_agent_demo(
     meta.upsert_agent_experiment(&exp).await?;
     info!(project_id, traces = 60, "Seeded demo AI agent data");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_seed_ts;
+    use pulse_exec::TimeInterval;
+
+    #[test]
+    fn fit_seed_ts_keeps_all_14_cohorts_inside_window_across_utc_hours() {
+        let day_ms = 86_400_000i64;
+        let today_floor = 1_795_651_200_000i64; // 2026-11-26T00:00:00Z
+        let start_day_ms = TimeInterval::Day.align_floor(today_floor) - 13 * day_ms;
+        let min_raw = start_day_ms + 18_000_000; // cohort 0 @ 05:00Z
+        let max_raw = today_floor + day_ms + 28_000; // day 13 retention @ ~24:00:28Z
+
+        for offset_ms in [1_000i64, 7_200_000, 18_000_000, 43_200_000, day_ms - 1] {
+            let now_ms = today_floor + offset_ms;
+            let fitted_min = fit_seed_ts(min_raw, start_day_ms, max_raw, now_ms);
+            let fitted_exp = fit_seed_ts(min_raw + 30_000, start_day_ms, max_raw, now_ms);
+            let fitted_mandate = fit_seed_ts(min_raw + 44_000, start_day_ms, max_raw, now_ms);
+            let fitted_max = fit_seed_ts(max_raw, start_day_ms, max_raw, now_ms);
+
+            assert!(
+                fitted_min >= start_day_ms,
+                "offset={offset_ms}: cohort 0 clipped before start_day_ms"
+            );
+            assert!(
+                fitted_max <= now_ms,
+                "offset={offset_ms}: event exceeds now_ms"
+            );
+            assert!(
+                fitted_min < fitted_exp
+                    && fitted_exp < fitted_mandate
+                    && fitted_mandate < fitted_max,
+                "offset={offset_ms}: ordering violated"
+            );
+        }
+    }
 }

@@ -2313,9 +2313,8 @@ impl ProjectStorage {
         }
     }
 
-    fn after_flush_local_segments(&self, written_segments: &[SegmentMeta], now_ms: i64) {
+    fn record_flushed_local_segments(&self, written_segments: &[SegmentMeta], now_ms: i64) {
         let today_utc = date_from_ms(now_ms);
-        let mut touched_closed_dates: HashSet<NaiveDate> = HashSet::new();
         for meta in written_segments {
             if meta.object_path.starts_with("hot/segments/") {
                 self.record_hot_segment(&meta.object_path, meta.file_size);
@@ -2324,13 +2323,21 @@ impl ProjectStorage {
                         .lock()
                         .entry(meta.date)
                         .or_insert(now_ms);
-                    touched_closed_dates.insert(meta.date);
                 }
             }
         }
+    }
+
+    fn notify_upload_if_hot_pressure(&self, written_segments: &[SegmentMeta], now_ms: i64) {
         if !self.is_local_segment_tier() || self.upload_interval().is_zero() {
             return;
         }
+        let today_utc = date_from_ms(now_ms);
+        let touched_closed_dates: HashSet<NaiveDate> = written_segments
+            .iter()
+            .filter(|meta| meta.object_path.starts_with("hot/segments/") && meta.date < today_utc)
+            .map(|meta| meta.date)
+            .collect();
         let proj_bytes = self.hot_segment_bytes();
         let proj_1x = self.node_load.hot_seg_max_project.load(Ordering::Relaxed);
         let node_bytes = self.node_load.hot_segment_bytes.load(Ordering::Relaxed);
@@ -2501,52 +2508,58 @@ impl ProjectStorage {
         let expire_ms = self.writer_offset_expire_ms();
         // Atomically commit new MVCC Manifest epoch (without holding `publish_lock`) BEFORE evicting from L0 MemBucket!
         let committed_res = self
-            .commit_manifest_cas(|next_manifest| {
-                for meta in &written_segments {
-                    let key = (meta.date, bucket_id);
-                    next_manifest
-                        .active_segments
-                        .entry(key)
-                        .or_default()
-                        .push(meta.clone());
-                    if !meta.object_path.starts_with("hot/") {
+            .commit_manifest_cas_with_hook(
+                |next_manifest| {
+                    for meta in &written_segments {
+                        let key = (meta.date, bucket_id);
                         next_manifest
-                            .s3_partition_last_upload_ms
-                            .insert(key, flush_ts_ms);
-                        prune_s3_partition_upload_time(next_manifest, key);
+                            .active_segments
+                            .entry(key)
+                            .or_default()
+                            .push(meta.clone());
+                        if !meta.object_path.starts_with("hot/") {
+                            next_manifest
+                                .s3_partition_last_upload_ms
+                                .insert(key, flush_ts_ms);
+                            prune_s3_partition_upload_time(next_manifest, key);
+                        }
                     }
-                }
-                if max_l0 > 0 {
+                    if max_l0 > 0 {
+                        next_manifest
+                            .committed_l0_seq
+                            .entry(bucket_id)
+                            .and_modify(|v| *v = (*v).max(max_l0))
+                            .or_insert(max_l0);
+                    }
                     next_manifest
-                        .committed_l0_seq
+                        .committed_wal_seq
                         .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_l0))
-                        .or_insert(max_l0);
-                }
-                next_manifest
-                    .committed_wal_seq
-                    .entry(bucket_id)
-                    .and_modify(|v| *v = (*v).max(max_wal))
-                    .or_insert(max_wal);
-                for (wid, entry) in &promotable_offsets {
-                    next_manifest
-                        .writer_offsets
-                        .entry((wid.clone(), bucket_id))
-                        .and_modify(|cur| {
-                            cur.last_applied_offset =
-                                cur.last_applied_offset.max(entry.last_applied_offset);
-                            cur.last_seen_ts_ms = cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
-                        })
-                        .or_insert(*entry);
-                }
-                prune_expired_writer_offsets(
-                    &mut next_manifest.writer_offsets,
-                    flush_ts_ms,
-                    expire_ms,
-                );
-                next_manifest.dict_snapshot = self.dictionary.snapshot();
-                true
-            })
+                        .and_modify(|v| *v = (*v).max(max_wal))
+                        .or_insert(max_wal);
+                    for (wid, entry) in &promotable_offsets {
+                        next_manifest
+                            .writer_offsets
+                            .entry((wid.clone(), bucket_id))
+                            .and_modify(|cur| {
+                                cur.last_applied_offset =
+                                    cur.last_applied_offset.max(entry.last_applied_offset);
+                                cur.last_seen_ts_ms =
+                                    cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+                            })
+                            .or_insert(*entry);
+                    }
+                    prune_expired_writer_offsets(
+                        &mut next_manifest.writer_offsets,
+                        flush_ts_ms,
+                        expire_ms,
+                    );
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                },
+                |_| {
+                    self.record_flushed_local_segments(&written_segments, flush_ts_ms);
+                },
+            )
             .await;
 
         let committed_opt = match committed_res {
@@ -2572,7 +2585,7 @@ impl ProjectStorage {
         let _ = self.wals[b_idx].purge_up_to(max_wal).await;
 
         let now_ms = Utc::now().timestamp_millis();
-        self.after_flush_local_segments(&written_segments, now_ms);
+        self.notify_upload_if_hot_pressure(&written_segments, now_ms);
         drop(bucket_guard);
 
         if committed_opt.is_some()
@@ -3268,9 +3281,21 @@ impl ProjectStorage {
         Ok(Some(published))
     }
 
-    async fn commit_manifest_cas<F>(&self, mut apply: F) -> Result<Option<Arc<Manifest>>>
+    async fn commit_manifest_cas<F>(&self, apply: F) -> Result<Option<Arc<Manifest>>>
     where
         F: FnMut(&mut Manifest) -> bool,
+    {
+        self.commit_manifest_cas_with_hook(apply, |_| {}).await
+    }
+
+    async fn commit_manifest_cas_with_hook<F, H>(
+        &self,
+        mut apply: F,
+        mut on_committed: H,
+    ) -> Result<Option<Arc<Manifest>>>
+    where
+        F: FnMut(&mut Manifest) -> bool,
+        H: FnMut(&Manifest),
     {
         let _commit_guard = self.manifest_commit_lock.lock().await;
         for attempt in 0..8u8 {
@@ -3292,6 +3317,7 @@ impl ProjectStorage {
             }
             match self.manifest_store.commit_next(candidate).await {
                 Ok(committed) => {
+                    on_committed(&committed);
                     let arc = Arc::new(committed);
                     *self.manifest.write() = arc.clone();
                     // Throttle manifest GC to every 16 commits so bursty flushes/compactions do
@@ -3430,57 +3456,62 @@ impl ProjectStorage {
         let flush_ts_ms = Utc::now().timestamp_millis();
         let expire_ms = self.writer_offset_expire_ms();
         let committed_res = self
-            .commit_manifest_cas(|next_manifest| {
-                for meta in &written_segments {
-                    let key = (meta.date, meta.bucket_id);
-                    next_manifest
-                        .active_segments
-                        .entry(key)
-                        .or_default()
-                        .push(meta.clone());
-                    if !meta.object_path.starts_with("hot/") {
+            .commit_manifest_cas_with_hook(
+                |next_manifest| {
+                    for meta in &written_segments {
+                        let key = (meta.date, meta.bucket_id);
                         next_manifest
-                            .s3_partition_last_upload_ms
-                            .insert(key, flush_ts_ms);
-                        prune_s3_partition_upload_time(next_manifest, key);
+                            .active_segments
+                            .entry(key)
+                            .or_default()
+                            .push(meta.clone());
+                        if !meta.object_path.starts_with("hot/") {
+                            next_manifest
+                                .s3_partition_last_upload_ms
+                                .insert(key, flush_ts_ms);
+                            prune_s3_partition_upload_time(next_manifest, key);
+                        }
                     }
-                }
-                for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
-                    if max_l0 > 0 {
+                    for &(bucket_id, _, max_l0, max_wal) in &bucket_watermarks {
+                        if max_l0 > 0 {
+                            next_manifest
+                                .committed_l0_seq
+                                .entry(bucket_id)
+                                .and_modify(|v| *v = (*v).max(max_l0))
+                                .or_insert(max_l0);
+                        }
                         next_manifest
-                            .committed_l0_seq
+                            .committed_wal_seq
                             .entry(bucket_id)
-                            .and_modify(|v| *v = (*v).max(max_l0))
-                            .or_insert(max_l0);
+                            .and_modify(|v| *v = (*v).max(max_wal))
+                            .or_insert(max_wal);
                     }
-                    next_manifest
-                        .committed_wal_seq
-                        .entry(bucket_id)
-                        .and_modify(|v| *v = (*v).max(max_wal))
-                        .or_insert(max_wal);
-                }
-                for (bucket_id, entries) in &promotable_by_bucket {
-                    for (wid, entry) in entries {
-                        next_manifest
-                            .writer_offsets
-                            .entry((wid.clone(), *bucket_id))
-                            .and_modify(|cur| {
-                                cur.last_applied_offset =
-                                    cur.last_applied_offset.max(entry.last_applied_offset);
-                                cur.last_seen_ts_ms =
-                                    cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
-                            })
-                            .or_insert(*entry);
+                    for (bucket_id, entries) in &promotable_by_bucket {
+                        for (wid, entry) in entries {
+                            next_manifest
+                                .writer_offsets
+                                .entry((wid.clone(), *bucket_id))
+                                .and_modify(|cur| {
+                                    cur.last_applied_offset =
+                                        cur.last_applied_offset.max(entry.last_applied_offset);
+                                    cur.last_seen_ts_ms =
+                                        cur.last_seen_ts_ms.max(entry.last_seen_ts_ms);
+                                })
+                                .or_insert(*entry);
+                        }
                     }
-                }
-                prune_expired_writer_offsets(
-                    &mut next_manifest.writer_offsets,
-                    flush_ts_ms,
-                    expire_ms,
-                );
-                next_manifest.dict_snapshot = self.dictionary.snapshot();
-                true
-            })
+                    prune_expired_writer_offsets(
+                        &mut next_manifest.writer_offsets,
+                        flush_ts_ms,
+                        expire_ms,
+                    );
+                    next_manifest.dict_snapshot = self.dictionary.snapshot();
+                    true
+                },
+                |_| {
+                    self.record_flushed_local_segments(&written_segments, flush_ts_ms);
+                },
+            )
             .await;
 
         let committed_opt = match committed_res {
@@ -3510,7 +3541,7 @@ impl ProjectStorage {
         }
 
         let now_ms = Utc::now().timestamp_millis();
-        self.after_flush_local_segments(&written_segments, now_ms);
+        self.notify_upload_if_hot_pressure(&written_segments, now_ms);
         drop(guards);
 
         if committed_opt.is_some()

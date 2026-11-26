@@ -1987,3 +1987,121 @@ fn t4_27bc_fenced_ingest_503_post_purge_pre_expiry_reingest_restart_and_restore_
         restored.shutdown().await;
     });
 }
+
+#[test]
+fn t4_adversarial_agent_store_close_fenced_project_does_not_skip_siblings() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::set(&[
+        ("PULSE_HOT_STORE", Some("local")),
+        ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
+        ("PULSE_BYOK_MASTER_KEY", Some(TEST_BYOK_KEY)),
+    ]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("node");
+        let s3_dir = tmp.path().join("s3");
+        std::fs::create_dir_all(&s3_dir).unwrap();
+        let s3_fs: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&s3_dir).unwrap());
+        let routed = pulse_storage::with_hot_store_for_role(s3_fs.clone(), &data_dir, false)
+            .await
+            .unwrap();
+        let enc = Arc::new(pulse_storage::EncryptedObjectStore::new(routed));
+        let mut byok_bytes = [0u8; 32];
+        for (idx, b) in byok_bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&TEST_BYOK_KEY[idx * 2..idx * 2 + 2], 16).unwrap();
+        }
+        enc.set_master_key(Some(byok_bytes));
+
+        let store = pulse_agent::AgentTraceStore::open_with_encrypted(
+            enc.as_object_store(),
+            Some(enc.clone()),
+            pulse_agent::AgentTraceStoreConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for idx in 0..8usize {
+            let pid = format!("proj_{idx:02}");
+            let batch: TraceIngestBatch = serde_json::from_value(trace_json(
+                &format!("tr_{idx:02}"),
+                &format!("sess_{idx:02}"),
+                &format!("u_{idx:02}"),
+                now_ms + idx as i64,
+                "prompt",
+            ))
+            .unwrap();
+            store.ingest_batch(&pid, batch).await.unwrap();
+        }
+
+        // Seed Step 4 conflict (`pub_000000000000.json`) for half the projects so `close()` hits
+        // `StoreError::NotWriter` during `upload_project_state`.
+        for idx in 0..4usize {
+            let pid = format!("proj_{idx:02}");
+            let pub_store = PublishedAgentManifestStore::new(&pid, enc.as_object_store()).unwrap();
+            let hijacked = pulse_agent::store::manifest::PublishedAgentManifest {
+                publish_seq: 0,
+                writer_generation: 99,
+                source_local_epoch: 1,
+                published_at_ms: now_ms,
+                committed_wal_seq: BTreeMap::new(),
+                segments: Vec::new(),
+                erased_traces: BTreeMap::new(),
+                intent_id: Some("hijack".to_string()),
+                writer_offsets: BTreeMap::new(),
+            };
+            pub_store.publish_next(hijacked).await.unwrap();
+        }
+
+        // `close()` must gracefully ignore `NotWriter` on fenced projects, continue flushing and
+        // publishing all remaining unfenced projects, and cleanly close Foyer cache (`cache.close()`).
+        store.close().await.unwrap();
+        // Idempotent second close must also return Ok(()).
+        store.close().await.unwrap();
+
+        let mut unfenced_published = 0usize;
+        for idx in 4..8usize {
+            let pid = format!("proj_{idx:02}");
+            let pub_store = PublishedAgentManifestStore::new(&pid, enc.as_object_store()).unwrap();
+            let latest = pub_store.load_latest().await.unwrap();
+            assert!(
+                latest.is_some(),
+                "unfenced project {pid} must be published during close() despite fenced siblings"
+            );
+            assert_eq!(latest.unwrap().segments.len(), 1);
+            unfenced_published += 1;
+        }
+        assert_eq!(unfenced_published, 4);
+
+        // Remove the intentionally fenced projects' local manifest dirs so reopening `store2`
+        // opens only the 4 unfenced projects and verifies the Foyer disk cache closed cleanly.
+        for idx in 0..4usize {
+            let pid = format!("proj_{idx:02}");
+            let _ = std::fs::remove_dir_all(data_dir.join("hot/agent_manifests").join(&pid));
+        }
+        let store2 = pulse_agent::AgentTraceStore::open_with_encrypted(
+            enc.as_object_store(),
+            Some(enc.clone()),
+            pulse_agent::AgentTraceStoreConfig::default(),
+        )
+        .await
+        .unwrap();
+        for idx in 4..8usize {
+            let pid = format!("proj_{idx:02}");
+            let got = store2
+                .get_trace_detail(&pid, &format!("tr_{idx:02}"), &[])
+                .await
+                .unwrap();
+            assert!(got.is_some(), "reopened store must read {pid} trace");
+        }
+        store2.close().await.unwrap();
+    });
+}

@@ -26,7 +26,7 @@ from lib.oracle import (  # noqa: E402
     set_active_gating,
 )
 
-_TIER_ORDER: dict[Any, int] = {"self": 0, 1: 1, 2: 2, 3: 3, 4: 4, None: 99}
+_TIER_ORDER: dict[Any, int] = {"self": 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, None: 99}
 
 
 def _iter_test_cases(suite: unittest.TestSuite) -> list[unittest.TestCase]:
@@ -83,7 +83,10 @@ def _discover_cases(
         tc_feats = meta["features"]
         tc_ms = meta["milestone"]
 
-        if tier_filter != "all":
+        if tier_filter == "1-4":
+            if tc_tier not in ("self", 1, 2, 3, 4):
+                continue
+        elif tier_filter != "all":
             want_tier: Any = "self" if tier_filter == "self" else int(tier_filter)
             if tc_tier != want_tier:
                 continue
@@ -112,7 +115,7 @@ def _summarize(cases: list[unittest.TestCase]) -> dict[str, Any]:
         m_label = str(meta["milestone"]) if meta["milestone"] is not None else "none"
         by_milestone[m_label] += 1
 
-    ordered_tiers = {k: by_tier[k] for k in ("self", "1", "2", "3", "4") if by_tier[k] or k in ("self", "1", "2", "3", "4")}
+    ordered_tiers = {k: by_tier[k] for k in ("self", "1", "2", "3", "4", "5") if by_tier[k] or k in ("self", "1", "2", "3", "4", "5")}
     if by_tier.get("untagged"):
         ordered_tiers["untagged"] = by_tier["untagged"]
     ordered_features = {f: by_feature[f] for f in VALID_FEATURES if by_feature[f]}
@@ -185,7 +188,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tier",
-        choices=["all", "self", "1", "2", "3", "4"],
+        choices=["all", "self", "1", "2", "3", "4", "5", "1-4"],
         default="all",
         help="Tier to list or execute (default: all).",
     )
@@ -278,11 +281,24 @@ def _prepare_binary(*, no_build: bool, explicit_binary: str | None) -> Path | No
             os.environ["E2E_TIERED_BINARY"] = str(debug_bin)
             return debug_bin
 
-    for rel in ("target/release/pulse-node", "target/debug/pulse-node"):
-        cand = repo_root / rel
-        if cand.is_file():
-            os.environ["E2E_TIERED_BINARY"] = str(cand)
-            return cand
+    if no_build:
+        env_bin = os.environ.get("E2E_TIERED_BINARY", "").strip()
+        if env_bin:
+            p = Path(env_bin).resolve()
+            if not p.is_file():
+                raise SystemExit(f"Specified E2E_TIERED_BINARY does not exist: {p}")
+            os.environ["E2E_TIERED_BINARY"] = str(p)
+            return p
+
+    candidates = [
+        repo_root / rel
+        for rel in ("target/release/pulse-node", "target/debug/pulse-node")
+        if (repo_root / rel).is_file()
+    ]
+    if candidates:
+        cand = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+        os.environ["E2E_TIERED_BINARY"] = str(cand)
+        return cand
     return None
 
 

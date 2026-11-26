@@ -530,3 +530,336 @@ fn metrics_endpoint_exposes_w1_wal_lag_and_queue_metrics_and_alerts_yaml_is_pres
         );
     }
 }
+
+#[test]
+fn quic_writer_async_flush_bound_and_mixed_batch_atomicity() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _hot = EnvGuard::set("PULSE_HOT_STORE", Some("local"));
+    let _ttl = EnvGuard::set("PULSE_WRITER_LEASE_TTL_SECS", Some("2"));
+    let _upload = EnvGuard::set("PULSE_UPLOAD_INTERVAL_SECS", Some("300"));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Part 1: QUIC against NodeRole::All with 60s flush bound + abrupt crash loses buffered batch;
+    // with 20ms flush bound + 120ms wait, abrupt crash preserves 100% of QUIC events in WAL.
+    {
+        let _flush = EnvGuard::set("PULSE_WRITER_FLUSH_MS", Some("60000"));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let s3 = Arc::new(InMemory::new());
+        let s3_c = s3.clone();
+        std::thread::spawn(move || {
+            let rt_c = tokio::runtime::Runtime::new().unwrap();
+            rt_c.block_on(async move {
+                let mut cfg = node_config(&dir, "proj_quic_60s");
+                cfg.quic_addr = Some("127.0.0.1:0".parse().unwrap());
+                let node = start_pulse_node_with_store(cfg, s3_c).await.unwrap();
+                let key = node
+                    .bootstrap_credentials
+                    .generated_ingest_key
+                    .clone()
+                    .unwrap();
+                let quic = node.quic.as_ref().unwrap();
+                let ts = 1_790_000_000_000i64;
+                let batch = WireBatch::new(vec![WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid("qu1", "qs", "Quic60s", ts, 1),
+                    routing_seed: "qu1".into(),
+                    distinct_id: "qu1".into(),
+                    session_id: "qs".into(),
+                    event_name: "Quic60s".into(),
+                    client_event_ts_ms: ts,
+                    client_sent_ts_ms: ts,
+                    props: Vec::new(),
+                    replay_offset_kb: 0,
+                }]);
+                let plsb = batch.encode_binary(1).unwrap();
+                let resp = pulse_ingest::quic::send_quic_ingest_batch(
+                    quic.local_addr,
+                    &quic.cert_der,
+                    &key,
+                    &plsb,
+                )
+                .await
+                .unwrap();
+                assert_eq!(resp.accepted, 1);
+                assert_eq!(resp.deduped, 0);
+                std::mem::forget(node);
+            });
+            rt_c.shutdown_background();
+        })
+        .join()
+        .unwrap();
+
+        rt.block_on(async {
+            let node = start_pulse_node_with_store(node_config(tmp.path(), "proj_quic_60s"), s3)
+                .await
+                .unwrap();
+            let mut rows = 0usize;
+            for _ in 0..40 {
+                if let Ok(ps) = node.storage.open_for_read("proj_quic_60s").await {
+                    rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            assert_eq!(
+                rows, 0,
+                "60s flush window must not yet be durable before flush"
+            );
+            node.shutdown().await;
+        });
+    }
+
+    {
+        let _flush = EnvGuard::set("PULSE_WRITER_FLUSH_MS", Some("20"));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let s3 = Arc::new(InMemory::new());
+        let s3_c = s3.clone();
+        std::thread::spawn(move || {
+            let rt_c = tokio::runtime::Runtime::new().unwrap();
+            rt_c.block_on(async move {
+                let mut cfg = node_config(&dir, "proj_quic_20ms");
+                cfg.quic_addr = Some("127.0.0.1:0".parse().unwrap());
+                let node = start_pulse_node_with_store(cfg, s3_c).await.unwrap();
+                let key = node
+                    .bootstrap_credentials
+                    .generated_ingest_key
+                    .clone()
+                    .unwrap();
+                let quic = node.quic.as_ref().unwrap();
+                let ts = 1_790_000_000_000i64;
+                let batch = WireBatch::new(vec![WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid("qu2", "qs", "Quic20ms", ts, 2),
+                    routing_seed: "qu2".into(),
+                    distinct_id: "qu2".into(),
+                    session_id: "qs".into(),
+                    event_name: "Quic20ms".into(),
+                    client_event_ts_ms: ts,
+                    client_sent_ts_ms: ts,
+                    props: Vec::new(),
+                    replay_offset_kb: 0,
+                }]);
+                let plsb = batch.encode_binary(1).unwrap();
+                let resp = pulse_ingest::quic::send_quic_ingest_batch(
+                    quic.local_addr,
+                    &quic.cert_der,
+                    &key,
+                    &plsb,
+                )
+                .await
+                .unwrap();
+                assert_eq!(resp.accepted, 1);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                std::mem::forget(node);
+            });
+            rt_c.shutdown_background();
+        })
+        .join()
+        .unwrap();
+
+        rt.block_on(async {
+            let node = start_pulse_node_with_store(node_config(tmp.path(), "proj_quic_20ms"), s3)
+                .await
+                .unwrap();
+            let mut ps_opt = None;
+            for _ in 0..40 {
+                if let Ok(ps) = node.storage.open_for_read("proj_quic_20ms").await {
+                    ps_opt = Some(ps);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let ps = ps_opt.expect("20ms QUIC node must reopen cleanly");
+            let rows = ps.snapshot().manifest.total_l1_rows() as usize + ps.total_l0_rows();
+            assert_eq!(rows, 1, "20ms flushed QUIC event must survive abrupt crash");
+            node.shutdown().await;
+        });
+    }
+
+    // Part 2: NodeRole::Writer QUIC mixed-batch identify failure (returns QUIC error + 0 buffered
+    // events) and QUIC 429 writer_log_backpressure without cross-project HOL.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_db = tmp.path().join("w3_quic.db");
+        let meta_url = format!("sqlite://{}", meta_db.display());
+        let _db = EnvGuard::set("DATABASE_URL", Some(&meta_url));
+        let _flush = EnvGuard::set("PULSE_WRITER_FLUSH_MS", Some("10"));
+        let _cap = EnvGuard::set("PULSE_WRITER_LOG_PROJECT_MAX_BYTES", Some("1024"));
+        let _cache = EnvGuard::set("PULSE_OWNER_CACHE_TTL_MS", Some("60000"));
+
+        rt.block_on(async {
+            let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut owner_cfg = node_config(&tmp.path().join("owner"), "proj_q_default");
+            owner_cfg.role = NodeRole::All;
+            let owner = pulse_node::start_pulse_node_with_store_and_identity(
+                owner_cfg,
+                s3.clone(),
+                pulse_node::NodeIdentity::new("ing-quic", None),
+            )
+            .await
+            .unwrap();
+            let owner_url = format!("http://{}", owner.http_addr);
+
+            let mut w_cfg = node_config(&tmp.path().join("writer"), "proj_q_default");
+            w_cfg.role = NodeRole::Writer;
+            w_cfg.quic_addr = Some("127.0.0.1:0".parse().unwrap());
+            let writer = pulse_node::start_pulse_node_with_store_and_identity(
+                w_cfg,
+                Arc::new(InMemory::new()),
+                pulse_node::NodeIdentity::new("writer-quic", None),
+            )
+            .await
+            .unwrap();
+            let quic = writer.quic.as_ref().unwrap();
+
+            let create_proj = |name: &str| {
+                let url = owner_url.clone();
+                let name = name.to_string();
+                async move {
+                    let resp: Value = http_client()
+                        .post(format!("{url}/v1/projects"))
+                        .bearer_auth(ADMIN)
+                        .json(&json!({ "name": name }))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    (
+                        resp["project"]["id"].as_str().unwrap().to_string(),
+                        resp["api_key"]["plaintext_key"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                }
+            };
+            let (p1, pk1) = create_proj("quic-p1").await;
+            let (p2, pk2) = create_proj("quic-p2").await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            owner
+                .control
+                .meta()
+                .set_project_owner(&p1, "ing-quic", &owner_url, now_ms)
+                .await
+                .unwrap();
+            owner
+                .control
+                .meta()
+                .set_project_owner(&p2, "ing-quic", &owner_url, now_ms)
+                .await
+                .unwrap();
+
+            // Pre-link `anon_conflict` -> `canon_1`, then try mixed batch identifying `anon_conflict`
+            // -> `canon_2` + track event; sync identify conflict must fail and buffer 0 events.
+            assert_eq!(
+                http_client()
+                    .post(format!("{owner_url}/v1/identify"))
+                    .header("x-pulse-key", &pk1)
+                    .json(&json!({ "anon_id": "anon_conflict", "user_id": "canon_1" }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            let mixed_bad = serde_json::to_vec(&json!({
+                "batch": [
+                    { "type": "identify", "anonymousId": "anon_conflict", "userId": "canon_2" },
+                    { "type": "track", "userId": "u_should_not_buffer", "event": "Mixed_Fail_Ev", "messageId": "mf_1", "timestamp": now_ms }
+                ]
+            }))
+            .unwrap();
+            let err = pulse_ingest::quic::send_quic_ingest_batch(
+                quic.local_addr,
+                &quic.cert_der,
+                &pk1,
+                &mixed_bad,
+            )
+            .await
+            .expect_err("mixed-batch identify conflict over QUIC must fail");
+            let err_s = err.to_string();
+            assert!(
+                err_s.contains("conflict") || err_s.contains("error"),
+                "expected conflict QUIC error, got {err_s}"
+            );
+            assert_eq!(writer.ingest.buffer_stats().buffer_events, 0);
+
+            // Shutdown owner to induce writer_log backpressure on P1 over QUIC, while P2 succeeds!
+            owner.shutdown().await;
+            let mut hit_quic_429 = false;
+            for i in 0..20usize {
+                let batch = WireBatch::new(vec![WireEvent {
+                    event_uuid: WireEvent::deterministic_uuid(
+                        "qp1",
+                        "s",
+                        "Q429",
+                        now_ms + i as i64,
+                        i as u64,
+                    ),
+                    routing_seed: "qp1".into(),
+                    distinct_id: format!("qp1_{i}"),
+                    session_id: "s".into(),
+                    event_name: "Q429".into(),
+                    client_event_ts_ms: now_ms + i as i64,
+                    client_sent_ts_ms: now_ms + i as i64,
+                    props: vec![("pad".into(), PropValue::Str("z".repeat(600)))],
+                    replay_offset_kb: 0,
+                }]);
+                let plsb = batch.encode_binary(1).unwrap();
+                match pulse_ingest::quic::send_quic_ingest_batch(
+                    quic.local_addr,
+                    &quic.cert_der,
+                    &pk1,
+                    &plsb,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(e) => {
+                        let s = e.to_string();
+                        assert!(
+                            s.contains("writer_log_backpressure"),
+                            "expected writer_log_backpressure over QUIC, got {s}"
+                        );
+                        hit_quic_429 = true;
+                        break;
+                    }
+                }
+            }
+            assert!(hit_quic_429, "P1 must hit writer_log_backpressure over QUIC");
+
+            // P2 on the same Writer QUIC listener still succeeds 200 without HOL blocking!
+            let p2_batch = WireBatch::new(vec![WireEvent {
+                event_uuid: WireEvent::deterministic_uuid("qp2", "s", "QOk", now_ms + 100, 99),
+                routing_seed: "qp2".into(),
+                distinct_id: "qp2".into(),
+                session_id: "s".into(),
+                event_name: "QOk".into(),
+                client_event_ts_ms: now_ms + 100,
+                client_sent_ts_ms: now_ms + 100,
+                props: Vec::new(),
+                replay_offset_kb: 0,
+            }]);
+            let p2_resp = pulse_ingest::quic::send_quic_ingest_batch(
+                quic.local_addr,
+                &quic.cert_der,
+                &pk2,
+                &p2_batch.encode_binary(1).unwrap(),
+            )
+            .await
+            .expect("P2 QUIC ingest must succeed while P1 is 429'd");
+            assert_eq!(p2_resp.accepted, 1);
+
+            writer.shutdown().await;
+        });
+    }
+}

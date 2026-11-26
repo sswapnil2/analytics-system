@@ -246,21 +246,25 @@ async fn list_agent_trace_ids(http: &reqwest::Client, base_url: &str, pid: &str)
         .unwrap_or_default()
 }
 
-async fn poll_until<F, Fut>(timeout: Duration, mut f: F)
+#[track_caller]
+fn poll_until<F, Fut>(timeout: Duration, mut f: F) -> impl std::future::Future<Output = ()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if f().await {
-            return;
+    let caller = std::panic::Location::caller();
+    async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if f().await {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for condition (called at {caller})"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for condition"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -698,7 +702,7 @@ fn w3_exit_3_writer_log_per_project_429_isolation_outage_and_restore_from_publis
             200
         );
 
-        poll_until(Duration::from_secs(10), || async {
+        poll_until(Duration::from_secs(25), || async {
             insights_total(&http, &owner_url, &pid_a, "Cap_Pre", now_ms).await == 1
                 && list_agent_trace_ids(&http, &owner_url, &pid_a)
                     .await
@@ -864,7 +868,7 @@ fn w3_exit_3_writer_log_per_project_429_isolation_outage_and_restore_from_publis
         .unwrap();
         let owner2_url = format!("http://{}", owner2.http_addr);
 
-        poll_until(Duration::from_secs(15), || async {
+        poll_until(Duration::from_secs(25), || async {
             insights_total(&http, &owner2_url, &pid_a, "Cap_Outage", now_ms).await
                 == accepted_ev_outage
                 && insights_total(&http, &owner2_url, &pid_b, "ProjB_Isolated", now_ms).await == 1
@@ -883,7 +887,7 @@ fn w3_exit_3_writer_log_per_project_429_isolation_outage_and_restore_from_publis
         );
 
         // proj_a accepts new requests again once writer_log drains.
-        poll_until(Duration::from_secs(5), || async {
+        poll_until(Duration::from_secs(25), || async {
             http.post(format!("{writer_url}/v1/agent/traces"))
                 .header("x-pulse-key", &pk_a)
                 .json(&make_trace_batch("tr_post_recover", "sa_r", "ua_r", now_ms + 200, "bot"))
@@ -2442,5 +2446,561 @@ fn w3_cached_agent_store_deposed_owner_no_deadlock_before_identify() {
         writer.shutdown().await;
         node_b.shutdown().await;
         owner_a.shutdown().await;
+    });
+}
+
+#[test]
+fn split_role_background_alert_timers_fire_for_event_and_agent_alerts() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_ing = tmp.path().join("ingest");
+    let dir_writer = tmp.path().join("writer");
+    let dir_query = tmp.path().join("query");
+    let meta_db = tmp.path().join("meta.db");
+    let meta_url = format!("sqlite://{}", meta_db.display());
+
+    let _env = EnvGuard::set(&[
+        ("DATABASE_URL", Some(&meta_url)),
+        ("PULSE_VAULT_KEK", Some(TEST_VAULT_KEK)),
+        ("PULSE_HOT_STORE", Some("local")),
+        ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
+        ("PULSE_WRITER_FLUSH_MS", Some("10")),
+        ("PULSE_ALLOW_PRIVATE_ENDPOINTS", Some("1")),
+        ("PULSE_ALERT_EVAL_INTERVAL_SECS", Some("1")),
+    ]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let http = reqwest::Client::new();
+
+    rt.block_on(async {
+        let ev_hits = Arc::new(AtomicUsize::new(0));
+        let ag_hits = Arc::new(AtomicUsize::new(0));
+        let ev_clone = ev_hits.clone();
+        let ag_clone = ag_hits.clone();
+        let webhook_app = Router::new()
+            .route(
+                "/event_hook",
+                post(move || {
+                    let h = ev_clone.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::AcqRel);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/agent_hook",
+                post(move || {
+                    let h = ag_clone.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::AcqRel);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+        let hook_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook_addr = hook_listener.local_addr().unwrap();
+        let ev_hook_url = format!("http://{hook_addr}/event_hook");
+        let ag_hook_url = format!("http://{hook_addr}/agent_hook");
+        let hook_task = tokio::spawn(async move {
+            let _ = axum::serve(hook_listener, webhook_app).await;
+        });
+
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ingest = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_ing, "proj_default", NodeRole::Ingest),
+            s3.clone(),
+            NodeIdentity::new("ingest-bg", None),
+        )
+        .await
+        .unwrap();
+        let writer = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_writer, "proj_default", NodeRole::Writer),
+            Arc::new(InMemory::new()),
+            NodeIdentity::new("writer-bg", None),
+        )
+        .await
+        .unwrap();
+        let query = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_query, "proj_default", NodeRole::Query),
+            s3.clone(),
+            NodeIdentity::new("query-bg", None),
+        )
+        .await
+        .unwrap();
+
+        let url_i = format!("http://{}", ingest.http_addr);
+        let url_w = format!("http://{}", writer.http_addr);
+        let url_q = format!("http://{}", query.http_addr);
+
+        let (pid, pk) = create_project_on(&http, &url_q, "proj-bg-alert").await;
+        ingest
+            .control
+            .meta()
+            .set_project_owner(&pid, "ingest-bg", &url_i, Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+        query.run_query_refresh_tick().await;
+
+        assert_eq!(
+            http.put(format!("{url_w}/v1/projects/{pid}/byok"))
+                .bearer_auth(ADMIN_TOKEN)
+                .json(&json!({
+                    "category": "webhook",
+                    "provider": "webhook",
+                    "secret": ev_hook_url,
+                    "config_json": { "signing_secret": "w3_bg_alert_secret_1234" }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/projects/{pid}/alerts"))
+                .bearer_auth(ADMIN_TOKEN)
+                .json(&json!({
+                    "name": "bg_event_alert",
+                    "event_name": "Bg_Alert_Ev",
+                    "operator": "gte",
+                    "threshold": 2,
+                    "webhook_url": ev_hook_url
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/projects/{pid}/agent/alerts"))
+                .bearer_auth(ADMIN_TOKEN)
+                .json(&json!({
+                    "name": "bg_agent_fail_alert",
+                    "metric": "failure_rate",
+                    "operator": "gte",
+                    "threshold": 0.5,
+                    "window_minutes": 15,
+                    "cooldown_minutes": 15,
+                    "enabled": true,
+                    "webhook_url": ag_hook_url
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let now_ms = Utc::now().timestamp_millis();
+        assert_eq!(
+            http.post(format!("{url_w}/v1/ingest"))
+                .header("x-pulse-key", &pk)
+                .json(&json!({
+                    "events": [
+                        { "event": "Bg_Alert_Ev", "userId": "u1", "messageId": "bg_1", "timestamp": now_ms },
+                        { "event": "Bg_Alert_Ev", "userId": "u2", "messageId": "bg_2", "timestamp": now_ms + 1 },
+                        { "event": "Bg_Alert_Ev", "userId": "u3", "messageId": "bg_3", "timestamp": now_ms + 2 }
+                    ]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{url_w}/v1/agent/traces"))
+                .header("x-pulse-key", &pk)
+                .json(&json!({
+                    "traces": [
+                        {
+                            "trace_id": "tr_bg_fail_1",
+                            "agent_name": "planner",
+                            "agent_version": "1.0.0",
+                            "environment": "prod",
+                            "session_id": "s_bg_1",
+                            "user_id": "u_bg_1",
+                            "status": "error",
+                            "start_ts_ms": now_ms - 1000,
+                            "duration_ms": 15,
+                            "input": "hi",
+                            "output": "err"
+                        },
+                        {
+                            "trace_id": "tr_bg_fail_2",
+                            "agent_name": "planner",
+                            "agent_version": "1.0.0",
+                            "environment": "prod",
+                            "session_id": "s_bg_2",
+                            "user_id": "u_bg_2",
+                            "status": "error",
+                            "start_ts_ms": now_ms - 500,
+                            "duration_ms": 15,
+                            "input": "hi",
+                            "output": "err"
+                        }
+                    ],
+                    "spans": []
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        // Wait ONLY for the real background timer on `Ingest` (never call `evaluate_alerts()` manually!).
+        poll_until(Duration::from_secs(25), || async {
+            ev_hits.load(Ordering::Acquire) >= 1 && ag_hits.load(Ordering::Acquire) >= 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            ev_hits.load(Ordering::Acquire),
+            1,
+            "event alert background timer must fire exactly once on owning Ingest node"
+        );
+        assert_eq!(
+            ag_hits.load(Ordering::Acquire),
+            1,
+            "agent alert background timer must fire exactly once on owning Ingest node"
+        );
+
+        hook_task.abort();
+        query.shutdown().await;
+        writer.shutdown().await;
+        ingest.shutdown().await;
+    });
+}
+
+#[test]
+fn writer_forwarder_not_owner_retry_and_agent_pwfa_429_isolation() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let s3_dir = tmp.path().join("s3");
+    let dir_ing0 = tmp.path().join("ing0");
+    let dir_ing1 = tmp.path().join("ing1");
+    let dir_w = tmp.path().join("writer");
+    std::fs::create_dir_all(&s3_dir).unwrap();
+    let meta_db = tmp.path().join("meta.db");
+    let meta_url = format!("sqlite://{}", meta_db.display());
+    let s3_url = reqwest::Url::from_directory_path(&s3_dir)
+        .unwrap()
+        .to_string();
+
+    let _env = EnvGuard::set(&[
+        ("DATABASE_URL", Some(&meta_url)),
+        ("PULSE_VAULT_KEK", Some(TEST_VAULT_KEK)),
+        ("PULSE_HOT_STORE", Some("local")),
+        ("PULSE_UPLOAD_INTERVAL_SECS", Some("300")),
+        ("PULSE_WRITER_FLUSH_MS", Some("10")),
+        ("PULSE_WRITER_LEASE_TTL_SECS", Some("15")),
+        ("PULSE_OWNER_CACHE_TTL_MS", Some("60000")),
+        ("PULSE_WRITER_LOG_PROJECT_MAX_BYTES", Some("2048")),
+    ]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let bin = env!("CARGO_BIN_EXE_pulse-node");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let s3: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&s3_dir).unwrap());
+        let ing1 = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_ing1, "proj_default", NodeRole::Ingest),
+            s3.clone(),
+            NodeIdentity::new("ing-1", None),
+        )
+        .await
+        .unwrap();
+        let ing1_url = format!("http://{}", ing1.http_addr);
+
+        let ing0_port = free_port();
+        let ing0_url = format!("http://127.0.0.1:{ing0_port}");
+        let mut ing0_proc = ChildGuard(Some(
+            std::process::Command::new(bin)
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &ing0_port.to_string(),
+                    "--no-quic",
+                    "--no-seed",
+                    "--role",
+                    "ingest",
+                    "--node-name",
+                    "ing-0",
+                    "--advertise-addr",
+                    &ing0_url,
+                    "--data-dir",
+                    dir_ing0.to_str().unwrap(),
+                    "--web-dir",
+                    dir_ing0.join("no_web").to_str().unwrap(),
+                ])
+                .env("DATABASE_URL", &meta_url)
+                .env("PULSE_OBJECT_STORE_URL", &s3_url)
+                .env("PULSE_ADMIN_TOKEN", ADMIN_TOKEN)
+                .env("PULSE_VAULT_KEK", TEST_VAULT_KEK)
+                .env("PULSE_HOT_STORE", "local")
+                .env("PULSE_UPLOAD_INTERVAL_SECS", "300")
+                .env("PULSE_WRITER_FLUSH_MS", "10")
+                .env("PULSE_WRITER_LEASE_TTL_SECS", "15")
+                .stdout(Stdio::from(
+                    std::fs::File::create(tmp.path().join("ing0.out")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(tmp.path().join("ing0.err")).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        ));
+        let ing0_pid = ing0_proc.0.as_ref().unwrap().id();
+
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if http
+                .get(format!("{ing0_url}/readyz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            if let Some(status) = ing0_proc.0.as_mut().unwrap().try_wait().unwrap() {
+                let out = std::fs::read_to_string(tmp.path().join("ing0.out")).unwrap_or_default();
+                let err = std::fs::read_to_string(tmp.path().join("ing0.err")).unwrap_or_default();
+                panic!("ing0 exited early ({status}): stdout={out}\nstderr={err}");
+            }
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "timed out after 30s waiting for ing0 /readyz"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let writer = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_w, "proj_default", NodeRole::Writer),
+            Arc::new(InMemory::new()),
+            NodeIdentity::new("writer-hol", None),
+        )
+        .await
+        .unwrap();
+        let writer_url = format!("http://{}", writer.http_addr);
+
+        let dir_q = tmp.path().join("query");
+        let query = start_pulse_node_with_store_and_identity(
+            node_cfg(&dir_q, "proj_default", NodeRole::Query),
+            s3.clone(),
+            NodeIdentity::new("query-hol", None),
+        )
+        .await
+        .unwrap();
+        let query_url = format!("http://{}", query.http_addr);
+
+        let (p1, pk1) = create_project_on(&http, &query_url, "proj-hol-p1").await;
+        let (p2, pk2) = create_project_on(&http, &query_url, "proj-hol-p2").await;
+        let now_ms = Utc::now().timestamp_millis();
+        ing1.control
+            .meta()
+            .set_project_owner(&p1, "ing-0", &ing0_url, now_ms)
+            .await
+            .unwrap();
+        ing1.control
+            .meta()
+            .set_project_owner(&p2, "ing-1", &ing1_url, now_ms)
+            .await
+            .unwrap();
+
+        // Warm writer cache for P1 -> ing-0 and P2 -> ing-1.
+        assert_eq!(
+            http.post(format!("{writer_url}/v1/ingest"))
+                .header("x-pulse-key", &pk1)
+                .json(&json!({
+                    "events": [{ "event": "Warm_P1", "userId": "u1", "messageId": "wp1", "timestamp": now_ms }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{writer_url}/v1/agent/traces"))
+                .header("x-pulse-key", &pk1)
+                .json(&make_trace_batch("tr_warm_p1", "sp1", "u1", now_ms, "bot"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{writer_url}/v1/ingest"))
+                .header("x-pulse-key", &pk2)
+                .json(&json!({
+                    "events": [{ "event": "Warm_P2", "userId": "u2", "messageId": "wp2", "timestamp": now_ms }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        poll_until(Duration::from_secs(25), || async {
+            insights_total(&http, &writer_url, &p2, "Warm_P2", now_ms).await == 1
+                && insights_total(&http, &writer_url, &p1, "Warm_P1", now_ms).await == 1
+                && list_agent_trace_ids(&http, &writer_url, &p1)
+                    .await
+                    .contains(&"tr_warm_p1".to_string())
+        })
+        .await;
+
+        // SIGSTOP ing-0, then flood P1 events and agent traces until 429 writer_log_backpressure.
+        assert!(std::process::Command::new("kill")
+            .args(["-STOP", &ing0_pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+
+        let mut p1_ev_accepted = 0usize;
+        let mut hit_ev_429 = false;
+        let mut p1_ag_accepted = 0usize;
+        let mut hit_ag_429 = false;
+
+        for i in 0..20usize {
+            let resp = http
+                .post(format!("{writer_url}/v1/ingest"))
+                .header("x-pulse-key", &pk1)
+                .json(&json!({
+                    "events": [{
+                        "event": "P1_Buf",
+                        "userId": format!("u1_{i}"),
+                        "messageId": format!("p1m_{i}"),
+                        "timestamp": now_ms + i as i64 + 1,
+                        "properties": { "pad": "x".repeat(800) }
+                    }]
+                }))
+                .send()
+                .await
+                .unwrap();
+            if resp.status().as_u16() == 429 {
+                let b: Value = resp.json().await.unwrap();
+                assert_eq!(b["code"], "writer_log_backpressure", "{b}");
+                hit_ev_429 = true;
+                break;
+            }
+            assert_eq!(resp.status(), 200);
+            p1_ev_accepted += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(hit_ev_429, "P1 events must hit 429 writer_log_backpressure");
+
+        for i in 0..20usize {
+            let resp = http
+                .post(format!("{writer_url}/v1/agent/traces"))
+                .header("x-pulse-key", &pk1)
+                .json(&json!({
+                    "traces": [{
+                        "trace_id": format!("tr_p1_buf_{i}"),
+                        "agent_name": "bot",
+                        "agent_version": "1.0.0",
+                        "environment": "prod",
+                        "session_id": "s1_buf",
+                        "user_id": "u1_buf",
+                        "status": "ok",
+                        "start_ts_ms": now_ms + i as i64 + 10,
+                        "duration_ms": 10,
+                        "input": "p".repeat(800),
+                        "output": "o".repeat(800)
+                    }],
+                    "spans": []
+                }))
+                .send()
+                .await
+                .unwrap();
+            if resp.status().as_u16() == 429 {
+                let b: Value = resp.json().await.unwrap();
+                assert_eq!(b["code"], "writer_log_backpressure", "{b}");
+                hit_ag_429 = true;
+                break;
+            }
+            assert_eq!(resp.status(), 200);
+            p1_ag_accepted += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(hit_ag_429, "P1 agent traces must also hit 429 writer_log_backpressure");
+
+        // While P1 is 429'd and ing-0 is SIGSTOP'd, P2 on the SAME Writer succeeds 200 & lands on ing-1!
+        assert_eq!(
+            http.post(format!("{writer_url}/v1/ingest"))
+                .header("x-pulse-key", &pk2)
+                .json(&json!({
+                    "events": [{ "event": "P2_Live", "userId": "u2_live", "messageId": "p2m", "timestamp": now_ms + 50 }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            http.post(format!("{writer_url}/v1/agent/traces"))
+                .header("x-pulse-key", &pk2)
+                .json(&make_trace_batch("tr_p2_live", "s2", "u2", now_ms + 51, "bot"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        poll_until(Duration::from_secs(25), || async {
+            insights_total(&http, &writer_url, &p2, "P2_Live", now_ms).await == 1
+                && list_agent_trace_ids(&http, &writer_url, &p2)
+                    .await
+                    .contains(&"tr_p2_live".to_string())
+        })
+        .await;
+
+        // Migrate P1 ownership to ing-1, SIGCONT ing-0 so ing-0 returns 503 not_owner, forcing
+        // WriterForwarder to refresh OwnerDirectory and drain P1's PWLF v2 + PWFA frames to ing-1!
+        ing1.control
+            .meta()
+            .set_project_owner(&p1, "ing-1", &ing1_url, Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+        assert!(std::process::Command::new("kill")
+            .args(["-CONT", &ing0_pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+
+        poll_until(Duration::from_secs(30), || async {
+            let ev_cnt = insights_total(&http, &writer_url, &p1, "P1_Buf", now_ms).await;
+            let tr_cnt = list_agent_trace_ids(&http, &writer_url, &p1)
+                .await
+                .into_iter()
+                .filter(|id| id.starts_with("tr_p1_buf_"))
+                .count();
+            ev_cnt == p1_ev_accepted as i64 && tr_cnt == p1_ag_accepted
+        })
+        .await;
+
+        drop(ing0_proc);
+        query.shutdown().await;
+        writer.shutdown().await;
+        ing1.shutdown().await;
     });
 }

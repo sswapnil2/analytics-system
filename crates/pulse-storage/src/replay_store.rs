@@ -489,45 +489,92 @@ impl ReplayStore {
         project_id: &str,
         session_id: &str,
     ) -> Result<Vec<ReplayChunkMeta>> {
+        let (chunks, _) = self
+            .list_and_pin_session_chunks(project_id, session_id, false)
+            .await?;
+        Ok(chunks)
+    }
+
+    async fn list_and_pin_session_chunks(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        pin_local: bool,
+    ) -> Result<(Vec<ReplayChunkMeta>, Option<LocalChunkPinGuard>)> {
         validate_replay_identifier("project_id", project_id)?;
         validate_replay_identifier("session_id", session_id)?;
 
-        let local_chunks = if self.is_local_hot_tier() && !self.read_only {
-            self.list_prefix_chunks(&hot_session_prefix(project_id, session_id))
-                .await?
-        } else {
-            Vec::new()
-        };
-        let s3_chunks = self
-            .list_prefix_chunks(&s3_session_prefix(project_id, session_id))
-            .await?;
+        if !self.is_local_hot_tier() || self.read_only {
+            let s3_chunks = self
+                .list_prefix_chunks(&s3_session_prefix(project_id, session_id))
+                .await?;
+            return Ok((s3_chunks, None));
+        }
 
-        if !local_chunks.is_empty() {
-            let cursor = self.load_cursor(project_id, session_id).await?;
-            if let Some(committed_before) = cursor.local_committed_before_seq {
+        for attempt in 0..8u8 {
+            let cursor_before = self.load_cursor(project_id, session_id).await?;
+            let local_chunks = self
+                .list_prefix_chunks(&hot_session_prefix(project_id, session_id))
+                .await?;
+            let pin_guard = if pin_local && !local_chunks.is_empty() {
+                let hot_paths: Vec<String> = local_chunks
+                    .iter()
+                    .map(|c| c.location.as_ref().to_string())
+                    .collect();
+                self.pin_tracker.pin_all(&hot_paths);
+                Some(LocalChunkPinGuard {
+                    tracker: self.pin_tracker.clone(),
+                    paths: hot_paths,
+                })
+            } else {
+                None
+            };
+            let s3_chunks = self
+                .list_prefix_chunks(&s3_session_prefix(project_id, session_id))
+                .await?;
+            let cursor_after = self.load_cursor(project_id, session_id).await?;
+
+            if cursor_before != cursor_after && attempt < 7 {
+                drop(pin_guard);
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let committed_before = cursor_after.local_committed_before_seq();
+            if cursor_after.local_committed_before_seq.is_some() && !local_chunks.is_empty() {
                 // During recovery from a partial shift after `AlreadyExists` with differing
-                // bytes, S3 holds `[0..s3_next_seq)` (including already-shifted chunks) while
-                // un-shifted local chunks with `seq >= committed_before` logically follow them
-                // even if their local `seq` numbers overlap S3.
-                let mut out = s3_chunks;
+                // bytes, S3 holds `[0..cursor_after.next_seq)` (including already-shifted chunks)
+                // while un-shifted local chunks with `seq >= committed_before` logically follow
+                // them even if their local `seq` numbers overlap S3. Any S3 objects at
+                // `seq >= cursor_after.next_seq` were copied by an in-flight `upload_session`
+                // whose cursor has not been persisted yet, so `local_chunks` remains authoritative
+                // for them until `save_cursor` advances `next_seq` / clears `local_committed_before_seq`.
+                let mut out: Vec<ReplayChunkMeta> = s3_chunks
+                    .into_iter()
+                    .filter(|c| c.seq < cursor_after.next_seq)
+                    .collect();
                 for c in local_chunks {
                     if c.seq >= committed_before {
                         out.push(c);
                     }
                 }
-                return Ok(out);
+                return Ok((out, pin_guard));
             }
+
+            let mut by_seq: BTreeMap<u64, ReplayChunkMeta> = BTreeMap::new();
+            for c in local_chunks {
+                if c.seq >= committed_before {
+                    by_seq.insert(c.seq, c);
+                }
+            }
+            for c in s3_chunks {
+                // Prefer uploaded S3 `replays/` entry on seq collision.
+                by_seq.insert(c.seq, c);
+            }
+            return Ok((by_seq.into_values().collect(), pin_guard));
         }
 
-        let mut by_seq: BTreeMap<u64, ReplayChunkMeta> = BTreeMap::new();
-        for c in local_chunks {
-            by_seq.insert(c.seq, c);
-        }
-        for c in s3_chunks {
-            // Prefer uploaded S3 `replays/` entry on seq collision.
-            by_seq.insert(c.seq, c);
-        }
-        Ok(by_seq.into_values().collect())
+        unreachable!("loop returns on attempt == 7")
     }
 
     /// Appends an immutable `ReplayChunk` object and returns its virtual stream byte offset
@@ -1076,43 +1123,13 @@ impl ReplayStore {
         Ok(count)
     }
 
-    async fn read_chunk_full(
-        &self,
-        project_id: &str,
-        session_id: &str,
-        c: &ReplayChunkMeta,
-    ) -> Result<Bytes> {
-        match self.object_store.get(&c.location).await {
-            Ok(res) => Ok(res.bytes().await?),
-            Err(OsError::NotFound { .. }) if c.location.as_ref().starts_with("hot/replay/") => {
-                let s3_loc =
-                    ObjectPath::from(s3_chunk_path(project_id, session_id, c.seq).as_str());
-                Ok(self.object_store.get(&s3_loc).await?.bytes().await?)
-            }
-            Err(e) => Err(StorageError::ObjectStore(e)),
-        }
+    async fn read_chunk_full(&self, c: &ReplayChunkMeta) -> Result<Bytes> {
+        let res = self.object_store.get(&c.location).await?;
+        Ok(res.bytes().await?)
     }
 
-    async fn read_chunk_range(
-        &self,
-        project_id: &str,
-        session_id: &str,
-        c: &ReplayChunkMeta,
-        range: Range<u64>,
-    ) -> Result<Bytes> {
-        match self
-            .object_store
-            .get_range(&c.location, range.clone())
-            .await
-        {
-            Ok(b) => Ok(b),
-            Err(OsError::NotFound { .. }) if c.location.as_ref().starts_with("hot/replay/") => {
-                let s3_loc =
-                    ObjectPath::from(s3_chunk_path(project_id, session_id, c.seq).as_str());
-                Ok(self.object_store.get_range(&s3_loc, range).await?)
-            }
-            Err(e) => Err(StorageError::ObjectStore(e)),
-        }
+    async fn read_chunk_range(&self, c: &ReplayChunkMeta, range: Range<u64>) -> Result<Bytes> {
+        Ok(self.object_store.get_range(&c.location, range).await?)
     }
 
     /// Returns total concatenated byte length across all chunks of `session_id`, or `None` if session has no chunks.
@@ -1137,59 +1154,63 @@ impl ReplayStore {
         start_byte_offset: u64,
         max_len: Option<u64>,
     ) -> Result<Option<Bytes>> {
-        let chunks = self.list_session_chunks(project_id, session_id).await?;
-        if chunks.is_empty() {
-            return Ok(None);
-        }
-
-        let hot_paths: Vec<String> = chunks
-            .iter()
-            .filter(|c| c.location.as_ref().starts_with("hot/replay/"))
-            .map(|c| c.location.as_ref().to_string())
-            .collect();
-        let _pin_guard = (!hot_paths.is_empty()).then(|| {
-            self.pin_tracker.pin_all(&hot_paths);
-            LocalChunkPinGuard {
-                tracker: self.pin_tracker.clone(),
-                paths: hot_paths,
+        for attempt in 0..4u8 {
+            let (chunks, _pin_guard) = self
+                .list_and_pin_session_chunks(project_id, session_id, true)
+                .await?;
+            if chunks.is_empty() {
+                return Ok(None);
             }
-        });
 
-        let total: u64 = chunks.iter().map(|c| c.size).sum();
-        if start_byte_offset >= total {
-            return Ok(Some(Bytes::new()));
-        }
-        let end = max_len
-            .map(|m| start_byte_offset.saturating_add(m).min(total))
-            .unwrap_or(total);
+            let total: u64 = chunks.iter().map(|c| c.size).sum();
+            if start_byte_offset >= total {
+                return Ok(Some(Bytes::new()));
+            }
+            let end = max_len
+                .map(|m| start_byte_offset.saturating_add(m).min(total))
+                .unwrap_or(total);
 
-        let mut out = BytesMut::with_capacity((end - start_byte_offset) as usize);
-        let mut cursor = 0u64;
-        for c in chunks {
-            let chunk_start = cursor;
-            let chunk_end = cursor + c.size;
-            cursor = chunk_end;
+            let mut out = BytesMut::with_capacity((end - start_byte_offset) as usize);
+            let mut cursor = 0u64;
+            let mut retry_after_hot_unlinked = false;
+            for c in chunks {
+                let chunk_start = cursor;
+                let chunk_end = cursor + c.size;
+                cursor = chunk_end;
 
-            if chunk_end <= start_byte_offset {
+                if chunk_end <= start_byte_offset {
+                    continue;
+                }
+                if chunk_start >= end {
+                    break;
+                }
+
+                let rel_start = start_byte_offset.saturating_sub(chunk_start);
+                let rel_end = (end - chunk_start).min(c.size);
+                let res = if rel_start == 0 && rel_end == c.size {
+                    self.read_chunk_full(&c).await
+                } else {
+                    self.read_chunk_range(&c, rel_start..rel_end).await
+                };
+                match res {
+                    Ok(b) => out.extend_from_slice(&b),
+                    Err(StorageError::ObjectStore(OsError::NotFound { .. }))
+                        if attempt < 3 && c.location.as_ref().starts_with("hot/replay/") =>
+                    {
+                        retry_after_hot_unlinked = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if retry_after_hot_unlinked {
+                drop(_pin_guard);
+                tokio::task::yield_now().await;
                 continue;
             }
-            if chunk_start >= end {
-                break;
-            }
-
-            let rel_start = start_byte_offset.saturating_sub(chunk_start);
-            let rel_end = (end - chunk_start).min(c.size);
-            if rel_start == 0 && rel_end == c.size {
-                let b = self.read_chunk_full(project_id, session_id, &c).await?;
-                out.extend_from_slice(&b);
-            } else {
-                let b = self
-                    .read_chunk_range(project_id, session_id, &c, rel_start..rel_end)
-                    .await?;
-                out.extend_from_slice(&b);
-            }
+            return Ok(Some(out.freeze()));
         }
-        Ok(Some(out.freeze()))
+        unreachable!("loop returns on attempt == 3")
     }
 
     /// Reads and decodes `ReplayChunk` frames starting from `start_byte_offset`.
@@ -1201,36 +1222,44 @@ impl ReplayStore {
         session_id: &str,
         start_byte_offset: u64,
     ) -> Result<Vec<ReplayChunk>> {
-        let chunks = self.list_session_chunks(project_id, session_id).await?;
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let hot_paths: Vec<String> = chunks
-            .iter()
-            .filter(|c| c.location.as_ref().starts_with("hot/replay/"))
-            .map(|c| c.location.as_ref().to_string())
-            .collect();
-        let _pin_guard = (!hot_paths.is_empty()).then(|| {
-            self.pin_tracker.pin_all(&hot_paths);
-            LocalChunkPinGuard {
-                tracker: self.pin_tracker.clone(),
-                paths: hot_paths,
+        for attempt in 0..4u8 {
+            let (chunks, _pin_guard) = self
+                .list_and_pin_session_chunks(project_id, session_id, true)
+                .await?;
+            if chunks.is_empty() {
+                return Ok(Vec::new());
             }
-        });
 
-        let mut out = Vec::new();
-        let mut cursor = 0u64;
-        for c in chunks {
-            let chunk_end = cursor + c.size;
-            if chunk_end > start_byte_offset {
-                let raw = self.read_chunk_full(project_id, session_id, &c).await?;
-                let mut decoded = ReplayChunk::decode_stream(&raw)?;
-                out.append(&mut decoded);
+            let mut out = Vec::new();
+            let mut cursor = 0u64;
+            let mut retry_after_hot_unlinked = false;
+            for c in chunks {
+                let chunk_end = cursor + c.size;
+                if chunk_end > start_byte_offset {
+                    match self.read_chunk_full(&c).await {
+                        Ok(raw) => {
+                            let mut decoded = ReplayChunk::decode_stream(&raw)?;
+                            out.append(&mut decoded);
+                        }
+                        Err(StorageError::ObjectStore(OsError::NotFound { .. }))
+                            if attempt < 3 && c.location.as_ref().starts_with("hot/replay/") =>
+                        {
+                            retry_after_hot_unlinked = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                cursor = chunk_end;
             }
-            cursor = chunk_end;
+            if retry_after_hot_unlinked {
+                drop(_pin_guard);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            return Ok(out);
         }
-        Ok(out)
+        unreachable!("loop returns on attempt == 3")
     }
 
     /// Deletes all `.plsr` replay chunks (both S3 `replays/` and local `hot/replay/` +
@@ -2124,5 +2153,64 @@ mod tests {
         );
         let decoded = store.read_chunks("proj_shift", "sess_s", 0).await.unwrap();
         assert_eq!(decoded.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn list_session_chunks_excludes_uncommitted_in_flight_shifted_s3_chunks() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set_local();
+        let s3 = Arc::new(InMemory::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let routed = crate::with_hot_store(s3.clone(), tmp.path()).await.unwrap();
+        let store = ReplayStore::new_with_options(routed.clone(), true, false);
+
+        // Simulate the exact window after `copy_if_not_exists` copied local seq=1 -> S3 seq=3 and
+        // local seq=2 -> S3 seq=4, strictly before `save_cursor(&final_cursor)` persists:
+        // persisted cursor still has `next_seq = 3, local_committed_before_seq = Some(1)`,
+        // and local chunks seq=1, seq=2 are still on disk awaiting `save_cursor` + delete.
+        for (i, path) in [
+            (0u32, "replays/proj_win/sess_w/0000000000.plsr"),
+            (1, "replays/proj_win/sess_w/0000000001.plsr"),
+            (2, "replays/proj_win/sess_w/0000000002.plsr"),
+            (3, "replays/proj_win/sess_w/0000000003.plsr"),
+            (4, "replays/proj_win/sess_w/0000000004.plsr"),
+            (3, "hot/replay/proj_win/sess_w/0000000001.plsr"),
+            (4, "hot/replay/proj_win/sess_w/0000000002.plsr"),
+        ] {
+            let chunk = sample_chunk("proj_win", "sess_w", i);
+            let encoded = Bytes::from(chunk.encode_binary(3).unwrap());
+            routed
+                .put(&ObjectPath::from(path), PutPayload::from_bytes(encoded))
+                .await
+                .unwrap();
+        }
+        let cursor = ReplaySessionCursor {
+            next_seq: 3,
+            uploaded_bytes: 300,
+            local_committed_before_seq: Some(1),
+        };
+        store
+            .save_cursor("proj_win", "sess_w", &cursor)
+            .await
+            .unwrap();
+
+        let listed = store
+            .list_session_chunks("proj_win", "sess_w")
+            .await
+            .unwrap();
+        let paths: Vec<&str> = listed.iter().map(|c| c.location.as_ref()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "replays/proj_win/sess_w/0000000000.plsr",
+                "replays/proj_win/sess_w/0000000001.plsr",
+                "replays/proj_win/sess_w/0000000002.plsr",
+                "hot/replay/proj_win/sess_w/0000000001.plsr",
+                "hot/replay/proj_win/sess_w/0000000002.plsr",
+            ],
+            "uncommitted in-flight S3 copies >= cursor.next_seq must not duplicate local chunks"
+        );
+        let decoded = store.read_chunks("proj_win", "sess_w", 0).await.unwrap();
+        assert_eq!(decoded.len(), 5);
     }
 }

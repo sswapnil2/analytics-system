@@ -818,7 +818,7 @@ pub async fn start_pulse_node_with_store_and_identity(
         }
     }
 
-    if config.role.serves_query_and_admin() {
+    if config.role.owns_storage() {
         let alerts_control = control.clone();
         let mut alerts_shutdown = shutdown_bg_rx.clone();
         let alert_interval = std::env::var("PULSE_ALERT_EVAL_INTERVAL_SECS")

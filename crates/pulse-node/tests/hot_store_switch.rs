@@ -351,3 +351,55 @@ fn local_mode_refuses_to_start_when_entire_data_dir_is_wiped_and_published_exist
         clean_node.shutdown().await;
     });
 }
+
+#[test]
+fn local_mode_refuses_when_identity_wiped_with_only_agent_or_replay_state() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        // Case A: Initialized `local` mode (`hot_store_mode=local`), empty `hot/identity/` and
+        // `hot/agent_manifests/`, while S3 has `agent_published/` -> refused!
+        let tmp_agent = tempfile::tempdir().unwrap();
+        let s3_agent: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let _init_a =
+            pulse_storage::with_hot_store_for_role(s3_agent.clone(), tmp_agent.path(), false)
+                .await
+                .unwrap();
+        s3_agent
+            .put(
+                &ObjectPath::from("agent_published/proj_agent/pub_000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        let err_a = pulse_storage::with_hot_store_for_role(s3_agent, tmp_agent.path(), false)
+            .await
+            .expect_err("empty hot/identity + empty hot/agent_manifests with S3 agent_published must refuse");
+        assert!(
+            err_a.to_string().contains("restore --from-published"),
+            "{err_a}"
+        );
+
+        // Case B: Initialized `local` mode (`hot_store_mode=local`), empty `hot/identity/`,
+        // `hot/replay/`, and `hot/replay_cursors/`, while S3 has `replays/` -> refused!
+        let tmp_replay = tempfile::tempdir().unwrap();
+        let s3_replay: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let _init_b =
+            pulse_storage::with_hot_store_for_role(s3_replay.clone(), tmp_replay.path(), false)
+                .await
+                .unwrap();
+        s3_replay
+            .put(
+                &ObjectPath::from("replays/proj_rep/sess_1/0000000000.plsr"),
+                PutPayload::from_static(b"PLSR"),
+            )
+            .await
+            .unwrap();
+        let err_b = pulse_storage::with_hot_store_for_role(s3_replay, tmp_replay.path(), false)
+            .await
+            .expect_err("empty hot/identity + empty hot/replay with S3 replays must refuse");
+        assert!(
+            err_b.to_string().contains("restore --from-published"),
+            "{err_b}"
+        );
+    });
+}

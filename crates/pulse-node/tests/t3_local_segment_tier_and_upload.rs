@@ -1348,3 +1348,201 @@ fn t3_5_live_step5_to_step6_s3_failure_recovery_without_restart() {
         node.shutdown().await;
     });
 }
+
+#[test]
+fn t3_adversarial_flush_vs_upload_hot_segment_bytes_no_leak() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _hot = EnvGuard::set("PULSE_HOT_STORE", Some("local"));
+    let _interval = EnvGuard::set("PULSE_UPLOAD_INTERVAL_SECS", Some("300"));
+    let _byok = EnvGuard::set("PULSE_BYOK_MASTER_KEY", Some(TEST_BYOK_KEY));
+
+    #[derive(Debug)]
+    struct WalDeleteBarrierStore {
+        inner: Arc<dyn ObjectStore>,
+        arm_once: AtomicBool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl fmt::Display for WalDeleteBarrierStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "WalDeleteBarrierStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for WalDeleteBarrierStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(l, o).await
+        }
+        async fn get_range(&self, l: &ObjectPath, r: Range<u64>) -> OsResult<Bytes> {
+            self.inner.get_range(l, r).await
+        }
+        async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
+            self.inner.head(l).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+            if l.as_ref().starts_with("wal/") && self.arm_once.swap(false, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.delete(l).await
+        }
+        fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &ObjectPath, t: &ObjectPath) -> OsResult<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(&self, f: &ObjectPath, t: &ObjectPath) -> OsResult<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("node");
+        let s3_dir = tmp.path().join("s3");
+        std::fs::create_dir_all(&s3_dir).unwrap();
+        let s3_fs: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&s3_dir).unwrap());
+        let routed = with_hot_store(s3_fs, &data_dir).await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let barrier = Arc::new(WalDeleteBarrierStore {
+            inner: routed,
+            arm_once: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let enc = Arc::new(EncryptedObjectStore::new(barrier.clone()));
+        let id_router = Arc::new(IdentityRouter::new(enc.as_object_store()));
+        let cfg = StorageConfig {
+            num_buckets: 4,
+            ..Default::default()
+        };
+        let engine = StorageEngine::new_with_encrypted(cfg, enc, id_router);
+        engine.set_local_segment_tier(true);
+        engine.set_upload_interval(Duration::from_secs(300));
+        engine.set_hot_segment_byte_limits(100, 200);
+
+        let pid = "proj_race_leak";
+        let ps = engine.get_or_open_project(pid).await.unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let closed_ts = now_ms - 3 * 86_400_000;
+
+        let make_ev = |did: &str, ts: i64, salt: u64| {
+            let ev = WireEvent {
+                event_uuid: WireEvent::deterministic_uuid(did, "s", "RaceEv", ts, salt),
+                routing_seed: did.into(),
+                distinct_id: did.into(),
+                session_id: "s".into(),
+                event_name: "RaceEv".into(),
+                client_event_ts_ms: ts,
+                client_sent_ts_ms: ts,
+                props: vec![("pad".into(), pulse_wire::PropValue::Str("x".repeat(512)))],
+                replay_offset_kb: 0,
+            };
+            let uid = ps.id_graph().get_or_intern(did, 0);
+            (ev, uid)
+        };
+
+        // Part A: Race `flush_bucket(0)` (pausing inside `purge_up_to`) vs `upload_if_dirty_at`.
+        ps.append_bucket_events(0, vec![make_ev("u_a", closed_ts, 1)])
+            .await
+            .unwrap();
+        barrier.arm_once.store(true, Ordering::Release);
+        let ps_flush = ps.clone();
+        let flush_task = tokio::spawn(async move { ps_flush.flush_bucket(0).await });
+        entered.notified().await;
+
+        let pub0 = ps
+            .upload_if_dirty_at(now_ms, true)
+            .await
+            .unwrap()
+            .expect("upload_if_dirty_at must upload and publish flushed hot segment");
+        assert_eq!(pub0.publish_seq, 0);
+
+        release.notify_one();
+        flush_task.await.unwrap().unwrap();
+        // Follow-up idle upload cycle must see zero dirty work (no stale closed_date_pending_since_ms).
+        assert!(
+            ps.upload_if_dirty_at(now_ms + 1_000, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "idle upload after flush_bucket race must have 0 pending closed-date work"
+        );
+        assert_eq!(
+            count_files_recursive(&data_dir.join("hot/hot/segments").join(pid)),
+            0
+        );
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+        assert!(ps.check_hot_segment_backpressure().is_ok());
+
+        // Part B: Race `flush_buckets(&[0, 1])` vs `upload_if_dirty_at`.
+        ps.append_bucket_events(0, vec![make_ev("u_b0", closed_ts, 2)])
+            .await
+            .unwrap();
+        ps.append_bucket_events(1, vec![make_ev("u_b1", closed_ts, 3)])
+            .await
+            .unwrap();
+        barrier.arm_once.store(true, Ordering::Release);
+        let ps_flushes = ps.clone();
+        let flushes_task = tokio::spawn(async move { ps_flushes.flush_buckets(&[0, 1]).await });
+        entered.notified().await;
+
+        let pub1 = ps
+            .upload_if_dirty_at(now_ms + 2_000, true)
+            .await
+            .unwrap()
+            .expect("upload_if_dirty_at must upload multi-bucket flushed segments");
+        assert_eq!(pub1.publish_seq, 1);
+
+        release.notify_one();
+        flushes_task.await.unwrap().unwrap();
+        assert!(
+            ps.upload_if_dirty_at(now_ms + 3_000, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "idle upload after flush_buckets race must have 0 pending closed-date work"
+        );
+        assert_eq!(
+            count_files_recursive(&data_dir.join("hot/hot/segments").join(pid)),
+            0
+        );
+        assert_eq!(ps.hot_segment_bytes(), 0);
+        assert_eq!(engine.hot_segment_bytes(), 0);
+        assert!(ps.check_hot_segment_backpressure().is_ok());
+
+        engine.identity_router().close_all().await.unwrap();
+        engine.profile_router().close_all().await.unwrap();
+    });
+}

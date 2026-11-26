@@ -1670,3 +1670,217 @@ fn t4_27a_same_bucket_dpdp_erasure_preserves_survivor_sessions_and_purges_subseq
         ingest.shutdown().await;
     });
 }
+
+#[test]
+fn t4_adversarial_replay_concurrent_shift_upload_preserves_all_chunks() {
+    use futures::StreamExt as _;
+    use std::sync::atomic::AtomicBool;
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _hot = EnvGuard::set("PULSE_HOT_STORE", Some("local"));
+    let _interval = EnvGuard::set("PULSE_UPLOAD_INTERVAL_SECS", Some("300"));
+    let _byok = EnvGuard::set("PULSE_BYOK_MASTER_KEY", Some(TEST_BYOK_KEY));
+
+    #[derive(Debug)]
+    struct CursorBarrierStore {
+        inner: Arc<dyn ObjectStore>,
+        arm_on_s3_list: AtomicBool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl fmt::Display for CursorBarrierStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "CursorBarrierStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CursorBarrierStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(l, o).await
+        }
+        async fn get_range(&self, l: &ObjectPath, r: std::ops::Range<u64>) -> OsResult<Bytes> {
+            self.inner.get_range(l, r).await
+        }
+        async fn head(&self, l: &ObjectPath) -> OsResult<ObjectMeta> {
+            self.inner.head(l).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> OsResult<()> {
+            self.inner.delete(l).await
+        }
+        fn list(&self, p: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            if let Some(prefix) = p {
+                if prefix.as_ref().starts_with("replays/")
+                    && self.arm_on_s3_list.swap(false, Ordering::AcqRel)
+                {
+                    let inner = self.inner.clone();
+                    let p_owned = prefix.clone();
+                    let entered = self.entered.clone();
+                    let release = self.release.clone();
+                    return Box::pin(
+                        futures::stream::once(async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            let items: Vec<OsResult<ObjectMeta>> =
+                                inner.list(Some(&p_owned)).collect::<Vec<_>>().await;
+                            futures::stream::iter(items)
+                        })
+                        .flatten(),
+                    );
+                }
+            }
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &ObjectPath, t: &ObjectPath) -> OsResult<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(&self, f: &ObjectPath, t: &ObjectPath) -> OsResult<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("node");
+        let s3_dir = tmp.path().join("s3");
+        std::fs::create_dir_all(&s3_dir).unwrap();
+        let s3_fs: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&s3_dir).unwrap());
+        let routed = with_hot_store(s3_fs, &data_dir).await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let barrier = Arc::new(CursorBarrierStore {
+            inner: routed,
+            arm_on_s3_list: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let rstore = Arc::new(pulse_storage::ReplayStore::new_with_options(
+            barrier.clone(),
+            true,
+            false,
+        ));
+
+        let pid = "proj_rep_shift";
+        let sid = "sess_shift_race";
+        let old_chunk = pulse_wire::ReplayChunk {
+            project_id: pid.to_string(),
+            session_id: sid.to_string(),
+            chunk_start_ts_ms: 1_762_000_000_000,
+            ops: vec![pulse_wire::WireframeOp::PointerInteraction {
+                ts_offset_ms: 10,
+                x: 1,
+                y: 2,
+                kind: pulse_wire::InteractionKind::Tap,
+            }],
+        };
+        let new_chunk = pulse_wire::ReplayChunk {
+            project_id: pid.to_string(),
+            session_id: sid.to_string(),
+            chunk_start_ts_ms: 1_762_000_001_000,
+            ops: vec![
+                pulse_wire::WireframeOp::PointerInteraction {
+                    ts_offset_ms: 20,
+                    x: 3,
+                    y: 4,
+                    kind: pulse_wire::InteractionKind::Tap,
+                },
+                pulse_wire::WireframeOp::PointerInteraction {
+                    ts_offset_ms: 30,
+                    x: 5,
+                    y: 6,
+                    kind: pulse_wire::InteractionKind::Tap,
+                },
+            ],
+        };
+        let old_bytes = Bytes::from(old_chunk.encode_binary(3).unwrap());
+        let new_bytes = Bytes::from(new_chunk.encode_binary(3).unwrap());
+        assert_ne!(old_bytes.len(), new_bytes.len());
+
+        // Pre-seed S3 seq=0 (`old_bytes`), unshifted local seq=0 (`new_bytes`), and partial-shift
+        // cursor `local_committed_before_seq: Some(0)`.
+        barrier
+            .inner
+            .put(
+                &ObjectPath::from(format!("replays/{pid}/{sid}/0000000000.plsr")),
+                PutPayload::from_bytes(old_bytes.clone()),
+            )
+            .await
+            .unwrap();
+        barrier
+            .inner
+            .put(
+                &ObjectPath::from(format!("hot/replay/{pid}/{sid}/0000000000.plsr")),
+                PutPayload::from_bytes(new_bytes.clone()),
+            )
+            .await
+            .unwrap();
+        let cursor = pulse_storage::ReplaySessionCursor {
+            next_seq: 1,
+            uploaded_bytes: old_bytes.len() as u64,
+            local_committed_before_seq: Some(0),
+        };
+        barrier
+            .inner
+            .put(
+                &ObjectPath::from(format!("hot/replay_cursors/{pid}/{sid}.json")),
+                PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&cursor).unwrap())),
+            )
+            .await
+            .unwrap();
+
+        // Pause `read_bytes_from` while listing `replays/`, run `upload_session` concurrently
+        // (shifting local seq=0 -> S3 seq=1 and clearing `local_committed_before_seq`), then resume.
+        barrier.arm_on_s3_list.store(true, Ordering::Release);
+        let rstore_read = rstore.clone();
+        let read_task =
+            tokio::spawn(async move { rstore_read.read_bytes_from(pid, sid, 0, None).await });
+        entered.notified().await;
+
+        let uploaded = rstore.upload_session(pid, sid).await.unwrap();
+        assert_eq!(uploaded, 1);
+
+        release.notify_one();
+        let got = read_task.await.unwrap().unwrap().unwrap();
+        let mut expected = Vec::with_capacity(old_bytes.len() + new_bytes.len());
+        expected.extend_from_slice(&old_bytes);
+        expected.extend_from_slice(&new_bytes);
+        assert_eq!(
+            got.as_ref(),
+            expected.as_slice(),
+            "concurrent shift-recovery upload must never drop or duplicate chunks (got {} bytes vs expected {})",
+            got.len(),
+            expected.len()
+        );
+
+        let decoded = rstore.read_chunks(pid, sid, 0).await.unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].chunk_start_ts_ms, old_chunk.chunk_start_ts_ms);
+        assert_eq!(decoded[1].chunk_start_ts_ms, new_chunk.chunk_start_ts_ms);
+    });
+}

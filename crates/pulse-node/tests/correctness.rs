@@ -180,7 +180,8 @@ impl Api {
         (st, r.json().await.unwrap_or(Value::Null))
     }
     fn tr() -> Value {
-        json!({"start_ts_ms": ms(2026, 10, 25, 0, 0), "end_ts_ms": ms(2026, 11, 25, 0, 0)})
+        let end = ms(2026, 11, 25, 0, 0).max(Utc::now().timestamp_millis() + D);
+        json!({"start_ts_ms": ms(2026, 10, 25, 0, 0), "end_ts_ms": end})
     }
     async fn funnel(&self, window_days: i64, extra: Value) -> Value {
         let mut q = json!({"time_range": Self::tr(),
